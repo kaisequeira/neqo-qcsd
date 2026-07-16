@@ -54,6 +54,13 @@ architecture, reproducible commands, output schemas, and known research
 boundaries. Explicit configuration examples are in
 [`qcsd-presets`](./qcsd-presets).
 
+The companion
+[`neqo-qcsd-lab`](https://github.com/kaisequeira/neqo-qcsd-lab) repository pins
+this fork as a submodule and supplies Docker-only live workload discovery,
+bounded PCAPNG capture, deterministic campaigns, drift detection, and
+Figure-2-style visualization. GitHub Actions remain disabled on this research
+fork; both repositories expose local checks instead.
+
 ## Build with separate NSS/NSPR
 
 1. Clone [NSS][NSS] and [NSPR][NSPR] into the same directory and export an environment variable called `NSS_DIR` pointing to NSS.

@@ -22,7 +22,7 @@ pub use controller::{
     QcsdStreamId,
 };
 pub use defense::{Capacity, Defense, Front, SharedDefense, StaticSchedule, Tamaraw};
-pub use resource::{Resource, ResourceManifest};
+pub use resource::{HeaderPolicy, HeaderPolicyMode, Resource, ResourceManifest};
 pub use trace::{Direction, Packet, Trace};
 
 /// Errors raised while loading or executing a QCSD experiment.

@@ -21,7 +21,7 @@ pub enum Direction {
 }
 
 /// One defense schedule slot.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Packet {
     timestamp_us: u64,
     direction: Direction,

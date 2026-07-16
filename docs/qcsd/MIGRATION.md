@@ -112,6 +112,32 @@ cargo run --locked -p neqo-bin --features qcsd --bin neqo-qcsd-client -- \
   --max-response-bytes 16777216 https://example.com/
 ```
 
+For reproducible application graphs, use a versioned workload instead of
+positional URLs:
+
+```shell
+cargo run --locked -p neqo-bin --features qcsd --bin neqo-qcsd-client -- \
+  run --workload workload.json \
+  --chaff-manifest workload.json \
+  --config qcsd-presets/published-front.toml \
+  --seed 42 --output-dir results/front-42 \
+  --max-response-bytes 16777216
+```
+
+The runner validates unknown, self, and cyclic dependencies and starts a
+resource only after all parents have completed successfully. Descendants of a
+failed parent are recorded as `skipped_dependency`, and the run terminates as
+`partial`. `probe --input-manifest` enriches a discovered graph without
+discarding IDs, dependencies, resource types, or headers.
+
+Application headers use explicit `minimal`, `fresh-browser`, or `custom`
+policies. Stored credentials, pseudo-headers, and HTTP/3-invalid
+connection-specific fields are rejected. Fresh browser replay preserves safe
+content-negotiation, referrer/origin, client-hint, fetch-metadata, and custom
+fields while suppressing cache conditions and ranges; custom policy can enable
+those two behaviors explicitly. This is separate from the stricter,
+unchanged QCSD chaff policy.
+
 `--preset published-front`, `--preset published-tamaraw`, and
 `--preset conservative-live` expand into the same resolved values recorded in
 `run.json`. Static schedules use an explicit config and CSV because the
@@ -121,12 +147,21 @@ schedule.
 Each run writes:
 
 - `run.json`: source commits, fully resolved config, seed, URLs, endpoints,
-  ALPN, timestamps, completion state, response status/bytes/SHA-256;
+  exact UDP tuples, workload hash, nanosecond anchor, resolved header policy,
+  ALPN, completion state, and response request/response headers,
+  status/bytes/SHA-256/outcome;
 - `packets.csv`: direction, monotonic time, connection, observed UDP length,
   scheduled target, and satisfaction;
 - `events.csv`: observations/actions, receive releases, chaff lifecycle,
   failures, and explicit miss reasons;
+- `schedule.csv`: scheduled time/direction/size, endpoint and action time,
+  final satisfaction, observed size, and miss reason;
 - `qlog/`: one Neqo qlog per endpoint.
+
+`run.json` is created atomically with `running` status before network setup and
+atomically replaced on complete, partial, timeout, or error outcomes. It
+records both the bound local address and the resolved remote address so an
+external collector can apply an exact five-tuple capture filter.
 
 The runner bounds application bodies with `--max-response-bytes`. Live runs
 should use a probed same-origin manifest and the conservative preset. Public
@@ -177,7 +212,7 @@ separately. Local test linking requires a compatible system NSS or the
 
 ### Verification snapshot (2026-07-16)
 
-- All 18 `neqo-qcsd` unit tests pass, and strict all-target core clippy is
+- All 21 `neqo-qcsd` unit tests pass, and strict all-target core clippy is
   clean.
 - All 856 QCSD-enabled `neqo-transport` library tests pass, including six new
   focused tests covering manual credit, restoring automatic credit, exact
@@ -194,6 +229,13 @@ separately. Local test linking requires a compatible system NSS or the
   All three scheduled outgoing FRONT datagrams were exactly 1200 bytes and
   recorded as satisfied. Incoming misses were recorded explicitly because the
   deliberately minimal server exposed only a one-byte chaff resource.
+- The workload/dependency runner was subsequently gated against the
+  unmodified server's `/1048576` and dependent `/1024` responses in all four
+  modes. Baseline, padding-only Static, conservative FRONT, and conservative
+  Tamaraw all completed with status 200 and identical per-resource hashes.
+  Static emitted six schedule outcomes, FRONT 41, and Tamaraw 1205 in the
+  bounded local profiles; exact outgoing targets were recorded as satisfied
+  and all receive-credit/miss outcomes remained explicit.
 
 On the ARM64 verification host, upstream `nss-rs` built its assembly wrapper
 archive but did not add that archive to the test link command. Focused linked

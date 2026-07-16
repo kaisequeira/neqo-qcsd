@@ -736,7 +736,9 @@ mod tests {
     use super::{
         QcsdAction, QcsdController, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdStreamId,
     };
-    use crate::{DefenseConfig, QcsdConfig, Resource, ResourceManifest, TamarawConfig};
+    use crate::{
+        DefenseConfig, HeaderPolicy, QcsdConfig, Resource, ResourceManifest, TamarawConfig,
+    };
 
     fn tamaraw_controller() -> QcsdController {
         let config = QcsdConfig {
@@ -909,6 +911,7 @@ mod tests {
     fn chaff_is_routed_to_an_exact_same_origin_endpoint() {
         let manifest = ResourceManifest {
             schema_version: 1,
+            header_policy: HeaderPolicy::default(),
             resources: vec![
                 Resource {
                     id: 1,
