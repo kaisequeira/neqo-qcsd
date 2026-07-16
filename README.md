@@ -38,6 +38,22 @@ To run test HTTP/3 programs (`neqo-client` and `neqo-server`):
 ./target/debug/neqo-client 'https://[::]:12345/'
 ```
 
+## QCSD research client
+
+This fork contains a feature-gated migration of the published client-side QCSD
+framework. It adds no server requirements and leaves normal Neqo builds
+unchanged. Build the dedicated current-thread runner with:
+
+```shell
+cargo build --locked -p neqo-bin --features qcsd --bin neqo-qcsd-client
+target/debug/neqo-qcsd-client --help
+```
+
+Start with [`docs/qcsd/MIGRATION.md`](./docs/qcsd/MIGRATION.md) for provenance,
+architecture, reproducible commands, output schemas, and known research
+boundaries. Explicit configuration examples are in
+[`qcsd-presets`](./qcsd-presets).
+
 ## Build with separate NSS/NSPR
 
 1. Clone [NSS][NSS] and [NSPR][NSPR] into the same directory and export an environment variable called `NSS_DIR` pointing to NSS.

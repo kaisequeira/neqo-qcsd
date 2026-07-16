@@ -1040,6 +1040,27 @@ impl RecvStream {
         }
     }
 
+    /// Switch this receive stream to a monotonically increasing absolute QCSD limit.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_set_manual_limit(&mut self, absolute_limit: u64) -> bool {
+        if let RecvStreamState::Recv { fc, .. } = &mut self.state {
+            fc.set_manual_limit(absolute_limit)
+        } else {
+            false
+        }
+    }
+
+    /// Restore automatic flow-control updates for a stream excluded from QCSD shaping.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_set_auto_window(&mut self, window: u64) -> bool {
+        if let RecvStreamState::Recv { fc, .. } = &mut self.state {
+            fc.set_auto_window(window);
+            true
+        } else {
+            false
+        }
+    }
+
     #[must_use]
     pub const fn is_ended(&self) -> bool {
         matches!(

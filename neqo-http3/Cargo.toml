@@ -24,6 +24,7 @@ http = { workspace = true }
 log = { workspace = true }
 neqo-common = { path = "./../neqo-common" }
 neqo-qpack = { path = "./../neqo-qpack", default-features = false }
+neqo-qcsd = { path = "./../neqo-qcsd", optional = true }
 neqo-transport = { path = "./../neqo-transport", default-features = false }
 nss = { workspace = true }
 qlog = { workspace = true }
@@ -54,6 +55,7 @@ build-fuzzing-corpus = [
 ]
 disable-encryption = ["neqo-transport/disable-encryption", "nss/disable-encryption"]
 draft-29 = ["neqo-transport/draft-29"]
+qcsd = ["dep:neqo-qcsd", "neqo-transport/qcsd"]
 
 [package.metadata.cargo-machete]
 ignored = ["criterion", "log"]

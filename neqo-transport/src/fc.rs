@@ -271,6 +271,9 @@ where
     /// Retired items.
     retired: u64,
     frame_pending: bool,
+    /// Absolute receive limit controlled by QCSD rather than the automatic window.
+    #[cfg(feature = "qcsd")]
+    manual_limit: Option<u64>,
 }
 
 impl<T> ReceiverFlowControl<T>
@@ -287,6 +290,8 @@ where
             consumed: 0,
             retired: 0,
             frame_pending: false,
+            #[cfg(feature = "qcsd")]
+            manual_limit: None,
         }
     }
 
@@ -298,7 +303,7 @@ where
         }
 
         self.retired = retired;
-        if self.should_send_update() {
+        if self.auto_updates_enabled() && self.should_send_update() {
             self.frame_pending = true;
         }
     }
@@ -306,7 +311,7 @@ where
     /// This function is called when `STREAM_DATA_BLOCKED` frame is received.
     /// The flow control will try to send an update if possible.
     pub const fn send_flowc_update(&mut self) {
-        if self.retired + self.max_active > self.max_allowed {
+        if self.auto_updates_enabled() && self.retired + self.max_active > self.max_allowed {
             self.frame_pending = true;
         }
     }
@@ -321,6 +326,10 @@ where
     }
 
     pub fn next_limit(&self) -> u64 {
+        #[cfg(feature = "qcsd")]
+        if let Some(manual_limit) = self.manual_limit {
+            return min(manual_limit, MAX_VARINT);
+        }
         min(
             self.retired + self.max_active,
             // Flow control limits are encoded as QUIC varints and are thus
@@ -348,6 +357,34 @@ where
         // If max_active has been increased, send an update immediately.
         self.frame_pending |= self.max_active < max;
         self.max_active = max;
+    }
+
+    /// Switch to QCSD's absolute manual receive limit.
+    ///
+    /// Returns `false` when the limit would revoke credit already advertised or consumed.
+    #[cfg(feature = "qcsd")]
+    pub const fn set_manual_limit(&mut self, absolute_limit: u64) -> bool {
+        if absolute_limit < self.max_allowed || absolute_limit < self.consumed {
+            return false;
+        }
+        self.frame_pending |= absolute_limit > self.max_allowed;
+        self.manual_limit = Some(absolute_limit);
+        true
+    }
+
+    /// Return a QCSD-controlled stream to automatic receive-window updates.
+    #[cfg(feature = "qcsd")]
+    pub const fn set_auto_window(&mut self, window: u64) {
+        self.manual_limit = None;
+        self.set_max_active(window);
+    }
+
+    const fn auto_updates_enabled(&self) -> bool {
+        #[cfg(feature = "qcsd")]
+        if self.manual_limit.is_some() {
+            return false;
+        }
+        true
     }
 
     pub const fn retired(&self) -> u64 {
@@ -532,7 +569,9 @@ impl ReceiverFlowControl<StreamId> {
             return;
         }
 
-        self.auto_tune(now, rtt);
+        if self.auto_updates_enabled() {
+            self.auto_tune(now, rtt);
+        }
 
         let max_allowed = self.next_limit();
         if builder.write_varint_frame(&[
@@ -906,6 +945,48 @@ mod test {
         let mut fc = ReceiverFlowControl::new((), 100);
         fc.retire(10);
         assert!(!fc.frame_needed());
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_manual_limit_only_advances_explicitly() {
+        let mut fc = ReceiverFlowControl::new((), 16);
+        assert!(fc.set_manual_limit(16));
+        fc.consume(16).unwrap();
+        fc.retire(16);
+        fc.send_flowc_update();
+        assert!(!fc.frame_needed());
+
+        assert!(fc.set_manual_limit(128));
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 128);
+        fc.frame_sent(128);
+        assert!(!fc.frame_needed());
+
+        fc.retire(100);
+        assert!(!fc.frame_needed());
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_manual_limit_never_revokes_credit() {
+        let mut fc = ReceiverFlowControl::new((), 64);
+        assert!(!fc.set_manual_limit(16));
+        assert!(fc.set_manual_limit(64));
+        assert!(fc.consume(32).is_ok());
+        assert!(!fc.set_manual_limit(31));
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_can_restore_automatic_updates() {
+        let mut fc = ReceiverFlowControl::new((), 16);
+        assert!(fc.set_manual_limit(16));
+        fc.set_auto_window(64);
+        fc.consume(16).unwrap();
+        fc.retire(16);
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 80);
     }
 
     #[test]

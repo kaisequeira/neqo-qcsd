@@ -326,6 +326,28 @@ impl Streams {
         self.send.write_frames(priority, builder, tokens, stats);
     }
 
+    /// Write non-critical stream frames within a QCSD slot budget.
+    #[cfg(feature = "qcsd")]
+    pub fn write_frames_budgeted<B: Buffer>(
+        &mut self,
+        priority: TransmissionPriority,
+        builder: &mut packet::Builder<B>,
+        tokens: &mut recovery::Tokens,
+        stats: &mut FrameStats,
+        budget: &mut usize,
+    ) {
+        if *budget == 0 {
+            return;
+        }
+        let original_limit = builder.limit();
+        let budget_limit = builder.len().saturating_add(*budget).min(original_limit);
+        builder.set_limit(budget_limit);
+        let before = builder.len();
+        self.send.write_frames(priority, builder, tokens, stats);
+        *budget = budget.saturating_sub(builder.len().saturating_sub(before));
+        builder.set_limit(original_limit);
+    }
+
     pub fn lost(&mut self, token: &StreamRecoveryToken) {
         match token {
             StreamRecoveryToken::Stream(st) => self.send.lost(st),

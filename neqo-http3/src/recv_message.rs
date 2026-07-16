@@ -13,6 +13,8 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "qcsd")]
+use neqo_common::Encoder;
 use neqo_common::{Header, header::HeadersExt as _, qdebug, qinfo, qtrace};
 use neqo_qpack as qpack;
 use neqo_transport::{Connection, StreamId};
@@ -84,6 +86,8 @@ pub struct RecvMessage {
     stream_id: StreamId,
     priority_handler: PriorityHandler,
     blocked_push_promise: VecDeque<PushInfo>,
+    #[cfg(feature = "qcsd")]
+    qcsd_header_frame_bytes: u64,
 }
 
 impl Display for RecvMessage {
@@ -117,10 +121,21 @@ impl RecvMessage {
             stream_id: message_info.stream_id,
             priority_handler,
             blocked_push_promise: VecDeque::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_header_frame_bytes: 0,
         }
     }
 
     fn handle_headers_frame(&mut self, header_block: Vec<u8>, fin: bool) -> Res<()> {
+        #[cfg(feature = "qcsd")]
+        {
+            self.qcsd_header_frame_bytes = u64::try_from(
+                Encoder::varint_len(HFrameType::HEADERS.0)
+                    + Encoder::varint_len(header_block.len() as u64)
+                    + header_block.len(),
+            )
+            .map_err(|_| Error::HttpFrame)?;
+        }
         match self.state {
             RecvMessageState::WaitingForResponseHeaders { .. } => {
                 if header_block.is_empty() {
@@ -145,6 +160,13 @@ impl RecvMessage {
     }
 
     fn handle_data_frame(&mut self, len: u64, fin: bool) -> Res<()> {
+        #[cfg(feature = "qcsd")]
+        self.conn_events.qcsd_data_frame(
+            self.stream_id,
+            u64::try_from(Encoder::varint_len(HFrameType::DATA.0) + Encoder::varint_len(len))
+                .map_err(|_| Error::HttpFrame)?,
+            len,
+        );
         match self.state {
             RecvMessageState::WaitingForResponseHeaders { .. }
             | RecvMessageState::WaitingForFinAfterTrailers { .. } => {
@@ -180,6 +202,15 @@ impl RecvMessage {
 
         if fin && interim {
             return Err(Error::HttpGeneralProtocolStream);
+        }
+
+        #[cfg(feature = "qcsd")]
+        if self.message_type == MessageType::Response && !interim {
+            self.conn_events.qcsd_response_headers(
+                self.stream_id,
+                self.qcsd_header_frame_bytes,
+                &headers,
+            );
         }
 
         let is_extended_connect = self.message_type == MessageType::Request
@@ -426,6 +457,11 @@ impl RecvStream for RecvMessage {
                         .stream_recv(self.stream_id, &mut buf[written..written + to_read])
                         .map_err(|e| Error::map_stream_recv_errors(&Error::from(e)))?;
                     qlog::h3_data_moved_up(conn.qlog_mut(), self.stream_id, amount, now);
+                    #[cfg(feature = "qcsd")]
+                    self.conn_events.qcsd_bytes_read(
+                        self.stream_id,
+                        u64::try_from(amount).map_err(|_| Error::Internal)?,
+                    );
 
                     debug_assert!(amount <= to_read);
                     *remaining_data_len -= amount;

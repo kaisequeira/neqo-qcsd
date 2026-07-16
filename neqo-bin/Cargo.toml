@@ -23,6 +23,12 @@ name = "neqo-server"
 path = "src/bin/server.rs"
 bench = false
 
+[[bin]]
+name = "neqo-qcsd-client"
+path = "src/bin/qcsd-client.rs"
+required-features = ["qcsd"]
+bench = false
+
 [lints]
 workspace = true
 
@@ -43,6 +49,7 @@ libc = { workspace = true }
 log = { workspace = true }
 neqo-common = { path = "./../neqo-common" }
 neqo-http3 = { path = "./../neqo-http3" }
+neqo-qcsd = { path = "./../neqo-qcsd", optional = true }
 neqo-transport = { path = "./../neqo-transport" }
 neqo-udp = { path = "./../neqo-udp" }
 nss = { workspace = true }
@@ -50,6 +57,8 @@ nss-test-fixture = { workspace = true }
 qlog = { workspace = true }
 quinn-udp = { workspace = true }
 rustc-hash = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["net", "time", "macros", "rt"] }
@@ -65,6 +74,13 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 [features]
 bench = ["neqo-bin/bench", "neqo-http3/bench", "neqo-transport/bench", "log/release_max_level_info"]
 draft-29 = ["neqo-http3/draft-29", "neqo-transport/draft-29"]
+qcsd = [
+        "dep:neqo-qcsd",
+        "dep:serde",
+        "dep:serde_json",
+        "neqo-http3/qcsd",
+        "neqo-transport/qcsd",
+]
 
 [build-dependencies]
 cfg_aliases = { workspace = true }

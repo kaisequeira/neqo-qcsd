@@ -7,6 +7,8 @@
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use neqo_common::{Bytes, Header, event::Provider as EventProvider, qtrace};
+#[cfg(feature = "qcsd")]
+use neqo_qcsd::{QcsdEndpointId, QcsdObservation, QcsdStreamId};
 use neqo_transport::{AppError, StreamId, StreamType};
 use nss::ResumptionToken;
 
@@ -138,6 +140,10 @@ pub enum Http3ClientEvent {
 #[derive(Debug, Default, Clone)]
 pub struct Http3ClientEvents {
     events: Rc<RefCell<VecDeque<Http3ClientEvent>>>,
+    #[cfg(feature = "qcsd")]
+    qcsd_endpoint: Rc<RefCell<Option<QcsdEndpointId>>>,
+    #[cfg(feature = "qcsd")]
+    qcsd_observations: Rc<RefCell<VecDeque<QcsdObservation>>>,
 }
 
 impl RecvStreamEvents for Http3ClientEvents {
@@ -151,6 +157,11 @@ impl RecvStreamEvents for Http3ClientEvents {
     /// Add a new `Reset` event.
     fn recv_closed(&self, stream_info: &Http3StreamInfo, close_type: CloseType) {
         let stream_id = stream_info.stream_id();
+        #[cfg(feature = "qcsd")]
+        self.qcsd_observe(|endpoint| QcsdObservation::StreamFinished {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+        });
         let (local, error) = match close_type {
             CloseType::ResetApp(_) => {
                 self.remove_recv_stream_events(stream_id);
@@ -189,6 +200,40 @@ impl HttpRecvStreamEvents for Http3ClientEvents {
             headers,
             interim,
             fin,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_response_headers(&self, stream_id: StreamId, frame_bytes: u64, headers: &[Header]) {
+        let content_length = headers
+            .iter()
+            .find(|header| header.name().eq_ignore_ascii_case("content-length"))
+            .and_then(|header| header.value_utf8().ok())
+            .and_then(|value| value.trim().parse().ok());
+        self.qcsd_observe(|endpoint| QcsdObservation::ResponseHeaders {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            frame_bytes,
+            content_length,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_data_frame(&self, stream_id: StreamId, frame_header_bytes: u64, data_bytes: u64) {
+        self.qcsd_observe(|endpoint| QcsdObservation::DataFrame {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            frame_header_bytes,
+            data_bytes,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_bytes_read(&self, stream_id: StreamId, bytes: u64) {
+        self.qcsd_observe(|endpoint| QcsdObservation::BytesRead {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            bytes,
         });
     }
 }
@@ -308,6 +353,25 @@ impl ExtendedConnectEvents for Http3ClientEvents {
 }
 
 impl Http3ClientEvents {
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_enable(&self, endpoint: QcsdEndpointId) {
+        *self.qcsd_endpoint.borrow_mut() = Some(endpoint);
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_observe(&self, observation: impl FnOnce(QcsdEndpointId) -> QcsdObservation) {
+        if let Some(endpoint) = *self.qcsd_endpoint.borrow() {
+            self.qcsd_observations
+                .borrow_mut()
+                .push_back(observation(endpoint));
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_observations(&self) -> Vec<QcsdObservation> {
+        self.qcsd_observations.borrow_mut().drain(..).collect()
+    }
+
     pub fn push_promise(&self, push_id: PushId, request_stream_id: StreamId, headers: Vec<Header>) {
         self.insert(Http3ClientEvent::PushPromise {
             push_id,
@@ -372,6 +436,10 @@ impl Http3ClientEvents {
 
     /// Add a new `StateChange` event.
     pub(crate) fn connection_state_change(&self, state: Http3State) {
+        #[cfg(feature = "qcsd")]
+        if matches!(state, Http3State::Closing { .. } | Http3State::Closed(_)) {
+            self.qcsd_observe(|endpoint| QcsdObservation::EndpointClosed { endpoint });
+        }
         match state {
             // If closing, existing events no longer relevant.
             Http3State::Closing { .. } | Http3State::Closed(_) => self.events.borrow_mut().clear(),

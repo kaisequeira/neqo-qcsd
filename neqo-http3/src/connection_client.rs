@@ -22,6 +22,8 @@ use neqo_common::{
     qlog::Qlog,
     qtrace, qwarn,
 };
+#[cfg(feature = "qcsd")]
+use neqo_qcsd::{QcsdAction, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdStreamId};
 use neqo_qpack::Stats as QpackStats;
 use neqo_transport::{
     AppError, Connection, ConnectionEvent, ConnectionId, ConnectionIdGenerator, Output,
@@ -280,6 +282,10 @@ pub struct Http3Client {
     base_handler: Http3Connection,
     events: Http3ClientEvents,
     push_handler: Rc<RefCell<PushController>>,
+    #[cfg(feature = "qcsd")]
+    qcsd_endpoint: Option<QcsdEndpointId>,
+    #[cfg(feature = "qcsd")]
+    qcsd_origin: Option<(String, String)>,
 }
 
 impl Display for Http3Client {
@@ -335,7 +341,191 @@ impl Http3Client {
             events: events.clone(),
             push_handler: Rc::new(RefCell::new(PushController::new(push_streams, events))),
             base_handler,
+            #[cfg(feature = "qcsd")]
+            qcsd_endpoint: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_origin: None,
         }
+    }
+
+    /// Enable the narrow QCSD adapter for this HTTP/3 connection.
+    ///
+    /// `origin` is retained to enforce that controller-generated chaff stays on the
+    /// same HTTPS origin. The caller must set the connection's initial local
+    /// bidirectional stream-data limit before construction when a defense requires
+    /// the published 16-byte starting allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] unless `origin` is an absolute HTTPS URI.
+    #[cfg(feature = "qcsd")]
+    pub fn enable_qcsd(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        origin: &http::Uri,
+        configured_max_udp_payload_size: u16,
+        shape_stream_sends: bool,
+    ) -> Res<()> {
+        let scheme = origin.scheme_str().ok_or(Error::InvalidInput)?;
+        let authority = origin.authority().ok_or(Error::InvalidInput)?.as_str();
+        if scheme != "https" {
+            return Err(Error::InvalidInput);
+        }
+        self.qcsd_endpoint = Some(endpoint);
+        self.qcsd_origin = Some((scheme.to_owned(), authority.to_owned()));
+        self.events.qcsd_enable(endpoint);
+        let qcsd_origin = format!("{scheme}://{authority}");
+        let max_udp_payload_size = self
+            .conn
+            .qcsd_max_udp_payload_size()
+            .map_or(configured_max_udp_payload_size, |path_limit| {
+                path_limit.min(configured_max_udp_payload_size)
+            });
+        self.events
+            .qcsd_observe(|endpoint| QcsdObservation::EndpointReady {
+                endpoint,
+                origin: qcsd_origin,
+                max_udp_payload_size,
+            });
+        self.conn.qcsd_enable_send_shaping(shape_stream_sends);
+        Ok(())
+    }
+
+    /// Register the application/chaff role of a request stream with QCSD.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] when QCSD has not been enabled.
+    #[cfg(feature = "qcsd")]
+    pub fn register_qcsd_stream(&self, stream_id: StreamId, role: QcsdRequestRole) -> Res<()> {
+        let endpoint = self.qcsd_endpoint.ok_or(Error::InvalidInput)?;
+        self.events.qcsd_observe(|_| QcsdObservation::StreamOpened {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            role,
+        });
+        Ok(())
+    }
+
+    /// Drain observations accumulated by the HTTP/3 and transport adapters.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_observations(&self) -> Vec<QcsdObservation> {
+        self.events.qcsd_observations()
+    }
+
+    /// Number of scheduled QCSD output targets not yet transmitted.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_pending_packet_targets(&self) -> usize {
+        self.conn.qcsd_pending_packet_targets()
+    }
+
+    /// Apply one controller action addressed to this connection.
+    ///
+    /// A newly opened chaff stream is returned so the research runner can track
+    /// response status, bytes, and hashes in the same way as application streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid stream/packet target, cross-origin chaff,
+    /// or a request that cannot be created.
+    #[cfg(feature = "qcsd")]
+    pub fn apply_qcsd_action(&mut self, now: Instant, action: QcsdAction) -> Res<Option<StreamId>> {
+        let own_endpoint = self.qcsd_endpoint.ok_or(Error::InvalidInput)?;
+        match action {
+            QcsdAction::ConfigureManualReceive {
+                endpoint,
+                stream,
+                initial_limit,
+            } if endpoint == own_endpoint => {
+                let stream_id = StreamId::new(stream.0);
+                self.conn
+                    .qcsd_set_stream_receive_limit(stream_id, initial_limit)?;
+                self.conn.stream_keep_alive(stream_id, true)?;
+            }
+            QcsdAction::ConfigureAutomaticReceive {
+                endpoint,
+                stream,
+                window,
+            } if endpoint == own_endpoint => {
+                self.conn
+                    .qcsd_set_stream_auto_receive(StreamId::new(stream.0), window)?;
+            }
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit,
+                ..
+            } if endpoint == own_endpoint => {
+                self.conn
+                    .qcsd_set_stream_receive_limit(StreamId::new(stream.0), absolute_limit)?;
+            }
+            QcsdAction::IncreaseSendBudget {
+                endpoint, bytes, ..
+            } if endpoint == own_endpoint => {
+                self.conn.qcsd_add_send_budget(bytes);
+            }
+            QcsdAction::SendPacket {
+                endpoint,
+                udp_payload_size,
+                ..
+            } if endpoint == own_endpoint => {
+                self.conn.qcsd_queue_packet_target(udp_payload_size)?;
+            }
+            QcsdAction::RequestChaff { endpoint, resource } if endpoint == own_endpoint => {
+                let target = resource
+                    .url
+                    .parse::<http::Uri>()
+                    .map_err(|_| Error::InvalidInput)?;
+                let origin = self.qcsd_origin.as_ref().ok_or(Error::InvalidInput)?;
+                if target.scheme_str() != Some(origin.0.as_str())
+                    || target.authority().map(http::uri::Authority::as_str)
+                        != Some(origin.1.as_str())
+                {
+                    self.events
+                        .qcsd_observe(|_| QcsdObservation::ChaffRequestFailed {
+                            resource_id: resource.id,
+                        });
+                    return Err(Error::InvalidInput);
+                }
+                let mut headers = resource
+                    .headers
+                    .into_iter()
+                    .filter_map(|(name, value)| {
+                        let name = name.to_ascii_lowercase();
+                        (!matches!(
+                            name.as_str(),
+                            "accept-encoding"
+                                | "if-match"
+                                | "if-modified-since"
+                                | "if-none-match"
+                                | "if-range"
+                                | "if-unmodified-since"
+                                | "range"
+                        ))
+                        .then(|| Header::new(name, value))
+                    })
+                    .collect::<Vec<_>>();
+                headers.push(Header::new("accept-encoding", "identity"));
+                let resource_id = resource.id;
+                let stream_id = match self.fetch(now, "GET", &target, &headers, Priority::default())
+                {
+                    Ok(stream_id) => stream_id,
+                    Err(error) => {
+                        self.events
+                            .qcsd_observe(|_| QcsdObservation::ChaffRequestFailed { resource_id });
+                        return Err(error);
+                    }
+                };
+                self.register_qcsd_stream(stream_id, QcsdRequestRole::Chaff { resource_id })?;
+                return Ok(Some(stream_id));
+            }
+            QcsdAction::KeepAlive { endpoint } if endpoint == own_endpoint => {}
+            QcsdAction::SlotMissed { .. } | QcsdAction::DefenseComplete => {}
+            _ => return Ok(None),
+        }
+        Ok(None)
     }
 
     pub(crate) const fn connection(&self) -> &Connection {
@@ -489,6 +679,9 @@ impl Http3Client {
             self.base_handler.state(),
             Http3State::Closing(_) | Http3State::Closed(_)
         ) {
+            #[cfg(feature = "qcsd")]
+            self.events
+                .qcsd_observe(|endpoint| QcsdObservation::EndpointClosed { endpoint });
             self.push_handler.borrow_mut().clear();
             self.conn.close(now, error, msg);
             self.base_handler.close(error);
@@ -669,11 +862,20 @@ impl Http3Client {
             "[{self}] end_data from stream {stream_id} sending {} bytes",
             buf.len()
         );
-        self.base_handler
+        let sent = self
+            .base_handler
             .send_streams_mut()
             .get_mut(&stream_id)
             .ok_or(Error::InvalidStreamId)?
-            .send_data(&mut self.conn, buf, now)
+            .send_data(&mut self.conn, buf, now)?;
+        #[cfg(feature = "qcsd")]
+        self.events
+            .qcsd_observe(|endpoint| QcsdObservation::BytesQueued {
+                endpoint,
+                stream: QcsdStreamId(stream_id.as_u64()),
+                bytes: u64::try_from(sent).unwrap_or(u64::MAX),
+            });
+        Ok(sent)
     }
 
     /// Response data are read directly into a buffer supplied as a parameter of this function to
@@ -1593,7 +1795,7 @@ mod tests {
                     .borrow_mut()
                     .encode_header_block(&mut self.conn, headers, stream_id);
             let hframe = HFrame::Headers {
-                header_block: header_block.as_ref().to_vec(),
+                header_block: header_block.to_vec(),
             };
             hframe.encode(encoder);
         }

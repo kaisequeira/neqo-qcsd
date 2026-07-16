@@ -48,6 +48,8 @@ mod migration;
 mod null;
 mod pmtud;
 mod priority;
+#[cfg(feature = "qcsd")]
+mod qcsd;
 mod recovery;
 mod reset_stream_at;
 mod resumption;

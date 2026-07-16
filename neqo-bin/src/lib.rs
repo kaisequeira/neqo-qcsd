@@ -21,6 +21,8 @@ use strum::VariantNames as _;
 use thiserror::Error;
 
 pub mod client;
+#[cfg(feature = "qcsd")]
+pub mod qcsd;
 mod send_data;
 pub mod server;
 pub mod udp;

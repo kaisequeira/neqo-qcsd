@@ -5,6 +5,8 @@
 
 // The class implementing a QUIC connection.
 
+#[cfg(feature = "qcsd")]
+use std::collections::VecDeque;
 use std::{
     cell::RefCell,
     cmp::{max, min},
@@ -329,6 +331,19 @@ pub struct Connection {
     conn_params: ConnectionParameters,
     hrtime: hrtime::Handle,
 
+    /// Exact 1-RTT UDP payload targets waiting for QCSD output slots.
+    #[cfg(feature = "qcsd")]
+    qcsd_packet_targets: VecDeque<u16>,
+    /// Target selected for the datagram currently being assembled.
+    #[cfg(feature = "qcsd")]
+    qcsd_active_target: Option<u16>,
+    /// Whether non-critical stream data is restricted to controller grants.
+    #[cfg(feature = "qcsd")]
+    qcsd_send_shaping: bool,
+    /// Remaining encoded stream-frame budget for the current QCSD slot.
+    #[cfg(feature = "qcsd")]
+    qcsd_send_budget: usize,
+
     /// For testing purposes it is sometimes necessary to inject frames that wouldn't
     /// otherwise be sent, just to see how a connection handles them.  Inserting them
     /// into packets proper mean that the frames follow the entire processing path.
@@ -475,6 +490,14 @@ impl Connection {
             release_resumption_token_timer: None,
             conn_params,
             hrtime: hrtime::Time::get(Self::LOOSE_TIMER_RESOLUTION),
+            #[cfg(feature = "qcsd")]
+            qcsd_packet_targets: VecDeque::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_active_target: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_send_shaping: false,
+            #[cfg(feature = "qcsd")]
+            qcsd_send_budget: 0,
             quic_datagrams,
             #[cfg(any(test, feature = "build-fuzzing-corpus"))]
             test_frame_writer: None,
@@ -1246,6 +1269,13 @@ impl Connection {
                 self.process_timer(now);
             }
         }
+
+        #[cfg(feature = "qcsd")]
+        let max_datagrams = if self.qcsd_packet_targets.is_empty() {
+            max_datagrams
+        } else {
+            NonZeroUsize::MIN
+        };
 
         match self.output(now, max_datagrams) {
             SendOptionBatch::Yes(dgram) => OutputBatch::DatagramBatch(dgram),
@@ -2375,6 +2405,24 @@ impl Connection {
             return;
         }
 
+        #[cfg(feature = "qcsd")]
+        if self.qcsd_send_shaping {
+            self.streams.write_frames_budgeted(
+                TransmissionPriority::Important,
+                builder,
+                tokens,
+                frame_stats,
+                &mut self.qcsd_send_budget,
+            );
+        } else {
+            self.streams.write_frames(
+                TransmissionPriority::Important,
+                builder,
+                tokens,
+                frame_stats,
+            );
+        }
+        #[cfg(not(feature = "qcsd"))]
         self.streams.write_frames(
             TransmissionPriority::Important,
             builder,
@@ -2397,6 +2445,20 @@ impl Connection {
         }
 
         for prio in [TransmissionPriority::High, TransmissionPriority::Normal] {
+            #[cfg(feature = "qcsd")]
+            if self.qcsd_send_shaping {
+                self.streams.write_frames_budgeted(
+                    prio,
+                    builder,
+                    tokens,
+                    &mut stats.frame_tx,
+                    &mut self.qcsd_send_budget,
+                );
+            } else {
+                self.streams
+                    .write_frames(prio, builder, tokens, &mut stats.frame_tx);
+            }
+            #[cfg(not(feature = "qcsd"))]
             self.streams
                 .write_frames(prio, builder, tokens, &mut stats.frame_tx);
             if builder.is_full() {
@@ -2563,6 +2625,20 @@ impl Connection {
                 assert!(!builder.is_full(), "test_frame_writer set on full packet");
                 w.write_frames(builder);
             }
+        }
+
+        #[cfg(feature = "qcsd")]
+        if space == PacketNumberSpace::ApplicationData
+            && self.qcsd_active_target.is_some()
+            && !profile.ack_only()
+            && !builder.is_full()
+        {
+            // A scheduled packet is always ack-eliciting, even if no application or
+            // control frame was ready. Padding below then fills the exact target.
+            builder.encode_frame(FrameType::Ping, |_| {});
+            builder.enable_padding(true);
+            self.stats.borrow_mut().frame_tx.ping += 1;
+            ack_eliciting = true;
         }
 
         // Maybe send a probe now, either to probe for losses or to keep the connection live.
@@ -2736,6 +2812,15 @@ impl Connection {
         let profile = self.loss_recovery.send_profile(&path.borrow(), now);
         qdebug!("[{self}] output_dgram_on_path send_profile {profile:?}");
 
+        #[cfg(feature = "qcsd")]
+        {
+            self.qcsd_active_target = self
+                .qcsd_packet_targets
+                .front()
+                .copied()
+                .filter(|target| usize::from(*target) <= profile.limit());
+        }
+
         // Frames for different epochs must go in different packets, but then these
         // packets can go in a single datagram
         for space in PacketNumberSpace::iter() {
@@ -2765,7 +2850,15 @@ impl Connection {
                     } else {
                         0
                     }
-            } - aead_expansion;
+            };
+            #[cfg(feature = "qcsd")]
+            let limit = if space == PacketNumberSpace::ApplicationData {
+                self.qcsd_active_target
+                    .map_or(limit, |target| limit.min(usize::from(target)))
+            } else {
+                limit
+            };
+            let limit = limit.saturating_sub(aead_expansion);
 
             let (pt, mut builder, pn) = Self::build_packet_header(
                 &path.borrow(),
@@ -2891,6 +2984,10 @@ impl Connection {
         }
 
         if encoder.is_empty() {
+            #[cfg(feature = "qcsd")]
+            {
+                self.qcsd_active_target = None;
+            }
             qdebug!("TX blocked, profile={profile:?}");
             Ok(SendOption::No(profile.paced()))
         } else {
@@ -2900,6 +2997,13 @@ impl Connection {
                     self.pad_initial(&mut encoder, &mut initial, &profile);
                 }
                 self.loss_recovery.on_packet_sent(path, initial, now);
+            }
+            #[cfg(feature = "qcsd")]
+            if let Some(target) = self.qcsd_active_target.take()
+                && encoder.len() == usize::from(target)
+            {
+                let removed = self.qcsd_packet_targets.pop_front();
+                debug_assert_eq!(removed, Some(target));
             }
             path.borrow_mut().add_sent(encoder.len());
             Ok(SendOption::Yes)
@@ -3983,6 +4087,97 @@ impl Connection {
 
         stream.set_stream_max_data(max_data);
         Ok(())
+    }
+
+    /// Configure a receive stream with QCSD's absolute `MAX_STREAM_DATA` limit.
+    ///
+    /// Unlike [`Self::set_stream_max_data`], this suppresses retirement-driven window updates
+    /// and auto-tuning until [`Self::qcsd_set_stream_auto_receive`] is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidStreamId` if the receive stream is unavailable and `InvalidInput` if the
+    /// requested limit would revoke credit already advertised or consumed.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_set_stream_receive_limit(
+        &mut self,
+        stream_id: StreamId,
+        absolute_limit: u64,
+    ) -> Res<()> {
+        let stream = self.streams.get_recv_stream_mut(stream_id)?;
+        if stream.qcsd_set_manual_limit(absolute_limit) {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput)
+        }
+    }
+
+    /// Restore normal receive-window management for a stream excluded from QCSD shaping.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidStreamId` if the receive stream is unavailable.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_set_stream_auto_receive(&mut self, stream_id: StreamId, window: u64) -> Res<()> {
+        let stream = self.streams.get_recv_stream_mut(stream_id)?;
+        if stream.qcsd_set_auto_window(window) {
+            Ok(())
+        } else {
+            Err(Error::InvalidStreamId)
+        }
+    }
+
+    /// Queue one exact-size, ack-eliciting 1-RTT UDP payload for QCSD.
+    ///
+    /// The target cannot exceed the active path MTU. Congestion control and packet protection
+    /// remain authoritative; a queued target waits until they permit transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotAvailable` before a path exists and `InvalidInput` for an unsafe size.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_queue_packet_target(&mut self, udp_payload_size: u16) -> Res<()> {
+        if !self.state.connected() {
+            return Err(Error::NotAvailable);
+        }
+        let path = self.paths.primary().ok_or(Error::NotAvailable)?;
+        if udp_payload_size < 64 || usize::from(udp_payload_size) > path.borrow().plpmtu() {
+            return Err(Error::InvalidInput);
+        }
+        self.qcsd_packet_targets.push_back(udp_payload_size);
+        Ok(())
+    }
+
+    /// Number of scheduled QCSD output slots not yet transmitted.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_pending_packet_targets(&self) -> usize {
+        self.qcsd_packet_targets.len()
+    }
+
+    /// Current primary-path UDP payload ceiling available to QCSD.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_max_udp_payload_size(&self) -> Option<u16> {
+        let path = self.paths.primary()?;
+        u16::try_from(path.borrow().plpmtu()).ok()
+    }
+
+    /// Enable or disable controller-granted stream transmission budgets.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_enable_send_shaping(&mut self, enabled: bool) {
+        self.qcsd_send_shaping = enabled;
+        if !enabled {
+            self.qcsd_send_budget = 0;
+        }
+    }
+
+    /// Add encoded stream capacity for an upcoming QCSD output slot.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_add_send_budget(&mut self, bytes: u64) {
+        self.qcsd_send_budget = self
+            .qcsd_send_budget
+            .saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
 
     /// Mark a receive stream as being important enough to keep the connection alive
