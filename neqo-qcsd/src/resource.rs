@@ -15,9 +15,9 @@ use crate::{Error, Result};
 #[serde(rename_all = "kebab-case")]
 pub enum HeaderPolicyMode {
     /// Ignore per-resource discovery headers and send only explicit overrides.
-    #[default]
     Minimal,
     /// Replay safe browser discovery headers, excluding conditional and range fields.
+    #[default]
     FreshBrowser,
     /// Replay safe discovery headers with explicitly selected conditional/range behavior.
     Custom,
@@ -469,6 +469,11 @@ mod tests {
         ],
         "links": [{"source":0,"target":1}]
     }"#;
+
+    #[test]
+    fn defaults_new_workloads_to_fresh_browser_headers() {
+        assert_eq!(HeaderPolicy::default().mode, HeaderPolicyMode::FreshBrowser);
+    }
 
     #[test]
     fn imports_legacy_dependency_graph() {

@@ -131,7 +131,8 @@ failed parent are recorded as `skipped_dependency`, and the run terminates as
 discarding IDs, dependencies, resource types, or headers.
 
 Application headers use explicit `minimal`, `fresh-browser`, or `custom`
-policies. Stored credentials, pseudo-headers, and HTTP/3-invalid
+policies; new manifests default to `fresh-browser`. Stored credentials,
+pseudo-headers, and HTTP/3-invalid
 connection-specific fields are rejected. Fresh browser replay preserves safe
 content-negotiation, referrer/origin, client-hint, fetch-metadata, and custom
 fields while suppressing cache conditions and ranges; custom policy can enable
