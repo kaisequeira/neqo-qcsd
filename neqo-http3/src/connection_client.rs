@@ -23,7 +23,7 @@ use neqo_common::{
     qtrace, qwarn,
 };
 #[cfg(feature = "qcsd")]
-use neqo_qcsd::{QcsdAction, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdStreamId};
+use neqo_csdef::QcsdEndpointId;
 use neqo_qpack::Stats as QpackStats;
 use neqo_transport::{
     AppError, Connection, ConnectionEvent, ConnectionId, ConnectionIdGenerator, Output,
@@ -43,6 +43,10 @@ use crate::{
     request_target::RequestTarget,
     settings::HSettings,
 };
+
+#[cfg(feature = "qcsd")]
+#[path = "connection_client_qcsd.rs"]
+mod qcsd;
 
 // This is used for filtering send_streams and recv_Streams with a stream_ids greater than or equal
 // a given id. Only the same type (bidirectional or unidirectional) streams are filtered.
@@ -294,6 +298,14 @@ impl Display for Http3Client {
     }
 }
 
+#[cfg_attr(
+    feature = "qcsd",
+    allow(
+        clippy::allow_attributes,
+        clippy::multiple_inherent_impl,
+        reason = "QCSD is an optional adapter kept out of the primary HTTP/3 client implementation"
+    )
+)]
 impl Http3Client {
     /// # Errors
     ///
@@ -346,186 +358,6 @@ impl Http3Client {
             #[cfg(feature = "qcsd")]
             qcsd_origin: None,
         }
-    }
-
-    /// Enable the narrow QCSD adapter for this HTTP/3 connection.
-    ///
-    /// `origin` is retained to enforce that controller-generated chaff stays on the
-    /// same HTTPS origin. The caller must set the connection's initial local
-    /// bidirectional stream-data limit before construction when a defense requires
-    /// the published 16-byte starting allowance.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidInput`] unless `origin` is an absolute HTTPS URI.
-    #[cfg(feature = "qcsd")]
-    pub fn enable_qcsd(
-        &mut self,
-        endpoint: QcsdEndpointId,
-        origin: &http::Uri,
-        configured_max_udp_payload_size: u16,
-        shape_stream_sends: bool,
-    ) -> Res<()> {
-        let scheme = origin.scheme_str().ok_or(Error::InvalidInput)?;
-        let authority = origin.authority().ok_or(Error::InvalidInput)?.as_str();
-        if scheme != "https" {
-            return Err(Error::InvalidInput);
-        }
-        self.qcsd_endpoint = Some(endpoint);
-        self.qcsd_origin = Some((scheme.to_owned(), authority.to_owned()));
-        self.events.qcsd_enable(endpoint);
-        let qcsd_origin = format!("{scheme}://{authority}");
-        let max_udp_payload_size = self
-            .conn
-            .qcsd_max_udp_payload_size()
-            .map_or(configured_max_udp_payload_size, |path_limit| {
-                path_limit.min(configured_max_udp_payload_size)
-            });
-        self.events
-            .qcsd_observe(|endpoint| QcsdObservation::EndpointReady {
-                endpoint,
-                origin: qcsd_origin,
-                max_udp_payload_size,
-            });
-        self.conn.qcsd_enable_send_shaping(shape_stream_sends);
-        Ok(())
-    }
-
-    /// Register the application/chaff role of a request stream with QCSD.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidInput`] when QCSD has not been enabled.
-    #[cfg(feature = "qcsd")]
-    pub fn register_qcsd_stream(&self, stream_id: StreamId, role: QcsdRequestRole) -> Res<()> {
-        let endpoint = self.qcsd_endpoint.ok_or(Error::InvalidInput)?;
-        self.events.qcsd_observe(|_| QcsdObservation::StreamOpened {
-            endpoint,
-            stream: QcsdStreamId(stream_id.as_u64()),
-            role,
-        });
-        Ok(())
-    }
-
-    /// Drain observations accumulated by the HTTP/3 and transport adapters.
-    #[cfg(feature = "qcsd")]
-    #[must_use]
-    pub fn qcsd_observations(&self) -> Vec<QcsdObservation> {
-        self.events.qcsd_observations()
-    }
-
-    /// Number of scheduled QCSD output targets not yet transmitted.
-    #[cfg(feature = "qcsd")]
-    #[must_use]
-    pub fn qcsd_pending_packet_targets(&self) -> usize {
-        self.conn.qcsd_pending_packet_targets()
-    }
-
-    /// Apply one controller action addressed to this connection.
-    ///
-    /// A newly opened chaff stream is returned so the research runner can track
-    /// response status, bytes, and hashes in the same way as application streams.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid stream/packet target, cross-origin chaff,
-    /// or a request that cannot be created.
-    #[cfg(feature = "qcsd")]
-    pub fn apply_qcsd_action(&mut self, now: Instant, action: QcsdAction) -> Res<Option<StreamId>> {
-        let own_endpoint = self.qcsd_endpoint.ok_or(Error::InvalidInput)?;
-        match action {
-            QcsdAction::ConfigureManualReceive {
-                endpoint,
-                stream,
-                initial_limit,
-            } if endpoint == own_endpoint => {
-                let stream_id = StreamId::new(stream.0);
-                self.conn
-                    .qcsd_set_stream_receive_limit(stream_id, initial_limit)?;
-                self.conn.stream_keep_alive(stream_id, true)?;
-            }
-            QcsdAction::ConfigureAutomaticReceive {
-                endpoint,
-                stream,
-                window,
-            } if endpoint == own_endpoint => {
-                self.conn
-                    .qcsd_set_stream_auto_receive(StreamId::new(stream.0), window)?;
-            }
-            QcsdAction::IncreaseReceiveLimit {
-                endpoint,
-                stream,
-                absolute_limit,
-                ..
-            } if endpoint == own_endpoint => {
-                self.conn
-                    .qcsd_set_stream_receive_limit(StreamId::new(stream.0), absolute_limit)?;
-            }
-            QcsdAction::IncreaseSendBudget {
-                endpoint, bytes, ..
-            } if endpoint == own_endpoint => {
-                self.conn.qcsd_add_send_budget(bytes);
-            }
-            QcsdAction::SendPacket {
-                endpoint,
-                udp_payload_size,
-                ..
-            } if endpoint == own_endpoint => {
-                self.conn.qcsd_queue_packet_target(udp_payload_size)?;
-            }
-            QcsdAction::RequestChaff { endpoint, resource } if endpoint == own_endpoint => {
-                let target = resource
-                    .url
-                    .parse::<http::Uri>()
-                    .map_err(|_| Error::InvalidInput)?;
-                let origin = self.qcsd_origin.as_ref().ok_or(Error::InvalidInput)?;
-                if target.scheme_str() != Some(origin.0.as_str())
-                    || target.authority().map(http::uri::Authority::as_str)
-                        != Some(origin.1.as_str())
-                {
-                    self.events
-                        .qcsd_observe(|_| QcsdObservation::ChaffRequestFailed {
-                            resource_id: resource.id,
-                        });
-                    return Err(Error::InvalidInput);
-                }
-                let mut headers = resource
-                    .headers
-                    .into_iter()
-                    .filter_map(|(name, value)| {
-                        let name = name.to_ascii_lowercase();
-                        (!matches!(
-                            name.as_str(),
-                            "accept-encoding"
-                                | "if-match"
-                                | "if-modified-since"
-                                | "if-none-match"
-                                | "if-range"
-                                | "if-unmodified-since"
-                                | "range"
-                        ))
-                        .then(|| Header::new(name, value))
-                    })
-                    .collect::<Vec<_>>();
-                headers.push(Header::new("accept-encoding", "identity"));
-                let resource_id = resource.id;
-                let stream_id = match self.fetch(now, "GET", &target, &headers, Priority::default())
-                {
-                    Ok(stream_id) => stream_id,
-                    Err(error) => {
-                        self.events
-                            .qcsd_observe(|_| QcsdObservation::ChaffRequestFailed { resource_id });
-                        return Err(error);
-                    }
-                };
-                self.register_qcsd_stream(stream_id, QcsdRequestRole::Chaff { resource_id })?;
-                return Ok(Some(stream_id));
-            }
-            QcsdAction::KeepAlive { endpoint } if endpoint == own_endpoint => {}
-            QcsdAction::SlotMissed { .. } | QcsdAction::DefenseComplete => {}
-            _ => return Ok(None),
-        }
-        Ok(None)
     }
 
     pub(crate) const fn connection(&self) -> &Connection {
@@ -679,9 +511,6 @@ impl Http3Client {
             self.base_handler.state(),
             Http3State::Closing(_) | Http3State::Closed(_)
         ) {
-            #[cfg(feature = "qcsd")]
-            self.events
-                .qcsd_observe(|endpoint| QcsdObservation::EndpointClosed { endpoint });
             self.push_handler.borrow_mut().clear();
             self.conn.close(now, error, msg);
             self.base_handler.close(error);
@@ -868,13 +697,6 @@ impl Http3Client {
             .get_mut(&stream_id)
             .ok_or(Error::InvalidStreamId)?
             .send_data(&mut self.conn, buf, now)?;
-        #[cfg(feature = "qcsd")]
-        self.events
-            .qcsd_observe(|endpoint| QcsdObservation::BytesQueued {
-                endpoint,
-                stream: QcsdStreamId(stream_id.as_u64()),
-                bytes: u64::try_from(sent).unwrap_or(u64::MAX),
-            });
         Ok(sent)
     }
 
@@ -1452,6 +1274,11 @@ mod tests {
 
     use http::Uri;
     use neqo_common::{Datagram, Decoder, Encoder, event::Provider as _, qtrace, to_u64};
+    #[cfg(feature = "qcsd")]
+    use neqo_csdef::{
+        QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdRequestRole,
+        QcsdStreamFinish, Resource,
+    };
     use neqo_qpack as qpack;
     use neqo_transport::{
         CloseReason, ConnectionEvent, ConnectionParameters, INITIAL_LOCAL_MAX_STREAM_DATA,
@@ -2751,6 +2578,119 @@ mod tests {
         assert_eq!(res.unwrap_err(), Error::InvalidStreamId);
 
         client.close(now(), 0, "");
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_chaff_non_success_responses_are_observed_without_followup() {
+        for (request_id, status) in [(1, 302), (2, 404)] {
+            let (mut client, mut server) = connect();
+            client
+                .enable_qcsd(
+                    QcsdEndpointId(7),
+                    &Uri::from_static("https://something.com/"),
+                    1_200,
+                    false,
+                    Duration::from_millis(100),
+                )
+                .unwrap();
+            let resource = Resource {
+                id: 9,
+                url: "https://something.com/chaff".into(),
+                kind: "Image".into(),
+                content_length: Some(100),
+                data_length: 100,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            };
+            let stream = client
+                .apply_qcsd_action(
+                    now(),
+                    QcsdAction::RequestChaff {
+                        endpoint: QcsdEndpointId(7),
+                        resource,
+                        request_id: QcsdChaffRequestId(request_id),
+                    },
+                )
+                .unwrap()
+                .expect("chaff stream");
+            client.stream_close_send(stream, now()).unwrap();
+            let request = client.process_output(now()).dgram().unwrap();
+            server.conn.process_input(request, now());
+
+            let mut headers = vec![Header::new(":status", status.to_string())];
+            if status == 302 {
+                headers.push(Header::new("location", "https://other.example/"));
+            }
+            let mut response = Encoder::default();
+            server.encode_headers(stream, &headers, &mut response);
+            server_send_response_and_exchange_packet(
+                &mut client,
+                &mut server,
+                stream,
+                response,
+                true,
+            );
+
+            let observations = client.qcsd_observations();
+            let raw_read = observations
+                .iter()
+                .position(|observation| matches!(observation, QcsdObservation::BytesRead { .. }))
+                .expect("raw request-stream bytes observed");
+            let response_headers = observations
+                .iter()
+                .position(|observation| {
+                    matches!(observation, QcsdObservation::ResponseHeaders { .. })
+                })
+                .expect("response headers observed");
+            assert!(raw_read < response_headers);
+            assert!(observations.iter().any(|observation| matches!(
+                observation,
+                QcsdObservation::ResponseHeaders {
+                    status: Some(observed),
+                    ..
+                } if *observed == status
+            )));
+            assert!(observations.iter().any(|observation| matches!(
+                observation,
+                QcsdObservation::StreamFinished {
+                    finish: QcsdStreamFinish::Fin,
+                    ..
+                }
+            )));
+            assert!(observations.iter().any(|observation| matches!(
+                observation,
+                QcsdObservation::StreamOpened {
+                    role: QcsdRequestRole::Chaff { resource_id: 9, .. },
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_endpoint_close_is_observed_once() {
+        let (mut client, _server) = connect();
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        drop(client.qcsd_observations());
+        client.close(now(), 0, "test");
+        let closed = client
+            .qcsd_observations()
+            .into_iter()
+            .filter(|observation| matches!(observation, QcsdObservation::EndpointClosed { .. }))
+            .count();
+        assert_eq!(closed, 1);
     }
 
     /// Force both endpoints into an idle state.

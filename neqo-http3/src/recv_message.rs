@@ -19,10 +19,14 @@ use neqo_common::{Header, header::HeadersExt as _, qdebug, qinfo, qtrace};
 use neqo_qpack as qpack;
 use neqo_transport::{Connection, StreamId};
 
+#[cfg(feature = "qcsd")]
+use crate::frames::QcsdStreamReaderConnectionWrapper;
+#[cfg(not(feature = "qcsd"))]
+use crate::frames::StreamReaderConnectionWrapper;
 use crate::{
     CloseType, Error, Http3StreamInfo, Http3StreamType, HttpRecvStream, HttpRecvStreamEvents,
     MessageType, Priority, PushId, ReceiveOutput, RecvStream, Res, Stream,
-    frames::{FrameReader, HFrame, StreamReaderConnectionWrapper, hframe::HFrameType},
+    frames::{FrameReader, HFrame, hframe::HFrameType},
     headers_checks::{headers_valid, is_interim},
     priority::PriorityHandler,
     push_controller::PushController,
@@ -72,6 +76,35 @@ enum RecvMessageState {
 struct PushInfo {
     push_id: PushId,
     header_block: Vec<u8>,
+}
+
+#[cfg(feature = "qcsd")]
+fn receive_frame(
+    frame_reader: &mut FrameReader,
+    conn: &mut Connection,
+    stream_id: StreamId,
+    conn_events: &dyn HttpRecvStreamEvents,
+    now: Instant,
+) -> Res<(Option<HFrame>, bool)> {
+    let observe = |bytes| conn_events.qcsd_bytes_read(stream_id, bytes);
+    frame_reader.receive(
+        &mut QcsdStreamReaderConnectionWrapper::new(conn, stream_id, &observe),
+        now,
+    )
+}
+
+#[cfg(not(feature = "qcsd"))]
+fn receive_frame(
+    frame_reader: &mut FrameReader,
+    conn: &mut Connection,
+    stream_id: StreamId,
+    _conn_events: &dyn HttpRecvStreamEvents,
+    now: Instant,
+) -> Res<(Option<HFrame>, bool)> {
+    frame_reader.receive(
+        &mut StreamReaderConnectionWrapper::new(conn, stream_id),
+        now,
+    )
 }
 
 #[derive(Debug)]
@@ -312,14 +345,26 @@ impl RecvMessage {
                 RecvMessageState::WaitingForResponseHeaders { frame_reader }
                 | RecvMessageState::WaitingForData { frame_reader }
                 | RecvMessageState::WaitingForFinAfterTrailers { frame_reader } => {
-                    match frame_reader.receive(
-                        &mut StreamReaderConnectionWrapper::new(conn, self.stream_id),
+                    let received = receive_frame(
+                        frame_reader,
+                        conn,
+                        self.stream_id,
+                        self.conn_events.as_ref(),
                         now,
-                    )? {
+                    )?;
+                    match received {
                         (None, true) => {
                             break self.set_state_to_close_pending(post_readable_event);
                         }
-                        (None, false) => break Ok(()),
+                        (None, false) => {
+                            #[cfg(feature = "qcsd")]
+                            self.conn_events.qcsd_header_progress(
+                                self.stream_id,
+                                u64::try_from(frame_reader.qcsd_min_remaining())
+                                    .map_err(|_| Error::Internal)?,
+                            );
+                            break Ok(());
+                        }
                         (Some(frame), fin) => {
                             qdebug!(
                                 "[{self}] recv frame: {frame:?}; state={:?} fin={fin}",

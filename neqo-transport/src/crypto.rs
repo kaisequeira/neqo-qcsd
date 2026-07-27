@@ -715,8 +715,8 @@ impl CryptoDxState {
         debug_assert_eq!(self.direction, CryptoDxDirection::Write);
         qtrace!(
             "[{self}] encrypt_in_place pn={pn} hdr={} body={}",
-            Hex::new(data[hdr.clone()].as_ref()),
-            Hex::new(data[hdr.end..].as_ref())
+            Hex::new(&data[hdr.clone()]),
+            Hex::new(&data[hdr.end..])
         );
 
         // The numbers in `Self::limit` assume a maximum packet size of `LIMIT`.
@@ -756,8 +756,8 @@ impl CryptoDxState {
         debug_assert_eq!(self.direction, CryptoDxDirection::Read);
         qtrace!(
             "[{self}] decrypt_in_place pn={pn} hdr={} body={}",
-            Hex::new(data[hdr.clone()].as_ref()),
-            Hex::new(data[hdr.end..].as_ref())
+            Hex::new(&data[hdr.clone()]),
+            Hex::new(&data[hdr.end..])
         );
         self.invoked()?;
         let (hdr, data) = data.split_at_mut(hdr.end);

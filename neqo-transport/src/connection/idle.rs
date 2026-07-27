@@ -31,6 +31,8 @@ pub struct IdleTimeout {
     timeout: Duration,
     state: IdleTimeoutState,
     keep_alive_outstanding: bool,
+    #[cfg(feature = "qcsd")]
+    keep_alive_lead_time: Option<Duration>,
 }
 
 impl IdleTimeout {
@@ -39,6 +41,8 @@ impl IdleTimeout {
             timeout,
             state: IdleTimeoutState::Init,
             keep_alive_outstanding: false,
+            #[cfg(feature = "qcsd")]
+            keep_alive_lead_time: None,
         }
     }
     pub fn set_peer_timeout(&mut self, peer_timeout: Duration) {
@@ -98,9 +102,24 @@ impl IdleTimeout {
     }
 
     fn keep_alive_timeout(&self, now: Instant, pto: Duration) -> Instant {
+        #[cfg(feature = "qcsd")]
+        if let Some(lead_time) = self.keep_alive_lead_time {
+            let earliest = self.start(now) + pto;
+            return max(
+                earliest,
+                self.expiry(now, pto)
+                    .checked_sub(lead_time)
+                    .unwrap_or(earliest),
+            );
+        }
         // For a keep-alive timer, wait for half the timeout interval, but be sure
         // not to wait too little or we will send many unnecessary probes.
         self.start(now) + max(self.timeout / 2, pto)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub const fn set_keep_alive_lead_time(&mut self, lead_time: Duration) {
+        self.keep_alive_lead_time = Some(lead_time);
     }
 
     pub fn next_keep_alive(&self, now: Instant, pto: Duration) -> Option<Instant> {

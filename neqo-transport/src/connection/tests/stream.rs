@@ -116,6 +116,32 @@ fn transfer() {
     assert!(fin3);
 }
 
+#[test]
+fn baseline_transfer_trace_is_feature_invariant() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let stream = client.stream_create(StreamType::UniDi).unwrap();
+    let payload = [0x5A; 2_048];
+    assert_eq!(client.stream_send(stream, &payload).unwrap(), payload.len());
+    client.stream_close_send(stream).unwrap();
+
+    let mut datagrams = Vec::new();
+    while let Some(datagram) = client.process_output(now()).dgram() {
+        datagrams.push(datagram);
+    }
+    let lengths: Vec<_> = datagrams.iter().map(neqo_common::Datagram::len).collect();
+    assert_eq!(lengths, [1_232, 876]);
+    for datagram in datagrams {
+        server.process_input(datagram, now());
+    }
+    let mut received = vec![0; payload.len()];
+    let (read, fin) = server.stream_recv(stream, &mut received).unwrap();
+    assert_eq!(read, payload.len());
+    assert!(fin);
+    assert_eq!(received, payload);
+}
+
 // tests stream sendorder prioritization
 fn sendorder_test(order_of_sendorder: &[Option<SendOrder>]) {
     let mut client = default_client();

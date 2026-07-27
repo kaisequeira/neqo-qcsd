@@ -581,6 +581,8 @@ trait HttpRecvStreamEvents: RecvStreamEvents {
     #[cfg(feature = "qcsd")]
     fn qcsd_response_headers(&self, _stream_id: StreamId, _frame_bytes: u64, _headers: &[Header]) {}
     #[cfg(feature = "qcsd")]
+    fn qcsd_header_progress(&self, _stream_id: StreamId, _min_remaining: u64) {}
+    #[cfg(feature = "qcsd")]
     fn qcsd_data_frame(&self, _stream_id: StreamId, _frame_header_bytes: u64, _data_bytes: u64) {}
     #[cfg(feature = "qcsd")]
     fn qcsd_bytes_read(&self, _stream_id: StreamId, _bytes: u64) {}

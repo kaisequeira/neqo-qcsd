@@ -733,8 +733,8 @@ dependencies = [
  "log",
  "neqo-bin",
  "neqo-common",
+ "neqo-csdef",
  "neqo-http3",
- "neqo-qcsd",
  "neqo-transport",
  "neqo-udp",
  "nss-rs",
@@ -768,6 +768,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "neqo-csdef"
+version = "0.30.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "neqo-http3"
 version = "0.30.0"
 dependencies = [
@@ -776,8 +786,8 @@ dependencies = [
  "http",
  "log",
  "neqo-common",
+ "neqo-csdef",
  "neqo-http3",
- "neqo-qcsd",
  "neqo-qpack",
  "neqo-transport",
  "nss-rs",
@@ -787,16 +797,6 @@ dependencies = [
  "strum",
  "test-fixture 0.30.0",
  "thiserror",
-]
-
-[[package]]
-name = "neqo-qcsd"
-version = "0.30.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "toml",
 ]
 
 [[package]]
@@ -824,7 +824,7 @@ dependencies = [
  "log",
  "mtu",
  "neqo-common",
- "neqo-qcsd",
+ "neqo-csdef",
  "neqo-transport",
  "nss-rs",
  "qlog",

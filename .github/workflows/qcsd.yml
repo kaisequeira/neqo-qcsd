@@ -2,9 +2,8 @@ name: QCSD
 on:
   push:
     branches:
-      - qcsd-migration
+      - main
   pull_request:
-  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -37,9 +36,9 @@ jobs:
           cargo check --locked -p neqo-bin
       - name: QCSD core and adapters
         run: |
-          cargo test --locked -p neqo-qcsd
-          cargo clippy --locked -p neqo-qcsd --all-targets -- -D warnings
-          cargo doc --locked -p neqo-qcsd --no-deps
+          cargo test --locked -p neqo-csdef
+          cargo clippy --locked -p neqo-csdef --all-targets -- -D warnings
+          cargo doc --locked -p neqo-csdef --no-deps
           cargo check --locked -p neqo-transport --features qcsd
           cargo clippy --locked -p neqo-transport --features qcsd --lib -- -D warnings
           cargo test --locked -p neqo-transport --features qcsd --lib

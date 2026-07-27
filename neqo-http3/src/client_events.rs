@@ -4,11 +4,13 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#[cfg(feature = "qcsd")]
+use std::cell::Cell;
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use neqo_common::{Bytes, Header, event::Provider as EventProvider, qtrace};
 #[cfg(feature = "qcsd")]
-use neqo_qcsd::{QcsdEndpointId, QcsdObservation, QcsdStreamId};
+use neqo_csdef::{QcsdEndpointId, QcsdObservation, QcsdStreamFinish, QcsdStreamId};
 use neqo_transport::{AppError, StreamId, StreamType};
 use nss::ResumptionToken;
 
@@ -144,6 +146,8 @@ pub struct Http3ClientEvents {
     qcsd_endpoint: Rc<RefCell<Option<QcsdEndpointId>>>,
     #[cfg(feature = "qcsd")]
     qcsd_observations: Rc<RefCell<VecDeque<QcsdObservation>>>,
+    #[cfg(feature = "qcsd")]
+    qcsd_endpoint_closed: Rc<Cell<bool>>,
 }
 
 impl RecvStreamEvents for Http3ClientEvents {
@@ -161,6 +165,11 @@ impl RecvStreamEvents for Http3ClientEvents {
         self.qcsd_observe(|endpoint| QcsdObservation::StreamFinished {
             endpoint,
             stream: QcsdStreamId(stream_id.as_u64()),
+            finish: match close_type {
+                CloseType::Done => QcsdStreamFinish::Fin,
+                CloseType::ResetApp(_) | CloseType::ResetRemote(_) => QcsdStreamFinish::Reset,
+                CloseType::LocalError(_) => QcsdStreamFinish::LocalError,
+            },
         });
         let (local, error) = match close_type {
             CloseType::ResetApp(_) => {
@@ -210,11 +219,26 @@ impl HttpRecvStreamEvents for Http3ClientEvents {
             .find(|header| header.name().eq_ignore_ascii_case("content-length"))
             .and_then(|header| header.value_utf8().ok())
             .and_then(|value| value.trim().parse().ok());
+        let status = headers
+            .iter()
+            .find(|header| header.name() == ":status")
+            .and_then(|header| header.value_utf8().ok())
+            .and_then(|value| value.parse().ok());
         self.qcsd_observe(|endpoint| QcsdObservation::ResponseHeaders {
             endpoint,
             stream: QcsdStreamId(stream_id.as_u64()),
             frame_bytes,
+            status,
             content_length,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_header_progress(&self, stream_id: StreamId, min_remaining: u64) {
+        self.qcsd_observe(|endpoint| QcsdObservation::HeaderProgress {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            min_remaining,
         });
     }
 
@@ -356,6 +380,7 @@ impl Http3ClientEvents {
     #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_enable(&self, endpoint: QcsdEndpointId) {
         *self.qcsd_endpoint.borrow_mut() = Some(endpoint);
+        self.qcsd_endpoint_closed.set(false);
     }
 
     #[cfg(feature = "qcsd")]
@@ -370,6 +395,13 @@ impl Http3ClientEvents {
     #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_observations(&self) -> Vec<QcsdObservation> {
         self.qcsd_observations.borrow_mut().drain(..).collect()
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_observe_endpoint_closed(&self) {
+        if !self.qcsd_endpoint_closed.replace(true) {
+            self.qcsd_observe(|endpoint| QcsdObservation::EndpointClosed { endpoint });
+        }
     }
 
     pub fn push_promise(&self, push_id: PushId, request_stream_id: StreamId, headers: Vec<Header>) {
@@ -438,7 +470,7 @@ impl Http3ClientEvents {
     pub(crate) fn connection_state_change(&self, state: Http3State) {
         #[cfg(feature = "qcsd")]
         if matches!(state, Http3State::Closing { .. } | Http3State::Closed(_)) {
-            self.qcsd_observe(|endpoint| QcsdObservation::EndpointClosed { endpoint });
+            self.qcsd_observe_endpoint_closed();
         }
         match state {
             // If closing, existing events no longer relevant.

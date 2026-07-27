@@ -267,8 +267,9 @@ fn zero_rtt_update_flow_control() {
     }
     assert!(uni_stream_event);
     assert!(bidi_stream_event);
-    // But no MAX_STREAM_DATA frame was received.
-    assert_eq!(client.stats().frame_rx.max_stream_data, 0);
+    // Both streams re-advertise their current limits after the stale
+    // STREAM_DATA_BLOCKED frames sent under the 0-RTT limits.
+    assert_eq!(client.stats().frame_rx.max_stream_data, 2);
 
     // And the new limit applies.
     assert!(client.stream_send_atomic(uni_stream, MESSAGE).unwrap());

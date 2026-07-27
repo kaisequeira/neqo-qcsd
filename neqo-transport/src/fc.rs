@@ -316,6 +316,21 @@ where
         }
     }
 
+    /// Handle a peer reporting that it is blocked at `blocked_at`.
+    ///
+    /// A peer can report an older limit even after a larger `MAX_DATA` or
+    /// `MAX_STREAM_DATA` was acknowledged.  Re-advertise the current limit in
+    /// that case so an implementation that missed or failed to apply the
+    /// earlier update can recover.  Flow-control limits are monotonic, so the
+    /// duplicate update is safe.
+    pub const fn peer_blocked(&mut self, blocked_at: u64) {
+        if self.auto_updates_enabled()
+            && (blocked_at < self.max_allowed || self.retired + self.max_active > self.max_allowed)
+        {
+            self.frame_pending = true;
+        }
+    }
+
     const fn should_send_update(&self) -> bool {
         let window_bytes_unused = self.max_allowed - self.retired;
         window_bytes_unused < self.max_active - self.max_active / WINDOW_UPDATE_FRACTION
@@ -379,6 +394,13 @@ where
         self.set_max_active(window);
     }
 
+    #[cfg_attr(
+        not(feature = "qcsd"),
+        expect(
+            clippy::unused_self,
+            reason = "the default build keeps the same receiver method as the QCSD feature build"
+        )
+    )]
     const fn auto_updates_enabled(&self) -> bool {
         #[cfg(feature = "qcsd")]
         if self.manual_limit.is_some() {
@@ -944,6 +966,27 @@ mod test {
     fn force_send_max_allowed() {
         let mut fc = ReceiverFlowControl::new((), 100);
         fc.retire(10);
+        assert!(!fc.frame_needed());
+    }
+
+    #[test]
+    fn peer_blocked_at_stale_limit_resends_current_limit() {
+        let mut fc = ReceiverFlowControl::new((), 16);
+        fc.set_max_active(1_048_576);
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 1_048_576);
+        fc.frame_sent(1_048_576);
+        assert!(!fc.frame_needed());
+
+        fc.peer_blocked(16);
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 1_048_576);
+    }
+
+    #[test]
+    fn peer_blocked_at_current_limit_waits_for_new_credit() {
+        let mut fc = ReceiverFlowControl::new((), 16);
+        fc.peer_blocked(16);
         assert!(!fc.frame_needed());
     }
 

@@ -73,6 +73,41 @@ impl StreamReader for StreamReaderConnectionWrapper<'_> {
     }
 }
 
+/// Request-stream reader that reports every raw byte to QCSD before frame
+/// parsing emits semantic observations.
+#[cfg(feature = "qcsd")]
+pub struct QcsdStreamReaderConnectionWrapper<'a> {
+    conn: &'a mut Connection,
+    stream_id: StreamId,
+    observer: &'a dyn Fn(u64),
+}
+
+#[cfg(feature = "qcsd")]
+impl<'a> QcsdStreamReaderConnectionWrapper<'a> {
+    pub const fn new(
+        conn: &'a mut Connection,
+        stream_id: StreamId,
+        observer: &'a dyn Fn(u64),
+    ) -> Self {
+        Self {
+            conn,
+            stream_id,
+            observer,
+        }
+    }
+}
+
+#[cfg(feature = "qcsd")]
+impl StreamReader for QcsdStreamReaderConnectionWrapper<'_> {
+    fn read_data(&mut self, buf: &mut [u8], _now: Instant) -> Res<(usize, bool)> {
+        let result = self.conn.stream_recv(self.stream_id, buf)?;
+        if result.0 > 0 {
+            (self.observer)(u64::try_from(result.0).unwrap_or(u64::MAX));
+        }
+        Ok(result)
+    }
+}
+
 pub struct StreamReaderRecvStreamWrapper<'a> {
     recv_stream: &'a mut Box<dyn RecvStream>,
     conn: &'a mut Connection,
@@ -164,6 +199,11 @@ impl FrameReader {
             FrameReaderState::GetData { decoder } => decoder.min_remaining(),
             FrameReaderState::UnknownFrameDischargeData { decoder } => decoder.min_remaining(),
         }
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_min_remaining(&self) -> usize {
+        self.min_remaining()
     }
 
     const fn decoding_in_progress(&self) -> bool {

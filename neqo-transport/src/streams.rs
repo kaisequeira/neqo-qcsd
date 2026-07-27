@@ -250,7 +250,10 @@ impl Streams {
                 stats.data_blocked += 1;
                 self.handle_data_blocked();
             }
-            Frame::StreamDataBlocked { stream_id, .. } => {
+            Frame::StreamDataBlocked {
+                stream_id,
+                stream_data_limit,
+            } => {
                 qtrace!("Received StreamDataBlocked");
                 stats.stream_data_blocked += 1;
                 // Terminate connection with STREAM_STATE_ERROR if send-only
@@ -260,7 +263,7 @@ impl Streams {
                 }
 
                 if let (_, Some(rs)) = self.obtain_stream(*stream_id)? {
-                    rs.send_flowc_update();
+                    rs.peer_blocked(*stream_data_limit);
                 }
             }
             Frame::StreamsBlocked { .. } => {

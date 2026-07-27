@@ -15,6 +15,8 @@ pub mod wtframe;
     reason = "These are exported."
 )]
 pub use hframe::{HFrame, HFrameType};
+#[cfg(feature = "qcsd")]
+pub use reader::QcsdStreamReaderConnectionWrapper;
 pub use reader::{FrameReader, StreamReaderConnectionWrapper, StreamReaderRecvStreamWrapper};
 pub use wtframe::WebTransportFrame;
 

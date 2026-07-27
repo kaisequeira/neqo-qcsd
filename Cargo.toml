@@ -6,7 +6,7 @@ members = [
   "neqo-common",
   "neqo-http3",
   "neqo-qpack",
-  "neqo-qcsd",
+  "neqo-csdef",
   "neqo-transport",
   "neqo-udp",
   "test-fixture",

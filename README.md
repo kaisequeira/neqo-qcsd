@@ -41,25 +41,118 @@ To run test HTTP/3 programs (`neqo-client` and `neqo-server`):
 ## QCSD research client
 
 This fork contains a feature-gated migration of the published client-side QCSD
-framework. It adds no server requirements and leaves normal Neqo builds
-unchanged. Build the dedicated current-thread runner with:
+framework to Mozilla Neqo 0.30.0. It adds no server requirements and leaves
+normal Neqo builds unchanged until the `qcsd` feature is enabled. The
+transport-independent client-side defence library is `neqo-csdef`; the narrow
+Neqo transport/HTTP/3 integration feature remains named `qcsd`, and
+`neqo-qcsd-client` is the dedicated current-thread research runner.
+
+### Provenance
+
+The base is Mozilla Neqo v0.30.0 commit
+`8a04d065c2d35c8e8fd804f91c7081ab6bb60b89`. Behavioral authority comes from
+`jpcsmith/neqo-qcsd` tag `usenixsecurity22-v1` commit
+`39e293fb384dd341156eedd1e4b833d24904b1f6`, whose exact pre-QCSD parent was
+`222bab99ee107f68101fab192c3903a15e22111a`. The accompanying publication is
+Jean-Pierre Smith, Luca Dolfi, Prateek Mittal, and Adrian Perrig,
+“[QCSD: A QUIC Client-Side Website-Fingerprinting Defence
+Framework](https://www.usenix.org/conference/usenixsecurity22/presentation/smith),”
+*31st USENIX Security Symposium*, 2022. Migrated code retains Neqo's dual
+MIT/Apache-2.0 licensing and the published authors' behavioral credit.
+
+### Architecture
+
+`neqo-csdef` has no Neqo dependency. Its focused modules retain the published
+responsibility boundaries while using a modern typed observation/action seam:
+
+- `defense/` implements Static, deterministic FRONT, Tamaraw, and independent
+  incoming/outgoing round-robin endpoint scheduling.
+- `stream/` implements the Figure-7 receive state machine and one-pass
+  per-endpoint receive-capacity allocation.
+- `controller/` is the single-owner replacement for `FlowShaper`; it composes
+  control-interval buckets, receive backlog, chaff replenishment, slot
+  accounting, and tail completion without `Rc<RefCell<_>>`, worker threads, or
+  mutex-protected shared defenses.
+- `event/` exposes typed observations/actions with stable endpoint, stream,
+  slot, and chaff-request IDs. `chaff_manager.rs` and
+  `dependency_tracker.rs` provide repeated-resource low-watermark chaff and
+  deterministic application graph dispatch.
+
+The feature-gated Neqo adapter gives controlled streams absolute
+`MAX_STREAM_DATA` credit and disables receive-window auto-growth only for those
+streams. Scheduled 1-RTT output uses application frames before chaff, then
+`PING` and `PADDING` to reach the exact UDP-payload target. Packet protection,
+path validation, congestion control, pacing, mandatory frames, and path MTU
+remain authoritative; unsafe or late slots receive one explicit miss reason.
+
+FRONT is a chaff-only defense: its scheduled datagrams never consume ordinary
+application or chaff `STREAM` data, and application transmission remains
+otherwise automatic. Tamaraw shapes application and chaff in both directions,
+prioritizing application data within each available slot and padding each
+direction to the published modulo completion rule. Their generators reproduce
+the published algorithms and control semantics; deterministic equality is
+defined against this implementation's pinned generator, not the historical
+`rand` crate's seed-to-sample mapping.
+
+Intentional modernizations include typed IDs, integer microsecond durations, a
+pinned SplitMix64 FRONT generator, explicit UDP-payload sizes, same-origin
+identity-encoded credential-free chaff, and current Neqo stream keep-alives.
+Exact historical RNG traces can be imported as Static CSV schedules. Legacy
+TOML, schedule CSV, and dependency JSON inputs remain readable, but obsolete
+clients, notebooks, worker threads, and direct core-to-Neqo coupling were not
+restored.
+
+### Profiles and runner
+
+Complete built-in profiles live in `neqo-csdef/profiles/`. The `published`
+profile captures the published source tag's defaults; it is not a claim that
+one parameter set represents every experiment in the paper. The runner resolves
+the selected profile and defense into the full configuration stored with every
+run. Explicit configuration files remain available for custom research
+defenses, and schedule-driven defenses accept their schedule as a separate
+input.
+
+Build the runner and inspect the current command surface with:
 
 ```shell
 cargo build --locked -p neqo-bin --features qcsd --bin neqo-qcsd-client
-target/debug/neqo-qcsd-client --help
+target/debug/neqo-qcsd-client run --help
 ```
 
-Start with [`docs/qcsd/MIGRATION.md`](./docs/qcsd/MIGRATION.md) for provenance,
-architecture, reproducible commands, output schemas, and known research
-boundaries. Explicit configuration examples are in
-[`qcsd-presets`](./qcsd-presets).
+`probe --input-manifest` enriches browser-discovered graphs without discarding
+IDs, dependencies, resource types, or safe headers.
+Application requests support `fresh-browser`, `minimal`, and broad `custom`
+header policies; stored credentials and HTTP/3-invalid connection fields are
+rejected. Chaff always remains same-origin GET-only with
+`Accept-Encoding: identity`, no credentials, ranges, conditions, or promoted
+cross-origin redirects.
+
+### Validation
+
+Regression tests cover controller schedules, stream-state transitions, chaff
+and dependency handling, shared endpoints, explicit transport misses,
+application-before-chaff transmission, default-feature inertness, response
+parity, and outgoing datagram correlation.
+
+Run the focused local checks with a compatible NSS setup:
+
+```shell
+cargo test --locked -p neqo-csdef
+cargo check --locked -p neqo-transport
+cargo check --locked -p neqo-transport --features qcsd
+cargo check --locked -p neqo-http3
+cargo check --locked -p neqo-http3 --features qcsd
+cargo clippy --locked -p neqo-bin --features qcsd \
+  --bin neqo-qcsd-client -- -D warnings
+```
 
 The companion
 [`neqo-qcsd-lab`](https://github.com/kaisequeira/neqo-qcsd-lab) repository pins
 this fork as a submodule and supplies Docker-only live workload discovery,
 bounded PCAPNG capture, deterministic campaigns, drift detection, and
-Figure-2-style visualization. GitHub Actions remain disabled on this research
-fork; both repositories expose local checks instead.
+paper-style PDF visualization. The focused QCSD workflow validates pushes to
+`main` and pull requests; live acceptance runs explicitly through the Docker
+lab.
 
 ## Build with separate NSS/NSPR
 

@@ -1025,12 +1025,11 @@ impl RecvStream {
         Self::flow_control_retire_data(target_retired.saturating_sub(fc.retired()), fc, session_fc);
     }
 
-    /// Send a flow control update.
-    /// This is used when a peer declares that they are blocked.
-    /// This sends `MAX_STREAM_DATA` if there is any increase possible.
-    pub const fn send_flowc_update(&mut self) {
+    /// Respond to `STREAM_DATA_BLOCKED`, including re-advertising a newer
+    /// limit that the peer reports it has not applied.
+    pub const fn peer_blocked(&mut self, blocked_at: u64) {
         if let RecvStreamState::Recv { fc, .. } = &mut self.state {
-            fc.send_flowc_update();
+            fc.peer_blocked(blocked_at);
         }
     }
 
