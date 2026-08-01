@@ -17,6 +17,8 @@ use std::{
     net::SocketAddr,
     slice::{self, ChunksMut},
 };
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::{os::fd::AsRawFd as _, ptr};
 
 use log::{Level, log_enabled};
 use neqo_common::{Datagram, Tos, datagram, qdebug, qtrace};
@@ -141,6 +143,51 @@ fn is_enobufs(_: &io::Error) -> bool {
 use std::os::fd::AsFd as SocketRef;
 #[cfg(windows)]
 use std::os::windows::io::AsSocket as SocketRef;
+
+/// Disable UDP receive coalescing for a socket configured by `quinn-udp`.
+///
+/// Linux enables UDP GRO per socket when [`UdpSocketState::new`] succeeds in
+/// setting `UDP_GRO`. Direct packet-capture experiments need each received UDP
+/// datagram to remain a distinct observable packet, so those sockets opt out
+/// after retaining the other `quinn-udp` configuration.
+pub fn disable_udp_gro<S: SocketRef>(state: &UdpSocketState, socket: &S) -> Result<(), io::Error> {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        if state.gro_segments() == 1 {
+            return Ok(());
+        }
+        let disabled: libc::c_int = 0;
+        let option_length = libc::socklen_t::try_from(size_of_val(&disabled))
+            .map_err(|_| io::Error::other("c_int size does not fit socklen_t"))?;
+        // SAFETY: `socket` owns a live UDP file descriptor, and `disabled`
+        // points to an initialized `c_int` for the duration of `setsockopt`.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_fd().as_raw_fd(),
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                ptr::from_ref(&disabled).cast(),
+                option_length,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        state.set_gro(socket.into(), false)
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux", windows)))]
+    {
+        let _ = (state, socket);
+        Ok(())
+    }
+}
 
 #[expect(clippy::missing_panics_doc, reason = "OK here.")]
 pub fn recv_inner<'a, S: SocketRef>(
@@ -437,6 +484,70 @@ mod tests {
     fn max_gso_segments_returns_at_least_one() -> Result<(), io::Error> {
         let s = socket()?;
         assert!(s.max_gso_segments() >= 1);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn disable_udp_gro_clears_socket_option() -> Result<(), io::Error> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let state = UdpSocketState::new((&socket).into())?;
+        disable_udp_gro(&state, &socket)?;
+        let mut enabled: libc::c_int = -1;
+        let mut length =
+            libc::socklen_t::try_from(size_of_val(&enabled)).expect("c_int size fits socklen_t");
+        // SAFETY: `socket` owns a live UDP file descriptor, and both
+        // output pointers refer to initialized writable values of the lengths
+        // passed to `getsockopt`.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_fd().as_raw_fd(),
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                ptr::from_mut(&mut enabled).cast(),
+                ptr::from_mut(&mut length),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        assert_eq!(enabled, 0);
+        assert_eq!(
+            usize::try_from(length).expect("socklen_t fits usize"),
+            size_of_val(&enabled)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn disabled_udp_gro_does_not_coalesce_gso_batch() -> Result<(), io::Error> {
+        const SEGMENT_SIZE: usize = 128;
+        const TEST_SEGMENTS: usize = 4;
+
+        let sender = socket()?;
+        let receiver = socket()?;
+        disable_udp_gro(&receiver.state, &receiver.inner)?;
+        let receiver_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let max_gso_segments = sender.max_gso_segments();
+        assert!(
+            max_gso_segments > 1,
+            "Linux regression test requires UDP GSO support"
+        );
+        let num_segments = max_gso_segments.min(TEST_SEGMENTS);
+        let batch = datagram::Batch::new(
+            sender.inner.local_addr()?,
+            receiver.inner.local_addr()?,
+            Tos::from((Dscp::Le, Ecn::Ect0)),
+            NonZeroUsize::new(SEGMENT_SIZE).expect("SEGMENT_SIZE cannot be zero"),
+            vec![0xAB; SEGMENT_SIZE * num_segments],
+        );
+
+        sender.send(&batch)?;
+
+        let mut recv_buf = RecvBuf::default();
+        let datagram_count = receiver.recv(receiver_addr, &mut recv_buf)?.count();
+        assert_eq!(datagram_count, 1);
         Ok(())
     }
 

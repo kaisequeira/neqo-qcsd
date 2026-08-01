@@ -112,6 +112,18 @@ impl PacketRange {
         (pn >= self.smallest) && (pn <= self.largest)
     }
 
+    /// Smallest packet number represented by this ACK range.
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn smallest(&self) -> packet::Number {
+        self.smallest
+    }
+
+    /// Largest packet number represented by this ACK range.
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn largest(&self) -> packet::Number {
+        self.largest
+    }
+
     /// Maybe add a packet number to the range.  Returns true if it was added
     /// at the small end (which indicates that this might need merging with a
     /// preceding range).
@@ -184,6 +196,12 @@ impl AckToken {
     /// Get the space for this token.
     pub const fn space(&self) -> PacketNumberSpace {
         self.space
+    }
+
+    /// Packet ranges encoded by this ACK frame.
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn ranges(&self) -> &[PacketRange] {
+        &self.ranges
     }
 }
 

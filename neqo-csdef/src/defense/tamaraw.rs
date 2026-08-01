@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::{Defense, DefenseMode};
+use super::{Defense, DefenseMode, DefenseSignal, SignalKind};
 use crate::{Direction, Packet, TamarawConfig};
 
 /// Tamaraw constant-rate bidirectional defense.
@@ -90,6 +90,15 @@ impl Tamaraw {
 }
 
 impl Defense for Tamaraw {
+    fn observe(&mut self, signal: DefenseSignal) {
+        if matches!(signal.kind, SignalKind::ApplicationComplete)
+            && self.final_incoming_count.is_none()
+        {
+            self.final_incoming_count = Some(self.rounded_final_count(self.incoming_count));
+            self.final_outgoing_count = Some(self.rounded_final_count(self.outgoing_count));
+        }
+    }
+
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let first = if self.next_outgoing_us <= self.next_incoming_us {
@@ -133,13 +142,6 @@ impl Defense for Tamaraw {
 
     fn mode(&self) -> DefenseMode {
         DefenseMode::ChaffAndShape
-    }
-
-    fn on_application_complete(&mut self) {
-        if self.final_incoming_count.is_none() {
-            self.final_incoming_count = Some(self.rounded_final_count(self.incoming_count));
-            self.final_outgoing_count = Some(self.rounded_final_count(self.outgoing_count));
-        }
     }
 }
 

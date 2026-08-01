@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 
 [controller]
 control_interval_us = 5000
@@ -25,3 +25,14 @@ incoming_interval_us = 5000
 outgoing_interval_us = 20000
 packet_size = 1450
 modulo = 100
+
+[traffic_morphing]
+ingress_packet_size = 1450
+max_ingress_deficit_bytes = 8000
+
+[wtf_pad]
+packet_size = 1450
+max_padding_events = 100000
+
+[walkie_talkie]
+packet_size = 1450

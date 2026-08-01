@@ -15,24 +15,35 @@ mod config;
 mod controller;
 mod defense;
 mod dependency_tracker;
+mod distribution;
 mod event;
 mod profile;
 mod resource;
+mod rng;
 mod stream;
 mod trace;
 
-pub use config::{DefenseConfig, FrontConfig, QcsdConfig, TamarawConfig};
+pub use config::{
+    DefenseConfig, FrontConfig, QcsdConfig, TamarawConfig, TrafficMorphingConfig,
+    WalkieTalkieConfig, WtfPadConfig,
+};
 pub use controller::QcsdController;
 pub use defense::{
-    Capacity, Defense, DefenseMode, Front, RoundRobinScheduler, StaticSchedule, Tamaraw,
+    BurstPair, Capacity, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome,
+    Front, MIN_SHAPED_PAYLOAD, RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw,
+    TrafficMorphing, TrafficMorphingEgress, WalkieTalkie, WalkieTalkieBurstDiagnostics, WtfPad,
+    clamp_packet_size,
 };
 pub use dependency_tracker::{DependencyTracker, ResourceRunState};
+pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
-    MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation,
-    QcsdRequestRole, QcsdSlotId, QcsdStreamFinish, QcsdStreamId,
+    MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdDatagramClass, QcsdEndpointId,
+    QcsdObservation, QcsdObservationClock, QcsdRequestRole, QcsdSlotId, QcsdStreamFinish,
+    QcsdStreamId, TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{HeaderPolicy, HeaderPolicyMode, Resource, ResourceManifest};
+pub use rng::{SplitMix64, derive};
 pub use trace::{Direction, Packet, Trace};
 
 /// Errors raised while loading or executing a QCSD experiment.
@@ -55,7 +66,7 @@ pub enum Error {
     /// TOML configuration parsing failed.
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
-    /// Resource manifest parsing failed.
+    /// JSON input parsing failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }

@@ -1,0 +1,76 @@
+{
+  "adaptation": "qcsd-client-only",
+  "burst_definition": "global-application-batch-direction-transitions",
+  "cell_byte_domain": "http3-request-stream-offset.bytes",
+  "schema_version": 2,
+  "generated_by": "neqo-csdef golden fixture",
+  "matching_algorithm": "minimum-cost-one-to-one",
+  "paper_equivalent": false,
+  "packet_size": 100,
+  "training_split": "train",
+  "profiles": [
+    {
+      "real": "real page",
+      "decoy": "decoy page",
+      "matching_cost_packets": 0,
+      "training_inputs": {
+        "real": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "decoy": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      },
+      "variation": {
+        "real": {
+          "visit_count": 1,
+          "varying_components": 0,
+          "maximum_component_spread": 0
+        },
+        "decoy": {
+          "visit_count": 1,
+          "varying_components": 0,
+          "maximum_component_spread": 0
+        }
+      },
+      "source_envelopes": {
+        "real": [
+          {
+            "outgoing": 2,
+            "incoming": 2
+          },
+          {
+            "outgoing": 1,
+            "incoming": 1
+          }
+        ],
+        "decoy": [
+          {
+            "outgoing": 2,
+            "incoming": 2
+          },
+          {
+            "outgoing": 1,
+            "incoming": 1
+          }
+        ]
+      },
+      "batch_ends": {
+        "real": [0, 1],
+        "decoy": [0, 1]
+      },
+      "molded_batch_ends": [0, 1],
+      "total_scheduled_bytes": 600,
+      "bursts": [
+        {
+          "outgoing": 2,
+          "incoming": 2
+        },
+        {
+          "outgoing": 1,
+          "incoming": 1
+        }
+      ]
+    }
+  ]
+}

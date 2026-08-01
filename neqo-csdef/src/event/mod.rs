@@ -11,4 +11,7 @@ mod observation;
 
 pub use action::QcsdAction;
 pub use ids::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
-pub use observation::{MissedSlotReason, QcsdObservation, QcsdStreamFinish};
+pub use observation::{
+    MissedSlotReason, QcsdDatagramClass, QcsdObservation, QcsdObservationClock, QcsdStreamFinish,
+    TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
+};

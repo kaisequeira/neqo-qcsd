@@ -5,51 +5,8 @@
 
 use std::time::Duration;
 
-use super::{Defense, DefenseMode, StaticSchedule};
-use crate::{Direction, FrontConfig, Packet, Trace};
-
-/// Version-stable PRNG used to keep research traces reproducible.
-#[derive(Clone, Debug)]
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    const fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        value ^ (value >> 31)
-    }
-
-    fn range_inclusive(&mut self, maximum: u32) -> u32 {
-        let range = u64::from(maximum);
-        let rejection = u64::MAX - (u64::MAX % range);
-        loop {
-            let value = self.next_u64();
-            if value < rejection {
-                return u32::try_from(value % range).expect("bounded by u32") + 1;
-            }
-        }
-    }
-
-    fn unit_open(&mut self) -> f64 {
-        let value = self.next_u64() >> 11;
-        let high = u32::try_from(value >> 32).expect("21 high bits fit u32");
-        let low = u32::try_from(value & u64::from(u32::MAX)).expect("32 low bits fit u32");
-        let value = f64::from(high).mul_add(4_294_967_296.0, f64::from(low));
-        (value + 0.5) / 9_007_199_254_740_992.0
-    }
-
-    fn range_f64(&mut self, minimum: f64, maximum: f64) -> f64 {
-        self.unit_open().mul_add(maximum - minimum, minimum)
-    }
-}
+use super::{Defense, DefenseMode, DefenseSignal, StaticSchedule};
+use crate::{Direction, FrontConfig, Packet, SplitMix64, Trace};
 
 /// FRONT chaff-only defense using Rayleigh-distributed packet times.
 #[derive(Debug)]
@@ -110,6 +67,8 @@ fn rayleigh_seconds(unit: f64, sigma: f64) -> f64 {
 }
 
 impl Defense for Front {
+    fn observe(&mut self, _signal: DefenseSignal) {}
+
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
         self.schedule.next_event(elapsed)
     }
@@ -129,8 +88,6 @@ impl Defense for Front {
     fn mode(&self) -> DefenseMode {
         DefenseMode::ChaffOnly
     }
-
-    fn on_application_complete(&mut self) {}
 }
 
 #[cfg(test)]

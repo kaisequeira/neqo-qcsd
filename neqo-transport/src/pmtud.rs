@@ -113,7 +113,8 @@ impl Pmtud {
         }
     }
 
-    /// Set the peer's `max_udp_payload_size` transport parameter as an upper bound for probing.
+    /// Set the peer's `max_udp_payload_size` transport parameter as an upper bound for both the
+    /// current effective PLPMTU and future probing.
     pub const fn set_peer_max_udp_payload(&mut self, peer_max_udp_payload: usize) {
         self.peer_max_udp_payload = Some(peer_max_udp_payload);
     }
@@ -137,7 +138,11 @@ impl Pmtud {
     /// sent. During probing, this may be larger than the actual path MTU.
     #[must_use]
     pub const fn plpmtu(&self) -> usize {
-        self.mtu - self.header_size
+        let discovered = self.mtu - self.header_size;
+        match self.peer_max_udp_payload {
+            Some(peer_max) if peer_max < discovered => peer_max,
+            _ => discovered,
+        }
     }
 
     /// Returns true if a PMTUD probe should be sent.
@@ -614,6 +619,22 @@ mod tests {
     fn pmtud_peer_max_v6() {
         let pmtud = find_pmtu_with_peer_max(V6, 9000, None, 1452);
         assert_eq!(pmtud.mtu, 1500);
+    }
+
+    #[test]
+    fn peer_max_below_search_minimum_caps_effective_plpmtu() {
+        for addr in [V4, V6] {
+            let mut pmtud = Pmtud::new(addr, None);
+            assert!(pmtud.plpmtu() > 1_200);
+
+            pmtud.set_peer_max_udp_payload(1_200);
+            assert_eq!(pmtud.plpmtu(), 1_200);
+
+            let mut stats = Stats::default();
+            pmtud.start(now(), &mut stats);
+            assert_eq!(pmtud.plpmtu(), 1_200);
+            assert!(!pmtud.needs_probe());
+        }
     }
 
     #[test]

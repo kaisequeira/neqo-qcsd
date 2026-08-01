@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::{Defense, DefenseMode};
+use super::{Defense, DefenseMode, DefenseSignal};
 use crate::{Direction, Packet, Result, Trace};
 
 /// A fixed, sorted defense schedule.
@@ -46,6 +46,8 @@ impl StaticSchedule {
 }
 
 impl Defense for StaticSchedule {
+    fn observe(&mut self, _signal: DefenseSignal) {}
+
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
         self.trace
             .front()
@@ -72,6 +74,4 @@ impl Defense for StaticSchedule {
     fn mode(&self) -> DefenseMode {
         self.mode
     }
-
-    fn on_application_complete(&mut self) {}
 }

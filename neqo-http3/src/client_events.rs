@@ -10,7 +10,10 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 use neqo_common::{Bytes, Header, event::Provider as EventProvider, qtrace};
 #[cfg(feature = "qcsd")]
-use neqo_csdef::{QcsdEndpointId, QcsdObservation, QcsdStreamFinish, QcsdStreamId};
+use neqo_csdef::{
+    QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdStreamFinish, QcsdStreamId,
+    TimestampedQcsdObservation,
+};
 use neqo_transport::{AppError, StreamId, StreamType};
 use nss::ResumptionToken;
 
@@ -145,7 +148,9 @@ pub struct Http3ClientEvents {
     #[cfg(feature = "qcsd")]
     qcsd_endpoint: Rc<RefCell<Option<QcsdEndpointId>>>,
     #[cfg(feature = "qcsd")]
-    qcsd_observations: Rc<RefCell<VecDeque<QcsdObservation>>>,
+    qcsd_observations: Rc<RefCell<VecDeque<TimestampedQcsdObservation>>>,
+    #[cfg(feature = "qcsd")]
+    qcsd_observation_clock: Rc<RefCell<Option<QcsdObservationClock>>>,
     #[cfg(feature = "qcsd")]
     qcsd_endpoint_closed: Rc<Cell<bool>>,
 }
@@ -378,22 +383,30 @@ impl ExtendedConnectEvents for Http3ClientEvents {
 
 impl Http3ClientEvents {
     #[cfg(feature = "qcsd")]
-    pub(crate) fn qcsd_enable(&self, endpoint: QcsdEndpointId) {
+    pub(crate) fn qcsd_enable(
+        &self,
+        endpoint: QcsdEndpointId,
+        observation_clock: QcsdObservationClock,
+    ) {
         *self.qcsd_endpoint.borrow_mut() = Some(endpoint);
+        *self.qcsd_observation_clock.borrow_mut() = Some(observation_clock);
         self.qcsd_endpoint_closed.set(false);
     }
 
     #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_observe(&self, observation: impl FnOnce(QcsdEndpointId) -> QcsdObservation) {
-        if let Some(endpoint) = *self.qcsd_endpoint.borrow() {
+        if let (Some(endpoint), Some(clock)) = (
+            *self.qcsd_endpoint.borrow(),
+            self.qcsd_observation_clock.borrow().as_ref(),
+        ) {
             self.qcsd_observations
                 .borrow_mut()
-                .push_back(observation(endpoint));
+                .push_back(clock.record(observation(endpoint)));
         }
     }
 
     #[cfg(feature = "qcsd")]
-    pub(crate) fn qcsd_observations(&self) -> Vec<QcsdObservation> {
+    pub(crate) fn qcsd_timestamped_observations(&self) -> Vec<TimestampedQcsdObservation> {
         self.qcsd_observations.borrow_mut().drain(..).collect()
     }
 

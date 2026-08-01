@@ -20,7 +20,8 @@ use crate::{
             ActiveConnectionIdLimit, DisableMigration, GreaseQuicBit, IdleTimeout, InitialMaxData,
             InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote, InitialMaxStreamDataUni,
             InitialMaxStreamsBidi, InitialMaxStreamsUni, MaxAckDelay, MaxDatagramFrameSize,
-            MinAckDelay, PreferredAddress as PreferredAddressTp, ResetStreamAt, Scone,
+            MaxUdpPayloadSize, MinAckDelay, PreferredAddress as PreferredAddressTp, ResetStreamAt,
+            Scone,
         },
         TransportParametersHandler,
     },
@@ -113,6 +114,8 @@ pub struct ConnectionParameters {
     hystart_css_baseline: HyStartCssBaseline,
     /// Initial connection-level flow control limit.
     max_data: u64,
+    /// Largest UDP payload this endpoint advertises that it can receive.
+    max_udp_payload_size: u64,
     /// Initial flow control limit for receiving data on bidirectional streams that the peer
     /// creates.
     max_stream_data_bidi_remote: u64,
@@ -171,6 +174,7 @@ impl Default for ConnectionParameters {
             slow_start: SlowStart::Classic,
             hystart_css_baseline: HyStartCssBaseline::CurrentRoundMinRtt,
             max_data: INITIAL_LOCAL_MAX_DATA,
+            max_udp_payload_size: 65_527,
             max_stream_data_bidi_remote: to_u64(INITIAL_LOCAL_MAX_STREAM_DATA),
             max_stream_data_bidi_local: to_u64(INITIAL_LOCAL_MAX_STREAM_DATA),
             max_stream_data_uni: to_u64(INITIAL_LOCAL_MAX_STREAM_DATA),
@@ -271,6 +275,26 @@ impl ConnectionParameters {
     }
 
     #[must_use]
+    pub const fn get_max_udp_payload_size(&self) -> u64 {
+        self.max_udp_payload_size
+    }
+
+    /// Set the local `max_udp_payload_size` transport parameter.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside QUIC's permitted range of 1200 through 65527.
+    #[must_use]
+    pub fn max_udp_payload_size(mut self, value: u64) -> Self {
+        assert!(
+            (1_200..=65_527).contains(&value),
+            "max_udp_payload_size is outside QUIC's permitted range"
+        );
+        self.max_udp_payload_size = value;
+        self
+    }
+
+    #[must_use]
     pub const fn get_max_streams(&self, stream_type: StreamType) -> u64 {
         match stream_type {
             StreamType::BiDi => self.max_streams_bidi,
@@ -293,6 +317,24 @@ impl ConnectionParameters {
             }
         }
         self
+    }
+
+    /// Return the configured initial receive limit for one stream type.
+    ///
+    /// # Panics
+    ///
+    /// If `StreamType::UniDi` and `false` are passed, because a locally
+    /// initiated unidirectional stream has no receive side.
+    #[must_use]
+    pub const fn get_max_stream_data(&self, stream_type: StreamType, remote: bool) -> u64 {
+        match (stream_type, remote) {
+            (StreamType::BiDi, false) => self.max_stream_data_bidi_local,
+            (StreamType::BiDi, true) => self.max_stream_data_bidi_remote,
+            (StreamType::UniDi, false) => {
+                panic!("Can't get a receive limit for a stream that can only be sent")
+            }
+            (StreamType::UniDi, true) => self.max_stream_data_uni,
+        }
     }
 
     /// Set the maximum stream data that we will accept on different types of streams.
@@ -579,6 +621,8 @@ impl ConnectionParameters {
 
         // set configurable parameters
         tps.local_mut().set_integer(InitialMaxData, self.max_data);
+        tps.local_mut()
+            .set_integer(MaxUdpPayloadSize, self.max_udp_payload_size);
         tps.local_mut().set_integer(
             InitialMaxStreamDataBidiLocal,
             self.max_stream_data_bidi_local,

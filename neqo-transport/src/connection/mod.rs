@@ -6,7 +6,7 @@
 // The class implementing a QUIC connection.
 
 #[cfg(feature = "qcsd")]
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::{
     cell::RefCell,
     cmp::{max, min},
@@ -28,7 +28,11 @@ use neqo_common::{
     qtrace, qwarn, to_u64,
 };
 #[cfg(feature = "qcsd")]
-use neqo_csdef::{MissedSlotReason, QcsdEndpointId, QcsdObservation, QcsdSlotId};
+use neqo_csdef::{
+    MissedSlotReason, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
+    QcsdRequestRole, QcsdSlotId, TimestampedQcsdObservation, TrafficMorphingBypassReason,
+    TrafficMorphingEgress, TrafficMorphingOutcome,
+};
 use nss::{
     Agent, AntiReplay, AuthenticationStatus, Cipher, Client, Group, HandshakeState, PrivateKey,
     PublicKey, ResumptionToken, SecretAgentInfo, SecretAgentPreInfo, Server, ZeroRttChecker,
@@ -348,7 +352,19 @@ pub struct Connection {
     qcsd_endpoint: Option<QcsdEndpointId>,
     /// Transport-level target and receive-credit outcomes.
     #[cfg(feature = "qcsd")]
-    qcsd_observations: VecDeque<QcsdObservation>,
+    qcsd_observations: VecDeque<TimestampedQcsdObservation>,
+    /// Shared production clock for causal multi-endpoint trace ordering.
+    #[cfg(feature = "qcsd")]
+    qcsd_observation_clock: Option<QcsdObservationClock>,
+    /// Bounded packet-number provenance used to classify cover-induced ACKs.
+    #[cfg(feature = "qcsd")]
+    qcsd_packet_classifier: qcsd::QcsdPacketClassifier,
+    /// Aggregate causal class of the UDP datagram currently being decrypted.
+    #[cfg(feature = "qcsd")]
+    qcsd_incoming_datagram_class: Option<QcsdDatagramClass>,
+    /// Application/chaff identity for request STREAM transmission evidence.
+    #[cfg(feature = "qcsd")]
+    qcsd_stream_roles: HashMap<StreamId, QcsdRequestRole>,
     /// Receive-credit actions awaiting an encoded `MAX_STREAM_DATA` frame.
     #[cfg(feature = "qcsd")]
     qcsd_pending_receive_credit: VecDeque<QcsdPendingReceiveCredit>,
@@ -361,6 +377,12 @@ pub struct Connection {
     /// Remaining encoded stream-frame budget for the current QCSD slot.
     #[cfg(feature = "qcsd")]
     qcsd_slot_send_budget: usize,
+    /// Per-connection same-datagram Traffic Morphing sampler.
+    #[cfg(feature = "qcsd")]
+    qcsd_traffic_morphing: Option<TrafficMorphingEgress>,
+    /// Common UDP-payload ceiling for every packet-number space in a QCSD run.
+    #[cfg(feature = "qcsd")]
+    qcsd_udp_payload_ceiling: Option<u16>,
 
     /// For testing purposes it is sometimes necessary to inject frames that wouldn't
     /// otherwise be sent, just to see how a connection handles them.  Inserting them
@@ -525,6 +547,14 @@ impl Connection {
             #[cfg(feature = "qcsd")]
             qcsd_observations: VecDeque::new(),
             #[cfg(feature = "qcsd")]
+            qcsd_observation_clock: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_packet_classifier: qcsd::QcsdPacketClassifier::default(),
+            #[cfg(feature = "qcsd")]
+            qcsd_incoming_datagram_class: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_stream_roles: HashMap::new(),
+            #[cfg(feature = "qcsd")]
             qcsd_pending_receive_credit: VecDeque::new(),
             #[cfg(feature = "qcsd")]
             qcsd_send_shaping: false,
@@ -532,6 +562,10 @@ impl Connection {
             qcsd_chaff_send_released: false,
             #[cfg(feature = "qcsd")]
             qcsd_slot_send_budget: 0,
+            #[cfg(feature = "qcsd")]
+            qcsd_traffic_morphing: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_udp_payload_ceiling: None,
             quic_datagrams,
             #[cfg(any(test, feature = "build-fuzzing-corpus"))]
             test_frame_writer: None,
@@ -1829,6 +1863,10 @@ impl Connection {
         received: Instant,
         now: Instant,
     ) {
+        #[cfg(feature = "qcsd")]
+        let datagram_length = d.len();
+        #[cfg(feature = "qcsd")]
+        self.qcsd_begin_incoming_datagram();
         // First determine the path.
         let path = self.paths.find_path(
             d.destination(),
@@ -1840,8 +1878,14 @@ impl Connection {
         path.borrow_mut().add_received(d.len());
         let res = self.input_path(&path, d, received);
         _ = self.capture_error(Some(path), now, FrameType::Padding, res);
+        #[cfg(feature = "qcsd")]
+        self.qcsd_finish_incoming_datagram(datagram_length);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "packet provenance adds bounded QCSD classification to the upstream input path"
+    )]
     fn input_path(
         &mut self,
         path: &PathRef,
@@ -1907,6 +1951,11 @@ impl Connection {
                         if space.is_duplicate(pn) {
                             qdebug!("Duplicate packet {space}-{pn}");
                             self.stats.borrow_mut().dups_rx += 1;
+                            #[cfg(feature = "qcsd")]
+                            self.qcsd_record_duplicate_incoming_packet(
+                                PacketNumberSpace::from(payload.packet_type()),
+                                pn,
+                            );
                         } else {
                             match self.process_packet(path, &payload, now) {
                                 Ok(migrate) => {
@@ -2002,11 +2051,19 @@ impl Connection {
 
         let mut ack_eliciting = false;
         let mut probing = true;
+        #[cfg(feature = "qcsd")]
+        let mut qcsd_class = None;
         let mut d = Decoder::from(&packet[..]);
         while d.remaining() > 0 {
             #[cfg(feature = "build-fuzzing-corpus")]
             let pos = d.offset();
             let f = Frame::decode(&mut d)?;
+            #[cfg(feature = "qcsd")]
+            if let Some(frame_class) =
+                self.qcsd_classify_incoming_frame(PacketNumberSpace::from(packet.packet_type()), &f)
+            {
+                qcsd_class = Some(qcsd::combine_datagram_class(qcsd_class, frame_class));
+            }
             #[cfg(feature = "build-fuzzing-corpus")]
             neqo_common::write_item_to_fuzzing_corpus("frame", &packet[pos..d.offset()]);
             ack_eliciting |= f.ack_eliciting();
@@ -2047,6 +2104,13 @@ impl Connection {
             // We don't migrate during the handshake, so return false.
             false
         };
+
+        #[cfg(feature = "qcsd")]
+        self.qcsd_record_incoming_packet(
+            PacketNumberSpace::from(packet.packet_type()),
+            packet.pn(),
+            qcsd_class.unwrap_or(QcsdDatagramClass::Natural),
+        );
 
         Ok(largest_received && !probing)
     }
@@ -2415,11 +2479,16 @@ impl Connection {
 
     /// Write the frames that are exchanged in the application data space.
     /// The order of calls here determines the relative priority of frames.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "frame priority and QCSD optional-data gating are clearest in transport order"
+    )]
     fn write_appdata_frames(
         &mut self,
         builder: &mut packet::Builder<&mut Vec<u8>>,
         tokens: &mut recovery::Tokens,
         now: Instant,
+        defer_optional_stream_data: bool,
     ) {
         let rtt = self.paths.primary().map_or_else(
             || RttEstimate::new(self.conn_params.get_initial_rtt()).estimate(),
@@ -2447,16 +2516,25 @@ impl Connection {
             return;
         }
 
-        #[cfg(feature = "qcsd")]
-        if self.qcsd_stream_priority_is_budgeted(TransmissionPriority::Important) {
-            self.streams.write_frames_budgeted(
-                TransmissionPriority::Important,
-                builder,
-                tokens,
-                frame_stats,
-                &mut self.qcsd_slot_send_budget,
-            );
-        } else {
+        if !defer_optional_stream_data {
+            #[cfg(feature = "qcsd")]
+            if self.qcsd_stream_priority_is_budgeted(TransmissionPriority::Important) {
+                self.streams.write_frames_budgeted(
+                    TransmissionPriority::Important,
+                    builder,
+                    tokens,
+                    frame_stats,
+                    &mut self.qcsd_slot_send_budget,
+                );
+            } else {
+                self.streams.write_frames(
+                    TransmissionPriority::Important,
+                    builder,
+                    tokens,
+                    frame_stats,
+                );
+            }
+            #[cfg(not(feature = "qcsd"))]
             self.streams.write_frames(
                 TransmissionPriority::Important,
                 builder,
@@ -2464,13 +2542,6 @@ impl Connection {
                 frame_stats,
             );
         }
-        #[cfg(not(feature = "qcsd"))]
-        self.streams.write_frames(
-            TransmissionPriority::Important,
-            builder,
-            tokens,
-            frame_stats,
-        );
         if builder.is_full() {
             return;
         }
@@ -2486,32 +2557,34 @@ impl Connection {
             return;
         }
 
-        for prio in [TransmissionPriority::High, TransmissionPriority::Normal] {
-            #[cfg(feature = "qcsd")]
-            if self.qcsd_stream_priority_is_budgeted(prio) {
-                self.streams.write_frames_budgeted(
-                    prio,
-                    builder,
-                    tokens,
-                    &mut stats.frame_tx,
-                    &mut self.qcsd_slot_send_budget,
-                );
-            } else {
+        if !defer_optional_stream_data {
+            for prio in [TransmissionPriority::High, TransmissionPriority::Normal] {
+                #[cfg(feature = "qcsd")]
+                if self.qcsd_stream_priority_is_budgeted(prio) {
+                    self.streams.write_frames_budgeted(
+                        prio,
+                        builder,
+                        tokens,
+                        &mut stats.frame_tx,
+                        &mut self.qcsd_slot_send_budget,
+                    );
+                } else {
+                    self.streams
+                        .write_frames(prio, builder, tokens, &mut stats.frame_tx);
+                }
+                #[cfg(not(feature = "qcsd"))]
                 self.streams
                     .write_frames(prio, builder, tokens, &mut stats.frame_tx);
+                if builder.is_full() {
+                    return;
+                }
             }
-            #[cfg(not(feature = "qcsd"))]
-            self.streams
-                .write_frames(prio, builder, tokens, &mut stats.frame_tx);
+
+            // Datagrams are best-effort and unreliable.  Let streams starve them for now.
+            self.quic_datagrams.write_frames(builder, tokens, stats);
             if builder.is_full() {
                 return;
             }
-        }
-
-        // Datagrams are best-effort and unreliable.  Let streams starve them for now.
-        self.quic_datagrams.write_frames(builder, tokens, stats);
-        if builder.is_full() {
-            return;
         }
 
         // CRYPTO here only includes NewSessionTicket, plus NEW_TOKEN.
@@ -2533,8 +2606,10 @@ impl Connection {
             return;
         }
 
-        self.streams
-            .write_frames(TransmissionPriority::Low, builder, tokens, frame_stats);
+        if !defer_optional_stream_data {
+            self.streams
+                .write_frames(TransmissionPriority::Low, builder, tokens, frame_stats);
+        }
     }
 
     // Maybe send a probe.  Return true if the packet was ack-eliciting.
@@ -2586,9 +2661,69 @@ impl Connection {
         probe
     }
 
+    #[cfg(feature = "qcsd")]
+    fn qcsd_morphing_optional_stream_limit(
+        &self,
+        space: PacketNumberSpace,
+        natural_size: u16,
+        capacity: u16,
+        coalesced: bool,
+    ) -> Option<u16> {
+        if space != PacketNumberSpace::ApplicationData
+            || !self.state.connected()
+            || self.qcsd_active_target.is_some()
+        {
+            return Some(capacity);
+        }
+        let Some(morpher) = self.qcsd_traffic_morphing.as_ref() else {
+            return Some(capacity);
+        };
+        if coalesced {
+            return None;
+        }
+        morpher.maximum_safe_source_for(natural_size, capacity)
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_record_morphing_bypass<B: Buffer>(
+        &mut self,
+        space: PacketNumberSpace,
+        builder: &packet::Builder<B>,
+        aead_expansion: usize,
+        reason: TrafficMorphingBypassReason,
+    ) {
+        if space != PacketNumberSpace::ApplicationData
+            || !self.state.connected()
+            || self.qcsd_active_target.is_some()
+            || self.qcsd_traffic_morphing.is_none()
+            || builder.packet_empty()
+        {
+            return;
+        }
+        let natural =
+            u16::try_from(builder.len().saturating_add(aead_expansion)).unwrap_or(u16::MAX);
+        self.qcsd_observe(|endpoint| QcsdObservation::TrafficMorphingEgress {
+            endpoint,
+            source_udp_size: natural,
+            outcome: TrafficMorphingOutcome::Bypassed { reason },
+        });
+    }
+
     /// Write frames to the provided builder.  Returns a list of tokens used for
     /// tracking loss or acknowledgment, whether any frame was ACK eliciting, and
     /// whether the packet was padded.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "packet assembly keeps transport and QCSD invariants in wire order"
+    )]
+    #[cfg_attr(
+        not(feature = "qcsd"),
+        expect(
+            unused_variables,
+            reason = "the AEAD expansion is needed only by feature-gated in-packet morphing"
+        )
+    )]
     fn write_frames(
         &mut self,
         path: &PathRef,
@@ -2596,6 +2731,7 @@ impl Connection {
         profile: &SendProfile,
         builder: &mut packet::Builder<&mut Vec<u8>>,
         coalesced: bool, // Whether this packet is coalesced behind another one.
+        aead_expansion: usize,
         now: Instant,
     ) -> (recovery::Tokens, bool, bool) {
         let mut tokens = recovery::Tokens::new();
@@ -2633,8 +2769,23 @@ impl Connection {
 
         if profile.ack_only() {
             // If we are CC limited we can only send ACKs!
+            #[cfg(feature = "qcsd")]
+            self.qcsd_record_morphing_bypass(
+                space,
+                builder,
+                aead_expansion,
+                if profile.paced() {
+                    TrafficMorphingBypassReason::PacingLimited
+                } else {
+                    TrafficMorphingBypassReason::CongestionLimited
+                },
+            );
             return (tokens, false, false);
         }
+
+        #[cfg(feature = "qcsd")]
+        let morphing_capacity =
+            u16::try_from(builder.limit().saturating_add(aead_expansion)).unwrap_or(u16::MAX);
 
         if primary {
             if space == PacketNumberSpace::ApplicationData {
@@ -2650,7 +2801,31 @@ impl Connection {
                     );
                     ack_eliciting = true;
                 }
-                self.write_appdata_frames(builder, &mut tokens, now);
+                #[cfg(feature = "qcsd")]
+                let natural_size =
+                    u16::try_from(builder.len().saturating_add(aead_expansion)).unwrap_or(u16::MAX);
+                #[cfg(feature = "qcsd")]
+                let optional_stream_limit = self.qcsd_morphing_optional_stream_limit(
+                    space,
+                    natural_size,
+                    morphing_capacity,
+                    coalesced,
+                );
+                #[cfg(feature = "qcsd")]
+                if let Some(limit) = optional_stream_limit {
+                    builder.set_limit(
+                        builder
+                            .limit()
+                            .min(usize::from(limit).saturating_sub(aead_expansion)),
+                    );
+                }
+                #[cfg(feature = "qcsd")]
+                let defer_optional_stream_data = optional_stream_limit.is_none();
+                #[cfg(not(feature = "qcsd"))]
+                let defer_optional_stream_data = false;
+                self.write_appdata_frames(builder, &mut tokens, now, defer_optional_stream_data);
+                #[cfg(feature = "qcsd")]
+                self.qcsd_observe_stream_transmissions(&tokens);
             } else {
                 let stats = &mut self.stats.borrow_mut().frame_tx;
                 self.crypto.write_frame(
@@ -2689,6 +2864,101 @@ impl Connection {
         // If this is not the primary path, this should be ack-eliciting.
         debug_assert!(primary || ack_eliciting);
 
+        #[cfg(feature = "qcsd")]
+        let morph_target = if space == PacketNumberSpace::ApplicationData
+            && self.state.connected()
+            && !coalesced
+            && self.qcsd_active_target.is_none()
+            && self.qcsd_traffic_morphing.is_some()
+            && !builder.packet_empty()
+        {
+            let natural = u16::try_from(builder.len().saturating_add(aead_expansion));
+            let (source, outcome) = match natural {
+                Ok(natural) => {
+                    let maximum = self
+                        .qcsd_traffic_morphing
+                        .as_ref()
+                        .and_then(|morpher| morpher.maximum_target_for(natural));
+                    if maximum.is_some_and(|maximum| maximum <= morphing_capacity) {
+                        self.qcsd_traffic_morphing
+                            .as_mut()
+                            .and_then(|morpher| morpher.sample_target(natural))
+                            .filter(|target| *target >= natural)
+                            .map_or_else(
+                                || {
+                                    (
+                                        natural,
+                                        TrafficMorphingOutcome::Bypassed {
+                                            reason:
+                                                TrafficMorphingBypassReason::TargetSelectionFailed,
+                                        },
+                                    )
+                                },
+                                |target_udp_size| {
+                                    (natural, TrafficMorphingOutcome::Morphed { target_udp_size })
+                                },
+                            )
+                    } else {
+                        (
+                            natural,
+                            TrafficMorphingOutcome::Bypassed {
+                                reason: if profile.paced() {
+                                    TrafficMorphingBypassReason::PacingLimited
+                                } else {
+                                    TrafficMorphingBypassReason::CongestionLimited
+                                },
+                            },
+                        )
+                    }
+                }
+                Err(_) => (
+                    u16::MAX,
+                    TrafficMorphingOutcome::Bypassed {
+                        reason: TrafficMorphingBypassReason::InvalidPacketSize,
+                    },
+                ),
+            };
+            self.qcsd_observe(|endpoint| QcsdObservation::TrafficMorphingEgress {
+                endpoint,
+                source_udp_size: source,
+                outcome,
+            });
+            let target = match outcome {
+                TrafficMorphingOutcome::Morphed { target_udp_size } => Some(target_udp_size),
+                TrafficMorphingOutcome::Bypassed { .. } => None,
+            };
+            if let Some(target) = target
+                && target > source
+            {
+                if !ack_eliciting {
+                    builder.encode_frame(FrameType::Ping, |_| {});
+                    self.stats.borrow_mut().frame_tx.ping += 1;
+                    ack_eliciting = true;
+                }
+                builder.set_limit(usize::from(target).saturating_sub(aead_expansion));
+                builder.enable_padding(true);
+            }
+            target
+        } else {
+            None
+        };
+        #[cfg(not(feature = "qcsd"))]
+        let morph_target: Option<u16> = None;
+
+        #[cfg(feature = "qcsd")]
+        if coalesced {
+            // Coalesced 1-RTT packets cannot be padded to a packet-local UDP
+            // target. Optional STREAM/DATAGRAM data was withheld above; any
+            // remaining mandatory control packet is an explicit fidelity-
+            // invalidating bypass.
+            self.qcsd_record_morphing_bypass(
+                space,
+                builder,
+                aead_expansion,
+                TrafficMorphingBypassReason::Coalesced,
+            );
+        }
+
         // Add padding.  Only pad 1-RTT packets so that we don't prevent coalescing.
         // And avoid padding packets that otherwise only contain ACK because adding PADDING
         // causes those packets to consume congestion window, which is not tracked (yet).
@@ -2698,7 +2968,10 @@ impl Connection {
         let target_padding = self.qcsd_active_target.is_some();
         #[cfg(not(feature = "qcsd"))]
         let target_padding = false;
-        let padded = if ack_eliciting && (full_mtu || target_padding) && builder.pad() {
+        let padded = if ack_eliciting
+            && (full_mtu || target_padding || morph_target.is_some())
+            && builder.pad()
+        {
             stats.padding += 1;
             true
         } else {
@@ -2858,6 +3131,8 @@ impl Connection {
     ) -> Res<SendOption> {
         let mut initial_sent = None;
         let mut needs_padding = false;
+        #[cfg(feature = "qcsd")]
+        let mut qcsd_datagram_class = None;
         let grease_quic_bit = self.can_grease_quic_bit();
         let version = self.version();
 
@@ -2865,14 +3140,36 @@ impl Connection {
         let profile = self.loss_recovery.send_profile(&path.borrow(), now);
         qdebug!("[{self}] output_dgram_on_path send_profile {profile:?}");
 
+        let pmtud_probe = path.borrow().pmtud().needs_probe();
+        let datagram_limit = if pmtud_probe {
+            let probe_size = path.borrow().pmtud().probe_size();
+            debug_assert!(probe_size >= profile.limit());
+            needs_padding = true;
+            probe_size
+        } else {
+            profile.limit()
+        };
+        #[cfg(feature = "qcsd")]
+        let datagram_limit = self
+            .qcsd_udp_payload_ceiling
+            .map_or(datagram_limit, |ceiling| {
+                datagram_limit.min(usize::from(ceiling))
+            });
+
+        #[cfg(feature = "qcsd")]
+        let configured_limit = self.qcsd_udp_payload_ceiling.map_or_else(
+            || profile.limit(),
+            |ceiling| profile.limit().min(usize::from(ceiling)),
+        );
+
         #[cfg(feature = "qcsd")]
         {
-            self.qcsd_expire_packet_targets(now, Some(profile.limit()), profile.paced());
+            self.qcsd_expire_packet_targets(now, Some(configured_limit), profile.paced());
             self.qcsd_active_target = self
                 .qcsd_packet_targets
                 .front()
                 .copied()
-                .filter(|target| usize::from(target.udp_payload_size) <= profile.limit());
+                .filter(|target| usize::from(target.udp_payload_size) <= configured_limit);
             self.qcsd_slot_send_budget = self.qcsd_active_target.map_or(0, |target| {
                 if target.allow_stream_data {
                     usize::from(target.udp_payload_size)
@@ -2895,23 +3192,20 @@ impl Connection {
             let header_start = encoder.len();
 
             // Configure the limits and padding for this packet.
-            let limit = if path.borrow().pmtud().needs_probe() {
-                needs_padding = true;
-                debug_assert!(path.borrow().pmtud().probe_size() >= profile.limit());
-                path.borrow().pmtud().probe_size()
-            } else {
-                profile.limit()
-                    - if space == PacketNumberSpace::Initial && self.conn_params.scone_enabled() {
-                        // Reserve some space for the SCONE indication in an Initial.
-                        // This reduces the amount available for building the packet,
-                        // but we'll pad to `profile.limit()` when padding.
-                        // This will not reserve space for the indication if packets
-                        // are coalesced (with Handshake or 0-RTT). That's too bad.
-                        Self::SCONE_INDICATION.len()
-                    } else {
-                        0
-                    }
-            };
+            let limit = datagram_limit
+                - if space == PacketNumberSpace::Initial
+                    && self.conn_params.scone_enabled()
+                    && !pmtud_probe
+                {
+                    // Reserve some space for the SCONE indication in an Initial.
+                    // This reduces the amount available for building the packet,
+                    // but we'll pad to `datagram_limit` when padding. This will not
+                    // reserve space for the indication if packets are coalesced (with
+                    // Handshake or 0-RTT). That's too bad.
+                    Self::SCONE_INDICATION.len()
+                } else {
+                    0
+                };
             #[cfg(feature = "qcsd")]
             let limit = if space == PacketNumberSpace::ApplicationData {
                 self.qcsd_active_target.map_or(limit, |target| {
@@ -2952,8 +3246,15 @@ impl Connection {
             if let Some(close) = closing_frame {
                 self.write_closing_frames(close, &mut builder, space, now, path, &mut tokens);
             } else {
-                (tokens, ack_eliciting, padded) =
-                    self.write_frames(path, space, &profile, &mut builder, header_start != 0, now);
+                (tokens, ack_eliciting, padded) = self.write_frames(
+                    path,
+                    space,
+                    &profile,
+                    &mut builder,
+                    header_start != 0,
+                    aead_expansion,
+                    now,
+                );
             }
             if builder.packet_empty() {
                 // Nothing to include in this packet.
@@ -2985,6 +3286,20 @@ impl Connection {
             // contained in the coalesced packet. This is per Section 13.4.1 of
             // RFC 9000.
             self.stats.borrow_mut().ecn_tx[pt] += Ecn::from(packet_tos);
+            #[cfg(feature = "qcsd")]
+            let packet_class = self.qcsd_classify_outgoing_packet(
+                space,
+                pn,
+                &tokens,
+                space == PacketNumberSpace::ApplicationData && self.qcsd_active_target.is_some(),
+            );
+            #[cfg(feature = "qcsd")]
+            {
+                qcsd_datagram_class = Some(qcsd::combine_datagram_class(
+                    qcsd_datagram_class,
+                    packet_class,
+                ));
+            }
             let tx = self
                 .crypto
                 .states_mut()
@@ -3072,7 +3387,7 @@ impl Connection {
             // Perform additional padding for Initial packets as necessary.
             if let Some(mut initial) = initial_sent.take() {
                 if needs_padding {
-                    self.pad_initial(&mut encoder, &mut initial, &profile);
+                    self.pad_initial(&mut encoder, &mut initial, datagram_limit);
                 }
                 self.loss_recovery.on_packet_sent(path, initial, now);
             }
@@ -3088,6 +3403,8 @@ impl Connection {
                     self.qcsd_target_missed(&target, MissedSlotReason::MandatoryFrames);
                 }
             }
+            #[cfg(feature = "qcsd")]
+            self.qcsd_observe_outgoing_datagram(encoder.len(), qcsd_datagram_class);
             path.borrow_mut().add_sent(encoder.len());
             Ok(SendOption::Yes)
         }
@@ -3097,33 +3414,29 @@ impl Connection {
         &self,
         encoder: &mut Encoder<&mut Vec<u8>>,
         initial: &mut sent::Packet,
-        profile: &SendProfile,
+        limit: usize,
     ) {
-        if encoder.len() >= profile.limit() {
+        if encoder.len() >= limit {
             return;
         }
 
-        qdebug!(
-            "[{self}] pad Initial from {} to {}",
-            encoder.len(),
-            profile.limit()
-        );
-        let pad_amount = profile.limit() - encoder.len();
+        qdebug!("[{self}] pad Initial from {} to {limit}", encoder.len());
+        let pad_amount = limit - encoder.len();
         initial.track_padding(pad_amount);
         if self.conn_params.scone_enabled() {
             // This ensures that the last bytes are a SCONE indication, if there is enough space.
             // This is not tracked, other than for congestion control (above)
             if pad_amount >= Self::SCONE_INDICATION.len() {
                 encoder.pad_to(
-                    profile.limit() - Self::SCONE_INDICATION.len() + 1,
+                    limit - Self::SCONE_INDICATION.len() + 1,
                     Self::SCONE_INDICATION[0],
                 );
                 encoder.encode(&Self::SCONE_INDICATION[1..]);
             } else {
-                encoder.pad_to(profile.limit(), Self::SCONE_INDICATION[0]);
+                encoder.pad_to(limit, Self::SCONE_INDICATION[0]);
             }
         } else {
-            encoder.pad_to(profile.limit(), 0);
+            encoder.pad_to(limit, 0);
         }
     }
 
@@ -3206,14 +3519,29 @@ impl Connection {
 
     fn set_initial_limits(&mut self) {
         self.streams.set_initial_limits();
-        let peer_timeout = self
-            .tps
-            .borrow()
-            .remote()
-            .get_integer(TransportParameterId::IdleTimeout);
+        let (peer_timeout, peer_max_udp_payload) = {
+            let tps = self.tps.borrow();
+            let remote = tps.remote();
+            (
+                remote.get_integer(TransportParameterId::IdleTimeout),
+                usize::try_from(remote.get_integer(MaxUdpPayloadSize)).ok(),
+            )
+        };
         if peer_timeout > 0 {
             self.idle_timeout
                 .set_peer_timeout(Duration::from_millis(peer_timeout));
+        }
+
+        // Apply this as soon as TLS exposes the peer parameters. In particular, a
+        // server must constrain its first flight rather than waiting for the
+        // handshake to complete and `process_tps()` to run.
+        if let (Some(path), Some(peer_max_udp_payload)) =
+            (self.paths.primary(), peer_max_udp_payload)
+        {
+            path.borrow_mut()
+                .pmtud_mut()
+                .set_peer_max_udp_payload(peer_max_udp_payload);
+            self.stats.borrow_mut().pmtud_peer_max_udp_payload = Some(peer_max_udp_payload);
         }
 
         self.quic_datagrams
@@ -3252,13 +3580,6 @@ impl Connection {
             )?;
             let path = self.paths.primary().ok_or(Error::NoAvailablePath)?;
             path.borrow_mut().set_reset_token(reset_token);
-
-            if let Ok(max_udp_payload) = usize::try_from(remote.get_integer(MaxUdpPayloadSize)) {
-                path.borrow_mut()
-                    .pmtud_mut()
-                    .set_peer_max_udp_payload(max_udp_payload);
-                self.stats.borrow_mut().pmtud_peer_max_udp_payload = Some(max_udp_payload);
-            }
 
             let max_ad = Duration::from_millis(remote.get_integer(MaxAckDelay));
             let min_ad = if remote.has_value(MinAckDelay) {
@@ -4280,7 +4601,11 @@ impl Connection {
     #[must_use]
     pub fn qcsd_max_udp_payload_size(&self) -> Option<u16> {
         let path = self.paths.primary()?;
-        u16::try_from(path.borrow().plpmtu()).ok()
+        let path_limit = path.borrow().plpmtu();
+        let effective_limit = self
+            .qcsd_udp_payload_ceiling
+            .map_or(path_limit, |ceiling| path_limit.min(usize::from(ceiling)));
+        u16::try_from(effective_limit).ok()
     }
 
     /// Enable or disable slot-local stream transmission permission.

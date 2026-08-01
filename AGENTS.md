@@ -3,9 +3,13 @@
 ## Overview
 Neqo is Mozilla's production QUIC, HTTP/3, and QPACK implementation used in Firefox. Written in Rust with NSS as the TLS backend. The server functionality is experimental and not production-ready.
 
-**Repository Structure**: Cargo workspace with 9 member crates plus support directories.
+**Repository Structure**: Cargo workspace with the upstream Neqo crates, the
+transport-independent `neqo-csdef` QCSD framework, and support directories.
 - **Core crates**: `neqo-common` (shared utilities), `neqo-transport` (QUIC protocol), `neqo-http3` (HTTP/3), `neqo-qpack` (QPACK compression), `neqo-udp` (UDP socket handling)
-- **Binary crate**: `neqo-bin` (CLI tools: `neqo-client`, `neqo-server`)
+- **Defense crate**: `neqo-csdef` (closed-loop QCSD defenses, configuration,
+  deterministic sampling, and controller; deliberately has no Neqo dependency)
+- **Binary crate**: `neqo-bin` (CLI tools: `neqo-client`, `neqo-server`,
+  and the feature-gated `neqo-qcsd-client`)
 - **Support crates**: `test-fixture` (test utilities), `fuzz` (fuzzing), `mtu` (MTU detection)
 - **Config files**: Root `.rustfmt.toml`, `.clippy.toml`, `.deny.toml`, `Cargo.toml` (workspace lints)
 
@@ -34,6 +38,17 @@ cargo build --locked --release --bin neqo-client --bin neqo-server
 
 # Run tests (see Known Issues about possible mtu failures)
 cargo test --locked --workspace
+
+# Fast QCSD framework gate (does not build NSS)
+cargo test --locked -p neqo-csdef
+cargo clippy --locked -p neqo-csdef --all-targets -- -D warnings
+cargo doc --locked -p neqo-csdef --no-deps
+
+# QCSD adapters and runner
+cargo test --locked -p neqo-transport --features qcsd --lib
+cargo test --locked -p neqo-http3 --features qcsd --lib
+cargo test --locked -p neqo-bin --features qcsd --lib
+cargo build --locked -p neqo-bin --features qcsd --bin neqo-qcsd-client
 ```
 
 ### Validation Pipeline (CI Equivalent)
@@ -89,12 +104,13 @@ Run these commands in order before submitting a PR. All must pass:
 ```
 neqo/
 ├── Cargo.toml          # Workspace manifest with shared dependencies and lints
+├── neqo-csdef/         # Transport-independent QCSD defense framework
 ├── neqo-common/        # Shared utilities: codecs, time, logging, qlog
 ├── neqo-transport/     # QUIC protocol: connections, streams, recovery, congestion control
 ├── neqo-http3/         # HTTP/3 protocol: client/server, streams, settings
 ├── neqo-qpack/         # QPACK compression for HTTP/3 headers
 ├── neqo-udp/           # UDP socket handling (platform-specific)
-├── neqo-bin/           # CLI tools (neqo-client, neqo-server)
+├── neqo-bin/           # CLI tools, including the feature-gated QCSD runner
 ├── test-fixture/       # Shared test utilities and NSS test database
 │   └── db/             # NSS certificate database for tests
 ├── fuzz/               # Fuzzing harnesses
@@ -106,6 +122,9 @@ neqo/
 
 ### Key Files
 - `Cargo.toml`: Workspace configuration, shared dependencies, lints (very strict clippy + Rust lints)
+- `neqo-csdef/src/controller/`: QCSD observation/action control loop
+- `neqo-csdef/src/defense/`: Built-in defense implementations
+- `neqo-bin/src/qcsd/`: Current-thread QCSD runner and trace artifacts
 - `.rustfmt.toml`: Format config (edition 2021, import grouping, comment formatting)
 - `.clippy.toml`: Clippy config (unwrap/dbg allowed in tests, disallows std::dbg macro, 32-byte pass-by-value limit)
 - `.deny.toml`: Cargo-deny config (license allowlist, advisory checks)
@@ -123,6 +142,7 @@ neqo/
 - **semver.yml**: Checks for semver compliance
 - **firefox.yml**: Integration test with Firefox
 - **check-mtu.yml**: Checks MTU crate separately
+- **qcsd.yml**: Focused defense-framework, adapter, and QCSD runner checks
 
 ### CI Commands Reference
 ```bash

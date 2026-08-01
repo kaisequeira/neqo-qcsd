@@ -1,0 +1,99 @@
+{
+  "schema_version": 2,
+  "adaptation": "qcsd-client-only",
+  "paper_equivalent": false,
+  "fitted_from": "finite realistic golden fixture",
+  "generated_by": "neqo-csdef golden fixture",
+  "fitting": {
+    "instantaneous_bandwidth_window_packets": 2,
+    "burst_threshold_method": "corpus-mean-bandwidth",
+    "bandwidth_threshold_bytes_per_second": 1.0,
+    "candidate_models": ["normal", "lognormal"],
+    "tuning_percentile": 0.5,
+    "tuning_applies_to": "burst-histogram-only",
+    "tuning_transformation": "paper-gaussian-percentile-shift-v1",
+    "finite_domain_percentile": 99.5,
+    "histogram_bin_count": 20,
+    "histogram_scale": "exponential",
+    "finite_token_budget": 4,
+    "fake_burst_probability": 0.9,
+    "infinity_token_formulas": {
+      "burst": "k_inf = p_inf / (1 - p_inf) * K",
+      "gap": "k_inf = (K - mean_burst_length + 1) / (mean_burst_length - 1)"
+    }
+  },
+  "outgoing": {
+    "burst": {
+      "edges_us": [10, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+      "tokens": [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "infinity_tokens": 1
+    },
+    "gap": {
+      "edges_us": [5, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+      "tokens": [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "infinity_tokens": 3
+    },
+    "fit": {
+      "mean_burst_length_packets": 2.0,
+      "burst": {
+        "sample_count": 4,
+        "selected_model": "normal",
+        "histogram_max_us": 47,
+        "runtime_parameters": [1.0, 1.0],
+        "parameter_transformation": "paper-gaussian-percentile-shift-v1",
+        "candidates": [
+          {"name": "normal", "parameters": [1.0, 1.0], "ks_statistic": 0.1},
+          {"name": "lognormal", "parameters": [1.0, 0.0, 1.0], "ks_statistic": 0.2}
+        ]
+      },
+      "gap": {
+        "sample_count": 4,
+        "selected_model": "lognormal",
+        "histogram_max_us": 32,
+        "runtime_parameters": [1.0, 0.0, 1.0],
+        "parameter_transformation": "identity",
+        "candidates": [
+          {"name": "normal", "parameters": [1.0, 1.0], "ks_statistic": 0.2},
+          {"name": "lognormal", "parameters": [1.0, 0.0, 1.0], "ks_statistic": 0.1}
+        ]
+      }
+    }
+  },
+  "incoming": {
+    "burst": {
+      "edges_us": [10, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+      "tokens": [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "infinity_tokens": 1
+    },
+    "gap": {
+      "edges_us": [5, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+      "tokens": [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "infinity_tokens": 3
+    },
+    "fit": {
+      "mean_burst_length_packets": 2.0,
+      "burst": {
+        "sample_count": 4,
+        "selected_model": "normal",
+        "histogram_max_us": 47,
+        "runtime_parameters": [1.0, 1.0],
+        "parameter_transformation": "paper-gaussian-percentile-shift-v1",
+        "candidates": [
+          {"name": "normal", "parameters": [1.0, 1.0], "ks_statistic": 0.1},
+          {"name": "lognormal", "parameters": [1.0, 0.0, 1.0], "ks_statistic": 0.2}
+        ]
+      },
+      "gap": {
+        "sample_count": 4,
+        "selected_model": "lognormal",
+        "histogram_max_us": 32,
+        "runtime_parameters": [1.0, 0.0, 1.0],
+        "parameter_transformation": "identity",
+        "candidates": [
+          {"name": "normal", "parameters": [1.0, 1.0], "ks_statistic": 0.2},
+          {"name": "lognormal", "parameters": [1.0, 0.0, 1.0], "ks_statistic": 0.1}
+        ]
+      }
+    }
+  }
+}

@@ -2417,6 +2417,21 @@ pub struct RecoveryToken {
     fin: bool,
 }
 
+#[cfg(feature = "qcsd")]
+impl RecoveryToken {
+    pub(crate) const fn stream_id(&self) -> StreamId {
+        self.id
+    }
+
+    pub(crate) const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) const fn length(&self) -> usize {
+        self.length
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

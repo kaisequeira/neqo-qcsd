@@ -10,24 +10,109 @@
 //! [`Defense`] generates a transport-independent packet schedule, while the
 //! controller decides which connection and stream can enact each event.
 
+#[cfg(test)]
+use std::time::Duration;
+
 mod front;
 mod shared;
 mod static_schedule;
 mod tamaraw;
+mod traffic_morphing;
 mod traits;
+mod walkie_talkie;
+mod wtf_pad;
 
 pub use front::Front;
 pub use shared::{Capacity, RoundRobinScheduler};
 pub use static_schedule::StaticSchedule;
 pub use tamaraw::Tamaraw;
-pub use traits::{Defense, DefenseMode};
+pub use traffic_morphing::{TrafficMorphing, TrafficMorphingEgress};
+pub use traits::{
+    Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, SignalKind,
+    WalkieTalkieBurstDiagnostics,
+};
+pub use walkie_talkie::{BurstPair, WalkieTalkie};
+pub use wtf_pad::WtfPad;
+
+/// QUIC's smallest safely shapeable UDP payload.
+pub const MIN_SHAPED_PAYLOAD: u16 = 64;
+
+/// Clamp a sampled size into the shapeable range.
+///
+/// Sizes below [`MIN_SHAPED_PAYLOAD`] cannot be realised by transport and
+/// return `None`, allowing a defense to retain or report the remainder
+/// explicitly.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the preceding comparison proves size is bounded by the u16 maximum"
+)]
+pub const fn clamp_packet_size(size: u32, max: u16) -> Option<u16> {
+    if size < MIN_SHAPED_PAYLOAD as u32 || max < MIN_SHAPED_PAYLOAD {
+        return None;
+    }
+    let clamped = if size > max as u32 { max } else { size as u16 };
+    Some(clamped)
+}
+
+#[cfg(test)]
+fn drive(
+    defense: &mut dyn Defense,
+    script: &[(Duration, SignalKind)],
+    until: Duration,
+) -> Vec<crate::Packet> {
+    let mut signals: Vec<_> = script
+        .iter()
+        .map(|(at, kind)| DefenseSignal {
+            at: *at,
+            kind: *kind,
+        })
+        .collect();
+    signals.sort_by_key(|signal| signal.at);
+    let mut next_signal = 0;
+    let mut packets = Vec::new();
+
+    loop {
+        let signal_at = signals.get(next_signal).map(|signal| signal.at);
+        let event_at = defense.next_event_at();
+        let Some(at) = signal_at.into_iter().chain(event_at).min() else {
+            break;
+        };
+        if at > until {
+            break;
+        }
+
+        while signals
+            .get(next_signal)
+            .is_some_and(|signal| signal.at == at)
+        {
+            defense.observe(signals[next_signal]);
+            next_signal += 1;
+        }
+
+        let before = packets.len();
+        while let Some(packet) = defense.next_event(at) {
+            packets.push(packet);
+        }
+        if before == packets.len()
+            && signals
+                .get(next_signal)
+                .is_none_or(|signal| signal.at != at)
+            && defense.next_event_at() == Some(at)
+        {
+            break;
+        }
+    }
+    packets
+}
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        Capacity, Defense as _, DefenseMode, Front, RoundRobinScheduler, StaticSchedule, Tamaraw,
+        Capacity, Defense as _, DefenseMode, DefenseSignal, Front, RoundRobinScheduler, SignalKind,
+        StaticSchedule, Tamaraw, clamp_packet_size, drive,
     };
     use crate::{Direction, FrontConfig, Packet, QcsdEndpointId, TamarawConfig, Trace};
 
@@ -185,7 +270,10 @@ mod tests {
                 None => panic!("a Tamaraw slot should be due"),
             }
         }
-        defense.on_application_complete();
+        defense.observe(DefenseSignal {
+            at: Duration::from_millis(21),
+            kind: SignalKind::ApplicationComplete,
+        });
         while let Some(packet) = defense.next_event(Duration::from_secs(1)) {
             match packet.direction() {
                 Direction::Incoming => incoming += 1,
@@ -210,7 +298,10 @@ mod tests {
         while let Some(packet) = defense.next_event(Duration::from_millis(35)) {
             actual.push((packet.timestamp_us(), packet.direction()));
         }
-        defense.on_application_complete();
+        defense.observe(DefenseSignal {
+            at: Duration::from_millis(35),
+            kind: SignalKind::ApplicationComplete,
+        });
         while let Some(packet) = defense.next_event(Duration::MAX) {
             actual.push((packet.timestamp_us(), packet.direction()));
         }
@@ -300,5 +391,28 @@ mod tests {
         scheduler.remove_endpoint(QcsdEndpointId(2));
         assert_eq!(scheduler.next_outgoing(), Some(QcsdEndpointId(3)));
         assert_eq!(scheduler.next_outgoing(), Some(QcsdEndpointId(1)));
+    }
+
+    #[test]
+    fn packet_size_clamp_rejects_transport_unsafe_remainders() {
+        assert_eq!(clamp_packet_size(0, 1_200), None);
+        assert_eq!(clamp_packet_size(63, 1_200), None);
+        assert_eq!(clamp_packet_size(64, 1_200), Some(64));
+        assert_eq!(clamp_packet_size(1_200, 1_200), Some(1_200));
+        assert_eq!(clamp_packet_size(9_000, 1_200), Some(1_200));
+        assert_eq!(clamp_packet_size(64, 63), None);
+    }
+
+    #[test]
+    fn reactive_defense_driver_stops_at_requested_time() {
+        let trace = Trace::new([
+            Packet::new(Duration::from_micros(1), Direction::Outgoing, 100).expect("packet"),
+            Packet::new(Duration::from_micros(3), Direction::Incoming, 100).expect("packet"),
+        ]);
+        let mut schedule = StaticSchedule::new(trace, true);
+        assert_eq!(
+            drive(&mut schedule, &[], Duration::from_micros(2)),
+            [Packet::new(Duration::from_micros(1), Direction::Outgoing, 100).expect("packet")]
+        );
     }
 }

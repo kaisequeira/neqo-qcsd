@@ -106,6 +106,16 @@ impl ReceiveState {
         }
     }
 
+    /// Raw stream bytes consumed by HTTP/3 so far.
+    pub const fn consumed(&self) -> u64 {
+        match self {
+            Self::ReceivingHeaders { consumed, .. }
+            | Self::ReceivingData { consumed, .. }
+            | Self::Automatic { consumed, .. } => *consumed,
+            Self::Created { .. } | Self::Closed { .. } => 0,
+        }
+    }
+
     pub fn header_progress(&mut self, min_remaining: u64, excess: u64) {
         match self {
             Self::ReceivingHeaders {

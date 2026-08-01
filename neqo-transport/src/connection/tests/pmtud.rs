@@ -11,7 +11,7 @@ use std::{
 };
 
 use neqo_common::Datagram;
-use test_fixture::{DEFAULT_ADDR_V4, fixture_init, now};
+use test_fixture::{DEFAULT_ADDR, DEFAULT_ADDR_V4, fixture_init, now};
 
 use super::Connection;
 use crate::{
@@ -61,6 +61,32 @@ fn gso_with_max_mtu() {
         server.process_multiple_input(pkts.iter_mut(), now());
         let ack = server.process_output(now()).dgram();
         client.process_input(ack.unwrap(), now());
+    }
+}
+
+#[test]
+fn server_immediately_honors_peer_payload_cap_below_search_minimum() {
+    for remote in [DEFAULT_ADDR_V4, DEFAULT_ADDR] {
+        fixture_init();
+        let mut client = Connection::new_client(
+            test_fixture::DEFAULT_SERVER_NAME,
+            test_fixture::DEFAULT_ALPN,
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            remote,
+            remote,
+            ConnectionParameters::default().max_udp_payload_size(1_200),
+            now(),
+        )
+        .expect("create client");
+        let mut server = default_server();
+
+        let first_initial = client.process_output(now()).dgram().unwrap();
+        let second_initial = client.process_output(now()).dgram().unwrap();
+        server.process_input(first_initial, now());
+        let response = server.process(Some(second_initial), now()).dgram().unwrap();
+
+        assert_eq!(server.plpmtu(), 1_200, "address family: {remote}");
+        assert_eq!(response.len(), 1_200, "address family: {remote}");
     }
 }
 
@@ -124,8 +150,14 @@ fn drive_pmtud(
 fn vpn_migration_triggers_pmtud() {
     fixture_init();
     let mut now = now();
-    let mut client = new_client(ConnectionParameters::default().pmtud(true));
-    let mut server = new_server(ConnectionParameters::default().pmtud(true));
+    // This test supplies its own synthetic path-MTU limits to `drive_pmtud`.
+    // Do not let the host running the unit test impose a smaller interface MTU
+    // and make the simulated 1500-byte initial path unreachable.
+    let params = ConnectionParameters::default()
+        .pmtud(true)
+        .pmtud_iface_mtu(false);
+    let mut client = new_client(params.clone());
+    let mut server = new_server(params);
     let header_size = Pmtud::header_size(
         client
             .paths

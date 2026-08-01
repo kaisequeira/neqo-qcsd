@@ -6,7 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DefenseConfig, FrontConfig, QcsdConfig, Result, TamarawConfig};
+use crate::{
+    DefenseConfig, FrontConfig, QcsdConfig, Result, TamarawConfig, TrafficMorphingConfig,
+    WalkieTalkieConfig, WtfPadConfig,
+};
 
 /// A complete family of QCSD controller and defense parameters.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -44,6 +47,25 @@ pub enum DefenseKind {
         /// How application traffic participates in scheduled capacity.
         mode: StaticMode,
     },
+    /// Use the profile's Traffic Morphing parameters and an explicit matrix.
+    TrafficMorphing {
+        /// Versioned workload-bound bidirectional morphing-matrix JSON bundle.
+        matrix: String,
+        /// Workload identity bound to exactly one source-to-decoy profile.
+        workload_id: String,
+    },
+    /// Use the profile's WTF-PAD parameters and explicit histograms.
+    WtfPad {
+        /// Versioned bidirectional adaptive-padding histogram JSON file.
+        histograms: String,
+    },
+    /// Use the profile's Walkie-Talkie parameters and an explicit molded sequence.
+    WalkieTalkie {
+        /// Versioned molded burst-sequence JSON file.
+        molded: String,
+        /// Workload identity bound to exactly one symmetric pair profile.
+        workload_id: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +75,22 @@ struct ProfileDefinition {
     controller: ControllerProfile,
     front: FrontConfig,
     tamaraw: TamarawConfig,
+    traffic_morphing: TrafficMorphingConfig,
+    wtf_pad: WtfPadConfig,
+    walkie_talkie: WalkieTalkieConfig,
+}
+
+impl ProfileDefinition {
+    fn parse(source: &str) -> Result<Self> {
+        let profile: Self = toml::from_str(source)?;
+        if profile.schema_version != 2 {
+            return Err(crate::Error::InvalidConfig(format!(
+                "unsupported QCSD profile schema_version {}; expected 2",
+                profile.schema_version
+            )));
+        }
+        Ok(profile)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,13 +121,7 @@ impl QcsdProfile {
             Self::Published => include_str!("../profiles/published.toml"),
             Self::Live => include_str!("../profiles/live.toml"),
         };
-        let profile: ProfileDefinition = toml::from_str(source)?;
-        if profile.schema_version != 1 {
-            return Err(crate::Error::InvalidConfig(format!(
-                "unsupported QCSD profile schema_version {}",
-                profile.schema_version
-            )));
-        }
+        let profile = ProfileDefinition::parse(source)?;
         let defense = match defense {
             DefenseKind::None => DefenseConfig::None,
             DefenseKind::Front => DefenseConfig::Front(profile.front),
@@ -98,6 +130,29 @@ impl QcsdProfile {
                 schedule,
                 padding_only: mode == StaticMode::ChaffOnly,
             },
+            DefenseKind::TrafficMorphing {
+                matrix,
+                workload_id,
+            } => {
+                let mut config = profile.traffic_morphing;
+                config.matrix = matrix;
+                config.workload_id = workload_id;
+                DefenseConfig::TrafficMorphing(config)
+            }
+            DefenseKind::WtfPad { histograms } => {
+                let mut config = profile.wtf_pad;
+                config.histograms = histograms;
+                DefenseConfig::WtfPad(config)
+            }
+            DefenseKind::WalkieTalkie {
+                molded,
+                workload_id,
+            } => {
+                let mut config = profile.walkie_talkie;
+                config.molded = molded;
+                config.workload_id = workload_id;
+                DefenseConfig::WalkieTalkie(config)
+            }
         };
         let controller = profile.controller;
         let config = QcsdConfig {
@@ -122,8 +177,11 @@ impl QcsdProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{DefenseKind, QcsdProfile, StaticMode};
-    use crate::{DefenseConfig, FrontConfig, TamarawConfig};
+    use super::{DefenseKind, ProfileDefinition, QcsdProfile, StaticMode};
+    use crate::{
+        DefenseConfig, FrontConfig, TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig,
+        WtfPadConfig,
+    };
 
     #[test]
     fn published_profile_resolves_every_defense() {
@@ -155,10 +213,50 @@ mod tests {
                 padding_only: false,
             }
         );
+        let traffic_morphing = QcsdProfile::Published
+            .resolve(DefenseKind::TrafficMorphing {
+                matrix: "matrix.json".into(),
+                workload_id: "published-workload".into(),
+            })
+            .expect("published Traffic Morphing");
+        assert_eq!(
+            traffic_morphing.defense,
+            DefenseConfig::TrafficMorphing(TrafficMorphingConfig {
+                matrix: "matrix.json".into(),
+                workload_id: "published-workload".into(),
+                ..TrafficMorphingConfig::default()
+            })
+        );
+        let wtf_pad = QcsdProfile::Published
+            .resolve(DefenseKind::WtfPad {
+                histograms: "histograms.json".into(),
+            })
+            .expect("published WTF-PAD");
+        assert_eq!(
+            wtf_pad.defense,
+            DefenseConfig::WtfPad(WtfPadConfig {
+                histograms: "histograms.json".into(),
+                ..WtfPadConfig::default()
+            })
+        );
+        let walkie_talkie = QcsdProfile::Published
+            .resolve(DefenseKind::WalkieTalkie {
+                molded: "molded.json".into(),
+                workload_id: "published-workload".into(),
+            })
+            .expect("published Walkie-Talkie");
+        assert_eq!(
+            walkie_talkie.defense,
+            DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
+                molded: "molded.json".into(),
+                workload_id: "published-workload".into(),
+                ..WalkieTalkieConfig::default()
+            })
+        );
     }
 
     #[test]
-    fn live_profile_is_complete_for_front_and_tamaraw() {
+    fn live_profile_resolves_every_defense() {
         let baseline = QcsdProfile::Live
             .resolve(DefenseKind::None)
             .expect("live baseline");
@@ -203,5 +301,58 @@ mod tests {
                 padding_only: true,
             }
         );
+        let traffic_morphing = QcsdProfile::Live
+            .resolve(DefenseKind::TrafficMorphing {
+                matrix: "live-matrix.json".into(),
+                workload_id: "live-workload".into(),
+            })
+            .expect("live Traffic Morphing");
+        assert_eq!(
+            traffic_morphing.defense,
+            DefenseConfig::TrafficMorphing(TrafficMorphingConfig {
+                matrix: "live-matrix.json".into(),
+                workload_id: "live-workload".into(),
+                ingress_packet_size: 1_200,
+                max_ingress_deficit_bytes: 8_000,
+            })
+        );
+        let wtf_pad = QcsdProfile::Live
+            .resolve(DefenseKind::WtfPad {
+                histograms: "live-histograms.json".into(),
+            })
+            .expect("live WTF-PAD");
+        assert_eq!(
+            wtf_pad.defense,
+            DefenseConfig::WtfPad(WtfPadConfig {
+                histograms: "live-histograms.json".into(),
+                packet_size: 1_200,
+                max_padding_events: 10_000,
+            })
+        );
+        let walkie_talkie = QcsdProfile::Live
+            .resolve(DefenseKind::WalkieTalkie {
+                molded: "live-molded.json".into(),
+                workload_id: "live-workload".into(),
+            })
+            .expect("live Walkie-Talkie");
+        assert_eq!(
+            walkie_talkie.defense,
+            DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
+                molded: "live-molded.json".into(),
+                workload_id: "live-workload".into(),
+                packet_size: 1_200,
+            })
+        );
+    }
+
+    #[test]
+    fn profiles_reject_every_schema_except_version_two() {
+        let version_one = include_str!("../profiles/live.toml").replacen(
+            "schema_version = 2",
+            "schema_version = 1",
+            1,
+        );
+        let error = ProfileDefinition::parse(&version_one).expect_err("version one is obsolete");
+        assert!(error.to_string().contains("expected 2"));
     }
 }

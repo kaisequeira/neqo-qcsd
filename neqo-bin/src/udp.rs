@@ -26,10 +26,25 @@ pub struct Socket {
 impl Socket {
     /// Create a new [`Socket`] bound to the provided address, not managed externally.
     pub fn bind<A: std::net::ToSocketAddrs>(addr: A) -> Result<Self, io::Error> {
+        Self::bind_inner(addr, false)
+    }
+
+    /// Bind a socket without UDP receive coalescing for direct packet capture.
+    pub fn bind_for_direct_capture<A: std::net::ToSocketAddrs>(addr: A) -> Result<Self, io::Error> {
+        Self::bind_inner(addr, true)
+    }
+
+    fn bind_inner<A: std::net::ToSocketAddrs>(
+        addr: A,
+        disable_udp_gro: bool,
+    ) -> Result<Self, io::Error> {
         const ONE_MB: usize = 1 << 20;
 
         let socket = std::net::UdpSocket::bind(addr)?;
         let state = quinn_udp::UdpSocketState::new((&socket).into())?;
+        if disable_udp_gro {
+            neqo_udp::disable_udp_gro(&state, &socket)?;
+        }
         #[cfg(apple)]
         // SAFETY: Quinn-udp resolves `sendmsg_x`/`recvmsg_x` via `dlsym` at
         // runtime and falls back to standard `sendmsg`/`recvmsg` if unavailable,

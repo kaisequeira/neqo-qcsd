@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use neqo_common::Header;
 use neqo_csdef::{
-    QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdStreamId,
-    Resource,
+    QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
+    QcsdRequestRole, QcsdStreamId, Resource, TimestampedQcsdObservation, TrafficMorphingEgress,
 };
 use neqo_transport::StreamId;
 
@@ -37,6 +37,34 @@ impl Http3Client {
         shape_stream_sends: bool,
         keep_alive_lead_time: Duration,
     ) -> Res<()> {
+        #![expect(
+            clippy::disallowed_methods,
+            reason = "standalone adapter callers need a monotonic observation-clock origin"
+        )]
+        self.enable_qcsd_with_observation_clock(
+            endpoint,
+            origin,
+            configured_max_udp_payload_size,
+            shape_stream_sends,
+            keep_alive_lead_time,
+            QcsdObservationClock::new(Instant::now()),
+        )
+    }
+
+    /// Enable QCSD with a production clock shared by every origin in one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] unless `origin` is an absolute HTTPS URI.
+    pub fn enable_qcsd_with_observation_clock(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        origin: &http::Uri,
+        configured_max_udp_payload_size: u16,
+        shape_stream_sends: bool,
+        keep_alive_lead_time: Duration,
+        observation_clock: QcsdObservationClock,
+    ) -> Res<()> {
         let scheme = origin.scheme_str().ok_or(Error::InvalidInput)?;
         let authority = origin.authority().ok_or(Error::InvalidInput)?.as_str();
         if scheme != "https" {
@@ -44,7 +72,7 @@ impl Http3Client {
         }
         self.qcsd_endpoint = Some(endpoint);
         self.qcsd_origin = Some((scheme.to_owned(), authority.to_owned()));
-        self.events.qcsd_enable(endpoint);
+        self.events.qcsd_enable(endpoint, observation_clock.clone());
         let qcsd_origin = format!("{scheme}://{authority}");
         let max_udp_payload_size = self
             .conn
@@ -58,33 +86,55 @@ impl Http3Client {
                 origin: qcsd_origin,
                 max_udp_payload_size,
             });
-        self.conn.qcsd_enable(endpoint, shape_stream_sends);
+        self.conn.qcsd_enable_with_observation_clock(
+            endpoint,
+            shape_stream_sends,
+            observation_clock,
+        );
+        self.conn
+            .qcsd_set_udp_payload_ceiling(configured_max_udp_payload_size)?;
         self.conn
             .qcsd_set_keep_alive_lead_time(keep_alive_lead_time);
         Ok(())
     }
 
+    /// Install the per-connection in-packet Traffic Morphing sampler.
+    pub fn enable_qcsd_traffic_morphing(&mut self, morpher: TrafficMorphingEgress) {
+        self.conn.qcsd_enable_traffic_morphing(morpher);
+    }
+
     /// Register the application/chaff role of a request stream with QCSD.
+    ///
+    /// `expected_response_length` supplies an optional workload-derived
+    /// receive-capacity floor for application streams. Chaff callers pass
+    /// `None`; the controller retains ownership of their resource estimate.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] when QCSD has not been enabled.
-    pub fn register_qcsd_stream(&mut self, stream_id: StreamId, role: QcsdRequestRole) -> Res<()> {
+    pub fn register_qcsd_stream(
+        &mut self,
+        stream_id: StreamId,
+        role: QcsdRequestRole,
+        expected_response_length: Option<u64>,
+    ) -> Res<()> {
         let endpoint = self.qcsd_endpoint.ok_or(Error::InvalidInput)?;
         self.conn.qcsd_register_stream_role(stream_id, role)?;
         self.events.qcsd_observe(|_| QcsdObservation::StreamOpened {
             endpoint,
             stream: QcsdStreamId(stream_id.as_u64()),
             role,
+            expected_response_length,
         });
         Ok(())
     }
 
-    /// Drain observations accumulated by the HTTP/3 and transport adapters.
+    /// Drain all adapter observations in causal production order.
     #[must_use]
-    pub fn qcsd_observations(&mut self) -> Vec<QcsdObservation> {
-        let mut observations = self.events.qcsd_observations();
-        observations.extend(self.conn.qcsd_observations());
+    pub fn qcsd_timestamped_observations(&mut self) -> Vec<TimestampedQcsdObservation> {
+        let mut observations = self.events.qcsd_timestamped_observations();
+        observations.extend(self.conn.qcsd_timestamped_observations());
+        observations.sort_by_key(TimestampedQcsdObservation::sequence);
         observations
     }
 
@@ -209,6 +259,7 @@ impl Http3Client {
                 resource_id,
                 request_id: Some(request_id),
             },
+            None,
         )?;
         Ok(stream_id)
     }

@@ -1277,7 +1277,7 @@ mod tests {
     #[cfg(feature = "qcsd")]
     use neqo_csdef::{
         QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdRequestRole,
-        QcsdStreamFinish, Resource,
+        QcsdStreamFinish, QcsdStreamId, Resource,
     };
     use neqo_qpack as qpack;
     use neqo_transport::{
@@ -1308,6 +1308,15 @@ mod tests {
             }
             _ => panic!("Wrong state {:?}", client.state()),
         }
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn drain_qcsd_observations(client: &mut Http3Client) -> Vec<QcsdObservation> {
+        client
+            .qcsd_timestamped_observations()
+            .into_iter()
+            .map(neqo_csdef::TimestampedQcsdObservation::into_observation)
+            .collect()
     }
 
     /// Create a http3 client with default configuration.
@@ -2582,6 +2591,41 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    fn qcsd_application_stream_reports_expected_response_length() {
+        let (mut client, _server) = connect();
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        drop(drain_qcsd_observations(&mut client));
+        let stream = make_request(&mut client, false, &[]);
+        client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(125_959))
+            .unwrap();
+        assert!(
+            drain_qcsd_observations(&mut client)
+                .iter()
+                .any(|observation| {
+                    matches!(
+                        observation,
+                        QcsdObservation::StreamOpened {
+                            endpoint: QcsdEndpointId(7),
+                            stream: observed_stream,
+                            role: QcsdRequestRole::Application,
+                            expected_response_length: Some(125_959),
+                        } if *observed_stream == QcsdStreamId(stream.as_u64())
+                    )
+                })
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_chaff_non_success_responses_are_observed_without_followup() {
         for (request_id, status) in [(1, 302), (2, 404)] {
             let (mut client, mut server) = connect();
@@ -2634,7 +2678,7 @@ mod tests {
                 true,
             );
 
-            let observations = client.qcsd_observations();
+            let observations = drain_qcsd_observations(&mut client);
             let raw_read = observations
                 .iter()
                 .position(|observation| matches!(observation, QcsdObservation::BytesRead { .. }))
@@ -2664,6 +2708,7 @@ mod tests {
                 observation,
                 QcsdObservation::StreamOpened {
                     role: QcsdRequestRole::Chaff { resource_id: 9, .. },
+                    expected_response_length: None,
                     ..
                 }
             )));
@@ -2683,10 +2728,9 @@ mod tests {
                 Duration::from_millis(100),
             )
             .unwrap();
-        drop(client.qcsd_observations());
+        drop(drain_qcsd_observations(&mut client));
         client.close(now(), 0, "test");
-        let closed = client
-            .qcsd_observations()
+        let closed = drain_qcsd_observations(&mut client)
             .into_iter()
             .filter(|observation| matches!(observation, QcsdObservation::EndpointClosed { .. }))
             .count();
