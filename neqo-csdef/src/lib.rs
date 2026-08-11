@@ -42,7 +42,7 @@ pub use event::{
     QcsdStreamId, TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
-pub use resource::{HeaderPolicy, HeaderPolicyMode, Resource, ResourceManifest};
+pub use resource::{Resource, ResourceManifest};
 pub use rng::{SplitMix64, derive};
 pub use trace::{Direction, Packet, Trace};
 

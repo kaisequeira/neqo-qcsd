@@ -8,10 +8,6 @@ use std::{collections::HashSet, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use super::{
-    HeaderPolicy, HeaderPolicyMode,
-    headers::{is_conditional, validate_headers},
-};
 use crate::{Error, Result};
 
 /// A same-origin resource that can supply downstream chaff capacity.
@@ -40,13 +36,89 @@ pub struct Resource {
     /// Resource identifiers that must complete first.
     #[serde(default)]
     pub depends_on: Vec<u32>,
-    /// Additional request headers. Unsafe conditional headers are removed by the adapter.
+    /// Exact application request headers captured during workload preparation.
+    ///
+    /// Header names are normalized to lowercase when they are returned to an adapter.
+    /// Headers that are unsafe to replay are rejected when the manifest is loaded.
     #[serde(default)]
     pub headers: Vec<(String, String)>,
 }
 
 fn default_resource_type() -> String {
     "Unknown".into()
+}
+
+fn validate_headers(headers: &[(String, String)]) -> Result<()> {
+    for (name, value) in headers {
+        let normalized = name.to_ascii_lowercase();
+        if name.is_empty()
+            || name.starts_with(':')
+            || !name.bytes().all(is_header_name_byte)
+            || is_connection_specific(&normalized, value)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "header {name:?} is not valid for an HTTP/3 request"
+            )));
+        }
+        if is_sensitive(&normalized) {
+            return Err(Error::InvalidConfig(format!(
+                "sensitive header {name:?} must be injected at runtime, not stored in a manifest"
+            )));
+        }
+        if is_conditional(&normalized) || normalized == "range" {
+            return Err(Error::InvalidConfig(format!(
+                "conditional or range header {name:?} cannot be replayed from a manifest"
+            )));
+        }
+        if value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')) {
+            return Err(Error::InvalidConfig(format!(
+                "header {name:?} contains an unsafe value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_conditional(name: &str) -> bool {
+    matches!(
+        name,
+        "if-match" | "if-modified-since" | "if-none-match" | "if-range" | "if-unmodified-since"
+    )
+}
+
+const fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_connection_specific(name: &str, value: &str) -> bool {
+    matches!(
+        name,
+        "connection" | "host" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+    ) || (name == "te" && !value.eq_ignore_ascii_case("trailers"))
+}
+
+fn is_sensitive(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization" | "cookie" | "cookie2" | "proxy-authorization"
+    )
 }
 
 impl Resource {
@@ -79,9 +151,6 @@ impl Resource {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceManifest {
-    /// Application-only request header policy. Chaff always uses the stricter QCSD policy.
-    #[serde(default)]
-    pub header_policy: HeaderPolicy,
     /// Resources in stable identifier order.
     pub resources: Vec<Resource>,
 }
@@ -175,10 +244,7 @@ impl ResourceManifest {
                 })?;
             target.depends_on.push(link.source);
         }
-        Ok(Self {
-            header_policy: HeaderPolicy::default(),
-            resources,
-        })
+        Ok(Self { resources })
     }
 
     /// Validate identifiers, dependencies, and URL schemes.
@@ -217,14 +283,6 @@ impl ResourceManifest {
                 )));
             }
             validate_headers(&resource.headers)?;
-        }
-        validate_headers(&self.header_policy.overrides)?;
-        if self.header_policy.mode != HeaderPolicyMode::Custom
-            && (self.header_policy.allow_conditional || self.header_policy.allow_range)
-        {
-            return Err(Error::InvalidConfig(
-                "conditional/range header switches require custom header policy".into(),
-            ));
         }
         self.validate_acyclic()?;
         Ok(())
@@ -277,8 +335,8 @@ impl ResourceManifest {
     ///
     /// # Errors
     ///
-    /// Returns an error when the resource is not part of this manifest or the
-    /// stored policy is invalid.
+    /// Returns an error when the resource is not part of this manifest or any
+    /// stored header is unsafe to replay.
     pub fn application_headers(&self, resource_id: u32) -> Result<Vec<(String, String)>> {
         self.validate()?;
         let resource = self
@@ -286,35 +344,11 @@ impl ResourceManifest {
             .iter()
             .find(|resource| resource.id == resource_id)
             .ok_or_else(|| Error::InvalidConfig(format!("unknown resource {resource_id}")))?;
-        let mut headers = if self.header_policy.mode == HeaderPolicyMode::Minimal {
-            Vec::new()
-        } else {
-            resource
-                .headers
-                .iter()
-                .filter(|(name, _)| self.header_allowed(name))
-                .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-                .collect()
-        };
-        for (name, value) in &self.header_policy.overrides {
-            let normalized = name.to_ascii_lowercase();
-            headers.retain(|(candidate, _)| candidate != &normalized);
-            headers.push((normalized, value.clone()));
-        }
-        Ok(headers)
-    }
-
-    fn header_allowed(&self, name: &str) -> bool {
-        let name = name.to_ascii_lowercase();
-        if is_conditional(&name) {
-            return self.header_policy.mode == HeaderPolicyMode::Custom
-                && self.header_policy.allow_conditional;
-        }
-        if name == "range" {
-            return self.header_policy.mode == HeaderPolicyMode::Custom
-                && self.header_policy.allow_range;
-        }
-        true
+        Ok(resource
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect())
     }
 
     /// Serialize the resolved current form.
@@ -329,7 +363,7 @@ impl ResourceManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{HeaderPolicy, HeaderPolicyMode, ResourceManifest};
+    use super::ResourceManifest;
 
     const LEGACY: &str = r#"{
         "nodes": [
@@ -339,11 +373,6 @@ mod tests {
         ],
         "links": [{"source":0,"target":1}]
     }"#;
-
-    #[test]
-    fn defaults_new_workloads_to_fresh_browser_headers() {
-        assert_eq!(HeaderPolicy::default().mode, HeaderPolicyMode::FreshBrowser);
-    }
 
     #[test]
     fn imports_legacy_dependency_graph() {
@@ -376,43 +405,51 @@ mod tests {
     }
 
     #[test]
-    fn resolves_application_header_policies() {
+    fn returns_exact_application_headers_with_normalized_names() {
         let mut manifest = ResourceManifest::from_json(LEGACY).expect("valid graph");
         manifest.resources[0].headers = vec![
             ("Accept".into(), "text/html".into()),
-            ("If-None-Match".into(), "old".into()),
-            ("Range".into(), "bytes=0-9".into()),
+            ("Accept-Language".into(), "en-AU".into()),
+            ("TE".into(), "trailers".into()),
         ];
-        manifest.header_policy = HeaderPolicy {
-            mode: HeaderPolicyMode::FreshBrowser,
-            overrides: vec![("Accept-Language".into(), "en-AU".into())],
-            allow_conditional: false,
-            allow_range: false,
-        };
         assert_eq!(
             manifest.application_headers(0).expect("resolve"),
             [
                 ("accept".into(), "text/html".into()),
-                ("accept-language".into(), "en-AU".into())
+                ("accept-language".into(), "en-AU".into()),
+                ("te".into(), "trailers".into())
             ]
         );
-
-        manifest.header_policy.mode = HeaderPolicyMode::Custom;
-        manifest.header_policy.allow_conditional = true;
-        manifest.header_policy.allow_range = true;
-        assert_eq!(manifest.application_headers(0).expect("resolve").len(), 4);
     }
 
     #[test]
-    fn rejects_sensitive_and_connection_headers() {
-        for name in ["Cookie", "Authorization", "Connection", ":authority"] {
+    fn rejects_unsafe_headers_instead_of_filtering_them() {
+        for (name, value) in [
+            ("Cookie", "value"),
+            ("Authorization", "value"),
+            ("Connection", "close"),
+            ("Host", "example.com"),
+            ("TE", "gzip"),
+            (":authority", "example.com"),
+            ("If-None-Match", "old"),
+            ("Range", "bytes=0-9"),
+        ] {
             let input = format!(
-                r#"{{"resources":[{{"id":0,"url":"https://example.com/","headers":[["{name}","value"]]}}]}}"#
+                r#"{{"resources":[{{"id":0,"url":"https://example.com/","headers":[["{name}","{value}"]]}}]}}"#
             );
             assert!(
                 ResourceManifest::from_json(&input).is_err(),
                 "accepted {name}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_removed_manifest_header_policy() {
+        let input = r#"{
+            "header_policy":{"mode":"minimal"},
+            "resources":[{"id":0,"url":"https://example.com/"}]
+        }"#;
+        assert!(ResourceManifest::from_json(input).is_err());
     }
 }

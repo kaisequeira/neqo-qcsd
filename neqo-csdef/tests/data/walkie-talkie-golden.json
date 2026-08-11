@@ -7,7 +7,6 @@
   "matching_algorithm": "minimum-cost-one-to-one",
   "paper_equivalent": false,
   "packet_size": 100,
-  "training_split": "train",
   "profiles": [
     {
       "real": "real page",

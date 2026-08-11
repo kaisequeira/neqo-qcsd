@@ -206,7 +206,7 @@ impl ChaffManager {
 #[cfg(test)]
 mod tests {
     use super::ChaffManager;
-    use crate::{HeaderPolicy, QcsdEndpointId, Resource, ResourceManifest};
+    use crate::{QcsdEndpointId, Resource, ResourceManifest};
 
     fn resource(id: u32, length: u64, origin: &str) -> Resource {
         Resource {
@@ -225,7 +225,6 @@ mod tests {
     #[test]
     fn repeats_the_largest_resource_to_reach_the_watermark() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![
                 resource(1, 250_000, "https://example.com"),
                 resource(2, 10_000, "https://example.com"),
@@ -247,7 +246,6 @@ mod tests {
     #[test]
     fn pending_requests_count_toward_stream_limit_and_capacity() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![resource(1, 400, "https://example.com")],
         };
         let mut manager = ChaffManager::new(manifest, false);
@@ -259,7 +257,6 @@ mod tests {
     #[test]
     fn failed_resources_are_not_reused() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![resource(1, 400, "https://example.com")],
         };
         let mut manager = ChaffManager::new(manifest, false);
@@ -272,7 +269,6 @@ mod tests {
     #[test]
     fn empty_resource_fallback_is_explicit_and_conservative() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![resource(1, 0, "https://example.com")],
         };
         let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];
@@ -288,7 +284,6 @@ mod tests {
     #[test]
     fn resources_are_routed_only_to_their_exact_origin() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![
                 resource(1, 400, "https://one.example"),
                 resource(2, 800, "https://two.example"),
@@ -306,7 +301,6 @@ mod tests {
         blocked.chaff_priority = true;
         blocked.known_valid = false;
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![blocked, resource(2, 400, "https://example.com")],
         };
         let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];
@@ -320,7 +314,6 @@ mod tests {
         blocked.chaff_priority = true;
         blocked.depends_on.push(99);
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![blocked, resource(2, 400, "https://example.com")],
         };
         let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];
@@ -333,7 +326,6 @@ mod tests {
         let mut priority = resource(1, 900, "https://example.com");
         priority.chaff_priority = true;
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![priority, resource(2, 400, "https://example.com")],
         };
         let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];

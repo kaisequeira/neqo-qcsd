@@ -3,8 +3,6 @@
 // <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
 // option.
 
-mod headers;
 mod manifest;
 
-pub use headers::{HeaderPolicy, HeaderPolicyMode};
 pub use manifest::{Resource, ResourceManifest};

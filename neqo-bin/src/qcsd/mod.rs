@@ -24,13 +24,12 @@ use futures::{
     future::{select, select_all},
 };
 use http::Uri;
-use neqo_common::{Header, Role, event::Provider as _, qlog::Qlog};
+use neqo_common::{Header, event::Provider as _};
 use neqo_csdef::{
-    DefenseConfig, DefenseDiagnostics, DefenseKind, DependencyTracker, Direction, HeaderPolicy,
-    MissedSlotReason, Packet, QcsdAction, QcsdConfig, QcsdController, QcsdEndpointId,
-    QcsdObservation, QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, Resource,
-    ResourceManifest, ResourceRunState, StaticMode, TimestampedQcsdObservation,
-    TrafficMorphingEgress, derive,
+    DefenseConfig, DefenseDiagnostics, DefenseKind, DependencyTracker, Direction, MissedSlotReason,
+    Packet, QcsdAction, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
+    QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, Resource, ResourceManifest,
+    ResourceRunState, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, derive,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -66,8 +65,6 @@ pub enum Error {
     Nss(#[from] nss::Error),
     #[error(transparent)]
     Qcsd(#[from] neqo_csdef::Error),
-    #[error(transparent)]
-    Qlog(#[from] qlog::Error),
     #[error(transparent)]
     Transport(#[from] neqo_transport::Error),
     #[error("run timed out after {0} seconds")]
@@ -763,7 +760,6 @@ async fn probe(
 
 fn positional_manifest(urls: &[Uri]) -> ResourceManifest {
     ResourceManifest {
-        header_policy: HeaderPolicy::default(),
         resources: urls
             .iter()
             .enumerate()
@@ -816,7 +812,6 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
         )));
     }
     fs::create_dir_all(&spec.output_dir)?;
-    fs::create_dir_all(spec.output_dir.join("qlog"))?;
     let wall_start = unix_nanos();
     let process_start = now();
     write_run_json(
@@ -1369,7 +1364,7 @@ fn create_endpoints(
             let socket = Socket::bind_for_direct_capture(bind_addr)?;
             let local_addr = socket.local_addr()?;
             let params = qcsd_connection_parameters(&spec.config, remote_addr.ip());
-            let mut transport = Connection::new_client(
+            let transport = Connection::new_client(
                 &host,
                 &["h3"],
                 Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8))),
@@ -1378,14 +1373,6 @@ fn create_endpoints(
                 params,
                 start,
             )?;
-            transport.set_qlog(Qlog::enabled_with_file(
-                spec.output_dir.join("qlog"),
-                Role::Client,
-                Some(format!("QCSD endpoint {index}")),
-                Some("neqo-qcsd-client".into()),
-                format!("endpoint-{index}"),
-                start,
-            )?);
             let mut client = Http3Client::new_with_conn(
                 transport,
                 Http3Parameters::default().max_concurrent_push_streams(0),
@@ -2562,9 +2549,6 @@ fn write_run_json(
         "method": spec.method,
         "request_policy": spec.request_policy,
         "workload_hash_sha256": spec.workload_hash,
-        "resolved_header_policy": spec.workload.header_policy,
-        "resolved_workload": spec.workload,
-        "urls": spec.workload.resources.iter().map(|resource| &resource.url).collect::<Vec<_>>(),
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
         "started_unix_ns": started_unix_ns,
@@ -2628,24 +2612,23 @@ mod tests {
     };
 
     use neqo_csdef::{
-        DefenseConfig, DependencyTracker, Direction, FrontConfig, HeaderPolicy, MissedSlotReason,
-        Packet, QcsdAction, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId,
-        QcsdObservation, QcsdObservationClock, QcsdSlotId, QcsdStreamId, Resource,
-        ResourceManifest, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
-        WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        DefenseConfig, DependencyTracker, Direction, FrontConfig, MissedSlotReason, Packet,
+        QcsdAction, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
+        QcsdObservationClock, QcsdSlotId, QcsdStreamId, Resource, ResourceManifest, StaticSchedule,
+        TamarawConfig, Trace, TrafficMorphingConfig, WalkieTalkieConfig, WtfPad, WtfPadConfig,
     };
 
     use super::{
         ApplicationBatchLifecycle, DefenseArg, Error, Preset, ProfileArg, QcsdRequestRole,
-        RequestPolicyArg, ResourceRunState, RunSpec, Socket, StaticModeArg, StreamRecord,
-        StreamType, TrafficMorphingActivation, action_failure_reason, activate_traffic_morphing,
-        apply_action_batch, create_endpoints, datagram_observation, deadline_error,
-        defense_parameter_provenance, expected_application_response_length,
+        RequestPolicyArg, ResourceRunState, RunCompletion, RunSpec, Socket, StaticModeArg,
+        StreamRecord, StreamType, TrafficMorphingActivation, action_failure_reason,
+        activate_traffic_morphing, apply_action_batch, create_endpoints, datagram_observation,
+        deadline_error, defense_parameter_provenance, expected_application_response_length,
         finish_application_record, forward_qcsd_observation, has_in_flight_application_stream, now,
         qcsd_connection_parameters, ready_request_batch, register_action_batch, resolve_run_config,
         resolve_run_config_with_workload, shapes_stream_sends, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
-        traffic_morphing_endpoint_seed, wait_for_activity,
+        traffic_morphing_endpoint_seed, wait_for_activity, write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -2686,6 +2669,56 @@ mod tests {
             known_valid: true,
             depends_on,
             headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_receipt_keeps_evidence_without_duplicate_workload_fields() {
+        let output = trace_output_dir("minimal-run-receipt");
+        let spec = RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: vec![request(1, "https://example.com", Vec::new())],
+            },
+            workload_hash: "frozen-workload-hash".into(),
+            config: QcsdConfig::default(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 7,
+            output_dir: output.clone(),
+            max_response_bytes: 1_024,
+            timeout_seconds: 30,
+        };
+        write_run_json(
+            &spec,
+            &[],
+            &[],
+            1,
+            &RunCompletion {
+                ended_unix_ns: Some(2),
+                status: "complete",
+                error: None,
+                defense_start_monotonic_ns: Some(3),
+                application_completion_monotonic_ns: Some(4),
+                defense_diagnostics: None,
+            },
+        )
+        .expect("write run receipt");
+
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("run.json")).expect("read run receipt"))
+                .expect("parse run receipt");
+        assert!(receipt.get("resolved_workload").is_none());
+        assert!(receipt.get("urls").is_none());
+        assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
+        for retained in [
+            "resolved_configuration",
+            "responses",
+            "endpoints",
+            "completion_status",
+        ] {
+            assert!(receipt.get(retained).is_some(), "missing {retained}");
         }
     }
 
@@ -2806,7 +2839,6 @@ mod tests {
     async fn traffic_morphing_activation_waits_for_every_endpoint_and_runs_once() {
         test_fixture::fixture_init();
         let output = trace_output_dir("traffic-morphing-activation");
-        fs::create_dir_all(output.join("qlog")).expect("create qlog directory");
         let matrix = output.join("matrix.json");
         fs::write(&matrix, TRAFFIC_MORPHING_PARAMETERS).expect("write morphing matrix");
         let config = QcsdConfig {
@@ -2822,7 +2854,6 @@ mod tests {
         let spec = RunSpec {
             method: "GET",
             workload: ResourceManifest {
-                header_policy: HeaderPolicy::default(),
                 resources: vec![
                     request(1, "https://127.0.0.1:4433", Vec::new()),
                     request(2, "https://127.0.0.1:4434", Vec::new()),
@@ -2841,6 +2872,7 @@ mod tests {
         let start = now();
         let clock = QcsdObservationClock::new(start);
         let mut endpoints = create_endpoints(&spec, start, &clock).expect("construct endpoints");
+        assert!(!output.join("qlog").exists());
 
         assert_eq!(endpoints.len(), 2);
         assert!(endpoints.iter().all(|endpoint| {
@@ -2897,7 +2929,6 @@ mod tests {
     #[test]
     fn walkie_talkie_batches_all_globally_ready_requests() {
         let mut tracker = DependencyTracker::new(ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![
                 request(1, "https://first.example", Vec::new()),
                 request(2, "https://second.example", Vec::new()),

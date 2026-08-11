@@ -41,7 +41,6 @@ struct MoldedFile {
     matching_algorithm: String,
     paper_equivalent: bool,
     packet_size: u16,
-    training_split: String,
     profiles: Vec<MoldedProfile>,
 }
 
@@ -123,14 +122,6 @@ impl MoldedFile {
         if self.generated_by.trim().is_empty() || self.profiles.is_empty() {
             return Err(Error::InvalidConfig(
                 "Walkie-Talkie bundle provenance and profiles must not be empty".into(),
-            ));
-        }
-        if !matches!(
-            self.training_split.as_str(),
-            "train" | "unsealed-engineering" | "reviewed-acceptance-fixture"
-        ) {
-            return Err(Error::InvalidConfig(
-                "Walkie-Talkie training_split is unsupported".into(),
             ));
         }
         if self.packet_size != configured_packet_size {
@@ -1324,7 +1315,6 @@ mod tests {
                 "matching_algorithm": "minimum-cost-one-to-one",
                 "paper_equivalent": false,
                 "packet_size": 100,
-                "training_split": "train",
                 "profiles": [{{
                     "real": "real page",
                     "decoy": "decoy page",
@@ -1628,7 +1618,6 @@ mod tests {
             matching_algorithm: "minimum-cost-one-to-one".into(),
             paper_equivalent: false,
             packet_size: u16::MAX,
-            training_split: "train".into(),
             profiles: vec![super::MoldedProfile {
                 real: "real".into(),
                 decoy: "decoy".into(),

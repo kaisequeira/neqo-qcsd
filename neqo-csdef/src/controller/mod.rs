@@ -1087,11 +1087,11 @@ mod tests {
     use super::{QcsdController, consume_ranges, merge_ranges, range_bytes};
     use crate::{
         Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
-        EventOutcome, HeaderPolicy, MissedSlotReason, Packet, QcsdAction, QcsdConfig,
-        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdSlotId,
-        QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, SignalKind, StaticSchedule,
-        TamarawConfig, Trace, TrafficMorphing, TrafficMorphingConfig, WalkieTalkie,
-        WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        EventOutcome, MissedSlotReason, Packet, QcsdAction, QcsdConfig, QcsdDatagramClass,
+        QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdSlotId, QcsdStreamFinish,
+        QcsdStreamId, Resource, ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace,
+        TrafficMorphing, TrafficMorphingConfig, WalkieTalkie, WalkieTalkieConfig, WtfPad,
+        WtfPadConfig,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1759,7 +1759,6 @@ mod tests {
             "matching_algorithm": "minimum-cost-one-to-one",
             "paper_equivalent": false,
             "packet_size": 100,
-            "training_split": "train",
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
@@ -1896,7 +1895,6 @@ mod tests {
         )
         .expect("two-batch Walkie-Talkie fixture");
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![Resource {
                 id: 7,
                 url: "https://example.com/chaff".into(),
@@ -2316,7 +2314,6 @@ mod tests {
         expected_response_length: Option<u64>,
     ) -> QcsdController {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![Resource {
                 id: 7,
                 url: "https://example.com/chaff".into(),
@@ -2614,7 +2611,6 @@ mod tests {
     #[test]
     fn chaff_repeats_a_large_same_origin_resource() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![Resource {
                 id: 1,
                 url: "https://one.example/chaff".into(),
@@ -2654,7 +2650,6 @@ mod tests {
     #[test]
     fn exhausted_chaff_misses_incoming_slots_explicitly() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![Resource {
                 id: 1,
                 url: "https://one.example/chaff".into(),
@@ -2711,7 +2706,6 @@ mod tests {
     #[test]
     fn chaff_redirect_is_failed_and_never_promoted() {
         let manifest = ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![Resource {
                 id: 1,
                 url: "https://one.example/chaff".into(),

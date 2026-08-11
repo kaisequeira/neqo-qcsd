@@ -204,11 +204,10 @@ impl DependencyTracker {
 #[cfg(test)]
 mod tests {
     use super::{DependencyTracker, ResourceRunState};
-    use crate::{HeaderPolicy, Resource, ResourceManifest};
+    use crate::{Resource, ResourceManifest};
 
     fn manifest() -> ResourceManifest {
         ResourceManifest {
-            header_policy: HeaderPolicy::default(),
             resources: vec![
                 resource(0, vec![]),
                 resource(1, vec![0]),
