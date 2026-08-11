@@ -19,6 +19,9 @@ pub enum QcsdProfile {
     Published,
     /// Conservative parameters for bounded experiments against public servers.
     Live,
+    /// Published research parameters constrained to 1200-byte UDP payloads.
+    #[serde(rename = "research-1200")]
+    Research1200,
 }
 
 /// Static schedule participation mode.
@@ -120,6 +123,7 @@ impl QcsdProfile {
         let source = match self {
             Self::Published => include_str!("../profiles/published.toml"),
             Self::Live => include_str!("../profiles/live.toml"),
+            Self::Research1200 => include_str!("../profiles/research-1200.toml"),
         };
         let profile = ProfileDefinition::parse(source)?;
         let defense = match defense {
@@ -177,11 +181,37 @@ impl QcsdProfile {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::{DefenseKind, ProfileDefinition, QcsdProfile, StaticMode};
     use crate::{
         DefenseConfig, FrontConfig, TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig,
         WtfPadConfig,
     };
+
+    fn assert_research_1200_snapshot(defense: DefenseKind, expected_defense: &Value) {
+        let resolved = QcsdProfile::Research1200
+            .resolve(defense)
+            .expect("research-1200 profile");
+        assert_eq!(
+            serde_json::to_value(resolved).expect("serialize resolved profile"),
+            json!({
+                "schema_version": 2,
+                "control_interval_us": 5_000,
+                "initial_max_stream_data": 16,
+                "automatic_receive_window": 1_048_576,
+                "max_chaff_streams": 5,
+                "low_watermark": 1_000_000,
+                "use_empty_resources": false,
+                "max_stream_data_excess": 1_000,
+                "max_udp_payload_size": 1_200,
+                "drop_unsatisfied_events": false,
+                "keep_alive_lead_time_us": 100_000,
+                "tail_wait_us": 0,
+                "defense": expected_defense,
+            })
+        );
+    }
 
     #[test]
     fn published_profile_resolves_every_defense() {
@@ -343,6 +373,98 @@ mod tests {
                 packet_size: 1_200,
             })
         );
+    }
+
+    #[test]
+    fn research_1200_profile_snapshots_every_resolved_field() {
+        assert_research_1200_snapshot(DefenseKind::None, &json!({"kind": "none"}));
+        assert_research_1200_snapshot(
+            DefenseKind::Static {
+                schedule: "research.csv".into(),
+                mode: StaticMode::ChaffAndShape,
+            },
+            &json!({
+                "kind": "static",
+                "schedule": "research.csv",
+                "padding_only": false,
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::Front,
+            &json!({
+                "kind": "front",
+                "n_client_packets": 900,
+                "n_server_packets": 1_200,
+                "packet_size": 1_200,
+                "peak_minimum_seconds": 0.1,
+                "peak_maximum_seconds": 2.5,
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::Tamaraw,
+            &json!({
+                "kind": "tamaraw",
+                "incoming_interval_us": 5_000,
+                "outgoing_interval_us": 20_000,
+                "packet_size": 1_200,
+                "modulo": 100,
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::TrafficMorphing {
+                matrix: "research-matrix.json".into(),
+                workload_id: "research-workload".into(),
+            },
+            &json!({
+                "kind": "traffic_morphing",
+                "matrix": "research-matrix.json",
+                "workload_id": "research-workload",
+                "ingress_packet_size": 1_200,
+                "max_ingress_deficit_bytes": 8_000,
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::WtfPad {
+                histograms: "research-histograms.json".into(),
+            },
+            &json!({
+                "kind": "wtf_pad",
+                "histograms": "research-histograms.json",
+                "packet_size": 1_200,
+                "max_padding_events": 100_000,
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::WalkieTalkie {
+                molded: "research-molded.json".into(),
+                workload_id: "research-workload".into(),
+            },
+            &json!({
+                "kind": "walkie_talkie",
+                "molded": "research-molded.json",
+                "workload_id": "research-workload",
+                "packet_size": 1_200,
+            }),
+        );
+    }
+
+    #[test]
+    fn research_1200_profile_uses_one_exact_serialized_token() {
+        assert_eq!(
+            serde_json::to_string(&QcsdProfile::Research1200).expect("serialize profile"),
+            r#""research-1200""#
+        );
+        assert_eq!(
+            serde_json::from_str::<QcsdProfile>(r#""research-1200""#).expect("deserialize profile"),
+            QcsdProfile::Research1200
+        );
+        for invalid in [
+            r#""research_1200""#,
+            r#""research1200""#,
+            r#""Research-1200""#,
+        ] {
+            assert!(serde_json::from_str::<QcsdProfile>(invalid).is_err());
+        }
     }
 
     #[test]

@@ -1,0 +1,38 @@
+schema_version = 2
+
+[controller]
+control_interval_us = 5000
+initial_max_stream_data = 16
+automatic_receive_window = 1048576
+max_chaff_streams = 5
+low_watermark = 1000000
+use_empty_resources = false
+max_stream_data_excess = 1000
+max_udp_payload_size = 1200
+drop_unsatisfied_events = false
+keep_alive_lead_time_us = 100000
+tail_wait_us = 0
+
+[front]
+n_client_packets = 900
+n_server_packets = 1200
+packet_size = 1200
+peak_minimum_seconds = 0.1
+peak_maximum_seconds = 2.5
+
+[tamaraw]
+incoming_interval_us = 5000
+outgoing_interval_us = 20000
+packet_size = 1200
+modulo = 100
+
+[traffic_morphing]
+ingress_packet_size = 1200
+max_ingress_deficit_bytes = 8000
+
+[wtf_pad]
+packet_size = 1200
+max_padding_events = 100000
+
+[walkie_talkie]
+packet_size = 1200

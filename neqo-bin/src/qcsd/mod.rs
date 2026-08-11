@@ -96,6 +96,8 @@ impl Preset {
 enum ProfileArg {
     Published,
     Live,
+    #[value(name = "research-1200")]
+    Research1200,
 }
 
 impl From<ProfileArg> for QcsdProfile {
@@ -103,6 +105,7 @@ impl From<ProfileArg> for QcsdProfile {
         match value {
             ProfileArg::Published => Self::Published,
             ProfileArg::Live => Self::Live,
+            ProfileArg::Research1200 => Self::Research1200,
         }
     }
 }
@@ -2611,6 +2614,7 @@ mod tests {
         time::Duration,
     };
 
+    use clap::Parser as _;
     use neqo_csdef::{
         DefenseConfig, DependencyTracker, Direction, FrontConfig, MissedSlotReason, Packet,
         QcsdAction, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
@@ -2619,7 +2623,7 @@ mod tests {
     };
 
     use super::{
-        ApplicationBatchLifecycle, DefenseArg, Error, Preset, ProfileArg, QcsdRequestRole,
+        ApplicationBatchLifecycle, Args, DefenseArg, Error, Preset, ProfileArg, QcsdRequestRole,
         RequestPolicyArg, ResourceRunState, RunCompletion, RunSpec, Socket, StaticModeArg,
         StreamRecord, StreamType, TrafficMorphingActivation, action_failure_reason,
         activate_traffic_morphing, apply_action_batch, create_endpoints, datagram_observation,
@@ -3511,6 +3515,59 @@ mod tests {
         )
         .expect("live baseline profile");
         assert_eq!(baseline.defense, DefenseConfig::None);
+    }
+
+    #[test]
+    fn profile_cli_accepts_only_the_exact_research_1200_token() {
+        let parse = |profile| {
+            Args::try_parse_from([
+                "neqo-qcsd-client",
+                "run",
+                "https://example.com/",
+                "--profile",
+                profile,
+                "--defense",
+                "none",
+                "--seed",
+                "7",
+                "--output-dir",
+                "output",
+                "--max-response-bytes",
+                "4096",
+            ])
+        };
+
+        assert!(parse("research-1200").is_ok());
+        for invalid in ["research_1200", "research1200", "Research-1200"] {
+            assert!(parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_cli_resolves_research_1200() {
+        let front = resolve_run_config(
+            None,
+            None,
+            Some(ProfileArg::Research1200),
+            Some(DefenseArg::Front),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("research-1200 FRONT profile");
+        assert_eq!(front.max_udp_payload_size, 1_200);
+        assert_eq!(
+            front.defense,
+            DefenseConfig::Front(FrontConfig {
+                n_client_packets: 900,
+                n_server_packets: 1_200,
+                packet_size: 1_200,
+                peak_minimum_seconds: 0.1,
+                peak_maximum_seconds: 2.5,
+            })
+        );
     }
 
     #[test]
