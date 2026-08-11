@@ -19,7 +19,7 @@ const ADAPTATION: &str = "qcsd-client-only";
 const BANDWIDTH_WINDOW_PACKETS: u8 = 2;
 const HISTOGRAM_BIN_COUNT: usize = 20;
 const FINITE_HISTOGRAM_BIN_COUNT: usize = HISTOGRAM_BIN_COUNT - 1;
-const BURST_INFINITY_FORMULA: &str = "k_inf = p_inf / (1 - p_inf) * K";
+const BURST_INFINITY_FORMULA: &str = "k_inf = (1 - p_fake) / p_fake * K";
 const GAP_INFINITY_FORMULA: &str = "k_inf = (K - mean_burst_length + 1) / (mean_burst_length - 1)";
 const TUNING_APPLIES_TO: &str = "burst-histogram-only";
 const BURST_TUNING_TRANSFORMATION: &str = "paper-gaussian-percentile-shift-v1";

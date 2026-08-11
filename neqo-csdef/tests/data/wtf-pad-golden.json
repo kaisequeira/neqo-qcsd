@@ -18,7 +18,7 @@
     "finite_token_budget": 4,
     "fake_burst_probability": 0.9,
     "infinity_token_formulas": {
-      "burst": "k_inf = p_inf / (1 - p_inf) * K",
+      "burst": "k_inf = (1 - p_fake) / p_fake * K",
       "gap": "k_inf = (K - mean_burst_length + 1) / (mean_burst_length - 1)"
     }
   },
