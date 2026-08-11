@@ -887,8 +887,8 @@ impl WtfPad {
                 self.incoming_credit_outstanding = self
                     .incoming_credit_outstanding
                     .saturating_add(u64::from(observed));
-                let unencoded = u64::from(packet.length().saturating_sub(observed));
-                self.abandon_incoming_bytes(unencoded);
+                let unrequested = u64::from(packet.length().saturating_sub(observed));
+                self.abandon_incoming_bytes(unrequested);
             }
             EventOutcome::Missed(_) => {
                 self.abandon_incoming_bytes(u64::from(packet.length()));
@@ -1119,8 +1119,21 @@ impl Defense for WtfPad {
                 self.suppressed_cover_feedback = self.suppressed_cover_feedback.saturating_add(1);
             }
             SignalKind::ApplicationComplete => self.application_complete = true,
+            SignalKind::ReceiveCreditRequested { packet } => {
+                self.resolve_incoming(
+                    packet,
+                    EventOutcome::Satisfied {
+                        observed: packet.length(),
+                    },
+                );
+            }
             SignalKind::Resolved { packet, outcome } => {
                 if packet.direction() == Direction::Incoming {
+                    // The controller retains incoming slots until their
+                    // advertised stream offsets are consumed or retired. The
+                    // earlier request signal transfers the logical event into
+                    // the realization ledger; this terminal signal therefore
+                    // finds no awaiting entry in production.
                     self.resolve_incoming(packet, outcome);
                 }
             }
@@ -1279,6 +1292,12 @@ mod tests {
         });
         let desired = defense.next_event(Duration::ZERO).expect("desired event");
         defense.incoming.silence();
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(1),
+            kind: SignalKind::ReceiveCreditRequested { packet: desired },
+        });
+        // The controller's later terminal outcome closes its slot but must
+        // not request the reactive byte debt again.
         defense.observe(DefenseSignal {
             at: Duration::from_micros(1),
             kind: SignalKind::Resolved {
@@ -1729,6 +1748,10 @@ mod tests {
 
         defense.observe(DefenseSignal {
             at: Duration::from_micros(1),
+            kind: SignalKind::ReceiveCreditRequested { packet: desired },
+        });
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2),
             kind: SignalKind::Resolved {
                 packet: desired,
                 outcome: EventOutcome::Satisfied { observed: 100 },

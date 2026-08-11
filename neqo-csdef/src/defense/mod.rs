@@ -253,6 +253,41 @@ mod tests {
     }
 
     #[test]
+    fn front_generation_oracle_preserves_directional_bounds_size_and_order() {
+        let config = FrontConfig {
+            n_client_packets: 17,
+            n_server_packets: 23,
+            packet_size: 1_200,
+            peak_minimum_seconds: 0.1,
+            peak_maximum_seconds: 2.5,
+        };
+        for seed in 0..128 {
+            let mut front = Front::new(&config, seed);
+            let mut packets = Vec::new();
+            while let Some(packet) = front.next_event(Duration::MAX) {
+                packets.push(packet);
+            }
+            let incoming = packets
+                .iter()
+                .filter(|packet| packet.direction() == Direction::Incoming)
+                .count();
+            let outgoing = packets
+                .iter()
+                .filter(|packet| packet.direction() == Direction::Outgoing)
+                .count();
+            assert!(incoming <= usize::try_from(config.n_server_packets).expect("usize"));
+            assert!(outgoing <= usize::try_from(config.n_client_packets).expect("usize"));
+            assert!(packets.iter().all(|packet| packet.length() == 1_200));
+            assert!(
+                packets
+                    .windows(2)
+                    .all(|pair| matches!(pair, [left, right] if left <= right))
+            );
+            assert!(front.is_complete());
+        }
+    }
+
+    #[test]
     fn tamaraw_rounds_each_direction_to_modulo() {
         let config = TamarawConfig {
             incoming_interval_us: 5_000,
@@ -322,6 +357,43 @@ mod tests {
                 (90_000, Direction::Outgoing),
             ]
         );
+        assert!(defense.is_complete());
+    }
+
+    #[test]
+    fn tamaraw_generation_oracle_preserves_cadence_and_strict_modulo_tail() {
+        let config = TamarawConfig {
+            incoming_interval_us: 5,
+            outgoing_interval_us: 20,
+            packet_size: 1_200,
+            modulo: 4,
+        };
+        let mut defense = Tamaraw::new(&config);
+        let mut packets = Vec::new();
+        while let Some(packet) = defense.next_event(Duration::from_micros(41)) {
+            packets.push(packet);
+        }
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(41),
+            kind: SignalKind::ApplicationComplete,
+        });
+        while let Some(packet) = defense.next_event(Duration::MAX) {
+            packets.push(packet);
+        }
+
+        let incoming: Vec<_> = packets
+            .iter()
+            .filter(|packet| packet.direction() == Direction::Incoming)
+            .map(|packet| packet.timestamp_us())
+            .collect();
+        let outgoing: Vec<_> = packets
+            .iter()
+            .filter(|packet| packet.direction() == Direction::Outgoing)
+            .map(|packet| packet.timestamp_us())
+            .collect();
+        assert_eq!(incoming, (0..12).map(|index| index * 5).collect::<Vec<_>>());
+        assert_eq!(outgoing, (0..4).map(|index| index * 20).collect::<Vec<_>>());
+        assert!(packets.iter().all(|packet| packet.length() == 1_200));
         assert!(defense.is_complete());
     }
 

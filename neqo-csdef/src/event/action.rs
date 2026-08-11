@@ -53,8 +53,8 @@ pub enum QcsdAction {
         slot: QcsdSlotId,
         reason: MissedSlotReason,
     },
-    /// An incoming slot is complete after all of its absolute receive credit
-    /// has actually been encoded by transport.
+    /// An incoming slot is complete after every scheduled receive-credit byte
+    /// has been consumed as response STREAM data.
     SlotSatisfied {
         endpoint: Option<QcsdEndpointId>,
         packet: Packet,

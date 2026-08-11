@@ -1172,7 +1172,16 @@ async fn execute_run_inner(
             ("error", MissedSlotReason::RunAborted)
         };
         let ended_at = now();
-        terminalize_pending_slots(&mut controller, &mut traces, ended_at, miss_reason)?;
+        let terminal_elapsed = defense_start.map_or(Duration::ZERO, |started| {
+            ended_at.saturating_duration_since(started)
+        });
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            ended_at,
+            terminal_elapsed,
+            miss_reason,
+        )?;
         for endpoint in &mut endpoints {
             endpoint.scheduled_outgoing.clear();
         }
@@ -1948,13 +1957,7 @@ fn record_terminal_action(
             endpoint,
             packet,
             slot,
-        } => (
-            *endpoint,
-            *packet,
-            "credit_advertised",
-            String::new(),
-            *slot,
-        ),
+        } => (*endpoint, *packet, "satisfied", String::new(), *slot),
         _ => return Ok(false),
     };
     traces.schedule(&ScheduleTraceRow {
@@ -1974,8 +1977,11 @@ fn terminalize_pending_slots(
     controller: &mut QcsdController,
     traces: &mut TraceFiles,
     now: Instant,
+    defense_elapsed: Duration,
     reason: MissedSlotReason,
 ) -> Result<(), Error> {
+    record_queued_terminal_actions(controller, traces, now)?;
+    controller.abort_pending_slots(defense_elapsed, reason);
     record_queued_terminal_actions(controller, traces, now)?;
 
     let mut pending = BTreeMap::new();
@@ -2629,8 +2635,9 @@ mod tests {
         activate_traffic_morphing, apply_action_batch, create_endpoints, datagram_observation,
         deadline_error, defense_parameter_provenance, expected_application_response_length,
         finish_application_record, forward_qcsd_observation, has_in_flight_application_stream, now,
-        qcsd_connection_parameters, ready_request_batch, register_action_batch, resolve_run_config,
-        resolve_run_config_with_workload, shapes_stream_sends, terminalize_pending_slots,
+        qcsd_connection_parameters, ready_request_batch, record_terminal_action,
+        register_action_batch, resolve_run_config, resolve_run_config_with_workload,
+        shapes_stream_sends, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, wait_for_activity, write_run_json,
     };
@@ -3173,6 +3180,47 @@ mod tests {
     }
 
     #[test]
+    fn consumed_incoming_slot_is_serialized_as_terminally_satisfied() {
+        let output = trace_output_dir("consumed-incoming-slot");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let endpoint = QcsdEndpointId(1);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let slot = QcsdSlotId(21);
+        traces
+            .register_slot(started, endpoint, packet, slot)
+            .expect("incoming registration");
+
+        assert!(
+            record_terminal_action(
+                &mut traces,
+                started + Duration::from_micros(7),
+                7,
+                "recorded",
+                &QcsdAction::SlotSatisfied {
+                    endpoint: Some(endpoint),
+                    packet,
+                    slot,
+                },
+            )
+            .expect("terminal action")
+        );
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        let row = schedule.lines().nth(1).expect("terminal row");
+        let mut fields = row.split(',');
+        assert_eq!(fields.nth(1), Some("incoming"));
+        assert_eq!(fields.nth(3), Some("satisfied"));
+        assert_eq!(fields.next(), Some(""));
+        assert_eq!(fields.next(), Some(""));
+        assert_eq!(fields.next(), Some("21"));
+        assert_eq!(fields.next(), None);
+        assert!(!schedule.contains("credit_advertised"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
     fn outgoing_slot_registration_rejects_pending_and_terminal_reuse() {
         let output = trace_output_dir("outgoing-slot-reuse");
         let started = now();
@@ -3416,6 +3464,7 @@ mod tests {
             &mut controller,
             &mut traces,
             started,
+            Duration::ZERO,
             MissedSlotReason::RunAborted,
         )
         .expect("terminalize controller slot");
@@ -3427,6 +3476,47 @@ mod tests {
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
         assert_eq!(schedule.lines().count(), 2);
         assert!(schedule.contains("RunAborted,0"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    fn run_end_retires_registered_incoming_slot_with_one_terminal_row() {
+        let output = trace_output_dir("registered-incoming-abort");
+        let started = now();
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let slot = QcsdSlotId(0);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+        controller.poll(Duration::ZERO);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        traces
+            .register_slot(started, QcsdEndpointId(7), packet, slot)
+            .expect("registered incoming action");
+
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            started + Duration::from_micros(9),
+            Duration::from_micros(9),
+            MissedSlotReason::RunAborted,
+        )
+        .expect("terminalize registered incoming slot");
+        traces.ensure_no_pending_slots().expect("no trace backlog");
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        assert_eq!(schedule.lines().count(), 2);
+        assert_eq!(schedule.matches("RunAborted").count(), 1);
+        assert!(schedule.ends_with("RunAborted,0\n"));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -3452,6 +3542,7 @@ mod tests {
             &mut controller,
             &mut traces,
             started,
+            Duration::ZERO,
             MissedSlotReason::DeadlineExpired,
         )
         .expect("record queued terminal action");

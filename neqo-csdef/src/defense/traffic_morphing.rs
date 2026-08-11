@@ -676,8 +676,21 @@ impl Defense for TrafficMorphing {
                 self.record_egress(source, outcome);
             }
             SignalKind::ApplicationComplete => self.finish_application(signal.at),
+            SignalKind::ReceiveCreditRequested { packet } => {
+                self.resolve_ingress(
+                    signal.at,
+                    packet,
+                    EventOutcome::Satisfied {
+                        observed: packet.length(),
+                    },
+                );
+            }
             SignalKind::Resolved { packet, outcome } => {
                 if packet.direction() == Direction::Incoming {
+                    // Production controllers request the complete logical
+                    // credit event first and retain the slot until peer bytes
+                    // consume it. The lookup makes the later terminal outcome
+                    // a no-op while preserving direct-defense test drivers.
                     self.resolve_ingress(signal.at, packet, outcome);
                 }
             }
@@ -744,7 +757,7 @@ impl Defense for TrafficMorphing {
             morphing_ingress_shortfall_bytes: self
                 .ingress_shortfall
                 .saturating_add(self.unresolved_ingress_bytes()),
-            morphing_ingress_target_l1_ppm: self.ingress_distribution.l1_ppm(),
+            morphing_ingress_wire_mixture_l1_ppm: self.ingress_distribution.l1_ppm(),
             suppressed_cover_feedback: self.suppressed_cover_feedback,
             ..DefenseDiagnostics::default()
         }
@@ -888,16 +901,25 @@ mod tests {
     }
 
     #[test]
-    fn capacity_preflight_is_row_specific_and_does_not_consume_rng() {
+    fn repeated_capacity_preflight_is_row_specific_and_defers_every_rng_draw() {
         let mut preflight =
             TrafficMorphingEgress::from_json(&config(), 7, 200, &matrix()).expect("matrix");
         let mut untouched =
             TrafficMorphingEgress::from_json(&config(), 7, 200, &matrix()).expect("matrix");
 
-        assert_eq!(preflight.maximum_target_for(64), Some(200));
-        assert_eq!(preflight.maximum_safe_source_for(64, 199), None);
-        assert_eq!(preflight.maximum_safe_source_for(64, 200), Some(200));
-        assert_eq!(preflight.sample_target(64), untouched.sample_target(64));
+        for _ in 0..32 {
+            assert_eq!(preflight.maximum_target_for(64), Some(200));
+            assert_eq!(preflight.maximum_safe_source_for(64, 199), None);
+            assert_eq!(preflight.maximum_safe_source_for(64, 200), Some(200));
+            assert_eq!(preflight.maximum_target_for(201), Some(200));
+        }
+        let preflight_samples: Vec<_> = std::iter::repeat_with(|| preflight.sample_target(64))
+            .take(64)
+            .collect();
+        let untouched_samples: Vec<_> = std::iter::repeat_with(|| untouched.sample_target(64))
+            .take(64)
+            .collect();
+        assert_eq!(preflight_samples, untouched_samples);
     }
 
     #[test]
@@ -927,13 +949,19 @@ mod tests {
         assert_eq!(event.length(), 136);
         defense.observe(DefenseSignal {
             at: Duration::from_micros(3),
+            kind: SignalKind::ReceiveCreditRequested { packet: event },
+        });
+        // Terminal consumption must not request the same reactive debt a
+        // second time.
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(4),
             kind: SignalKind::Resolved {
                 packet: event,
                 outcome: EventOutcome::Satisfied { observed: 136 },
             },
         });
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(4),
+            at: Duration::from_micros(5),
             kind: SignalKind::PayloadBytes {
                 direction: Direction::Incoming,
                 bytes: 136,
@@ -942,7 +970,7 @@ mod tests {
         });
 
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(5),
+            at: Duration::from_micros(6),
             kind: SignalKind::TrafficMorphingEgress {
                 source: 64,
                 outcome: TrafficMorphingOutcome::Morphed {
@@ -951,7 +979,7 @@ mod tests {
             },
         });
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(6),
+            at: Duration::from_micros(7),
             kind: SignalKind::TrafficMorphingEgress {
                 source: 80,
                 outcome: TrafficMorphingOutcome::Bypassed {
@@ -969,7 +997,7 @@ mod tests {
         assert_eq!(diagnostics.morphing_ingress_requested_bytes, 136);
         assert_eq!(diagnostics.morphing_ingress_received_bytes, 136);
         assert_eq!(diagnostics.morphing_ingress_shortfall_bytes, 0);
-        assert_eq!(diagnostics.morphing_ingress_target_l1_ppm, 2_000_000);
+        assert_eq!(diagnostics.morphing_ingress_wire_mixture_l1_ppm, 2_000_000);
     }
 
     #[test]
@@ -1378,6 +1406,6 @@ mod tests {
 
         let diagnostics = defense.diagnostics();
         assert_eq!(diagnostics.morphing_egress_target_l1_ppm, 0);
-        assert_eq!(diagnostics.morphing_ingress_target_l1_ppm, 500_000);
+        assert_eq!(diagnostics.morphing_ingress_wire_mixture_l1_ppm, 500_000);
     }
 }

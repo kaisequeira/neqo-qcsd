@@ -6,7 +6,7 @@
 mod control_loop;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -62,24 +62,67 @@ fn merge_ranges(ranges: &mut Vec<(u64, u64)>) {
     ranges.truncate(merged_index + 1);
 }
 
-fn consume_ranges(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> u64 {
-    let mut consumed = 0_u64;
-    for range in &mut *ranges {
-        let overlap_start = range.0.max(start);
-        let overlap_end = range.1.min(end);
-        consumed = consumed.saturating_add(overlap_end.saturating_sub(overlap_start));
-        if range.0 < end {
-            range.0 = end.min(range.1);
-        }
-    }
-    ranges.retain(|(range_start, range_end)| range_start < range_end);
-    consumed
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdvertisedIncomingCredit {
+    slot: QcsdSlotId,
+    start: u64,
+    end: u64,
 }
 
-fn range_bytes(ranges: &[(u64, u64)]) -> u64 {
-    ranges.iter().fold(0_u64, |total, (start, end)| {
-        total.saturating_add(end.saturating_sub(*start))
-    })
+impl AdvertisedIncomingCredit {
+    const fn bytes(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IncomingCreditLedger {
+    packet: crate::Packet,
+    endpoint: Option<QcsdEndpointId>,
+    multiple_endpoints: bool,
+    consumed: u64,
+    retired: u64,
+}
+
+impl IncomingCreditLedger {
+    const fn new(packet: crate::Packet) -> Self {
+        Self {
+            packet,
+            endpoint: None,
+            multiple_endpoints: false,
+            consumed: 0,
+            retired: 0,
+        }
+    }
+
+    fn requested(self) -> u64 {
+        u64::from(self.packet.length())
+    }
+
+    fn unresolved(self) -> u64 {
+        self.requested()
+            .saturating_sub(self.consumed)
+            .saturating_sub(self.retired)
+    }
+
+    fn assign_endpoint(&mut self, endpoint: QcsdEndpointId) {
+        match self.endpoint {
+            None if !self.multiple_endpoints => self.endpoint = Some(endpoint),
+            Some(current) if current != endpoint => {
+                self.endpoint = None;
+                self.multiple_endpoints = true;
+            }
+            None | Some(_) => {}
+        }
+    }
+
+    const fn action_endpoint(self) -> Option<QcsdEndpointId> {
+        if self.multiple_endpoints {
+            None
+        } else {
+            self.endpoint
+        }
+    }
 }
 
 /// Orchestrates one defense across one or more client connections.
@@ -98,7 +141,12 @@ pub struct QcsdController {
     actions: VecDeque<QcsdAction>,
     observations: VecDeque<QueuedDefenseObservation>,
     application_stream_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<(u64, u64)>>,
-    advertised_incoming_credit: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<(u64, u64)>>,
+    advertised_incoming_credit:
+        HashMap<(QcsdEndpointId, QcsdStreamId), Vec<AdvertisedIncomingCredit>>,
+    incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
+    scheduled_incoming_requested_bytes: u64,
+    scheduled_incoming_consumed_bytes: u64,
+    scheduled_incoming_retired_bytes: u64,
     last_capacity: Option<Capacity>,
     last_delivered_observation_at: Option<Duration>,
     pending_slots: HashMap<QcsdSlotId, crate::Packet>,
@@ -180,6 +228,10 @@ impl QcsdController {
             observations: VecDeque::new(),
             application_stream_ranges: HashMap::new(),
             advertised_incoming_credit: HashMap::new(),
+            incoming_credit_ledger: HashMap::new(),
+            scheduled_incoming_requested_bytes: 0,
+            scheduled_incoming_consumed_bytes: 0,
+            scheduled_incoming_retired_bytes: 0,
             last_capacity: None,
             last_delivered_observation_at: None,
             pending_slots: HashMap::new(),
@@ -199,7 +251,25 @@ impl QcsdController {
     /// Defense-specific runtime counters for the run artifact.
     #[must_use]
     pub fn defense_diagnostics(&self) -> DefenseDiagnostics {
-        self.defense.diagnostics()
+        let mut diagnostics = self.defense.diagnostics();
+        let unresolved = self
+            .incoming_credit_ledger
+            .values()
+            .fold(0_u64, |total, ledger| {
+                total.saturating_add(ledger.unresolved())
+            });
+        debug_assert_eq!(
+            self.scheduled_incoming_requested_bytes,
+            self.scheduled_incoming_consumed_bytes
+                .saturating_add(self.scheduled_incoming_retired_bytes)
+                .saturating_add(unresolved),
+            "scheduled incoming-credit accounting must conserve bytes"
+        );
+        diagnostics.scheduled_incoming_requested_bytes = self.scheduled_incoming_requested_bytes;
+        diagnostics.scheduled_incoming_consumed_bytes = self.scheduled_incoming_consumed_bytes;
+        diagnostics.scheduled_incoming_retired_bytes = self.scheduled_incoming_retired_bytes;
+        diagnostics.scheduled_incoming_unresolved_bytes = unresolved;
+        diagnostics
     }
 
     /// Whether the selected defense permits opening another application batch.
@@ -221,6 +291,48 @@ impl QcsdController {
             .collect();
         pending.sort_unstable_by_key(|(slot, _)| *slot);
         pending
+    }
+
+    /// Terminalize every outstanding scheduled slot after a run aborts.
+    ///
+    /// Incoming slots retire every unresolved scheduled offset before their
+    /// typed failure is delivered. Buffered defense signals are reduced
+    /// immediately so terminal diagnostics include reactive-defense state,
+    /// without polling the defense and creating replacement work during
+    /// shutdown.
+    pub fn abort_pending_slots(&mut self, at: Duration, reason: MissedSlotReason) {
+        let pending = self.pending_slots();
+        let pending_ids: HashSet<_> = pending.iter().map(|(slot, _)| *slot).collect();
+        self.actions.retain(|action| {
+            !matches!(
+                action,
+                QcsdAction::SendPacket { slot, .. }
+                    | QcsdAction::IncreaseReceiveLimit { slot, .. }
+                    if pending_ids.contains(slot)
+            )
+        });
+        self.control.outgoing.clear();
+        self.control.incoming.clear();
+        self.control.credit.clear();
+
+        for (slot, packet) in pending {
+            if self.incoming_credit_ledger.contains_key(&slot) {
+                self.fail_incoming_slot(slot, reason, at, true);
+            } else {
+                self.actions.push_back(QcsdAction::SlotMissed {
+                    endpoint: None,
+                    packet,
+                    slot,
+                    reason,
+                });
+                self.resolve_slot(at, slot, EventOutcome::Missed(reason));
+            }
+        }
+        self.drain_observations();
+
+        debug_assert!(self.pending_slots.is_empty());
+        debug_assert!(self.incoming_credit_ledger.is_empty());
+        debug_assert!(self.advertised_incoming_credit.is_empty());
     }
 
     /// Consume one endpoint, HTTP/3, or transport observation.
@@ -246,19 +358,7 @@ impl QcsdController {
                 self.streams.remove_endpoint(endpoint);
                 self.application_stream_ranges
                     .retain(|(candidate, _), _| *candidate != endpoint);
-                let mut retired = 0_u64;
-                self.advertised_incoming_credit
-                    .retain(|(candidate, _), ranges| {
-                        if *candidate == endpoint {
-                            retired = retired.saturating_add(range_bytes(ranges));
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                if retired > 0 {
-                    self.push_signal(at, SignalKind::ReceiveCreditRetired { bytes: retired });
-                }
+                self.retire_endpoint_advertised_credit(endpoint, at);
                 self.control.reassign_endpoint(endpoint);
                 self.return_endpoint_credit(endpoint, at);
                 self.released_chaff_send_shaping.remove(&endpoint);
@@ -316,12 +416,6 @@ impl QcsdController {
                         (cover, consumed_start, state.receive.consumed())
                     })
                 {
-                    let consumed_credit = self
-                        .advertised_incoming_credit
-                        .get_mut(&(endpoint, stream))
-                        .map_or(0, |ranges| {
-                            consume_ranges(ranges, consumed_start, consumed_end)
-                        });
                     self.push_signal(
                         at,
                         SignalKind::PayloadBytes {
@@ -337,14 +431,13 @@ impl QcsdController {
                     if !cover {
                         self.push_application_bytes(at, Direction::Incoming, bytes);
                     }
-                    if consumed_credit > 0 {
-                        self.push_signal(
-                            at,
-                            SignalKind::ReceiveCreditConsumed {
-                                bytes: consumed_credit,
-                            },
-                        );
-                    }
+                    self.consume_advertised_credit(
+                        endpoint,
+                        stream,
+                        consumed_start,
+                        consumed_end,
+                        at,
+                    );
                 }
             }
             QcsdObservation::StreamDataBlocked {
@@ -454,8 +547,11 @@ impl QcsdController {
                 );
             }
             QcsdObservation::SlotMissed { slot, reason, .. } => {
-                self.fail_incoming_slot(slot);
-                self.resolve_slot(at, slot, EventOutcome::Missed(reason));
+                if self.incoming_credit_ledger.contains_key(&slot) {
+                    self.fail_incoming_slot(slot, reason, at, false);
+                } else {
+                    self.resolve_slot(at, slot, EventOutcome::Missed(reason));
+                }
             }
         }
     }
@@ -555,13 +651,7 @@ impl QcsdController {
             return;
         };
         self.return_stream_credit(endpoint, stream, at);
-        let retired = self
-            .advertised_incoming_credit
-            .remove(&(endpoint, stream))
-            .map_or(0, |ranges| range_bytes(&ranges));
-        if retired > 0 {
-            self.push_signal(at, SignalKind::ReceiveCreditRetired { bytes: retired });
-        }
+        self.retire_stream_advertised_credit(endpoint, stream, at);
         if let QcsdRequestRole::Chaff { resource_id, .. } = state.role {
             let success = state
                 .status
@@ -579,23 +669,11 @@ impl QcsdController {
         stream: QcsdStreamId,
         absolute_limit: u64,
         slot: Option<QcsdSlotId>,
-        at: Duration,
+        _at: Duration,
     ) {
         if let Some(state) = self.streams.get_mut(endpoint, stream) {
             state.receive.advertised(absolute_limit);
         }
-        let packet = slot.and_then(|slot| {
-            self.control
-                .credit
-                .iter()
-                .find(|credit| {
-                    credit.endpoint == endpoint
-                        && credit.stream == stream
-                        && credit.slot == slot
-                        && credit.absolute_limit <= absolute_limit
-                })
-                .map(|credit| credit.packet)
-        });
         let mut advertised_ranges = Vec::new();
         self.control.credit.retain(|credit| {
             let same_release = credit.endpoint == endpoint
@@ -603,10 +681,11 @@ impl QcsdController {
                 && credit.absolute_limit <= absolute_limit
                 && slot.is_none_or(|slot| credit.slot == slot);
             if same_release {
-                advertised_ranges.push((
-                    credit.absolute_limit.saturating_sub(credit.increase),
-                    credit.absolute_limit,
-                ));
+                advertised_ranges.push(AdvertisedIncomingCredit {
+                    slot: credit.slot,
+                    start: credit.absolute_limit.saturating_sub(credit.increase),
+                    end: credit.absolute_limit,
+                });
             }
             !same_release
         });
@@ -616,27 +695,144 @@ impl QcsdController {
                 .entry((endpoint, stream))
                 .or_default();
             ranges.append(&mut advertised_ranges);
-            ranges.sort_unstable();
-            merge_ranges(ranges);
+            ranges.sort_unstable_by_key(|range| (range.start, range.end, range.slot));
         }
-        if let (Some(slot), Some(packet)) = (slot, packet)
-            && !self.control.terminal_incoming.contains(&slot)
-            && !self.control.incoming_slot_pending(slot)
+    }
+
+    fn consume_advertised_credit(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        start: u64,
+        end: u64,
+        at: Duration,
+    ) {
+        let key = (endpoint, stream);
+        let mut consumed_by_slot = BTreeMap::new();
+        let remove_stream = self
+            .advertised_incoming_credit
+            .get_mut(&key)
+            .is_some_and(|ranges| {
+                for range in &mut *ranges {
+                    let overlap_start = range.start.max(start);
+                    let overlap_end = range.end.min(end);
+                    let consumed = overlap_end.saturating_sub(overlap_start);
+                    if consumed > 0 {
+                        let total = consumed_by_slot.entry(range.slot).or_insert(0_u64);
+                        *total = total.saturating_add(consumed);
+                    }
+                    if range.start < end {
+                        range.start = end.min(range.end);
+                    }
+                }
+                ranges.retain(|range| range.start < range.end);
+                ranges.is_empty()
+            });
+        if remove_stream {
+            self.advertised_incoming_credit.remove(&key);
+        }
+        for (slot, bytes) in consumed_by_slot {
+            self.record_consumed_credit(slot, bytes, at);
+        }
+    }
+
+    fn record_consumed_credit(&mut self, slot: QcsdSlotId, bytes: u64, at: Duration) {
+        let Some(ledger) = self.incoming_credit_ledger.get_mut(&slot) else {
+            return;
+        };
+        let consumed = bytes.min(ledger.unresolved());
+        if consumed == 0 {
+            return;
+        }
+        ledger.consumed = ledger.consumed.saturating_add(consumed);
+        self.scheduled_incoming_consumed_bytes = self
+            .scheduled_incoming_consumed_bytes
+            .saturating_add(consumed);
+        self.push_signal(at, SignalKind::ReceiveCreditConsumed { bytes: consumed });
+        self.finish_incoming_slot_if_resolved(slot, at);
+    }
+
+    fn retire_stream_advertised_credit(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        at: Duration,
+    ) {
+        let Some(ranges) = self.advertised_incoming_credit.remove(&(endpoint, stream)) else {
+            return;
+        };
+        let mut retired_by_slot = BTreeMap::new();
+        for range in ranges {
+            let total = retired_by_slot.entry(range.slot).or_insert(0_u64);
+            *total = total.saturating_add(range.bytes());
+        }
+        for (slot, bytes) in retired_by_slot {
+            self.record_retired_credit(slot, bytes, at);
+        }
+    }
+
+    fn retire_endpoint_advertised_credit(&mut self, endpoint: QcsdEndpointId, at: Duration) {
+        let mut streams: Vec<_> = self
+            .advertised_incoming_credit
+            .keys()
+            .filter_map(|(candidate, stream)| (*candidate == endpoint).then_some(*stream))
+            .collect();
+        streams.sort_unstable();
+        for stream in streams {
+            self.retire_stream_advertised_credit(endpoint, stream, at);
+        }
+    }
+
+    fn record_retired_credit(&mut self, slot: QcsdSlotId, bytes: u64, at: Duration) {
+        let Some(ledger) = self.incoming_credit_ledger.get_mut(&slot) else {
+            return;
+        };
+        let retired = bytes.min(ledger.unresolved());
+        if retired == 0 {
+            return;
+        }
+        ledger.retired = ledger.retired.saturating_add(retired);
+        self.scheduled_incoming_retired_bytes = self
+            .scheduled_incoming_retired_bytes
+            .saturating_add(retired);
+        self.push_signal(at, SignalKind::ReceiveCreditRetired { bytes: retired });
+        self.finish_incoming_slot_if_resolved(slot, at);
+    }
+
+    fn finish_incoming_slot_if_resolved(&mut self, slot: QcsdSlotId, at: Duration) {
+        if self
+            .incoming_credit_ledger
+            .get(&slot)
+            .is_none_or(|ledger| ledger.unresolved() > 0)
         {
-            self.control.terminal_incoming.insert(slot);
+            return;
+        }
+        let Some(ledger) = self.incoming_credit_ledger.remove(&slot) else {
+            return;
+        };
+        if !self.control.terminal_incoming.insert(slot) {
+            return;
+        }
+        let outcome = if ledger.retired == 0 {
             self.actions.push_back(QcsdAction::SlotSatisfied {
-                endpoint: Some(endpoint),
-                packet,
+                endpoint: ledger.action_endpoint(),
+                packet: ledger.packet,
                 slot,
             });
-            self.resolve_slot(
-                at,
+            EventOutcome::Satisfied {
+                observed: ledger.packet.length(),
+            }
+        } else {
+            let reason = MissedSlotReason::ReceiveCreditRetired;
+            self.actions.push_back(QcsdAction::SlotMissed {
+                endpoint: ledger.action_endpoint(),
+                packet: ledger.packet,
                 slot,
-                EventOutcome::Satisfied {
-                    observed: packet.length(),
-                },
-            );
-        }
+                reason,
+            });
+            EventOutcome::Missed(reason)
+        };
+        self.resolve_slot(at, slot, outcome);
     }
 
     fn return_stream_credit(
@@ -676,20 +872,7 @@ impl QcsdController {
 
     fn return_credit(&mut self, credit: &PendingCredit, at: Duration) {
         if self.config.drop_unsatisfied_events {
-            if !self.control.terminal_incoming.insert(credit.slot) {
-                return;
-            }
-            self.actions.push_back(QcsdAction::SlotMissed {
-                endpoint: Some(credit.endpoint),
-                packet: credit.packet,
-                slot: credit.slot,
-                reason: MissedSlotReason::EndpointClosed,
-            });
-            self.resolve_slot(
-                at,
-                credit.slot,
-                EventOutcome::Missed(MissedSlotReason::EndpointClosed),
-            );
+            self.fail_incoming_slot(credit.slot, MissedSlotReason::EndpointClosed, at, true);
             return;
         }
         if let Some(pending) = self
@@ -710,20 +893,42 @@ impl QcsdController {
         }
     }
 
-    fn fail_incoming_slot(&mut self, slot: QcsdSlotId) {
-        let had_credit = self.control.credit.iter().any(|credit| credit.slot == slot);
-        let had_backlog = self
-            .control
+    fn fail_incoming_slot(
+        &mut self,
+        slot: QcsdSlotId,
+        reason: MissedSlotReason,
+        at: Duration,
+        emit_action: bool,
+    ) {
+        self.control.credit.retain(|credit| credit.slot != slot);
+        self.control
             .incoming
-            .iter()
-            .any(|incoming| incoming.slot == slot);
-        if had_credit || had_backlog {
-            self.control.credit.retain(|credit| credit.slot != slot);
-            self.control
-                .incoming
-                .retain(|incoming| incoming.slot != slot);
-            self.control.terminal_incoming.insert(slot);
+            .retain(|incoming| incoming.slot != slot);
+        self.advertised_incoming_credit.retain(|_, ranges| {
+            ranges.retain(|range| range.slot != slot);
+            !ranges.is_empty()
+        });
+        let Some(mut ledger) = self.incoming_credit_ledger.remove(&slot) else {
+            return;
+        };
+        let retired = ledger.unresolved();
+        ledger.retired = ledger.retired.saturating_add(retired);
+        self.scheduled_incoming_retired_bytes = self
+            .scheduled_incoming_retired_bytes
+            .saturating_add(retired);
+        if retired > 0 {
+            self.push_signal(at, SignalKind::ReceiveCreditRetired { bytes: retired });
         }
+        self.control.terminal_incoming.insert(slot);
+        if emit_action {
+            self.actions.push_back(QcsdAction::SlotMissed {
+                endpoint: ledger.action_endpoint(),
+                packet: ledger.packet,
+                slot,
+                reason,
+            });
+        }
+        self.resolve_slot(at, slot, EventOutcome::Missed(reason));
     }
 
     /// Advance the published control loop to `elapsed` and queue due actions.
@@ -779,12 +984,20 @@ impl QcsdController {
             self.pending_slots.insert(slot, packet);
             match packet.direction() {
                 Direction::Outgoing => self.control.outgoing.push(PendingOutgoing { slot, packet }),
-                Direction::Incoming => self.control.incoming.push(PendingIncoming {
-                    slot,
-                    packet,
-                    endpoint: None,
-                    remaining: u64::from(packet.length()),
-                }),
+                Direction::Incoming => {
+                    self.incoming_credit_ledger
+                        .insert(slot, IncomingCreditLedger::new(packet));
+                    self.scheduled_incoming_requested_bytes = self
+                        .scheduled_incoming_requested_bytes
+                        .saturating_add(u64::from(packet.length()));
+                    self.push_signal(elapsed, SignalKind::ReceiveCreditRequested { packet });
+                    self.control.incoming.push(PendingIncoming {
+                        slot,
+                        packet,
+                        endpoint: None,
+                        remaining: u64::from(packet.length()),
+                    });
+                }
             }
         }
     }
@@ -883,6 +1096,9 @@ impl QcsdController {
                     total.saturating_add(release.increase)
                 });
                 for release in releases {
+                    if let Some(ledger) = self.incoming_credit_ledger.get_mut(&incoming.slot) {
+                        ledger.assign_endpoint(endpoint);
+                    }
                     self.control.credit.push(PendingCredit {
                         slot: incoming.slot,
                         packet: incoming.packet,
@@ -923,14 +1139,7 @@ impl QcsdController {
         at: Duration,
     ) {
         if self.config.drop_unsatisfied_events {
-            self.control.terminal_incoming.insert(incoming.slot);
-            self.actions.push_back(QcsdAction::SlotMissed {
-                endpoint: incoming.endpoint,
-                packet: incoming.packet,
-                slot: incoming.slot,
-                reason,
-            });
-            self.resolve_slot(at, incoming.slot, EventOutcome::Missed(reason));
+            self.fail_incoming_slot(incoming.slot, reason, at, true);
         } else {
             self.control.incoming.push(incoming);
         }
@@ -940,6 +1149,8 @@ impl QcsdController {
         let has_backlog = self.control.incoming_backlog() > 0
             || !self.control.outgoing.is_empty()
             || !self.control.credit.is_empty()
+            || !self.incoming_credit_ledger.is_empty()
+            || !self.advertised_incoming_credit.is_empty()
             || !self.pending_slots.is_empty()
             || !self.observations.is_empty();
         if self.defense.is_complete() && !has_backlog {
@@ -1084,7 +1295,7 @@ mod tests {
         time::Duration,
     };
 
-    use super::{QcsdController, consume_ranges, merge_ranges, range_bytes};
+    use super::QcsdController;
     use crate::{
         Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
         EventOutcome, MissedSlotReason, Packet, QcsdAction, QcsdConfig, QcsdDatagramClass,
@@ -1103,20 +1314,6 @@ mod tests {
             bytes: u64,
         },
         NextEvent(Duration),
-    }
-
-    #[test]
-    fn scheduled_receive_credit_uses_exact_raw_stream_offset_intersections() {
-        let mut ranges = vec![(16, 116), (116, 216)];
-        merge_ranges(&mut ranges);
-        assert_eq!(ranges, [(16, 216)]);
-
-        // The first 16 bytes came from the transport's initial stream limit,
-        // so only offsets 16..40 consume defense-scheduled credit.
-        assert_eq!(consume_ranges(&mut ranges, 0, 40), 24);
-        assert_eq!(ranges, [(40, 216)]);
-        assert_eq!(consume_ranges(&mut ranges, 40, 150), 110);
-        assert_eq!(range_bytes(&ranges), 66);
     }
 
     #[derive(Debug)]
@@ -1236,6 +1433,10 @@ mod tests {
             },
             at,
         );
+        let consumed = controller
+            .streams
+            .get_mut(endpoint, stream)
+            .map_or(0, |state| state.receive.consumed());
         // Model the coalesced MAX_STREAM_DATA control datagram and the
         // corresponding observed cover response at the terminal instant.
         for (direction, length) in [
@@ -1265,7 +1466,10 @@ mod tests {
             QcsdObservation::BytesRead {
                 endpoint,
                 stream,
-                bytes: u64::from(packet.length()),
+                // A stream's initial allowance precedes defense-scheduled
+                // offsets. Model receipt through the newly advertised limit
+                // so the replay consumes the exact tagged range.
+                bytes: absolute_limit.saturating_sub(consumed),
             },
             at,
         );
@@ -1535,14 +1739,6 @@ mod tests {
             Duration::from_micros(30),
             QcsdObservation::ApplicationComplete,
         ));
-        script.push((
-            Duration::from_secs(1),
-            QcsdObservation::StreamFinished {
-                endpoint: QcsdEndpointId(1),
-                stream: QcsdStreamId(4),
-                finish: QcsdStreamFinish::Fin,
-            },
-        ));
         replay_controller(
             DefenseConfig::TrafficMorphing(config),
             Box::new(defense),
@@ -1575,14 +1771,6 @@ mod tests {
         script.push((
             Duration::from_micros(40),
             QcsdObservation::ApplicationComplete,
-        ));
-        script.push((
-            Duration::from_secs(1),
-            QcsdObservation::StreamFinished {
-                endpoint: QcsdEndpointId(1),
-                stream: QcsdStreamId(4),
-                finish: QcsdStreamFinish::Fin,
-            },
         ));
         replay_controller(
             DefenseConfig::WtfPad(config),
@@ -1669,6 +1857,12 @@ mod tests {
         assert!(replay.diagnostics.suppressed_cover_feedback > 0);
         assert_eq!(replay.diagnostics.morphing_egress_packets, 1);
         assert_eq!(replay.diagnostics.morphing_ingress_shortfall_bytes, 328);
+        assert_eq!(
+            replay.diagnostics.scheduled_incoming_requested_bytes,
+            replay.diagnostics.scheduled_incoming_consumed_bytes
+        );
+        assert_eq!(replay.diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(replay.diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -1702,6 +1896,12 @@ mod tests {
         );
         assert_eq!(replay.diagnostics.wtf_pad_incoming_shortfall_bytes, 0);
         assert!(replay.diagnostics.wtf_pad_incoming_observed_events > 0);
+        assert_eq!(
+            replay.diagnostics.scheduled_incoming_requested_bytes,
+            replay.diagnostics.scheduled_incoming_consumed_bytes
+        );
+        assert_eq!(replay.diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(replay.diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -1742,6 +1942,12 @@ mod tests {
         );
         assert_eq!(replay.diagnostics.walkie_talkie_incoming_shortfall_bytes, 0);
         assert_eq!(replay.diagnostics.retried_outgoing_events, 0);
+        assert_eq!(
+            replay.diagnostics.scheduled_incoming_requested_bytes,
+            replay.diagnostics.scheduled_incoming_consumed_bytes
+        );
+        assert_eq!(replay.diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(replay.diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -1874,6 +2080,180 @@ mod tests {
             QcsdAction::SendPacket { packet, .. }
                 if packet.direction() == Direction::Outgoing
         )));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the two-endpoint Walkie-Talkie realization is kept explicit"
+    )]
+    fn walkie_talkie_one_logical_incoming_cell_fans_out_across_origins() {
+        let molded = r#"{
+            "adaptation": "qcsd-client-only",
+            "burst_definition": "global-application-batch-direction-transitions",
+            "cell_byte_domain": "http3-request-stream-offset.bytes",
+            "schema_version": 2,
+            "generated_by": "controller multi-origin test",
+            "matching_algorithm": "minimum-cost-one-to-one",
+            "paper_equivalent": false,
+            "packet_size": 100,
+            "profiles": [{
+                "real": "real page",
+                "decoy": "decoy page",
+                "matching_cost_packets": 0,
+                "training_inputs": {
+                    "real": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                    "decoy": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+                },
+                "variation": {
+                    "real": {"visit_count": 1, "varying_components": 0, "maximum_component_spread": 0},
+                    "decoy": {"visit_count": 1, "varying_components": 0, "maximum_component_spread": 0}
+                },
+                "source_envelopes": {
+                    "real": [{"outgoing": 0, "incoming": 1}],
+                    "decoy": [{"outgoing": 0, "incoming": 1}]
+                },
+                "batch_ends": {"real": [0], "decoy": [0]},
+                "molded_batch_ends": [0],
+                "total_scheduled_bytes": 100,
+                "bursts": [{"outgoing": 0, "incoming": 1}]
+            }]
+        }"#;
+        let config = WalkieTalkieConfig {
+            molded: "inline-multi-origin-test.json".into(),
+            workload_id: "real page".into(),
+            packet_size: 100,
+        };
+        let defense = WalkieTalkie::from_json(&config, 1_200, molded).expect("valid mould");
+        let manifest = ResourceManifest {
+            resources: vec![
+                Resource {
+                    id: 7,
+                    url: "https://1.example/chaff".into(),
+                    kind: "Image".into(),
+                    content_length: Some(60),
+                    data_length: 60,
+                    chaff_priority: false,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                },
+                Resource {
+                    id: 8,
+                    url: "https://2.example/chaff".into(),
+                    kind: "Image".into(),
+                    content_length: Some(40),
+                    data_length: 40,
+                    chaff_priority: false,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                },
+            ],
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 1,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 0,
+                max_udp_payload_size: 1_200,
+                tail_wait_us: 0,
+                defense: DefenseConfig::WalkieTalkie(config),
+                ..QcsdConfig::default()
+            },
+            Some(manifest),
+            Box::new(defense),
+        )
+        .expect("controller");
+        for (endpoint_id, stream_id, resource_id) in [(1, 0, 7), (2, 4, 8)] {
+            ready(
+                &mut controller,
+                endpoint_id,
+                &format!("https://{endpoint_id}.example"),
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(endpoint_id),
+                    stream: QcsdStreamId(stream_id),
+                    role: QcsdRequestRole::Chaff {
+                        resource_id,
+                        request_id: None,
+                    },
+                    expected_response_length: None,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::ZERO);
+        let credits: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((endpoint, stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .collect();
+        let [
+            (_, _, first_limit, first_slot),
+            (_, _, second_limit, second_slot),
+        ] = credits.as_slice()
+        else {
+            panic!("one logical credit must fan out exactly twice");
+        };
+        assert_eq!(*first_limit, 60);
+        assert_eq!(*second_limit, 40);
+        assert_eq!(first_slot, second_slot);
+
+        for (endpoint, stream, absolute_limit, slot) in &credits {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: *endpoint,
+                    stream: *stream,
+                    absolute_limit: *absolute_limit,
+                    slot: Some(*slot),
+                },
+                Duration::from_micros(1),
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: *endpoint,
+                    stream: *stream,
+                    bytes: *absolute_limit,
+                },
+                Duration::from_micros(1),
+            );
+        }
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(1),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied {
+                endpoint: None,
+                slot,
+                ..
+            }) if slot == *first_slot
+        ));
+        controller.poll(Duration::from_micros(1));
+
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 1);
+        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 100);
+        assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 0);
+        assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
+        assert!(controller.is_complete());
     }
 
     #[test]
@@ -2593,19 +2973,33 @@ mod tests {
                 },
                 Duration::from_micros(1),
             );
+            assert!(controller.next_action().is_none());
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: absolute_limit,
+                },
+                Duration::from_micros(2),
+            );
             if index == 0 {
                 assert!(controller.next_action().is_none());
             } else {
                 assert!(matches!(
                     controller.next_action(),
                     Some(QcsdAction::SlotSatisfied {
-                        endpoint: Some(QcsdEndpointId(2)),
+                        endpoint: None,
                         slot: satisfied,
                         ..
                     }) if satisfied == slot
                 ));
             }
         }
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -2852,11 +3246,14 @@ mod tests {
     }
 
     #[test]
-    fn incoming_slot_is_satisfied_only_after_credit_is_encoded() {
-        let trace =
-            Trace::new([Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet")]);
+    fn incoming_slot_is_satisfied_only_after_advertised_credit_is_consumed() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let trace = Trace::new([packet]);
         let mut controller = QcsdController::with_defense(
-            QcsdConfig::default(),
+            QcsdConfig {
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
             None,
             Box::new(StaticSchedule::new(trace, false)),
         )
@@ -2895,6 +3292,29 @@ mod tests {
             },
             Duration::ZERO,
         );
+        assert!(controller.next_action().is_none());
+        assert_eq!(controller.pending_slots(), [(slot, packet)]);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_unresolved_bytes,
+            100
+        );
+        controller.poll(Duration::ZERO);
+        assert!(
+            !controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: absolute_limit,
+            },
+            Duration::from_micros(1),
+        );
         assert!(matches!(
             controller.next_action(),
             Some(QcsdAction::SlotSatisfied {
@@ -2902,6 +3322,16 @@ mod tests {
                 ..
             }) if observed_slot == slot
         ));
+        controller.poll(Duration::from_micros(1));
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::DefenseComplete)
+        ));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -3483,12 +3913,30 @@ mod tests {
         );
         controller.poll(Duration::from_micros(50));
 
+        assert_eq!(controller.pending_slots(), [(slot, packet)]);
+        assert!(!calls.borrow().iter().any(|call| matches!(
+            call,
+            RecordedCall::Signal(DefenseSignal {
+                kind: SignalKind::Resolved { packet: resolved, .. },
+                ..
+            }) if *resolved == packet
+        )));
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: absolute_limit,
+            },
+            Duration::from_micros(75),
+        );
+        controller.poll(Duration::from_micros(75));
+
         assert!(controller.pending_slots.is_empty());
         assert!(
             calls
                 .borrow()
                 .contains(&RecordedCall::Signal(DefenseSignal {
-                    at: Duration::from_micros(50),
+                    at: Duration::from_micros(75),
                     kind: SignalKind::Resolved {
                         packet,
                         outcome: EventOutcome::Satisfied { observed: 100 },
@@ -3541,6 +3989,123 @@ mod tests {
                 .count(),
             1
         );
+        let calls = calls.borrow();
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::ReceiveCreditRequested { packet },
+        })));
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::ReceiveCreditRetired { bytes: 100 },
+        })));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn abort_retires_pending_incoming_credit_and_delivers_reactive_signals() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let (defense, calls) = RecordingDefense::new([packet], DefenseMode::ChaffAndShape);
+        let mut controller =
+            QcsdController::with_defense(QcsdConfig::default(), None, Box::new(defense))
+                .expect("controller");
+        controller.poll(Duration::ZERO);
+        assert_eq!(controller.pending_slots(), [(QcsdSlotId(0), packet)]);
+
+        let at = Duration::from_micros(9);
+        controller.abort_pending_slots(at, MissedSlotReason::RunAborted);
+
+        assert!(controller.pending_slots().is_empty());
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotMissed {
+                endpoint: None,
+                packet: missed_packet,
+                slot: QcsdSlotId(0),
+                reason: MissedSlotReason::RunAborted,
+            }) if missed_packet == packet
+        ));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+
+        let calls = calls.borrow();
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::ReceiveCreditRequested { packet },
+        })));
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at,
+            kind: SignalKind::ReceiveCreditRetired { bytes: 100 },
+        })));
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at,
+            kind: SignalKind::Resolved {
+                packet,
+                outcome: EventOutcome::Missed(MissedSlotReason::RunAborted),
+            },
+        })));
+    }
+
+    #[test]
+    fn abort_updates_wtf_pad_terminal_shortfall_without_polling_retries() {
+        let config = WtfPadConfig {
+            histograms: "inline-abort-test.json".into(),
+            packet_size: 100,
+            max_padding_events: 32,
+        };
+        let defense = WtfPad::from_json(
+            &config,
+            0x5eed,
+            1_200,
+            include_str!("../../tests/data/wtf-pad-golden.json"),
+        )
+        .expect("WTF-PAD histograms");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: DefenseConfig::WtfPad(config),
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        controller.observe(
+            QcsdObservation::ClassifiedDatagram {
+                endpoint: QcsdEndpointId(1),
+                direction: Direction::Incoming,
+                length: 90,
+                class: QcsdDatagramClass::Natural,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let deadline = controller.next_deadline().expect("incoming padding timer");
+        controller.poll(deadline);
+        assert_eq!(controller.pending_slots().len(), 1);
+        assert_eq!(
+            controller.pending_slots()[0].1.direction(),
+            Direction::Incoming
+        );
+
+        controller.abort_pending_slots(deadline, MissedSlotReason::RunAborted);
+
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert_eq!(diagnostics.wtf_pad_incoming_desired_bytes, 100);
+        assert_eq!(diagnostics.wtf_pad_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.wtf_pad_incoming_received_bytes, 0);
+        assert_eq!(diagnostics.wtf_pad_incoming_shortfall_bytes, 100);
+        assert_eq!(controller.pending_slots(), []);
     }
 
     #[test]
@@ -3669,6 +4234,31 @@ mod tests {
                     kind: SignalKind::ReceiveCreditConsumed { bytes: 84 },
                 }))
         );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 84);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 16);
+        assert_eq!(controller.pending_slots(), [(slot, packet)]);
+
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 16,
+            },
+            Duration::from_micros(3),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied {
+                slot: satisfied,
+                ..
+            }) if satisfied == slot
+        ));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -3730,6 +4320,21 @@ mod tests {
         );
         controller.poll(Duration::from_micros(3));
 
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotMissed {
+                endpoint: Some(closed),
+                slot: missed,
+                reason: MissedSlotReason::ReceiveCreditRetired,
+                ..
+            }) if closed == endpoint && missed == slot
+        ));
+        assert_eq!(controller.pending_slots(), []);
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 24);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 76);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
         let calls = calls.borrow();
         assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
             at: Duration::from_micros(2),
@@ -3738,6 +4343,97 @@ mod tests {
         assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
             at: Duration::from_micros(3),
             kind: SignalKind::ReceiveCreditRetired { bytes: 76 },
+        })));
+    }
+
+    #[test]
+    fn stream_close_retires_only_its_unconsumed_scheduled_offsets() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let (defense, calls) = RecordingDefense::new([packet], DefenseMode::ChaffAndShape);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 116,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(116),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::ZERO);
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit,
+            slot,
+            ..
+        } = controller.next_action().expect("credit action")
+        else {
+            panic!("expected receive credit");
+        };
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 60,
+            },
+            Duration::from_micros(2),
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(3),
+        );
+
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotMissed {
+                endpoint: Some(closed),
+                slot: missed,
+                reason: MissedSlotReason::ReceiveCreditRetired,
+                ..
+            }) if closed == endpoint && missed == slot
+        ));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 44);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 56);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        controller.poll(Duration::from_micros(3));
+        let calls = calls.borrow();
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at: Duration::from_micros(3),
+            kind: SignalKind::ReceiveCreditRetired { bytes: 56 },
+        })));
+        assert!(calls.contains(&RecordedCall::Signal(DefenseSignal {
+            at: Duration::from_micros(3),
+            kind: SignalKind::Resolved {
+                packet,
+                outcome: EventOutcome::Missed(MissedSlotReason::ReceiveCreditRetired),
+            },
         })));
     }
 }

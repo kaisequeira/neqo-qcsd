@@ -38,8 +38,8 @@ pub(super) struct ControlLoop {
     pub incoming: Vec<PendingIncoming>,
     pub outgoing: Vec<PendingOutgoing>,
     pub credit: Vec<PendingCredit>,
-    /// Incoming slots already classified as missed must not later be marked
-    /// satisfied when a partially released credit fragment is encoded.
+    /// Incoming slots already classified as terminal must not be resolved a
+    /// second time if a delayed observation arrives for an old offset range.
     pub terminal_incoming: HashSet<QcsdSlotId>,
 }
 
@@ -74,10 +74,5 @@ impl ControlLoop {
                 pending.endpoint = None;
             }
         }
-    }
-
-    pub(super) fn incoming_slot_pending(&self, slot: QcsdSlotId) -> bool {
-        self.incoming.iter().any(|pending| pending.slot == slot)
-            || self.credit.iter().any(|credit| credit.slot == slot)
     }
 }

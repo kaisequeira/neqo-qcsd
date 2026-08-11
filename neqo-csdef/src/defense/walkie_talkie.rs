@@ -977,16 +977,21 @@ impl Defense for WalkieTalkie {
         self.record_now(at);
 
         match signal.kind {
+            SignalKind::ReceiveCreditRequested { packet }
+                if packet.direction() == Direction::Incoming =>
+            {
+                self.on_incoming_credit_resolution(
+                    packet,
+                    EventOutcome::Satisfied {
+                        observed: packet.length(),
+                    },
+                );
+            }
             SignalKind::Resolved { packet, outcome }
                 if packet.direction() == Direction::Outgoing
                     && packet.length() == self.packet_size =>
             {
                 self.on_outgoing_resolution(outcome);
-            }
-            SignalKind::Resolved { packet, outcome }
-                if packet.direction() == Direction::Incoming =>
-            {
-                self.on_incoming_credit_resolution(packet, outcome);
             }
             SignalKind::PayloadBytes {
                 direction: Direction::Incoming,
@@ -1027,6 +1032,7 @@ impl Defense for WalkieTalkie {
             }
             | SignalKind::Capacity(_)
             | SignalKind::TrafficMorphingEgress { .. }
+            | SignalKind::ReceiveCreditRequested { .. }
             | SignalKind::Resolved { .. } => {}
         }
     }
@@ -1349,6 +1355,20 @@ mod tests {
     }
 
     fn resolve(defense: &mut WalkieTalkie, at_us: u64, packet: Packet, outcome: EventOutcome) {
+        if packet.direction() == Direction::Incoming {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(at_us),
+                kind: SignalKind::ReceiveCreditRequested { packet },
+            });
+            if matches!(outcome, EventOutcome::Missed(_)) {
+                defense.observe(DefenseSignal {
+                    at: Duration::from_micros(at_us),
+                    kind: SignalKind::ReceiveCreditRetired {
+                        bytes: u64::from(packet.length()),
+                    },
+                });
+            }
+        }
         defense.observe(DefenseSignal {
             at: Duration::from_micros(at_us),
             kind: SignalKind::Resolved { packet, outcome },
@@ -1830,10 +1850,15 @@ mod tests {
             Some(Direction::Incoming)
         );
         incoming_wire(&mut defense, 10);
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(11),
+            kind: SignalKind::ApplicationComplete,
+        });
 
         assert_eq!(defense.next_event(Duration::from_micros(109)), None);
         assert_eq!(defense.next_event(Duration::from_micros(999)), None);
         assert_eq!(defense.next_event(Duration::from_secs(60)), None);
+        assert!(!defense.is_complete());
         assert_eq!(
             defense.diagnostics().walkie_talkie_incoming_shortfall_bytes,
             200
@@ -1968,8 +1993,9 @@ mod tests {
             assert_eq!(retry.length(), residual);
             assert_eq!(defense.next_event(Duration::from_micros(at + 4)), None);
 
-            // Encoding receive credit is terminal slot evidence, not observed
-            // response traffic, and therefore cannot advance or self-rearm.
+            // Requesting receive credit transfers logical debt into the
+            // realization ledger, but it is not observed response traffic and
+            // therefore cannot advance or self-rearm.
             resolve(
                 &mut defense,
                 at + 5,
@@ -2720,9 +2746,8 @@ mod tests {
             ),
             (
                 Duration::from_micros(30),
-                SignalKind::Resolved {
+                SignalKind::ReceiveCreditRequested {
                     packet: incoming(20),
-                    outcome: EventOutcome::Satisfied { observed: 100 },
                 },
             ),
             (
@@ -2739,9 +2764,8 @@ mod tests {
             ),
             (
                 Duration::from_micros(40),
-                SignalKind::Resolved {
+                SignalKind::ReceiveCreditRequested {
                     packet: incoming(20),
-                    outcome: EventOutcome::Satisfied { observed: 100 },
                 },
             ),
             (
@@ -2765,9 +2789,8 @@ mod tests {
             ),
             (
                 Duration::from_micros(60),
-                SignalKind::Resolved {
+                SignalKind::ReceiveCreditRequested {
                     packet: incoming(50),
-                    outcome: EventOutcome::Satisfied { observed: 100 },
                 },
             ),
             (

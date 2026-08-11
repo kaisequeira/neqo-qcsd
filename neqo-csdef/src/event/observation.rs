@@ -115,6 +115,9 @@ pub enum MissedSlotReason {
     PathMtu,
     MandatoryFrames,
     EndpointClosed,
+    /// Receive credit reached the wire, but the corresponding stream or
+    /// endpoint ended before every scheduled offset was consumed.
+    ReceiveCreditRetired,
     DeadlineExpired,
     RunAborted,
 }

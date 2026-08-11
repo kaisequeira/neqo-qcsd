@@ -26,7 +26,8 @@ pub enum EventOutcome {
     /// The adapter realised `observed` bytes for the event.
     ///
     /// For outgoing events this is the UDP datagram size. For incoming events
-    /// it is the amount of receive credit whose absolute limit was encoded.
+    /// it is the scheduled receive-credit amount whose tagged raw stream
+    /// offsets were consumed.
     Satisfied { observed: u16 },
     /// The adapter could not realise the event.
     Missed(MissedSlotReason),
@@ -64,6 +65,14 @@ pub enum SignalKind {
         /// Whether the bytes belong to an explicitly reviewed chaff stream.
         cover: bool,
     },
+    /// One complete incoming event was handed to the shared receive-credit
+    /// controller.
+    ///
+    /// This is deliberately distinct from [`Self::Resolved`]: requesting
+    /// receive credit does not prove that the peer produced the scheduled
+    /// bytes. The terminal outcome arrives only after consumption or an
+    /// explicit impossibility/retirement failure.
+    ReceiveCreditRequested { packet: Packet },
     /// Exact overlap between consumed raw STREAM offsets and previously
     /// advertised defense-scheduled receive-credit ranges.
     ///
@@ -130,6 +139,14 @@ pub struct WalkieTalkieBurstDiagnostics {
 /// Defense-specific counters recorded with the terminal run artifact.
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DefenseDiagnostics {
+    /// Incoming schedule bytes handed to the shared receive-credit adapter.
+    pub scheduled_incoming_requested_bytes: u64,
+    /// Scheduled receive-credit offsets actually consumed as response bytes.
+    pub scheduled_incoming_consumed_bytes: u64,
+    /// Scheduled offsets made impossible by an adapter failure or retirement.
+    pub scheduled_incoming_retired_bytes: u64,
+    /// Requested bytes that are neither consumed nor terminally retired.
+    pub scheduled_incoming_unresolved_bytes: u64,
     /// Number of natural client datagrams transformed in place.
     pub morphing_egress_packets: u64,
     /// Natural UDP-payload bytes presented to the egress transformer.
@@ -157,16 +174,19 @@ pub struct DefenseDiagnostics {
     pub morphing_ingress_received_bytes: u64,
     /// Incoming target deficit left unrealized at the configured bound or tail.
     pub morphing_ingress_shortfall_bytes: u64,
-    /// L1 distance in parts per million between observed incoming datagram
-    /// sizes and the configured incoming target distribution.
-    pub morphing_ingress_target_l1_ppm: u64,
+    /// Informational L1 distance between the aggregate incoming wire mixture
+    /// (natural plus cover) and the configured incoming target distribution.
+    ///
+    /// The client-only ingress adapter realizes byte deficits on later chaff;
+    /// this is not a same-datagram Traffic Morphing fidelity claim.
+    pub morphing_ingress_wire_mixture_l1_ppm: u64,
     /// Number of padding events emitted by WTF-PAD.
     pub padding_events: u64,
     /// Whether WTF-PAD stopped at its configured event guard.
     pub padding_event_guard_triggered: bool,
     /// Desired incoming cover bytes emitted by the WTF-PAD automaton.
     pub wtf_pad_incoming_desired_bytes: u64,
-    /// Total receive-credit bytes encoded for desired incoming events,
+    /// Total receive-credit bytes requested for desired incoming events,
     /// including exact retries after unused scheduled offsets retire.
     pub wtf_pad_incoming_requested_bytes: u64,
     /// Desired incoming bytes satisfied by observed response payload.
