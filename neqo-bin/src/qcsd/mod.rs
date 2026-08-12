@@ -882,7 +882,7 @@ impl ApplicationBatchLifecycle {
         }
     }
 
-    const fn after_stream_processing(
+    const fn before_dispatch(
         &mut self,
         application_stream_in_flight: bool,
     ) -> Option<QcsdObservation> {
@@ -1019,6 +1019,30 @@ async fn execute_run_inner(
             let defense_elapsed =
                 defense_start.map(|start| loop_now.saturating_duration_since(start));
             if let Some(defense_elapsed) = defense_elapsed {
+                // Drain observations produced while the previous application
+                // batch was retired before closing that batch.  In
+                // particular, BytesRead and stream lifecycle observations
+                // must causally precede ApplicationBatchCompleted.  Complete
+                // the old batch before dispatching the next layer made
+                // eligible by dependency retirement in this same loop turn.
+                handle_all_qcsd_observations(
+                    &mut endpoints,
+                    &mut controller,
+                    &mut traces,
+                    defense_elapsed,
+                )?;
+                let application_stream_in_flight = has_in_flight_application_stream(
+                    endpoints
+                        .iter()
+                        .flat_map(|endpoint| endpoint.streams.values()),
+                );
+                if let Some(observation) =
+                    application_batches.before_dispatch(application_stream_in_flight)
+                {
+                    let record = observation_clock.record(observation);
+                    traces.observation(None, &record)?;
+                    controller.observe(record.into_observation(), defense_elapsed);
+                }
                 let started_requests = dispatch_ready_requests(
                     &mut endpoints,
                     spec,
@@ -1073,18 +1097,6 @@ async fn execute_run_inner(
                     &mut traces,
                     defense_elapsed,
                 )?;
-                let application_stream_in_flight = has_in_flight_application_stream(
-                    endpoints
-                        .iter()
-                        .flat_map(|endpoint| endpoint.streams.values()),
-                );
-                if let Some(observation) =
-                    application_batches.after_stream_processing(application_stream_in_flight)
-                {
-                    let record = observation_clock.record(observation);
-                    traces.observation(None, &record)?;
-                    controller.observe(record.into_observation(), defense_elapsed);
-                }
                 if !application_complete_observed && dependencies.is_complete() {
                     application_complete_observed = true;
                     application_completion = Some(control_now);
@@ -2991,17 +3003,17 @@ mod tests {
         let defense = DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default());
         let mut lifecycle = ApplicationBatchLifecycle::new(&defense, RequestPolicyArg::AsDefined);
 
-        assert_eq!(lifecycle.after_stream_processing(false), None);
+        assert_eq!(lifecycle.before_dispatch(false), None);
         assert_eq!(
             lifecycle.after_dispatch(2).expect("start batch"),
             Some(QcsdObservation::ApplicationBatchStarted)
         );
-        assert_eq!(lifecycle.after_stream_processing(true), None);
+        assert_eq!(lifecycle.before_dispatch(true), None);
         assert_eq!(
-            lifecycle.after_stream_processing(false),
+            lifecycle.before_dispatch(false),
             Some(QcsdObservation::ApplicationBatchCompleted)
         );
-        assert_eq!(lifecycle.after_stream_processing(false), None);
+        assert_eq!(lifecycle.before_dispatch(false), None);
 
         assert_eq!(lifecycle.after_dispatch(0).expect("no batch"), None);
         assert_eq!(
@@ -3009,6 +3021,35 @@ mod tests {
             Some(QcsdObservation::ApplicationBatchStarted)
         );
         assert!(lifecycle.after_dispatch(1).is_err());
+    }
+
+    #[test]
+    fn application_batch_lifecycle_closes_before_dependent_batch_dispatch() {
+        let defense = DefenseConfig::None;
+        let mut lifecycle = ApplicationBatchLifecycle::new(&defense, RequestPolicyArg::HalfDuplex);
+
+        assert_eq!(
+            lifecycle.after_dispatch(1).expect("start root batch"),
+            Some(QcsdObservation::ApplicationBatchStarted)
+        );
+        assert_eq!(lifecycle.before_dispatch(true), None);
+
+        // Once the root stream retires, its dependent resources can become
+        // ready in this same event-loop turn.  The global batch must close
+        // before that newly ready layer is dispatched.
+        assert_eq!(
+            lifecycle.before_dispatch(false),
+            Some(QcsdObservation::ApplicationBatchCompleted)
+        );
+        assert_eq!(
+            lifecycle.after_dispatch(8).expect("start dependent batch"),
+            Some(QcsdObservation::ApplicationBatchStarted)
+        );
+        assert_eq!(lifecycle.before_dispatch(true), None);
+        assert_eq!(
+            lifecycle.before_dispatch(false),
+            Some(QcsdObservation::ApplicationBatchCompleted)
+        );
     }
 
     #[test]
