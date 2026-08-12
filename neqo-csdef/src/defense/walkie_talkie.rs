@@ -9,10 +9,10 @@ use std::{collections::HashSet, fs, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, SignalKind,
+    Capacity, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, SignalKind,
     WalkieTalkieBurstDiagnostics,
 };
-use crate::{Direction, Error, Packet, Result, WalkieTalkieConfig};
+use crate::{Direction, Error, MissedSlotReason, Packet, Result, WalkieTalkieConfig};
 
 const SCHEMA_VERSION: u32 = 2;
 const ADAPTATION: &str = "qcsd-client-only";
@@ -421,8 +421,6 @@ enum Turn {
         index: usize,
         credits_to_emit: u32,
         initial_credits_awaiting: u32,
-        retry_bytes_to_emit: u64,
-        retry_credits_awaiting: u32,
         credited_bytes_outstanding: u64,
         observed_remaining_bytes: u64,
     },
@@ -445,6 +443,12 @@ struct NaturalSegment {
 struct NaturalBurst {
     outgoing_cells: u64,
     incoming_cells: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealizationFailure {
+    ReceiveCreditRetired,
+    IncomingSlotMissed(MissedSlotReason),
 }
 
 /// Walkie-Talkie half-duplex burst-molding defense.
@@ -480,6 +484,11 @@ pub struct WalkieTalkie {
     now: Duration,
     application_complete: bool,
     retried_outgoing_events: u64,
+    incoming_capacity_reported: Option<u64>,
+    incoming_capacity_reserved: u64,
+    incoming_capacity_committed: u64,
+    realization_failure: Option<RealizationFailure>,
+    failed_incoming_shortfall_bytes: u64,
 }
 
 impl WalkieTalkie {
@@ -579,6 +588,11 @@ impl WalkieTalkie {
             now: Duration::ZERO,
             application_complete: false,
             retried_outgoing_events: 0,
+            incoming_capacity_reported: None,
+            incoming_capacity_reserved: 0,
+            incoming_capacity_committed: 0,
+            realization_failure: None,
+            failed_incoming_shortfall_bytes: 0,
         })
     }
 
@@ -599,8 +613,6 @@ impl WalkieTalkie {
             index,
             credits_to_emit: pair.incoming,
             initial_credits_awaiting: 0,
-            retry_bytes_to_emit: 0,
-            retry_credits_awaiting: 0,
             credited_bytes_outstanding: 0,
             observed_remaining_bytes: u64::from(pair.incoming) * u64::from(self.packet_size),
         };
@@ -649,8 +661,6 @@ impl WalkieTalkie {
                     index,
                     credits_to_emit: 0,
                     initial_credits_awaiting: 0,
-                    retry_bytes_to_emit: 0,
-                    retry_credits_awaiting: 0,
                     credited_bytes_outstanding: 0,
                     observed_remaining_bytes: 0,
                     ..
@@ -669,7 +679,6 @@ impl WalkieTalkie {
         }
         let Turn::Incoming {
             index,
-            retry_bytes_to_emit,
             observed_remaining_bytes,
             ..
         } = &mut self.turn
@@ -685,13 +694,6 @@ impl WalkieTalkie {
             .saturating_add(bytes);
         let attributed = bytes.min(*observed_remaining_bytes);
         *observed_remaining_bytes = observed_remaining_bytes.saturating_sub(bytes);
-        if *observed_remaining_bytes == 0 {
-            // A late response can satisfy the target before an armed retry is
-            // handed to the controller.  Do not request credit that is no
-            // longer needed; already emitted credit remains terminally
-            // accounted and cannot be retracted.
-            *retry_bytes_to_emit = 0;
-        }
         self.incoming_overflow_bytes = self
             .incoming_overflow_bytes
             .saturating_add(bytes.saturating_sub(attributed));
@@ -845,36 +847,89 @@ impl WalkieTalkie {
         self.normalize_turn();
     }
 
-    fn queue_retry(&mut self, bytes: u64) {
-        let Turn::Incoming {
-            retry_bytes_to_emit,
-            observed_remaining_bytes,
-            ..
-        } = &mut self.turn
-        else {
-            return;
-        };
-        let available = observed_remaining_bytes.saturating_sub(*retry_bytes_to_emit);
-        *retry_bytes_to_emit = retry_bytes_to_emit.saturating_add(bytes.min(available));
+    fn incoming_capacity_available(&self) -> u64 {
+        self.incoming_capacity_reported
+            .unwrap_or(0)
+            .saturating_sub(self.incoming_capacity_reserved)
+            .saturating_sub(self.incoming_capacity_committed)
+    }
+
+    fn on_capacity(&mut self, capacity: Capacity) {
+        let reported = capacity.available(DefenseMode::ChaffAndShape);
+        if self.incoming_capacity_reported != Some(reported) {
+            // A changed controller snapshot incorporates allocations accepted
+            // since the previous snapshot.  Reservations for events that the
+            // controller has not observed yet remain local and must still be
+            // subtracted.  Repeating an identical snapshot deliberately does
+            // not replenish either category.
+            self.incoming_capacity_reported = Some(reported);
+            self.incoming_capacity_committed = 0;
+        }
+    }
+
+    fn fail_realization(&mut self, failure: RealizationFailure) {
+        self.failed_incoming_shortfall_bytes = self.remaining_incoming_bytes();
+        self.realization_failure = Some(failure);
+        self.incoming_capacity_reserved = 0;
+        self.incoming_capacity_committed = 0;
+        self.turn = Turn::Done;
+    }
+
+    fn remaining_incoming_bytes(&self) -> u64 {
+        match self.turn {
+            Turn::Incoming {
+                index,
+                observed_remaining_bytes,
+                ..
+            } => observed_remaining_bytes.saturating_add(
+                self.molded
+                    .iter()
+                    .skip(index.saturating_add(1))
+                    .map(|pair| u64::from(pair.incoming) * u64::from(self.packet_size))
+                    .sum(),
+            ),
+            Turn::Outgoing { index, .. } => self
+                .molded
+                .iter()
+                .skip(index)
+                .map(|pair| u64::from(pair.incoming) * u64::from(self.packet_size))
+                .sum(),
+            Turn::Done => self.failed_incoming_shortfall_bytes,
+        }
     }
 
     fn on_receive_credit_retired(&mut self, bytes: u64) {
-        let retired = match &mut self.turn {
-            Turn::Incoming {
-                credited_bytes_outstanding,
-                ..
-            } => {
-                let retired = bytes.min(*credited_bytes_outstanding);
-                *credited_bytes_outstanding = credited_bytes_outstanding.saturating_sub(retired);
-                retired
-            }
-            Turn::Outgoing { .. } | Turn::Done => 0,
-        };
-        self.queue_retry(retired);
-        self.normalize_turn();
+        if let Turn::Incoming {
+            credited_bytes_outstanding,
+            ..
+        } = &mut self.turn
+        {
+            *credited_bytes_outstanding = credited_bytes_outstanding.saturating_sub(bytes);
+        }
+        if bytes > 0 {
+            self.fail_realization(RealizationFailure::ReceiveCreditRetired);
+        }
     }
 
-    fn on_incoming_credit_resolution(&mut self, packet: Packet, outcome: EventOutcome) {
+    fn on_incoming_slot_missed(&mut self, reason: MissedSlotReason) {
+        self.fail_realization(RealizationFailure::IncomingSlotMissed(reason));
+    }
+
+    fn commit_incoming_reservation(&mut self, bytes: u64) {
+        let committed = bytes.min(self.incoming_capacity_reserved);
+        self.incoming_capacity_reserved = self.incoming_capacity_reserved.saturating_sub(committed);
+        self.incoming_capacity_committed =
+            self.incoming_capacity_committed.saturating_add(committed);
+    }
+
+    fn on_incoming_credit_requested(&mut self, packet: Packet) {
+        self.commit_incoming_reservation(u64::from(packet.length()));
+        self.on_incoming_credit_resolution(EventOutcome::Satisfied {
+            observed: packet.length(),
+        });
+    }
+
+    fn on_incoming_credit_resolution(&mut self, outcome: EventOutcome) {
         let handled = match &mut self.turn {
             Turn::Incoming {
                 initial_credits_awaiting,
@@ -888,25 +943,10 @@ impl WalkieTalkie {
                 }
                 true
             }
-            Turn::Incoming {
-                retry_credits_awaiting,
-                credited_bytes_outstanding,
-                ..
-            } if *retry_credits_awaiting > 0 => {
-                *retry_credits_awaiting = retry_credits_awaiting.saturating_sub(1);
-                if let EventOutcome::Satisfied { observed } = outcome {
-                    *credited_bytes_outstanding =
-                        credited_bytes_outstanding.saturating_add(u64::from(observed));
-                }
-                true
-            }
             Turn::Outgoing { .. } | Turn::Incoming { .. } | Turn::Done => false,
         };
-        if handled && matches!(outcome, EventOutcome::Missed(_)) {
-            // Only a terminally missed increment is safe to retry here.
-            // Advertised credit remains in flight until payload consumes it
-            // or the controller explicitly retires its unused stream offset.
-            self.queue_retry(u64::from(packet.length()));
+        if handled && let EventOutcome::Missed(reason) = outcome {
+            self.on_incoming_slot_missed(reason);
         }
         self.normalize_turn();
     }
@@ -952,17 +992,14 @@ impl WalkieTalkie {
             Turn::Incoming {
                 index,
                 credits_to_emit,
-                retry_bytes_to_emit,
                 observed_remaining_bytes,
-                retry_credits_awaiting,
                 initial_credits_awaiting,
                 credited_bytes_outstanding,
                 ..
             } => (credits_to_emit > 0
-                || retry_bytes_to_emit > 0
+                && self.incoming_capacity_available() >= u64::from(self.packet_size)
                 || observed_remaining_bytes == 0
                     && initial_credits_awaiting == 0
-                    && retry_credits_awaiting == 0
                     && credited_bytes_outstanding == 0
                     && (!self.batch_ends.contains(&index) || !self.application_batch_active))
                 .then_some(self.now),
@@ -980,12 +1017,7 @@ impl Defense for WalkieTalkie {
             SignalKind::ReceiveCreditRequested { packet }
                 if packet.direction() == Direction::Incoming =>
             {
-                self.on_incoming_credit_resolution(
-                    packet,
-                    EventOutcome::Satisfied {
-                        observed: packet.length(),
-                    },
-                );
+                self.on_incoming_credit_requested(packet);
             }
             SignalKind::Resolved { packet, outcome }
                 if packet.direction() == Direction::Outgoing
@@ -1003,6 +1035,12 @@ impl Defense for WalkieTalkie {
             }
             SignalKind::ReceiveCreditConsumed { bytes } => {
                 self.on_receive_credit_consumed(bytes);
+            }
+            SignalKind::Resolved {
+                packet,
+                outcome: EventOutcome::Missed(reason),
+            } if packet.direction() == Direction::Incoming => {
+                self.on_incoming_slot_missed(reason);
             }
             SignalKind::PayloadBytes {
                 direction: Direction::Outgoing,
@@ -1035,6 +1073,9 @@ impl Defense for WalkieTalkie {
             | SignalKind::ReceiveCreditRequested { .. }
             | SignalKind::Resolved { .. } => {}
         }
+        if let SignalKind::Capacity(capacity) = signal.kind {
+            self.on_capacity(capacity);
+        }
     }
 
     fn observe_application_bytes(&mut self, at: Duration, direction: Direction, bytes: u64) {
@@ -1045,12 +1086,16 @@ impl Defense for WalkieTalkie {
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
         let at = elapsed;
         self.record_now(at);
+        if self.realization_failure.is_some() {
+            return None;
+        }
         self.normalize_turn();
         if self.awaiting_later_application_batch() && matches!(self.turn, Turn::Outgoing { .. }) {
             return None;
         }
 
         loop {
+            let incoming_capacity_available = self.incoming_capacity_available();
             match &mut self.turn {
                 Turn::Outgoing {
                     to_emit, awaiting, ..
@@ -1072,21 +1117,15 @@ impl Defense for WalkieTalkie {
                     initial_credits_awaiting,
                     ..
                 } if *credits_to_emit > 0 => {
+                    if incoming_capacity_available < u64::from(self.packet_size) {
+                        return None;
+                    }
+                    self.incoming_capacity_reserved = self
+                        .incoming_capacity_reserved
+                        .saturating_add(u64::from(self.packet_size));
                     let packet = Packet::new(at, Direction::Incoming, self.packet_size).ok()?;
                     *credits_to_emit = credits_to_emit.saturating_sub(1);
                     *initial_credits_awaiting = initial_credits_awaiting.saturating_add(1);
-                    return Some(packet);
-                }
-                Turn::Incoming {
-                    retry_bytes_to_emit,
-                    retry_credits_awaiting,
-                    ..
-                } if *retry_bytes_to_emit > 0 => {
-                    let length = (*retry_bytes_to_emit).min(u64::from(self.packet_size));
-                    let length = u16::try_from(length).ok()?;
-                    let packet = Packet::new(at, Direction::Incoming, length).ok()?;
-                    *retry_bytes_to_emit = retry_bytes_to_emit.saturating_sub(u64::from(length));
-                    *retry_credits_awaiting = retry_credits_awaiting.saturating_add(1);
                     return Some(packet);
                 }
                 Turn::Incoming { .. } => {
@@ -1101,16 +1140,22 @@ impl Defense for WalkieTalkie {
     }
 
     fn next_event_at(&self) -> Option<Duration> {
+        if self.realization_failure.is_some() {
+            return None;
+        }
         self.next_internal_deadline()
     }
 
     fn is_complete(&self) -> bool {
         self.application_complete
             && !self.application_batch_active
-            && matches!(self.turn, Turn::Done)
+            && (self.realization_failure.is_some() || matches!(self.turn, Turn::Done))
     }
 
     fn is_outgoing_complete(&self) -> bool {
+        if self.realization_failure.is_some() {
+            return true;
+        }
         match self.turn {
             Turn::Done => true,
             Turn::Outgoing {
@@ -1136,10 +1181,13 @@ impl Defense for WalkieTalkie {
     }
 
     fn can_release_chaff_send_shaping(&self) -> bool {
-        matches!(self.turn, Turn::Done)
+        self.realization_failure.is_some() || matches!(self.turn, Turn::Done)
     }
 
     fn can_start_application_batch(&self) -> bool {
+        if self.realization_failure.is_some() {
+            return !self.application_batch_active;
+        }
         self.application_batches_started < self.expected_application_batches
             && !self.application_batch_active
             && !self.application_batch_assigned
@@ -1151,26 +1199,7 @@ impl Defense for WalkieTalkie {
     }
 
     fn diagnostics(&self) -> DefenseDiagnostics {
-        let incoming_shortfall = match self.turn {
-            Turn::Incoming {
-                index,
-                observed_remaining_bytes,
-                ..
-            } => observed_remaining_bytes.saturating_add(
-                self.molded
-                    .iter()
-                    .skip(index.saturating_add(1))
-                    .map(|pair| u64::from(pair.incoming) * u64::from(self.packet_size))
-                    .sum(),
-            ),
-            Turn::Outgoing { index, .. } => self
-                .molded
-                .iter()
-                .skip(index)
-                .map(|pair| u64::from(pair.incoming) * u64::from(self.packet_size))
-                .sum(),
-            Turn::Done => 0,
-        };
+        let incoming_shortfall = self.remaining_incoming_bytes();
         let packet_size = u64::from(self.packet_size);
         let observed_incoming_cells = self.observed_incoming_bytes.div_ceil(packet_size);
         let outgoing_shortfall_cells = self
@@ -1255,8 +1284,9 @@ mod tests {
 
     use super::WalkieTalkie;
     use crate::{
-        Defense as _, DefenseMode, DefenseSignal, Direction, EventOutcome, MissedSlotReason,
-        Packet, SignalKind, WalkieTalkieBurstDiagnostics, WalkieTalkieConfig, defense::drive,
+        Capacity, Defense as _, DefenseMode, DefenseSignal, Direction, EventOutcome,
+        MissedSlotReason, Packet, SignalKind, WalkieTalkieBurstDiagnostics, WalkieTalkieConfig,
+        defense::drive,
     };
 
     fn config(packet_size: u16) -> WalkieTalkieConfig {
@@ -1355,6 +1385,7 @@ mod tests {
     }
 
     fn resolve(defense: &mut WalkieTalkie, at_us: u64, packet: Packet, outcome: EventOutcome) {
+        provide_capacity(defense, at_us, u64::MAX);
         if packet.direction() == Direction::Incoming {
             defense.observe(DefenseSignal {
                 at: Duration::from_micros(at_us),
@@ -1385,12 +1416,6 @@ mod tests {
                 initial_credits_awaiting,
                 ..
             } if initial_credits_awaiting > 0 => Some(defense.packet_size),
-            super::Turn::Incoming {
-                retry_credits_awaiting,
-                ..
-            } if retry_credits_awaiting > 0 => {
-                Some(u16::try_from(bytes.min(u64::from(defense.packet_size))).expect("cell bytes"))
-            }
             super::Turn::Outgoing { .. } | super::Turn::Incoming { .. } | super::Turn::Done => None,
         };
         if let Some(length) = pending_length {
@@ -1425,9 +1450,20 @@ mod tests {
     }
 
     fn application_batch_started(defense: &mut WalkieTalkie, at_us: u64) {
+        provide_capacity(defense, at_us, u64::MAX);
         defense.observe(DefenseSignal {
             at: Duration::from_micros(at_us),
             kind: SignalKind::ApplicationBatchStarted,
+        });
+    }
+
+    fn provide_capacity(defense: &mut WalkieTalkie, at_us: u64, bytes: u64) {
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(at_us),
+            kind: SignalKind::Capacity(Capacity {
+                application_incoming: bytes,
+                chaff_incoming: 0,
+            }),
         });
     }
 
@@ -1738,6 +1774,7 @@ mod tests {
             &molded(r#"[{"outgoing": 0, "incoming": 1}]"#),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
         assert_eq!(
             defense.next_event(Duration::ZERO).map(Packet::direction),
             Some(Direction::Incoming)
@@ -1763,6 +1800,7 @@ mod tests {
             &molded(r#"[{"outgoing": 0, "incoming": 1}]"#),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
         assert_eq!(
             defense.next_event(Duration::ZERO).map(Packet::direction),
             Some(Direction::Incoming)
@@ -1841,6 +1879,7 @@ mod tests {
             ),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
         assert_eq!(
             defense.next_event(Duration::ZERO).map(Packet::direction),
             Some(Direction::Incoming)
@@ -1936,92 +1975,126 @@ mod tests {
     }
 
     #[test]
-    fn application_fin_retries_exact_residual_credit_for_each_batch() {
+    fn incoming_events_wait_without_a_busy_deadline_when_capacity_is_absent() {
         let mut defense = WalkieTalkie::from_json(
             &config(100),
             1_200,
-            &molded(
-                r#"[
-                    {"outgoing": 1, "incoming": 2},
-                    {"outgoing": 1, "incoming": 2}
-                ]"#,
-            ),
+            &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
         )
-        .expect("two-batch molded sequence");
+        .expect("incoming-only molded sequence");
 
-        for (batch, natural_incoming, residual) in [(0_u64, 150_u64, 50_u16), (1, 175, 25)] {
-            let at = batch * 10;
-            assert!(defense.can_start_application_batch());
-            application_batch_started(&mut defense, at);
-            application_bytes(&mut defense, at, Direction::Outgoing, 100);
-
-            let outgoing = defense
-                .next_event(Duration::from_micros(at))
-                .expect("batch outgoing cell");
-            resolve(
-                &mut defense,
-                at + 1,
-                outgoing,
-                EventOutcome::Satisfied { observed: 100 },
-            );
-
-            let incoming: Vec<_> = std::iter::repeat_with(|| {
-                defense
-                    .next_event(Duration::from_micros(at + 1))
-                    .expect("initial incoming credit")
-            })
-            .take(2)
-            .collect();
-            for packet in incoming {
-                resolve(
-                    &mut defense,
-                    at + 2,
-                    packet,
-                    EventOutcome::Satisfied { observed: 100 },
-                );
-            }
-
-            incoming_payload(&mut defense, at + 3, natural_incoming, false);
-            application_bytes(&mut defense, at + 3, Direction::Incoming, natural_incoming);
-            retire_credit(&mut defense, at + 4, u64::from(residual));
-            application_batch_completed(&mut defense, at + 4);
-
-            let retry = defense
-                .next_event(Duration::from_micros(at + 4))
-                .expect("FIN-armed exact residual credit");
-            assert_eq!(retry.direction(), Direction::Incoming);
-            assert_eq!(retry.length(), residual);
-            assert_eq!(defense.next_event(Duration::from_micros(at + 4)), None);
-
-            // Requesting receive credit transfers logical debt into the
-            // realization ledger, but it is not observed response traffic and
-            // therefore cannot advance or self-rearm.
-            resolve(
-                &mut defense,
-                at + 5,
-                retry,
-                EventOutcome::Satisfied { observed: residual },
-            );
-            assert_eq!(defense.next_event(Duration::from_micros(at + 5)), None);
-            assert!(!defense.can_start_application_batch());
-
-            incoming_payload(&mut defense, at + 6, u64::from(residual), true);
+        for at_us in 0..=10_000 {
+            assert_eq!(defense.next_event(Duration::from_micros(at_us)), None);
+            assert_eq!(defense.next_event_at(), None);
         }
+        assert_eq!(defense.incoming_capacity_reserved, 0);
+        assert_eq!(defense.incoming_capacity_committed, 0);
+    }
+
+    #[test]
+    fn repeated_and_partially_growing_capacity_never_double_allocates() {
+        let mut defense = WalkieTalkie::from_json(
+            &config(100),
+            1_200,
+            &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
+        )
+        .expect("incoming-only molded sequence");
+
+        provide_capacity(&mut defense, 0, 150);
+        let first = defense.next_event(Duration::ZERO).expect("first cell");
+        assert_eq!(first.length(), 100);
+        assert_eq!(defense.incoming_capacity_reserved, 100);
+        assert_eq!(defense.next_event(Duration::ZERO), None);
+
+        provide_capacity(&mut defense, 1, 150);
+        assert_eq!(defense.next_event(Duration::from_micros(1)), None);
+        provide_capacity(&mut defense, 2, 175);
+        assert_eq!(defense.next_event(Duration::from_micros(2)), None);
 
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(17),
+            at: Duration::from_micros(3),
+            kind: SignalKind::ReceiveCreditRequested { packet: first },
+        });
+        assert_eq!(defense.incoming_capacity_reserved, 0);
+        assert_eq!(defense.incoming_capacity_committed, 100);
+        provide_capacity(&mut defense, 3, 175);
+        assert_eq!(defense.next_event(Duration::from_micros(3)), None);
+
+        // Changed values are authoritative remaining-capacity snapshots after
+        // the controller has incorporated the accepted first reservation.
+        provide_capacity(&mut defense, 4, 50);
+        assert_eq!(defense.next_event(Duration::from_micros(4)), None);
+        provide_capacity(&mut defense, 5, 75);
+        assert_eq!(defense.next_event(Duration::from_micros(5)), None);
+        provide_capacity(&mut defense, 6, 100);
+        let second = defense
+            .next_event(Duration::from_micros(6))
+            .expect("second cell after full capacity becomes available");
+        assert_eq!(second.length(), 100);
+        assert_eq!(defense.next_event(Duration::from_micros(6)), None);
+        assert_eq!(defense.incoming_capacity_reserved, 100);
+    }
+
+    #[test]
+    fn retired_credit_is_a_terminal_bounded_realization_failure() {
+        let mut defense = WalkieTalkie::from_json(
+            &config(100),
+            1_200,
+            &molded(r#"[{"outgoing": 1, "incoming": 2}]"#),
+        )
+        .expect("single-batch molded sequence");
+        application_batch_started(&mut defense, 0);
+        application_bytes(&mut defense, 0, Direction::Outgoing, 100);
+        let outgoing = defense.next_event(Duration::ZERO).expect("outgoing cell");
+        resolve(
+            &mut defense,
+            1,
+            outgoing,
+            EventOutcome::Satisfied { observed: 100 },
+        );
+        let credits: Vec<_> = std::iter::repeat_with(|| {
+            defense
+                .next_event(Duration::from_micros(1))
+                .expect("initial incoming credit")
+        })
+        .take(2)
+        .collect();
+        for credit in credits {
+            resolve(
+                &mut defense,
+                2,
+                credit,
+                EventOutcome::Satisfied { observed: 100 },
+            );
+        }
+        incoming_payload(&mut defense, 3, 150, false);
+        application_bytes(&mut defense, 3, Direction::Incoming, 150);
+        retire_credit(&mut defense, 4, 50);
+
+        assert_eq!(
+            defense.realization_failure,
+            Some(super::RealizationFailure::ReceiveCreditRetired)
+        );
+        for at_us in 4..=10_000 {
+            assert_eq!(defense.next_event(Duration::from_micros(at_us)), None);
+        }
+        assert_eq!(defense.next_event_at(), None);
+        assert!(defense.can_release_chaff_send_shaping());
+
+        application_batch_completed(&mut defense, 10_001);
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(10_002),
             kind: SignalKind::ApplicationComplete,
         });
         assert!(defense.is_complete());
         let diagnostics = defense.diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 4);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 4);
-        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 0);
+        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 2);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 2);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 50);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 0);
-        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 75);
-        assert_eq!(diagnostics.walkie_talkie_expected_application_batches, 2);
-        assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 2);
+        assert_eq!(diagnostics.walkie_talkie_expected_application_batches, 1);
+        assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 0);
     }
@@ -2060,28 +2133,23 @@ mod tests {
         // completion alone cannot prove that this allowance was lost.
         assert_eq!(defense.next_event(Duration::from_micros(3)), None);
         retire_credit(&mut defense, 4, 50);
-        let retry = defense
-            .next_event(Duration::from_micros(4))
-            .expect("only retired credit is retried");
-        assert_eq!(retry.length(), 50);
-        assert_eq!(defense.next_event(Duration::from_micros(4)), None);
-        resolve(
-            &mut defense,
-            5,
-            retry,
-            EventOutcome::Satisfied { observed: 50 },
+        assert_eq!(
+            defense.realization_failure,
+            Some(super::RealizationFailure::ReceiveCreditRetired)
         );
-        incoming_payload(&mut defense, 6, 150, true);
+        assert_eq!(defense.next_event(Duration::from_micros(4)), None);
+        assert_eq!(defense.next_event_at(), None);
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(7),
+            at: Duration::from_micros(5),
             kind: SignalKind::ApplicationComplete,
         });
 
         let diagnostics = defense.diagnostics();
         assert!(defense.is_complete());
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 2);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 1);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 150);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 0);
+        assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 1);
     }
 
     #[test]
@@ -2092,6 +2160,7 @@ mod tests {
             &molded(r#"[{"outgoing": 0, "incoming": 1}]"#),
         )
         .expect("single incoming cell");
+        provide_capacity(&mut defense, 0, 100);
         let credit = defense.next_event(Duration::ZERO).expect("incoming credit");
         resolve(
             &mut defense,
@@ -2130,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn missed_residual_credit_retries_only_after_terminal_failure_observation() {
+    fn impossible_incoming_slot_fails_once_without_a_retry_loop() {
         let mut defense = WalkieTalkie::from_json(
             &config(100),
             1_200,
@@ -2153,52 +2222,31 @@ mod tests {
             &mut defense,
             2,
             initial,
-            EventOutcome::Satisfied { observed: 100 },
-        );
-        incoming_payload(&mut defense, 3, 60, false);
-        application_bytes(&mut defense, 3, Direction::Incoming, 60);
-        retire_credit(&mut defense, 4, 40);
-        application_batch_completed(&mut defense, 4);
-
-        let first_retry = defense
-            .next_event(Duration::from_micros(4))
-            .expect("first exact residual attempt");
-        assert_eq!(first_retry.length(), 40);
-        assert_eq!(defense.next_event(Duration::from_micros(4)), None);
-        resolve(
-            &mut defense,
-            5,
-            first_retry,
             EventOutcome::Missed(MissedSlotReason::InsufficientIncomingCapacity),
         );
-        let second_retry = defense
-            .next_event(Duration::from_micros(5))
-            .expect("failed residual credit is retryable");
-        assert_eq!(second_retry.length(), 40);
-        resolve(
-            &mut defense,
-            6,
-            second_retry,
-            EventOutcome::Satisfied { observed: 40 },
+        assert_eq!(
+            defense.realization_failure,
+            Some(super::RealizationFailure::IncomingSlotMissed(
+                MissedSlotReason::InsufficientIncomingCapacity
+            ))
         );
-
-        for at in [6, 100, 10_000] {
+        for at in 2..=24_000 {
             assert_eq!(defense.next_event(Duration::from_micros(at)), None);
         }
+        assert_eq!(defense.next_event_at(), None);
+        provide_capacity(&mut defense, 24_001, 100);
+        provide_capacity(&mut defense, 24_002, 200);
+        assert_eq!(defense.next_event(Duration::from_micros(24_002)), None);
         assert_eq!(
             defense.diagnostics().walkie_talkie_incoming_shortfall_bytes,
-            40
+            100
         );
-        incoming_payload(&mut defense, 10_001, 40, true);
+        application_batch_completed(&mut defense, 24_003);
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(10_002),
+            at: Duration::from_micros(24_004),
             kind: SignalKind::ApplicationComplete,
         });
         assert!(defense.is_complete());
-        assert_eq!(
-            defense.diagnostics().walkie_talkie_incoming_shortfall_bytes,
-            0
-        );
     }
 
     #[test]
@@ -2553,6 +2601,7 @@ mod tests {
             ),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
         assert_eq!(
             defense.next_event(Duration::ZERO).map(Packet::direction),
             Some(Direction::Incoming)
@@ -2581,6 +2630,7 @@ mod tests {
             ),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
         assert!(defense.next_event(Duration::ZERO).is_some());
         incoming_payload(&mut defense, 1, 200, false);
         assert!(defense.next_event(Duration::from_micros(1)).is_some());
@@ -2631,6 +2681,7 @@ mod tests {
             &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
 
         assert!(defense.is_outgoing_complete());
         assert!(!defense.can_release_chaff_send_shaping());
@@ -2668,6 +2719,7 @@ mod tests {
             ),
         )
         .expect("molded sequence");
+        provide_capacity(&mut defense, 0, u64::MAX);
         assert_eq!(
             defense.next_event(Duration::ZERO).map(Packet::direction),
             Some(Direction::Incoming)
@@ -2730,6 +2782,13 @@ mod tests {
                 .expect("golden incoming packet")
         };
         let script = [
+            (
+                Duration::ZERO,
+                SignalKind::Capacity(Capacity {
+                    application_incoming: u64::MAX,
+                    chaff_incoming: 0,
+                }),
+            ),
             (
                 Duration::from_micros(10),
                 SignalKind::Resolved {
