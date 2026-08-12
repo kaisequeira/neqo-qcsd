@@ -13,8 +13,6 @@ use std::{
     time::Instant,
 };
 
-#[cfg(feature = "qcsd")]
-use neqo_common::Encoder;
 use neqo_common::{Header, header::HeadersExt as _, qdebug, qinfo, qtrace};
 use neqo_qpack as qpack;
 use neqo_transport::{Connection, StreamId};
@@ -159,15 +157,15 @@ impl RecvMessage {
         }
     }
 
-    fn handle_headers_frame(&mut self, header_block: Vec<u8>, fin: bool) -> Res<()> {
+    fn handle_headers_frame(
+        &mut self,
+        header_block: Vec<u8>,
+        fin: bool,
+        #[cfg(feature = "qcsd")] frame_bytes: u64,
+    ) -> Res<()> {
         #[cfg(feature = "qcsd")]
         {
-            self.qcsd_header_frame_bytes = u64::try_from(
-                Encoder::varint_len(HFrameType::HEADERS.0)
-                    + Encoder::varint_len(header_block.len() as u64)
-                    + header_block.len(),
-            )
-            .map_err(|_| Error::HttpFrame)?;
+            self.qcsd_header_frame_bytes = frame_bytes;
         }
         match self.state {
             RecvMessageState::WaitingForResponseHeaders { .. } => {
@@ -178,6 +176,12 @@ impl RecvMessage {
             }
             RecvMessageState::WaitingForData { .. } => {
                 // TODO implement trailers, for now just ignore them.
+                #[cfg(feature = "qcsd")]
+                self.conn_events.qcsd_response_headers(
+                    self.stream_id,
+                    self.qcsd_header_frame_bytes,
+                    &[],
+                );
                 self.state = RecvMessageState::WaitingForFinAfterTrailers {
                     frame_reader: FrameReader::new(),
                 };
@@ -192,14 +196,15 @@ impl RecvMessage {
         Ok(())
     }
 
-    fn handle_data_frame(&mut self, len: u64, fin: bool) -> Res<()> {
+    fn handle_data_frame(
+        &mut self,
+        len: u64,
+        fin: bool,
+        #[cfg(feature = "qcsd")] frame_header_bytes: u64,
+    ) -> Res<()> {
         #[cfg(feature = "qcsd")]
-        self.conn_events.qcsd_data_frame(
-            self.stream_id,
-            u64::try_from(Encoder::varint_len(HFrameType::DATA.0) + Encoder::varint_len(len))
-                .map_err(|_| Error::HttpFrame)?,
-            len,
-        );
+        self.conn_events
+            .qcsd_data_frame(self.stream_id, frame_header_bytes, len);
         match self.state {
             RecvMessageState::WaitingForResponseHeaders { .. }
             | RecvMessageState::WaitingForFinAfterTrailers { .. } => {
@@ -238,7 +243,7 @@ impl RecvMessage {
         }
 
         #[cfg(feature = "qcsd")]
-        if self.message_type == MessageType::Response && !interim {
+        if self.message_type == MessageType::Response {
             self.conn_events.qcsd_response_headers(
                 self.stream_id,
                 self.qcsd_header_frame_bytes,
@@ -303,9 +308,20 @@ impl RecvMessage {
         Ok(())
     }
 
-    fn handle_push_promise(&mut self, push_id: PushId, header_block: Vec<u8>) -> Res<()> {
+    fn handle_push_promise(
+        &mut self,
+        push_id: PushId,
+        header_block: Vec<u8>,
+        #[cfg(feature = "qcsd")] frame_bytes: u64,
+    ) -> Res<()> {
         if self.push_handler.is_none() {
             return Err(Error::HttpFrameUnexpected);
+        }
+
+        #[cfg(feature = "qcsd")]
+        {
+            self.conn_events
+                .qcsd_push_promise_frame(self.stream_id, frame_bytes);
         }
 
         if !self.blocked_push_promise.is_empty() {
@@ -332,6 +348,57 @@ impl RecvMessage {
         Ok(())
     }
 
+    fn handle_frame(
+        &mut self,
+        frame: HFrame,
+        fin: bool,
+        #[cfg(feature = "qcsd")] frame_bytes: u64,
+    ) -> Res<()> {
+        match frame {
+            HFrame::Headers { header_block } => self.handle_headers_frame(
+                header_block,
+                fin,
+                #[cfg(feature = "qcsd")]
+                frame_bytes,
+            ),
+            HFrame::Data { len } => self.handle_data_frame(
+                len,
+                fin,
+                #[cfg(feature = "qcsd")]
+                frame_bytes,
+            ),
+            HFrame::PushPromise {
+                push_id,
+                header_block,
+            } => self.handle_push_promise(
+                push_id,
+                header_block,
+                #[cfg(feature = "qcsd")]
+                frame_bytes,
+            ),
+            _ => Err(Error::HttpFrameUnexpected),
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_observe_ignored(
+        conn_events: &dyn HttpRecvStreamEvents,
+        stream_id: StreamId,
+        frame_reader: &mut FrameReader,
+    ) {
+        let frame_bytes = frame_reader.qcsd_take_ignored_frame_bytes();
+        if frame_bytes > 0 {
+            conn_events.qcsd_ignored_request_stream_frame(stream_id, frame_bytes);
+        }
+    }
+
+    #[cfg_attr(
+        feature = "qcsd",
+        expect(
+            clippy::too_many_lines,
+            reason = "keeping this state machine in one place makes transitions auditable"
+        )
+    )]
     fn receive_internal(
         &mut self,
         conn: &mut Connection,
@@ -340,6 +407,8 @@ impl RecvMessage {
     ) -> Res<()> {
         loop {
             qdebug!("[{self}] state={:?}", self.state);
+            #[cfg(feature = "qcsd")]
+            let waiting_for_data = matches!(&self.state, RecvMessageState::WaitingForData { .. });
             match &mut self.state {
                 // In the following 3 states we need to read frames.
                 RecvMessageState::WaitingForResponseHeaders { frame_reader }
@@ -352,6 +421,12 @@ impl RecvMessage {
                         self.conn_events.as_ref(),
                         now,
                     )?;
+                    #[cfg(feature = "qcsd")]
+                    Self::qcsd_observe_ignored(
+                        self.conn_events.as_ref(),
+                        self.stream_id,
+                        frame_reader,
+                    );
                     match received {
                         (None, true) => {
                             break self.set_state_to_close_pending(post_readable_event);
@@ -362,25 +437,23 @@ impl RecvMessage {
                                 self.stream_id,
                                 u64::try_from(frame_reader.qcsd_min_remaining())
                                     .map_err(|_| Error::Internal)?,
+                                waiting_for_data && frame_reader.qcsd_at_frame_boundary(),
                             );
                             break Ok(());
                         }
                         (Some(frame), fin) => {
+                            #[cfg(feature = "qcsd")]
+                            let frame_bytes = frame_reader.qcsd_last_frame_bytes();
                             qdebug!(
                                 "[{self}] recv frame: {frame:?}; state={:?} fin={fin}",
                                 self.state,
                             );
-                            match frame {
-                                HFrame::Headers { header_block } => {
-                                    self.handle_headers_frame(header_block, fin)?;
-                                }
-                                HFrame::Data { len } => self.handle_data_frame(len, fin)?,
-                                HFrame::PushPromise {
-                                    push_id,
-                                    header_block,
-                                } => self.handle_push_promise(push_id, header_block)?,
-                                _ => break Err(Error::HttpFrameUnexpected),
-                            }
+                            self.handle_frame(
+                                frame,
+                                fin,
+                                #[cfg(feature = "qcsd")]
+                                frame_bytes,
+                            )?;
                             if matches!(self.state, RecvMessageState::Closed) {
                                 break Ok(());
                             }

@@ -31,6 +31,19 @@ pub(super) struct PendingCredit {
     pub increase: u64,
 }
 
+/// Scheduled incoming work provisionally owned by one stream's bounded
+/// framing allowance.  A claim does not advertise receive credit; exact HTTP/3
+/// parser observations convert it into [`PendingCredit`] continuations for the
+/// same slot.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PendingClaim {
+    pub slot: QcsdSlotId,
+    pub packet: Packet,
+    pub endpoint: QcsdEndpointId,
+    pub stream: QcsdStreamId,
+    pub remaining: u64,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ControlLoop {
     pub next_slot_id: u64,
@@ -38,6 +51,7 @@ pub(super) struct ControlLoop {
     pub incoming: Vec<PendingIncoming>,
     pub outgoing: Vec<PendingOutgoing>,
     pub credit: Vec<PendingCredit>,
+    pub claims: Vec<PendingClaim>,
     /// Incoming slots already classified as terminal must not be resolved a
     /// second time if a delayed observation arrives for an old offset range.
     pub terminal_incoming: HashSet<QcsdSlotId>,
@@ -64,6 +78,12 @@ impl ControlLoop {
 
     pub(super) fn incoming_backlog(&self) -> u64 {
         self.incoming
+            .iter()
+            .fold(0, |total, pending| total.saturating_add(pending.remaining))
+    }
+
+    pub(super) fn claim_backlog(&self) -> u64 {
+        self.claims
             .iter()
             .fold(0, |total, pending| total.saturating_add(pending.remaining))
     }

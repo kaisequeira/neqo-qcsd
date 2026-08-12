@@ -80,6 +80,66 @@ fn encode_frame_header(frame_type: HFrameType, len: usize) -> Vec<u8> {
     enc.into()
 }
 
+#[cfg(feature = "qcsd")]
+#[test]
+fn qcsd_reports_exact_noncanonical_frame_encoding_lengths() {
+    let mut reader = FrameReaderTest::new();
+
+    // HEADERS type=1 encoded as a two-byte varint and payload length=1 as a
+    // four-byte varint, followed by one header-block byte.
+    let headers = [0x40, 0x01, 0x80, 0x00, 0x00, 0x01, 0xaa];
+    assert!(matches!(
+        reader.process::<HFrame>(&headers),
+        Some(HFrame::Headers { header_block }) if header_block == [0xaa]
+    ));
+    assert_eq!(reader.fr.qcsd_last_frame_bytes(), 7);
+
+    // PUSH_PROMISE type=5 encoded as an eight-byte varint and payload
+    // length=2 as a two-byte varint, followed by push-id 0 and one QPACK byte.
+    let push_promise = [
+        0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x40, 0x02, 0x00, 0xbb,
+    ];
+    assert!(matches!(
+        reader.process::<HFrame>(&push_promise),
+        Some(HFrame::PushPromise {
+            push_id,
+            header_block,
+        }) if push_id == PushId::new(0) && header_block == [0xbb]
+    ));
+    assert_eq!(reader.fr.qcsd_last_frame_bytes(), 12);
+
+    // Unknown extension frame type=0x21 and payload length=1 both use
+    // deliberately noncanonical four-byte varints. It is legal and ignored.
+    let extension = [0x80, 0x00, 0x00, 0x21, 0x80, 0x00, 0x00, 0x01, 0xcc];
+    assert!(reader.process::<HFrame>(&extension).is_none());
+    assert_eq!(reader.fr.qcsd_take_ignored_frame_bytes(), 9);
+    assert_eq!(reader.fr.qcsd_take_ignored_frame_bytes(), 0);
+}
+
+#[cfg(feature = "qcsd")]
+#[test]
+fn qcsd_frame_boundary_distinguishes_partial_data_length_varints() {
+    let mut reader = FrameReaderTest::new();
+    assert!(reader.fr.qcsd_at_frame_boundary());
+
+    // DATA type byte: the parser is now awaiting the first length byte.
+    assert!(reader.process::<HFrame>(&[0x00]).is_none());
+    assert!(!reader.fr.qcsd_at_frame_boundary());
+
+    // A two-byte varint announcing length 64 is still incomplete after its
+    // first byte; HeaderProgress can request its one exact remaining byte.
+    assert!(reader.process::<HFrame>(&[0x40]).is_none());
+    assert!(!reader.fr.qcsd_at_frame_boundary());
+    assert_eq!(reader.fr.qcsd_min_remaining(), 1);
+
+    assert!(matches!(
+        reader.process::<HFrame>(&[0x40]),
+        Some(HFrame::Data { len: 64 })
+    ));
+    assert!(reader.fr.qcsd_at_frame_boundary());
+    assert_eq!(reader.fr.qcsd_last_frame_bytes(), 3);
+}
+
 // Test receiving byte by byte for a SETTINGS frame.
 #[test]
 fn frame_reading_with_stream_settings1() {

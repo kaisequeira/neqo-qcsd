@@ -143,6 +143,23 @@ impl RoundRobinScheduler {
         Some((endpoint, false))
     }
 
+    /// Stable cyclic endpoint order for one logical incoming slot.
+    ///
+    /// Unlike repeated `next_incoming` calls, fan-out advances the cursor only
+    /// once, so the allocator can inspect every application stream before any
+    /// chaff stream without perturbing subsequent round-robin order.
+    pub fn next_incoming_order(&mut self) -> Vec<QcsdEndpointId> {
+        if self.endpoints.is_empty() {
+            return Vec::new();
+        }
+        let start = self.incoming_cursor;
+        let order = (0..self.endpoints.len())
+            .map(|offset| self.endpoints[(start + offset) % self.endpoints.len()])
+            .collect();
+        self.incoming_cursor = (start + 1) % self.endpoints.len();
+        order
+    }
+
     /// Endpoints in deterministic scheduling order.
     #[must_use]
     pub fn endpoints(&self) -> &[QcsdEndpointId] {

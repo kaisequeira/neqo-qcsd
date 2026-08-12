@@ -143,6 +143,12 @@ pub struct FrameReader {
     frame_type: HFrameType,
     frame_len: u64,
     buffer: [u8; MAX_READ_SIZE],
+    #[cfg(feature = "qcsd")]
+    qcsd_current_frame_bytes: u64,
+    #[cfg(feature = "qcsd")]
+    qcsd_last_frame_bytes: u64,
+    #[cfg(feature = "qcsd")]
+    qcsd_ignored_frame_bytes: u64,
 }
 
 impl Debug for FrameReader {
@@ -152,11 +158,17 @@ impl Debug for FrameReader {
             .try_into()
             .unwrap_or(usize::MAX)
             .min(self.buffer.len());
-        f.debug_struct("FrameReader")
+        let mut debug = f.debug_struct("FrameReader");
+        debug
             .field("state", &self.state)
             .field("frame_type", &self.frame_type)
-            .field("frame", &HexSnipMiddle::new(&self.buffer[..frame_len]))
-            .finish()
+            .field("frame", &HexSnipMiddle::new(&self.buffer[..frame_len]));
+        #[cfg(feature = "qcsd")]
+        debug
+            .field("qcsd_current_frame_bytes", &self.qcsd_current_frame_bytes)
+            .field("qcsd_last_frame_bytes", &self.qcsd_last_frame_bytes)
+            .field("qcsd_ignored_frame_bytes", &self.qcsd_ignored_frame_bytes);
+        debug.finish()
     }
 }
 
@@ -170,6 +182,12 @@ impl FrameReader {
             frame_type: HFrameType(u64::MAX),
             frame_len: 0,
             buffer: [0; MAX_READ_SIZE],
+            #[cfg(feature = "qcsd")]
+            qcsd_current_frame_bytes: 0,
+            #[cfg(feature = "qcsd")]
+            qcsd_last_frame_bytes: 0,
+            #[cfg(feature = "qcsd")]
+            qcsd_ignored_frame_bytes: 0,
         }
     }
 
@@ -182,6 +200,12 @@ impl FrameReader {
             frame_type,
             frame_len: 0,
             buffer: [0; MAX_READ_SIZE],
+            #[cfg(feature = "qcsd")]
+            qcsd_current_frame_bytes: 0,
+            #[cfg(feature = "qcsd")]
+            qcsd_last_frame_bytes: 0,
+            #[cfg(feature = "qcsd")]
+            qcsd_ignored_frame_bytes: 0,
         }
     }
 
@@ -189,6 +213,10 @@ impl FrameReader {
         self.state = FrameReaderState::GetType {
             decoder: IncrementalDecoderUint::default(),
         };
+        #[cfg(feature = "qcsd")]
+        {
+            self.qcsd_current_frame_bytes = 0;
+        }
     }
 
     fn min_remaining(&self) -> usize {
@@ -204,6 +232,23 @@ impl FrameReader {
     #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_min_remaining(&self) -> usize {
         self.min_remaining()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn qcsd_at_frame_boundary(&self) -> bool {
+        !self.decoding_in_progress()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn qcsd_last_frame_bytes(&self) -> u64 {
+        self.qcsd_last_frame_bytes
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn qcsd_take_ignored_frame_bytes(&mut self) -> u64 {
+        let ignored = self.qcsd_ignored_frame_bytes;
+        self.qcsd_ignored_frame_bytes = 0;
+        ignored
     }
 
     const fn decoding_in_progress(&self) -> bool {
@@ -260,6 +305,13 @@ impl FrameReader {
     ///
     /// May return `HttpFrame` if a frame cannot be decoded.
     fn consume<T: FrameDecoder<T>>(&mut self, amount: usize) -> Res<Option<T>> {
+        #[cfg(feature = "qcsd")]
+        {
+            self.qcsd_current_frame_bytes = self
+                .qcsd_current_frame_bytes
+                .checked_add(u64::try_from(amount).map_err(|_| Error::Internal)?)
+                .ok_or(Error::HttpFrame)?;
+        }
         let mut input = Decoder::from(&self.buffer[..amount]);
         match &mut self.state {
             FrameReaderState::GetType { decoder } => {
@@ -289,6 +341,8 @@ impl FrameReader {
             }
             FrameReaderState::UnknownFrameDischargeData { decoder } => {
                 if decoder.consume(&mut input) {
+                    #[cfg(feature = "qcsd")]
+                    self.qcsd_finish_ignored_frame()?;
                     self.reset();
                 }
             }
@@ -318,6 +372,8 @@ impl FrameReader {
                     // only type and length fields.
                     self.write_item_to_fuzzing_corpus(corpus, None);
                 }
+                #[cfg(feature = "qcsd")]
+                self.qcsd_finish_frame();
                 self.reset();
                 return Ok(Some(f));
             }
@@ -331,6 +387,8 @@ impl FrameReader {
                         decoder: IncrementalDecoderBuffer::new(len),
                     };
                 } else if self.frame_len == 0 {
+                    #[cfg(feature = "qcsd")]
+                    self.qcsd_finish_ignored_frame()?;
                     self.reset();
                 } else {
                     self.state = FrameReaderState::UnknownFrameDischargeData {
@@ -351,8 +409,28 @@ impl FrameReader {
         }
 
         let res = T::decode(self.frame_type, self.frame_len, Some(data))?;
+        #[cfg(feature = "qcsd")]
+        if res.is_some() {
+            self.qcsd_finish_frame();
+        }
         self.reset();
         Ok(res)
+    }
+
+    #[cfg(feature = "qcsd")]
+    const fn qcsd_finish_frame(&mut self) {
+        self.qcsd_last_frame_bytes = self.qcsd_current_frame_bytes;
+        self.qcsd_current_frame_bytes = 0;
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_finish_ignored_frame(&mut self) -> Res<()> {
+        self.qcsd_ignored_frame_bytes = self
+            .qcsd_ignored_frame_bytes
+            .checked_add(self.qcsd_current_frame_bytes)
+            .ok_or(Error::HttpFrame)?;
+        self.qcsd_current_frame_bytes = 0;
+        Ok(())
     }
 
     #[cfg(feature = "build-fuzzing-corpus")]

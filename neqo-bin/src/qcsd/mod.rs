@@ -2057,40 +2057,37 @@ fn register_action_batch(
     actions: &[QcsdAction],
 ) -> Result<BTreeSet<QcsdSlotId>, Error> {
     let mut registered_slots = BTreeMap::new();
-    let mut incoming_targets = BTreeSet::new();
     let mut incoming_fanout_slots = BTreeSet::new();
     for action in actions {
         let Some((endpoint, packet, slot)) = scheduled_action(action) else {
             continue;
         };
-        let incoming_target = match action {
+        let incoming_action = match action {
             QcsdAction::IncreaseReceiveLimit {
-                endpoint, stream, ..
-            } => Some((*endpoint, *stream)),
+                endpoint,
+                stream,
+                absolute_limit,
+                ..
+            } => Some((*endpoint, *stream, *absolute_limit)),
             QcsdAction::SendPacket { .. } => None,
             _ => unreachable!("scheduled_action returned an unscheduled action"),
         };
-        if let Some(target) = incoming_target
-            && !incoming_targets.insert((slot, target))
-        {
-            return Err(Error::SlotInvariant(format!(
-                "incoming slot {} targeted the same endpoint and stream more than once",
-                slot.0
-            )));
-        }
         if let std::collections::btree_map::Entry::Vacant(entry) = registered_slots.entry(slot) {
-            entry.insert(incoming_target.is_some());
-            traces.register_slot(now, endpoint, packet, slot)?;
+            entry.insert(incoming_action.is_some());
         } else {
             let primary_is_incoming = registered_slots.get(&slot).copied().unwrap_or(false);
-            if !primary_is_incoming || incoming_target.is_none() {
+            if !primary_is_incoming || incoming_action.is_none() {
                 return Err(Error::SlotInvariant(format!(
                     "slot {} was reused outside an incoming receive-credit fan-out",
                     slot.0
                 )));
             }
-            traces.register_incoming_sibling(endpoint, packet, slot)?;
             incoming_fanout_slots.insert(slot);
+        }
+        if let Some((endpoint, stream, absolute_limit)) = incoming_action {
+            traces.register_incoming_action(now, endpoint, stream, absolute_limit, packet, slot)?;
+        } else {
+            traces.register_slot(now, endpoint, packet, slot)?;
         }
     }
     Ok(incoming_fanout_slots)
@@ -3081,6 +3078,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cross-layer receive-credit lifecycle is one regression oracle"
+    )]
     fn exact_application_response_consumes_scheduled_credit_without_retiring_reserve() {
         let resource = Resource {
             id: 1,
@@ -3265,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_slot_registration_scopes_fanout_to_one_batch() {
+    fn logical_slot_registration_allows_strict_incoming_continuation() {
         let output = trace_output_dir("logical-slot");
         let started = now();
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
@@ -3273,22 +3274,49 @@ mod tests {
         let slot = QcsdSlotId(7);
 
         traces
-            .register_slot(started, QcsdEndpointId(1), packet, slot)
+            .register_incoming_action(
+                started + Duration::from_micros(3),
+                QcsdEndpointId(1),
+                QcsdStreamId(0),
+                116,
+                packet,
+                slot,
+            )
             .expect("first stream fragment");
-        assert!(
-            traces
-                .register_slot(started, QcsdEndpointId(1), packet, slot)
-                .is_err()
-        );
         traces
-            .register_incoming_sibling(QcsdEndpointId(1), packet, slot)
-            .expect("second stream fragment in the same batch");
+            .register_incoming_action(
+                started + Duration::from_micros(6),
+                QcsdEndpointId(1),
+                QcsdStreamId(0),
+                131,
+                packet,
+                slot,
+            )
+            .expect("later receive-limit continuation");
         traces
-            .register_incoming_sibling(QcsdEndpointId(2), packet, slot)
-            .expect("reassigned fragment in the same batch");
+            .register_incoming_action(
+                started + Duration::from_micros(7),
+                QcsdEndpointId(1),
+                QcsdStreamId(4),
+                216,
+                packet,
+                slot,
+            )
+            .expect("stream fan-out");
+        traces
+            .register_incoming_action(
+                started + Duration::from_micros(8),
+                QcsdEndpointId(2),
+                QcsdStreamId(0),
+                16,
+                packet,
+                slot,
+            )
+            .expect("endpoint reassignment");
+        assert!(traces.is_slot_pending(slot));
         traces
             .schedule(&ScheduleTraceRow {
-                action_time_us: 0,
+                action_time_us: 99,
                 endpoint: Some(QcsdEndpointId(2)),
                 packet,
                 satisfaction: "missed",
@@ -3299,12 +3327,14 @@ mod tests {
             .expect("terminal row");
         assert!(
             traces
-                .register_slot(started, QcsdEndpointId(2), packet, slot)
-                .is_err()
-        );
-        assert!(
-            traces
-                .register_incoming_sibling(QcsdEndpointId(2), packet, slot)
+                .register_incoming_action(
+                    started + Duration::from_micros(9),
+                    QcsdEndpointId(2),
+                    QcsdStreamId(0),
+                    32,
+                    packet,
+                    slot,
+                )
                 .is_err()
         );
         drop(traces);
@@ -3312,6 +3342,70 @@ mod tests {
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
         assert_eq!(schedule.lines().count(), 2);
         assert!(schedule.contains("EndpointClosed,7"));
+        let fields: Vec<_> = schedule
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
+        assert_eq!(fields[4], "3");
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    fn pending_incoming_slot_rejects_duplicate_regressing_and_cross_kind_reuse() {
+        let output = trace_output_dir("invalid-incoming-slot-reuse");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let slot = QcsdSlotId(8);
+        traces
+            .register_incoming_action(
+                started,
+                QcsdEndpointId(1),
+                QcsdStreamId(0),
+                116,
+                packet,
+                slot,
+            )
+            .expect("initial incoming action");
+
+        for invalid_limit in [116, 115] {
+            assert!(
+                traces
+                    .register_incoming_action(
+                        started,
+                        QcsdEndpointId(1),
+                        QcsdStreamId(0),
+                        invalid_limit,
+                        packet,
+                        slot,
+                    )
+                    .is_err()
+            );
+        }
+        let different_packet =
+            Packet::new(Duration::ZERO, Direction::Incoming, 101).expect("different packet");
+        assert!(
+            traces
+                .register_incoming_action(
+                    started,
+                    QcsdEndpointId(1),
+                    QcsdStreamId(4),
+                    216,
+                    different_packet,
+                    slot,
+                )
+                .is_err()
+        );
+        let outgoing_packet =
+            Packet::new(Duration::ZERO, Direction::Outgoing, 100).expect("outgoing packet");
+        assert!(
+            traces
+                .register_slot(started, QcsdEndpointId(1), outgoing_packet, slot)
+                .is_err()
+        );
+        drop(traces);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -3324,7 +3418,7 @@ mod tests {
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
         let slot = QcsdSlotId(21);
         traces
-            .register_slot(started, endpoint, packet, slot)
+            .register_incoming_action(started, endpoint, QcsdStreamId(0), 116, packet, slot)
             .expect("incoming registration");
 
         assert!(
@@ -3393,31 +3487,59 @@ mod tests {
     }
 
     #[test]
-    fn action_batch_allows_only_distinct_incoming_credit_fanout() {
+    fn action_batch_allows_increasing_incoming_credit_continuation_and_fanout() {
         let output = trace_output_dir("action-batch-fanout");
         let started = now();
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
         let slot = QcsdSlotId(13);
-        let incoming = |endpoint, stream| QcsdAction::IncreaseReceiveLimit {
+        let incoming = |endpoint, stream, absolute_limit| QcsdAction::IncreaseReceiveLimit {
             endpoint: QcsdEndpointId(endpoint),
             stream: QcsdStreamId(stream),
-            absolute_limit: 116,
+            absolute_limit,
             packet,
             slot,
         };
 
         let mut valid = TraceFiles::new(&output, started).expect("trace files");
-        let fanout = register_action_batch(&mut valid, started, &[incoming(1, 0), incoming(2, 4)])
-            .expect("cross-endpoint receive-credit fanout");
+        let fanout = register_action_batch(
+            &mut valid,
+            started,
+            &[incoming(1, 0, 116), incoming(2, 4, 216)],
+        )
+        .expect("cross-endpoint receive-credit fanout");
         assert_eq!(fanout, std::iter::once(slot).collect());
+        assert!(valid.is_slot_pending(slot));
+        assert!(
+            register_action_batch(
+                &mut valid,
+                started + Duration::from_micros(1),
+                &[incoming(1, 0, 131)],
+            )
+            .expect("later action-batch continuation")
+            .is_empty()
+        );
         drop(valid);
         fs::remove_dir_all(&output).expect("remove valid trace test directory");
 
         fs::create_dir_all(&output).expect("recreate trace test directory");
         let mut duplicate = TraceFiles::new(&output, started).expect("trace files");
+        register_action_batch(&mut duplicate, started, &[incoming(1, 0, 116)])
+            .expect("initial target");
         assert!(
-            register_action_batch(&mut duplicate, started, &[incoming(1, 0), incoming(1, 0)])
-                .is_err()
+            register_action_batch(
+                &mut duplicate,
+                started + Duration::from_micros(1),
+                &[incoming(1, 0, 116)],
+            )
+            .is_err()
+        );
+        assert!(
+            register_action_batch(
+                &mut duplicate,
+                started + Duration::from_micros(2),
+                &[incoming(1, 0, 115)],
+            )
+            .is_err()
         );
         drop(duplicate);
         fs::remove_dir_all(&output).expect("remove duplicate trace test directory");
@@ -3493,7 +3615,14 @@ mod tests {
         let slot = QcsdSlotId(12);
 
         traces
-            .register_slot(started, QcsdEndpointId(1), packet, slot)
+            .register_incoming_action(
+                started,
+                QcsdEndpointId(1),
+                QcsdStreamId(0),
+                116,
+                packet,
+                slot,
+            )
             .expect("registration");
         traces
             .schedule(&ScheduleTraceRow {
@@ -3521,7 +3650,14 @@ mod tests {
         );
         assert!(
             traces
-                .register_slot(started, QcsdEndpointId(1), different_packet, slot)
+                .register_incoming_action(
+                    started,
+                    QcsdEndpointId(1),
+                    QcsdStreamId(0),
+                    131,
+                    different_packet,
+                    slot,
+                )
                 .is_err()
         );
         drop(traces);
@@ -3630,7 +3766,14 @@ mod tests {
         controller.poll(Duration::ZERO);
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         traces
-            .register_slot(started, QcsdEndpointId(7), packet, slot)
+            .register_incoming_action(
+                started,
+                QcsdEndpointId(7),
+                QcsdStreamId(0),
+                116,
+                packet,
+                slot,
+            )
             .expect("registered incoming action");
 
         terminalize_pending_slots(

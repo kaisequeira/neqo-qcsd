@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use control_loop::{ControlLoop, PendingCredit, PendingIncoming, PendingOutgoing};
+use control_loop::{ControlLoop, PendingClaim, PendingCredit, PendingIncoming, PendingOutgoing};
 
 use crate::{
     Capacity, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
@@ -302,23 +302,25 @@ impl QcsdController {
     /// shutdown.
     pub fn abort_pending_slots(&mut self, at: Duration, reason: MissedSlotReason) {
         let pending = self.pending_slots();
-        let pending_ids: HashSet<_> = pending.iter().map(|(slot, _)| *slot).collect();
+        let incoming: HashSet<_> = self.incoming_credit_ledger.keys().copied().collect();
+        // Roll back the complete unadvertised set before terminalizing any
+        // individual slot.  A later release on the same stream depends on all
+        // earlier absolute limits, so per-slot ascending cancellation is not
+        // safe even when every individual release is still unadvertised.
+        self.fail_incoming_slots(&incoming, reason, at, true);
+
+        let outgoing: HashSet<_> = pending
+            .iter()
+            .filter_map(|(slot, _)| (!incoming.contains(slot)).then_some(*slot))
+            .collect();
         self.actions.retain(|action| {
-            !matches!(
-                action,
-                QcsdAction::SendPacket { slot, .. }
-                    | QcsdAction::IncreaseReceiveLimit { slot, .. }
-                    if pending_ids.contains(slot)
-            )
+            !matches!(action, QcsdAction::SendPacket { slot, .. } if outgoing.contains(slot))
         });
         self.control.outgoing.clear();
         self.control.incoming.clear();
-        self.control.credit.clear();
 
         for (slot, packet) in pending {
-            if self.incoming_credit_ledger.contains_key(&slot) {
-                self.fail_incoming_slot(slot, reason, at, true);
-            } else {
+            if !incoming.contains(&slot) && self.pending_slots.contains_key(&slot) {
                 self.actions.push_back(QcsdAction::SlotMissed {
                     endpoint: None,
                     packet,
@@ -332,6 +334,8 @@ impl QcsdController {
 
         debug_assert!(self.pending_slots.is_empty());
         debug_assert!(self.incoming_credit_ledger.is_empty());
+        debug_assert!(self.control.credit.is_empty());
+        debug_assert!(self.control.claims.is_empty());
         debug_assert!(self.advertised_incoming_credit.is_empty());
     }
 
@@ -353,6 +357,7 @@ impl QcsdController {
                 self.release_chaff_send_shaping_for(endpoint);
             }
             QcsdObservation::EndpointClosed { endpoint } => {
+                self.return_endpoint_claims(endpoint);
                 self.scheduler.remove_endpoint(endpoint);
                 self.endpoint_origins.remove(&endpoint);
                 self.streams.remove_endpoint(endpoint);
@@ -373,33 +378,54 @@ impl QcsdController {
                 endpoint,
                 stream,
                 min_remaining,
-            } => self.streams.header_progress(
-                endpoint,
-                stream,
-                min_remaining,
-                self.config.max_stream_data_excess,
-            ),
+                awaiting_data_frame,
+            } => {
+                self.streams
+                    .header_progress(endpoint, stream, min_remaining, awaiting_data_frame);
+                self.release_exact_claims(endpoint, stream);
+            }
             QcsdObservation::ResponseHeaders {
                 endpoint,
                 stream,
+                frame_bytes,
                 status,
                 content_length,
                 ..
             } => {
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
-                    state.status = status;
-                    state.receive.response_headers(content_length);
+                    if status.is_some() {
+                        state.status = status;
+                    }
+                    state.receive.response_headers(frame_bytes, content_length);
                 }
+                self.release_exact_claims(endpoint, stream);
             }
             QcsdObservation::DataFrame {
                 endpoint,
                 stream,
+                frame_header_bytes,
                 data_bytes,
                 ..
             } => {
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
-                    state.receive.data_frame(data_bytes);
+                    state.receive.data_frame(frame_header_bytes, data_bytes);
                 }
+                self.release_exact_claims(endpoint, stream);
+            }
+            QcsdObservation::PushPromiseFrame {
+                endpoint,
+                stream,
+                frame_bytes,
+            }
+            | QcsdObservation::IgnoredRequestStreamFrame {
+                endpoint,
+                stream,
+                frame_bytes,
+            } => {
+                if let Some(state) = self.streams.get_mut(endpoint, stream) {
+                    state.receive.framing(frame_bytes);
+                }
+                self.release_exact_claims(endpoint, stream);
             }
             QcsdObservation::BytesRead {
                 endpoint,
@@ -410,9 +436,7 @@ impl QcsdController {
                     self.streams.get_mut(endpoint, stream).map(|state| {
                         let consumed_start = state.receive.consumed();
                         let cover = matches!(state.role, QcsdRequestRole::Chaff { .. });
-                        state
-                            .receive
-                            .bytes_read(bytes, self.config.max_stream_data_excess);
+                        state.receive.bytes_read(bytes);
                         (cover, consumed_start, state.receive.consumed())
                     })
                 {
@@ -440,13 +464,7 @@ impl QcsdController {
                     );
                 }
             }
-            QcsdObservation::StreamDataBlocked {
-                endpoint,
-                stream,
-                blocked_at,
-            } => self
-                .streams
-                .stream_data_blocked(endpoint, stream, blocked_at),
+            QcsdObservation::StreamDataBlocked { .. } => {}
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
                 stream,
@@ -647,6 +665,7 @@ impl QcsdController {
 
     fn close_stream(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId, at: Duration) {
         self.application_stream_ranges.remove(&(endpoint, stream));
+        self.return_stream_claims(endpoint, stream);
         let Some((state, data_length, _unadvertised)) = self.streams.close(endpoint, stream) else {
             return;
         };
@@ -697,6 +716,59 @@ impl QcsdController {
             ranges.append(&mut advertised_ranges);
             ranges.sort_unstable_by_key(|range| (range.start, range.end, range.slot));
         }
+    }
+
+    /// Convert newly exact receive capacity into continuations owned by the
+    /// same slot that provisionally claimed it.  Claims are consumed in slot
+    /// order and never create more advertised work than the stream reports as
+    /// exact capacity.
+    fn release_exact_claims(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
+        let Some(state) = self.streams.get_mut(endpoint, stream) else {
+            return;
+        };
+        let mut available = state.receive.available();
+        if available == 0 {
+            return;
+        }
+        let mut indices: Vec<_> = self
+            .control
+            .claims
+            .iter()
+            .enumerate()
+            .filter_map(|(index, claim)| {
+                (claim.endpoint == endpoint && claim.stream == stream).then_some(index)
+            })
+            .collect();
+        indices.sort_unstable_by_key(|index| self.control.claims[*index].slot);
+        for index in indices {
+            if available == 0 {
+                break;
+            }
+            let requested = self.control.claims[index].remaining.min(available);
+            let Some((absolute_limit, increase)) = state.receive.release(requested) else {
+                break;
+            };
+            let claim = &mut self.control.claims[index];
+            claim.remaining -= increase;
+            available -= increase;
+            let credit = PendingCredit {
+                slot: claim.slot,
+                packet: claim.packet,
+                endpoint,
+                stream,
+                absolute_limit,
+                increase,
+            };
+            self.control.credit.push(credit);
+            self.actions.push_back(QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit,
+                packet: claim.packet,
+                slot: claim.slot,
+            });
+        }
+        self.control.claims.retain(|claim| claim.remaining > 0);
     }
 
     fn consume_advertised_credit(
@@ -855,6 +927,55 @@ impl QcsdController {
         }
     }
 
+    fn return_stream_claims(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
+        let mut returned = Vec::new();
+        self.control.claims.retain(|claim| {
+            if claim.endpoint == endpoint && claim.stream == stream {
+                returned.push(*claim);
+                false
+            } else {
+                true
+            }
+        });
+        for claim in returned {
+            self.return_claim(&claim);
+        }
+    }
+
+    fn return_endpoint_claims(&mut self, endpoint: QcsdEndpointId) {
+        let mut returned = Vec::new();
+        self.control.claims.retain(|claim| {
+            if claim.endpoint == endpoint {
+                returned.push(*claim);
+                false
+            } else {
+                true
+            }
+        });
+        for claim in returned {
+            self.return_claim(&claim);
+        }
+    }
+
+    fn return_claim(&mut self, claim: &PendingClaim) {
+        if let Some(pending) = self
+            .control
+            .incoming
+            .iter_mut()
+            .find(|pending| pending.slot == claim.slot)
+        {
+            pending.remaining = pending.remaining.saturating_add(claim.remaining);
+            pending.endpoint = None;
+        } else {
+            self.control.incoming.push(PendingIncoming {
+                slot: claim.slot,
+                packet: claim.packet,
+                endpoint: None,
+                remaining: claim.remaining,
+            });
+        }
+    }
+
     fn return_endpoint_credit(&mut self, endpoint: QcsdEndpointId, at: Duration) {
         let mut returned = Vec::new();
         self.control.credit.retain(|credit| {
@@ -900,35 +1021,140 @@ impl QcsdController {
         at: Duration,
         emit_action: bool,
     ) {
-        self.control.credit.retain(|credit| credit.slot != slot);
+        self.fail_incoming_slots(&HashSet::from([slot]), reason, at, emit_action);
+    }
+
+    /// Fail one or more incoming slots without leaving holes in a stream's
+    /// monotonically increasing receive limit.
+    ///
+    /// If a root slot owns an older unadvertised release, every later release
+    /// on that stream is dependent on it. Those slots join the failure set;
+    /// the closure is repeated because a dependent slot can itself own credit
+    /// on another stream. The complete set is rolled back in descending
+    /// absolute-limit order before any records or actions are removed.
+    fn dependent_unadvertised_slots(&self, roots: &HashSet<QcsdSlotId>) -> HashSet<QcsdSlotId> {
+        let mut affected = roots.clone();
+        loop {
+            let mut cutoffs = HashMap::new();
+            for credit in &self.control.credit {
+                if affected.contains(&credit.slot) {
+                    let start = credit.absolute_limit.saturating_sub(credit.increase);
+                    cutoffs
+                        .entry((credit.endpoint, credit.stream))
+                        .and_modify(|cutoff: &mut u64| *cutoff = (*cutoff).min(start))
+                        .or_insert(start);
+                }
+            }
+            let before = affected.len();
+            for credit in &self.control.credit {
+                if cutoffs
+                    .get(&(credit.endpoint, credit.stream))
+                    .is_some_and(|cutoff| credit.absolute_limit > *cutoff)
+                {
+                    affected.insert(credit.slot);
+                }
+            }
+            if affected.len() == before {
+                return affected;
+            }
+        }
+    }
+
+    fn rollback_unadvertised_credits(&mut self, affected: &HashSet<QcsdSlotId>) {
+        let mut credits: Vec<_> = self
+            .control
+            .credit
+            .iter()
+            .copied()
+            .filter(|credit| affected.contains(&credit.slot))
+            .collect();
+        credits.sort_unstable_by(|left, right| {
+            left.endpoint
+                .cmp(&right.endpoint)
+                .then_with(|| left.stream.cmp(&right.stream))
+                .then_with(|| right.absolute_limit.cmp(&left.absolute_limit))
+        });
+        for credit in credits {
+            let cancelled = self.streams.cancel_release(
+                credit.endpoint,
+                credit.stream,
+                credit.absolute_limit,
+                credit.increase,
+            );
+            assert!(
+                cancelled,
+                "unadvertised receive-credit rollback must be LIFO-complete"
+            );
+        }
+    }
+
+    fn fail_incoming_slots(
+        &mut self,
+        roots: &HashSet<QcsdSlotId>,
+        reason: MissedSlotReason,
+        at: Duration,
+        emit_root_actions: bool,
+    ) {
+        if roots.is_empty() {
+            return;
+        }
+
+        let affected = self.dependent_unadvertised_slots(roots);
+        self.rollback_unadvertised_credits(&affected);
+
+        self.actions.retain(|action| {
+            !matches!(action, QcsdAction::IncreaseReceiveLimit { slot, .. } if affected.contains(slot))
+        });
+        self.control
+            .credit
+            .retain(|credit| !affected.contains(&credit.slot));
+        let claims: Vec<_> = self
+            .control
+            .claims
+            .iter()
+            .copied()
+            .filter(|claim| affected.contains(&claim.slot))
+            .collect();
+        self.control
+            .claims
+            .retain(|claim| !affected.contains(&claim.slot));
+        for claim in claims {
+            self.streams
+                .restore_claim(claim.endpoint, claim.stream, claim.remaining);
+        }
         self.control
             .incoming
-            .retain(|incoming| incoming.slot != slot);
+            .retain(|incoming| !affected.contains(&incoming.slot));
         self.advertised_incoming_credit.retain(|_, ranges| {
-            ranges.retain(|range| range.slot != slot);
+            ranges.retain(|range| !affected.contains(&range.slot));
             !ranges.is_empty()
         });
-        let Some(mut ledger) = self.incoming_credit_ledger.remove(&slot) else {
-            return;
-        };
-        let retired = ledger.unresolved();
-        ledger.retired = ledger.retired.saturating_add(retired);
-        self.scheduled_incoming_retired_bytes = self
-            .scheduled_incoming_retired_bytes
-            .saturating_add(retired);
-        if retired > 0 {
-            self.push_signal(at, SignalKind::ReceiveCreditRetired { bytes: retired });
+
+        let mut slots: Vec<_> = affected.into_iter().collect();
+        slots.sort_unstable();
+        for slot in slots {
+            let Some(mut ledger) = self.incoming_credit_ledger.remove(&slot) else {
+                continue;
+            };
+            let retired = ledger.unresolved();
+            ledger.retired = ledger.retired.saturating_add(retired);
+            self.scheduled_incoming_retired_bytes = self
+                .scheduled_incoming_retired_bytes
+                .saturating_add(retired);
+            if retired > 0 {
+                self.push_signal(at, SignalKind::ReceiveCreditRetired { bytes: retired });
+            }
+            self.control.terminal_incoming.insert(slot);
+            if emit_root_actions || !roots.contains(&slot) {
+                self.actions.push_back(QcsdAction::SlotMissed {
+                    endpoint: ledger.action_endpoint(),
+                    packet: ledger.packet,
+                    slot,
+                    reason,
+                });
+            }
+            self.resolve_slot(at, slot, EventOutcome::Missed(reason));
         }
-        self.control.terminal_incoming.insert(slot);
-        if emit_action {
-            self.actions.push_back(QcsdAction::SlotMissed {
-                endpoint: ledger.action_endpoint(),
-                packet: ledger.packet,
-                slot,
-                reason,
-            });
-        }
-        self.resolve_slot(at, slot, EventOutcome::Missed(reason));
     }
 
     /// Advance the published control loop to `elapsed` and queue due actions.
@@ -1052,6 +1278,10 @@ impl QcsdController {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "atomic staged allocation keeps exact credit, claims, rollback, and promotion auditable"
+    )]
     fn process_incoming(&mut self, boundary_us: u64, elapsed: Duration) {
         let pending = std::mem::take(&mut self.control.incoming);
         for mut incoming in pending {
@@ -1059,68 +1289,102 @@ impl QcsdController {
                 self.control.incoming.push(incoming);
                 continue;
             }
-            let endpoint_count = self.scheduler.endpoints().len();
-            let mut attempted = HashSet::new();
-            let mut miss_reason = if endpoint_count == 0 {
+            let endpoint_order = self.scheduler.next_incoming_order();
+            let miss_reason = if endpoint_order.is_empty() {
                 MissedSlotReason::NoEndpoint
             } else {
                 MissedSlotReason::InsufficientIncomingCapacity
             };
-            while incoming.remaining > 0 && attempted.len() < endpoint_count {
-                if incoming.endpoint.is_none() {
-                    let streams = &self.streams;
-                    incoming.endpoint = self
-                        .scheduler
-                        .next_incoming(incoming.remaining, self.defense.mode(), |endpoint| {
-                            if attempted.contains(&endpoint) {
-                                Capacity::default()
-                            } else {
-                                streams.capacity(endpoint)
-                            }
-                        })
-                        .map(|(endpoint, _)| endpoint);
-                }
-                let Some(endpoint) = incoming.endpoint else {
-                    miss_reason = MissedSlotReason::NoEndpoint;
-                    break;
-                };
-                if !attempted.insert(endpoint) {
-                    incoming.endpoint = None;
-                    continue;
-                }
-
-                let releases =
+            let mut staged_credit = Vec::new();
+            let mut staged_claims = Vec::new();
+            let mut opportunities = Vec::new();
+            for endpoint in endpoint_order {
+                opportunities.extend(
                     self.streams
-                        .release(endpoint, incoming.remaining, self.defense.mode());
-                let released_bytes = releases.iter().fold(0_u64, |total, release| {
-                    total.saturating_add(release.increase)
-                });
-                for release in releases {
-                    if let Some(ledger) = self.incoming_credit_ledger.get_mut(&incoming.slot) {
-                        ledger.assign_endpoint(endpoint);
-                    }
-                    self.control.credit.push(PendingCredit {
+                        .allocation_opportunities(endpoint, self.defense.mode()),
+                );
+            }
+            // Preserve the cyclic endpoint order within each class, but always
+            // exhaust every application stream (exact then its own bounded
+            // claim) before any chaff stream.
+            opportunities.sort_by_key(|opportunity| {
+                matches!(opportunity.role, QcsdRequestRole::Chaff { .. })
+            });
+            for opportunity in opportunities {
+                if incoming.remaining == 0 {
+                    break;
+                }
+                if opportunity.exact > 0 {
+                    let release = self
+                        .streams
+                        .release_stream(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                            incoming.remaining.min(opportunity.exact),
+                        )
+                        .expect("snapshotted exact stream capacity remains available");
+                    incoming.remaining = incoming.remaining.saturating_sub(release.increase);
+                    staged_credit.push(PendingCredit {
                         slot: incoming.slot,
                         packet: incoming.packet,
-                        endpoint,
-                        stream: release.stream,
+                        endpoint: opportunity.endpoint,
+                        stream: opportunity.stream,
                         absolute_limit: release.absolute_limit,
                         increase: release.increase,
                     });
-                    self.actions.push_back(QcsdAction::IncreaseReceiveLimit {
-                        endpoint,
-                        stream: release.stream,
-                        absolute_limit: release.absolute_limit,
-                        packet: incoming.packet,
-                        slot: incoming.slot,
-                    });
                 }
-                incoming.remaining = incoming.remaining.saturating_sub(released_bytes);
-                // One logical incoming slot is an aggregate receive budget.
-                // When the preferred application endpoint supplies only a
-                // fragment, continue the identical slot over another endpoint
-                // before classifying it as unrealizable.
-                incoming.endpoint = None;
+                if incoming.remaining > 0 && opportunity.claimable > 0 {
+                    let amount = self.streams.claim_stream(
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        incoming.remaining.min(opportunity.claimable),
+                    );
+                    incoming.remaining = incoming.remaining.saturating_sub(amount);
+                    if amount > 0 {
+                        staged_claims.push(PendingClaim {
+                            slot: incoming.slot,
+                            packet: incoming.packet,
+                            endpoint: opportunity.endpoint,
+                            stream: opportunity.stream,
+                            remaining: amount,
+                        });
+                    }
+                }
+            }
+
+            if incoming.remaining == 0 || !self.config.drop_unsatisfied_events {
+                for credit in staged_credit {
+                    if let Some(ledger) = self.incoming_credit_ledger.get_mut(&incoming.slot) {
+                        ledger.assign_endpoint(credit.endpoint);
+                    }
+                    self.actions.push_back(QcsdAction::IncreaseReceiveLimit {
+                        endpoint: credit.endpoint,
+                        stream: credit.stream,
+                        absolute_limit: credit.absolute_limit,
+                        packet: credit.packet,
+                        slot: credit.slot,
+                    });
+                    self.control.credit.push(credit);
+                }
+                for claim in staged_claims {
+                    if let Some(ledger) = self.incoming_credit_ledger.get_mut(&incoming.slot) {
+                        ledger.assign_endpoint(claim.endpoint);
+                    }
+                    self.control.claims.push(claim);
+                }
+            } else {
+                for credit in staged_credit.into_iter().rev() {
+                    assert!(self.streams.cancel_release(
+                        credit.endpoint,
+                        credit.stream,
+                        credit.absolute_limit,
+                        credit.increase,
+                    ));
+                }
+                for claim in staged_claims {
+                    self.streams
+                        .restore_claim(claim.endpoint, claim.stream, claim.remaining);
+                }
             }
             if incoming.remaining > 0 {
                 self.unsatisfied_incoming(incoming, miss_reason, elapsed);
@@ -1147,6 +1411,7 @@ impl QcsdController {
 
     fn update_completion(&mut self, elapsed: Duration) {
         let has_backlog = self.control.incoming_backlog() > 0
+            || self.control.claim_backlog() > 0
             || !self.control.outgoing.is_empty()
             || !self.control.credit.is_empty()
             || !self.incoming_credit_ledger.is_empty()
@@ -1171,6 +1436,7 @@ impl QcsdController {
             || !self.defense.can_release_chaff_send_shaping()
             || (self.defense.is_complete()
                 && self.control.incoming_backlog() == 0
+                && self.control.claim_backlog() == 0
                 && self.control.credit.is_empty())
         {
             return;
@@ -1186,6 +1452,7 @@ impl QcsdController {
             && self.defense.can_release_chaff_send_shaping()
             && (!self.defense.is_complete()
                 || self.control.incoming_backlog() > 0
+                || self.control.claim_backlog() > 0
                 || !self.control.credit.is_empty())
             && self.released_chaff_send_shaping.insert(endpoint)
         {
@@ -1295,7 +1562,9 @@ mod tests {
         time::Duration,
     };
 
-    use super::QcsdController;
+    use super::{
+        AdvertisedIncomingCredit, IncomingCreditLedger, PendingClaim, PendingCredit, QcsdController,
+    };
     use crate::{
         Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
         EventOutcome, MissedSlotReason, Packet, QcsdAction, QcsdConfig, QcsdDatagramClass,
@@ -2749,7 +3018,8 @@ mod tests {
 
     #[test]
     fn application_length_hint_schedules_application_credit_before_chaff() {
-        // 11,445 bytes of expected body plus 1,000 bytes of framing allowance.
+        // The body estimate is exact capacity; the 1,000 framing allowance is
+        // retained only as a non-advertised scheduling reservation.
         let mut controller = controller_with_application_length_hint(Some(12_445));
         assert_eq!(
             controller
@@ -2764,6 +3034,60 @@ mod tests {
             _ => None,
         });
         assert_eq!(stream, Some(QcsdStreamId(0)));
+    }
+
+    #[test]
+    fn claim_only_application_origin_precedes_exact_chaff_on_another_origin() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let (defense, _) = RecordingDefense::new([packet], DefenseMode::ChaffAndShape);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 100,
+                low_watermark: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://application.example");
+        ready(&mut controller, 2, "https://chaff.example");
+        controller.streams.open(
+            QcsdEndpointId(1),
+            QcsdStreamId(0),
+            QcsdRequestRole::Application,
+            true,
+            16,
+            100,
+            16,
+        );
+        controller.streams.open(
+            QcsdEndpointId(2),
+            QcsdStreamId(4),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            100,
+            1_000,
+        );
+
+        controller.poll(Duration::ZERO);
+        assert!(controller.control.credit.is_empty());
+        assert_eq!(controller.control.claims.len(), 1);
+        assert_eq!(controller.control.claims[0].endpoint, QcsdEndpointId(1));
+        assert_eq!(controller.control.claims[0].stream, QcsdStreamId(0));
+        assert_eq!(controller.control.claims[0].remaining, 100);
+        assert_eq!(
+            controller
+                .streams
+                .capacity(QcsdEndpointId(2))
+                .chaff_incoming,
+            984
+        );
     }
 
     #[test]
@@ -2782,6 +3106,498 @@ mod tests {
             _ => None,
         });
         assert_eq!(stream, Some(QcsdStreamId(4)));
+    }
+
+    #[test]
+    fn partial_drop_rolls_back_staged_credit_and_claims_atomically() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("packet");
+        let (defense, _) = RecordingDefense::new([packet], DefenseMode::ChaffAndShape);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 100,
+                drop_unsatisfied_events: true,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(500),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            484
+        );
+
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed {
+                reason: MissedSlotReason::InsufficientIncomingCapacity,
+                ..
+            }
+        )));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+        );
+        assert!(controller.control.credit.is_empty());
+        assert!(controller.control.claims.is_empty());
+        // The exact 484 bytes and the bounded 100-byte claim remain reusable;
+        // staged allocation did not advance requested state or leak ownership.
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            484
+        );
+        assert_eq!(
+            controller
+                .streams
+                .allocation_opportunities(endpoint, DefenseMode::ChaffAndShape)[0]
+                .claimable,
+            100
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "FIN return, chaff reassignment, and exact ledger settlement are one lifecycle oracle"
+    )]
+    fn early_fin_returns_unused_claim_to_chaff_even_when_unsatisfied_events_drop() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_000).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 1_000,
+                drop_unsatisfied_events: true,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let application = QcsdStreamId(0);
+        let chaff = QcsdStreamId(4);
+        ready(&mut controller, 1, "https://example.com");
+        controller.streams.open(
+            endpoint,
+            application,
+            QcsdRequestRole::Application,
+            true,
+            1,
+            1_000,
+            1_000,
+        );
+        controller.streams.open(
+            endpoint,
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            1,
+            1_000,
+            2_000,
+        );
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, application)
+                .expect("application")
+                .receive
+                .claim(969),
+            969
+        );
+        let slot = QcsdSlotId(10);
+        controller.pending_slots.insert(slot, packet);
+        controller.incoming_credit_ledger.insert(
+            slot,
+            IncomingCreditLedger {
+                packet,
+                endpoint: Some(endpoint),
+                multiple_endpoints: false,
+                consumed: 31,
+                retired: 0,
+            },
+        );
+        controller.scheduled_incoming_requested_bytes = 1_000;
+        controller.scheduled_incoming_consumed_bytes = 31;
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream: application,
+            remaining: 969,
+        });
+
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream: application,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(controller.control.incoming_backlog(), 969);
+        controller.poll(Duration::ZERO);
+        let (stream, absolute_limit, continued_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .expect("claim remainder flows to chaff");
+        assert_eq!((stream, absolute_limit, continued_slot), (chaff, 970, slot));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: chaff,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: chaff,
+                bytes: 970,
+            },
+            Duration::from_micros(2),
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_000);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_000);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn abort_clears_claims_actions_and_restores_stream_allowance() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            1,
+            1_000,
+            100,
+        );
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, stream)
+                .expect("stream")
+                .receive
+                .claim(100),
+            100
+        );
+        let slot = QcsdSlotId(7);
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 100;
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 100,
+        });
+        controller.abort_pending_slots(Duration::ZERO, MissedSlotReason::RunAborted);
+        assert!(controller.control.claims.is_empty());
+        assert!(controller.control.credit.is_empty());
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+        );
+        assert_eq!(
+            controller
+                .streams
+                .allocation_opportunities(endpoint, DefenseMode::ChaffAndShape)[0]
+                .claimable,
+            1_000
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    fn seed_unadvertised_credit(
+        controller: &mut QcsdController,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        slot: QcsdSlotId,
+        packet: Packet,
+        increase: u64,
+    ) -> u64 {
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = controller
+            .scheduled_incoming_requested_bytes
+            .saturating_add(u64::from(packet.length()));
+        let release = controller
+            .streams
+            .release_stream(endpoint, stream, increase)
+            .expect("exact receive capacity");
+        controller.control.credit.push(PendingCredit {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            absolute_limit: release.absolute_limit,
+            increase: release.increase,
+        });
+        controller
+            .actions
+            .push_back(QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit: release.absolute_limit,
+                packet,
+                slot,
+            });
+        release.absolute_limit
+    }
+
+    #[test]
+    fn abort_atomically_rolls_back_two_same_stream_releases() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            1_000,
+            216,
+        );
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        assert_eq!(
+            seed_unadvertised_credit(
+                &mut controller,
+                endpoint,
+                stream,
+                QcsdSlotId(0),
+                packet,
+                100,
+            ),
+            116
+        );
+        assert_eq!(
+            seed_unadvertised_credit(
+                &mut controller,
+                endpoint,
+                stream,
+                QcsdSlotId(1),
+                packet,
+                100,
+            ),
+            216
+        );
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            0
+        );
+
+        controller.abort_pending_slots(Duration::ZERO, MissedSlotReason::RunAborted);
+
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            200
+        );
+        assert!(controller.control.credit.is_empty());
+        assert_eq!(controller.scheduled_incoming_retired_bytes, 200);
+    }
+
+    #[test]
+    fn failing_older_release_cascades_same_stream_suffix_but_not_another_stream() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let first_stream = QcsdStreamId(0);
+        let independent_stream = QcsdStreamId(4);
+        for stream in [first_stream, independent_stream] {
+            controller.streams.open(
+                endpoint,
+                stream,
+                QcsdRequestRole::Application,
+                true,
+                16,
+                1_000,
+                216,
+            );
+        }
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        seed_unadvertised_credit(
+            &mut controller,
+            endpoint,
+            first_stream,
+            QcsdSlotId(0),
+            packet,
+            100,
+        );
+        seed_unadvertised_credit(
+            &mut controller,
+            endpoint,
+            first_stream,
+            QcsdSlotId(1),
+            packet,
+            100,
+        );
+        seed_unadvertised_credit(
+            &mut controller,
+            endpoint,
+            independent_stream,
+            QcsdSlotId(2),
+            packet,
+            100,
+        );
+
+        controller.fail_incoming_slot(
+            QcsdSlotId(0),
+            MissedSlotReason::RunAborted,
+            Duration::ZERO,
+            false,
+        );
+
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            300
+        );
+        assert_eq!(controller.control.credit.len(), 1);
+        assert_eq!(controller.control.credit[0].slot, QcsdSlotId(2));
+        assert_eq!(controller.control.credit[0].absolute_limit, 116);
+        assert!(
+            !controller
+                .incoming_credit_ledger
+                .contains_key(&QcsdSlotId(0))
+        );
+        assert!(
+            !controller
+                .incoming_credit_ledger
+                .contains_key(&QcsdSlotId(1))
+        );
+        assert!(
+            controller
+                .incoming_credit_ledger
+                .contains_key(&QcsdSlotId(2))
+        );
+        let missed: BTreeSet<_> = controller
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::SlotMissed { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        // The adapter already emitted the root miss. The dependent suffix is
+        // terminalized exactly once without duplicating that root action.
+        assert_eq!(missed, BTreeSet::from([QcsdSlotId(1)]));
+    }
+
+    #[test]
+    fn exhausted_extent_does_not_turn_stream_data_blocked_into_speculative_credit() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            0,
+            1_000,
+            100,
+        );
+        assert_eq!(
+            controller
+                .streams
+                .release_stream(endpoint, stream, 100)
+                .expect("prepared extent")
+                .absolute_limit,
+            100
+        );
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            0
+        );
+
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint,
+                stream,
+                blocked_at: 100,
+            },
+            Duration::ZERO,
+        );
+
+        // STREAM_DATA_BLOCKED can race with FIN/reset, while Neqo needs at
+        // least three bytes to start another DATA frame. Neither one nor three
+        // bytes is proof-safe, so a mismatched prepared extent remains a
+        // bounded typed/time-out failure instead of being over-advertised.
+        assert_eq!(
+            controller.streams.capacity(endpoint).application_incoming,
+            0
+        );
+        assert!(controller.actions.is_empty());
     }
 
     #[test]
@@ -2895,7 +3711,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_incoming_slot_fans_out_before_it_is_declared_missed() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cross-origin continuation and ledger settlement form one lifecycle oracle"
+    )]
+    fn same_stream_bounded_claim_precedes_cross_origin_fanout() {
         let mut controller = QcsdController::new(
             QcsdConfig {
                 max_udp_payload_size: 1_200,
@@ -2917,7 +3737,9 @@ mod tests {
         // The first endpoint reproduces the Chromium config.json case:
         // 1,143 known bytes minus the 16-byte initial limit leaves only
         // 1,127 bytes for a 1,200-byte Tamaraw slot. The second endpoint has
-        // enough capacity for the remaining 73 bytes.
+        // enough exact capacity for the remaining 73 bytes. The first stream's
+        // bounded framing claim must retain that work instead of spilling it to
+        // the second origin.
         for (endpoint, stream, expected_response_length) in [(1, 0, 1_143), (2, 4, 5_000)] {
             controller.observe(
                 QcsdObservation::StreamOpened {
@@ -2952,49 +3774,75 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(credits.len(), 2);
+        assert_eq!(credits.len(), 1);
         assert_eq!(
             credits
                 .iter()
                 .map(|(endpoint, _, absolute_limit, _, _)| (*endpoint, *absolute_limit))
                 .collect::<Vec<_>>(),
-            [(QcsdEndpointId(1), 1_143), (QcsdEndpointId(2), 89)]
+            [(QcsdEndpointId(1), 1_143)]
         );
-        assert_eq!(credits[0].4, credits[1].4);
-
-        for (index, (endpoint, stream, absolute_limit, _, slot)) in credits.into_iter().enumerate()
-        {
-            controller.observe(
-                QcsdObservation::ReceiveLimitAdvertised {
-                    endpoint,
-                    stream,
-                    absolute_limit,
-                    slot: Some(slot),
-                },
-                Duration::from_micros(1),
-            );
-            assert!(controller.next_action().is_none());
-            controller.observe(
-                QcsdObservation::BytesRead {
-                    endpoint,
-                    stream,
-                    bytes: absolute_limit,
-                },
-                Duration::from_micros(2),
-            );
-            if index == 0 {
-                assert!(controller.next_action().is_none());
-            } else {
-                assert!(matches!(
-                    controller.next_action(),
-                    Some(QcsdAction::SlotSatisfied {
-                        endpoint: None,
-                        slot: satisfied,
-                        ..
-                    }) if satisfied == slot
-                ));
-            }
-        }
+        let (endpoint, stream, absolute_limit, _, slot) = credits[0];
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: absolute_limit,
+            },
+            Duration::from_micros(2),
+        );
+        assert!(controller.next_action().is_none());
+        controller.observe(
+            QcsdObservation::PushPromiseFrame {
+                endpoint,
+                stream,
+                frame_bytes: 73,
+            },
+            Duration::from_micros(3),
+        );
+        let Some(QcsdAction::IncreaseReceiveLimit {
+            endpoint: continued_endpoint,
+            stream: continued_stream,
+            absolute_limit: continued_limit,
+            slot: continued_slot,
+            ..
+        }) = controller.next_action()
+        else {
+            panic!("exact framing must continue its owning slot");
+        };
+        assert_eq!((continued_endpoint, continued_stream), (endpoint, stream));
+        assert_eq!(continued_limit, 1_216);
+        assert_eq!(continued_slot, slot);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: continued_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(4),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 73,
+            },
+            Duration::from_micros(5),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied { slot: satisfied, .. }) if satisfied == slot
+        ));
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
@@ -3183,6 +4031,48 @@ mod tests {
     }
 
     #[test]
+    fn interim_final_and_trailer_headers_preserve_the_final_status() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10),
+            },
+            Duration::ZERO,
+        );
+        for (frame_bytes, status) in [(7, Some(103)), (11, Some(200)), (5, None)] {
+            controller.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint,
+                    stream,
+                    frame_bytes,
+                    status,
+                    content_length: Some(10).filter(|_| status == Some(200)),
+                },
+                Duration::ZERO,
+            );
+        }
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, stream)
+                .expect("open stream")
+                .status,
+            Some(200)
+        );
+    }
+
+    #[test]
     fn completion_waits_for_tail() {
         let mut controller = QcsdController::new(
             QcsdConfig {
@@ -3330,6 +4220,138 @@ mod tests {
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the full deferred-slot lifecycle is one indivisible accounting oracle"
+    )]
+    fn exact_framing_continues_the_same_incoming_slot_after_reserved_deferral() {
+        const BODY: u64 = 131_072;
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(BODY),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        let slot = QcsdSlotId(112);
+        let state = controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("application stream");
+        assert_eq!(state.receive.claim(2), 2);
+        state.receive.response_headers(11, Some(BODY));
+        state.receive.data_frame(22, BODY - 2);
+        assert_eq!(
+            state.receive.release(BODY + 32),
+            Some((BODY + 33, BODY + 32))
+        );
+        state.receive.advertised(BODY + 33);
+        state.receive.bytes_read(BODY + 31);
+
+        controller.pending_slots.insert(slot, packet);
+        controller.incoming_credit_ledger.insert(
+            slot,
+            IncomingCreditLedger {
+                packet,
+                endpoint: Some(endpoint),
+                multiple_endpoints: false,
+                consumed: 1_196,
+                retired: 0,
+            },
+        );
+        controller.scheduled_incoming_requested_bytes = 1_200;
+        controller.scheduled_incoming_consumed_bytes = 1_196;
+        controller.advertised_incoming_credit.insert(
+            (endpoint, stream),
+            vec![AdvertisedIncomingCredit {
+                slot,
+                start: BODY + 31,
+                end: BODY + 33,
+            }],
+        );
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 2,
+        });
+
+        // Retained live order at the deadlock boundary: raw=131,103,
+        // declared DATA=131,070, exact framing=33. Two body bytes remain, so a
+        // pristine next-DATA boundary raises the exact raw floor to 131,107.
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 0,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(1),
+        );
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit: continued_limit,
+            slot: continued_slot,
+            ..
+        } = controller
+            .next_action()
+            .expect("exact framing continuation")
+        else {
+            panic!("expected continued receive credit");
+        };
+        assert_eq!(continued_slot, slot);
+        assert_eq!(continued_limit, BODY + 35);
+        assert!(controller.next_action().is_none());
+
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: continued_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(2),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 4,
+            },
+            Duration::from_micros(3),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied {
+                slot: satisfied,
+                ..
+            }) if satisfied == slot
+        ));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }

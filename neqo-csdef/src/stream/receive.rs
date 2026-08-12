@@ -18,14 +18,24 @@ pub enum ReceiveState {
         advertised_limit: u64,
         requested_limit: u64,
         known_limit: u64,
+        reservation_capacity: u64,
+        reservation_available: u64,
         consumed: u64,
+        payload_floor: u64,
+        framing_bytes: u64,
+        prospective_frame_header_bytes: u64,
     },
     /// At least one HTTP/3 DATA frame length is known.
     ReceivingData {
         advertised_limit: u64,
         requested_limit: u64,
         known_limit: u64,
+        reservation_capacity: u64,
+        reservation_available: u64,
         consumed: u64,
+        payload_floor: u64,
+        framing_bytes: u64,
+        prospective_frame_header_bytes: u64,
         data_length: u64,
     },
     /// Neqo owns receive-window growth; QCSD only records response size.
@@ -55,14 +65,32 @@ impl ReceiveState {
             return;
         };
         *self = if controlled {
+            // A stream with no body estimate needs a bounded bootstrap window
+            // so HTTP/3 can observe enough of HEADERS or a DATA frame to
+            // establish an exact extent.  Prepared research workloads always
+            // provide an estimate; zero remains the conservative compatibility
+            // path for peers without one.
+            let known_limit = if expected == 0 {
+                initial_limit.max(excess)
+            } else {
+                initial_limit.max(expected)
+            };
+            let reservation_capacity = if expected == 0 { 0 } else { excess };
             Self::ReceivingHeaders {
                 advertised_limit: initial_limit,
                 requested_limit: initial_limit,
-                // Figure 7 initializes `limit` to the largest independent
-                // source of known capacity. `excess` is an absolute allowance,
-                // not an increment on top of the transport's initial limit.
-                known_limit: initial_limit.max(expected).max(excess),
+                // The workload body estimate is a conservative lower bound on
+                // the raw response-stream extent.  HTTP/3 framing is added only
+                // after the parser reports its exact size.  `excess` reserves
+                // scheduling work for that framing, but is never itself
+                // advertised as receive credit.
+                known_limit,
+                reservation_capacity,
+                reservation_available: reservation_capacity,
                 consumed: 0,
+                payload_floor: expected,
+                framing_bytes: 0,
+                prospective_frame_header_bytes: 0,
             }
         } else {
             Self::Automatic {
@@ -106,6 +134,64 @@ impl ReceiveState {
         }
     }
 
+    /// Maximum scheduled work that may still be claimed as a non-advertised
+    /// reservation for this stream.
+    pub const fn claimable(&self) -> u64 {
+        match self {
+            Self::ReceivingHeaders {
+                reservation_available,
+                ..
+            }
+            | Self::ReceivingData {
+                reservation_available,
+                ..
+            } => *reservation_available,
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => 0,
+        }
+    }
+
+    /// Claim at most the configured per-stream excess.  A claim is scheduling
+    /// ownership only: it does not increase the advertised receive limit.
+    pub fn claim(&mut self, amount: u64) -> u64 {
+        match self {
+            Self::ReceivingHeaders {
+                reservation_available,
+                ..
+            }
+            | Self::ReceivingData {
+                reservation_available,
+                ..
+            } => {
+                let claimed = amount.min(*reservation_available);
+                *reservation_available -= claimed;
+                claimed
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => 0,
+        }
+    }
+
+    /// Restore a claim whose scheduled slot was terminalized before the claim
+    /// became exact receive capacity.
+    pub fn restore_claim(&mut self, amount: u64) {
+        match self {
+            Self::ReceivingHeaders {
+                reservation_capacity,
+                reservation_available,
+                ..
+            }
+            | Self::ReceivingData {
+                reservation_capacity,
+                reservation_available,
+                ..
+            } => {
+                *reservation_available = reservation_available
+                    .saturating_add(amount)
+                    .min(*reservation_capacity);
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
+        }
+    }
+
     /// Raw stream bytes consumed by HTTP/3 so far.
     pub const fn consumed(&self) -> u64 {
         match self {
@@ -116,65 +202,131 @@ impl ReceiveState {
         }
     }
 
-    pub fn header_progress(&mut self, min_remaining: u64, excess: u64) {
+    pub fn header_progress(&mut self, min_remaining: u64, awaiting_data_frame: bool) {
         match self {
             Self::ReceivingHeaders {
                 known_limit,
                 consumed,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
+                ..
+            } => {
+                *prospective_frame_header_bytes = if awaiting_data_frame {
+                    prospective_data_frame_header(*payload_floor)
+                } else {
+                    0
+                };
+                *known_limit = (*known_limit).max(consumed.saturating_add(min_remaining));
+                *known_limit = (*known_limit).max(
+                    payload_floor
+                        .saturating_add(*framing_bytes)
+                        .saturating_add(*prospective_frame_header_bytes),
+                );
+            }
+            Self::ReceivingData {
+                known_limit,
+                consumed,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
+                data_length,
+                ..
+            } => {
+                *prospective_frame_header_bytes = if awaiting_data_frame {
+                    prospective_data_frame_header(payload_floor.saturating_sub(*data_length))
+                } else {
+                    0
+                };
+                *known_limit = (*known_limit).max(consumed.saturating_add(min_remaining));
+                *known_limit = (*known_limit).max(
+                    payload_floor
+                        .saturating_add(*framing_bytes)
+                        .saturating_add(*prospective_frame_header_bytes),
+                );
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
+        }
+    }
+
+    pub fn response_headers(&mut self, frame_bytes: u64, content_length: Option<u64>) {
+        match self {
+            Self::ReceivingHeaders {
+                known_limit,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
                 ..
             }
             | Self::ReceivingData {
                 known_limit,
-                consumed,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
                 ..
             } => {
-                *known_limit =
-                    (*known_limit).max(consumed.saturating_add(min_remaining.max(excess)));
-            }
-            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
-        }
-    }
-
-    pub fn response_headers(&mut self, content_length: Option<u64>) {
-        match self {
-            Self::ReceivingHeaders { known_limit, .. }
-            | Self::ReceivingData { known_limit, .. } => {
+                *framing_bytes = framing_bytes.saturating_add(frame_bytes);
+                *prospective_frame_header_bytes = 0;
                 if let Some(content_length) = content_length {
-                    // Figure 7 action A3: `limit <- max(limit, x)`.
-                    *known_limit = (*known_limit).max(content_length);
+                    *payload_floor = (*payload_floor).max(content_length);
                 }
+                let exact = payload_floor.saturating_add(*framing_bytes);
+                *known_limit = (*known_limit).max(exact);
             }
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
         }
     }
 
-    pub fn data_frame(&mut self, data: u64) {
+    pub fn data_frame(&mut self, frame_header_bytes: u64, data: u64) {
         match self {
             Self::ReceivingHeaders {
                 advertised_limit,
                 requested_limit,
                 known_limit,
+                reservation_capacity,
+                reservation_available,
                 consumed,
+                payload_floor,
+                framing_bytes,
+                ..
             } => {
-                // Figure 7 action A1: the DATA payload becomes known after its
-                // frame header has already contributed to consumed raw bytes.
-                let known_limit = (*known_limit).max(consumed.saturating_add(data));
+                let framing_bytes = framing_bytes.saturating_add(frame_header_bytes);
+                let payload_floor = (*payload_floor).max(data);
+                // The DATA payload becomes known after its frame header has
+                // already contributed to consumed raw bytes.  Both forms are
+                // exact lower bounds; neither includes the speculative reserve.
+                let known_limit = (*known_limit)
+                    .max(consumed.saturating_add(data))
+                    .max(payload_floor.saturating_add(framing_bytes));
                 *self = Self::ReceivingData {
                     advertised_limit: *advertised_limit,
                     requested_limit: *requested_limit,
                     known_limit,
+                    reservation_capacity: *reservation_capacity,
+                    reservation_available: *reservation_available,
                     consumed: *consumed,
+                    payload_floor,
+                    framing_bytes,
+                    prospective_frame_header_bytes: 0,
                     data_length: data,
                 };
             }
             Self::ReceivingData {
                 known_limit,
                 consumed,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
                 data_length,
                 ..
             } => {
                 *data_length = data_length.saturating_add(data);
-                *known_limit = (*known_limit).max(consumed.saturating_add(data));
+                *payload_floor = (*payload_floor).max(*data_length);
+                *framing_bytes = framing_bytes.saturating_add(frame_header_bytes);
+                *prospective_frame_header_bytes = 0;
+                *known_limit = (*known_limit)
+                    .max(consumed.saturating_add(data))
+                    .max(payload_floor.saturating_add(*framing_bytes));
             }
             Self::Automatic { data_length, .. } => {
                 *data_length = data_length.saturating_add(data);
@@ -183,7 +335,7 @@ impl ReceiveState {
         }
     }
 
-    pub fn bytes_read(&mut self, bytes: u64, excess: u64) {
+    pub fn bytes_read(&mut self, bytes: u64) {
         match self {
             Self::ReceivingHeaders {
                 known_limit,
@@ -196,28 +348,35 @@ impl ReceiveState {
                 ..
             } => {
                 *consumed = consumed.saturating_add(bytes);
-                *known_limit = (*known_limit).max(consumed.saturating_add(excess));
+                *known_limit = (*known_limit).max(*consumed);
             }
             Self::Automatic { consumed, .. } => *consumed = consumed.saturating_add(bytes),
             Self::Created { .. } | Self::Closed { .. } => {}
         }
     }
 
-    pub const fn stream_data_blocked(&mut self, blocked_at: u64, increment: u64) {
+    /// Add exact non-DATA HTTP/3 framing observed on the request stream.
+    pub fn framing(&mut self, frame_bytes: u64) {
         match self {
             Self::ReceivingHeaders {
-                requested_limit,
                 known_limit,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
                 ..
             }
             | Self::ReceivingData {
-                requested_limit,
                 known_limit,
+                payload_floor,
+                framing_bytes,
+                prospective_frame_header_bytes,
                 ..
-            } if *requested_limit == *known_limit && *requested_limit == blocked_at => {
-                *known_limit = known_limit.saturating_add(increment);
+            } => {
+                *framing_bytes = framing_bytes.saturating_add(frame_bytes);
+                *prospective_frame_header_bytes = 0;
+                *known_limit = (*known_limit).max(payload_floor.saturating_add(*framing_bytes));
             }
-            _ => {}
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
         }
     }
 
@@ -238,6 +397,29 @@ impl ReceiveState {
                 Some((*requested_limit, released))
             }
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => None,
+        }
+    }
+
+    /// Roll back one unadvertised staged release. Callers reverse releases in
+    /// LIFO order, so the absolute limit must exactly match requested state.
+    pub const fn cancel_release(&mut self, absolute_limit: u64, increase: u64) -> bool {
+        match self {
+            Self::ReceivingHeaders {
+                requested_limit,
+                advertised_limit,
+                ..
+            }
+            | Self::ReceivingData {
+                requested_limit,
+                advertised_limit,
+                ..
+            } if *requested_limit == absolute_limit
+                && absolute_limit.saturating_sub(increase) >= *advertised_limit =>
+            {
+                *requested_limit -= increase;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -288,6 +470,14 @@ impl ReceiveState {
     }
 }
 
+/// At a pristine frame boundary the sender needs at least one byte for the
+/// DATA type and one byte for the first length-varint octet.  The peer may
+/// split the remaining body arbitrarily, so no wider speculative prefix is
+/// safe until the parser observes it and reports `min_remaining`.
+const fn prospective_data_frame_header(remaining_payload: u64) -> u64 {
+    if remaining_payload == 0 { 0 } else { 2 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReceiveState;
@@ -306,67 +496,59 @@ mod tests {
 
     #[test]
     fn controlled_stream_tracks_known_and_requested_credit() {
-        let mut state = ReceiveState::controlled(16, 1_000, 0);
-        assert_eq!(state.available(), 984);
-        assert_eq!(state.release(600), Some((616, 600)));
-        assert_eq!(state.available(), 384);
-        state.advertised(616);
+        let mut state = ReceiveState::controlled(16, 1_000, 600);
+        assert_eq!(state.available(), 584);
+        assert_eq!(state.claimable(), 1_000);
+        assert_eq!(state.claim(1_200), 1_000);
+        assert_eq!(state.claim(1), 0);
+        assert_eq!(state.release(500), Some((516, 500)));
+        assert_eq!(state.available(), 84);
+        state.advertised(516);
         assert_eq!(state.close(), (0, 0));
     }
 
     #[test]
     fn data_frame_discovers_payload_capacity() {
         let mut state = ReceiveState::controlled(16, 100, 0);
-        state.bytes_read(2, 100);
-        state.data_frame(4_000);
-        assert_eq!(state.available(), 3_986);
+        state.bytes_read(2);
+        state.data_frame(5, 4_000);
+        assert_eq!(state.available(), 3_989);
         assert_eq!(state.close(), (4_000, 0));
     }
 
     #[test]
     fn header_progress_prevents_large_header_deadlock() {
         let mut state = ReceiveState::controlled(16, 100, 0);
-        state.release(100);
+        assert_eq!(state.release(84), Some((100, 84)));
         assert_eq!(state.available(), 0);
-        state.bytes_read(100, 100);
-        state.header_progress(2_000, 100);
-        assert!(state.available() >= 1_900);
+        state.bytes_read(100);
+        state.header_progress(2_000, false);
+        assert_eq!(state.available(), 2_000);
     }
 
     #[test]
     fn closing_reports_credit_not_yet_advertised() {
-        let mut state = ReceiveState::controlled(16, 1_000, 0);
+        let mut state = ReceiveState::controlled(16, 1_000, 516);
         state.release(500);
         assert_eq!(state.close(), (0, 500));
     }
 
     #[test]
-    fn blocked_stream_adds_capacity_only_at_the_known_limit() {
-        let mut state = ReceiveState::controlled(16, 100, 0);
-        state.release(100);
-        assert_eq!(state.available(), 0);
-        state.stream_data_blocked(99, 100);
-        assert_eq!(state.available(), 0);
-        state.stream_data_blocked(100, 100);
-        assert_eq!(state.available(), 100);
-    }
-
-    #[test]
     fn multiple_data_frames_override_incorrect_content_length_safely() {
         let mut state = ReceiveState::controlled(16, 100, 0);
-        state.bytes_read(10, 100);
-        state.response_headers(Some(1));
-        state.bytes_read(2, 100);
-        state.data_frame(600);
-        state.bytes_read(602, 100);
-        state.bytes_read(2, 100);
-        state.data_frame(700);
+        state.bytes_read(10);
+        state.response_headers(10, Some(1));
+        state.bytes_read(2);
+        state.data_frame(2, 600);
+        state.bytes_read(602);
+        state.bytes_read(2);
+        state.data_frame(2, 700);
         assert_eq!(state.close(), (1_300, 0));
     }
 
     #[test]
     fn partial_release_tracks_absolute_and_unadvertised_credit() {
-        let mut state = ReceiveState::controlled(16, 1_000, 0);
+        let mut state = ReceiveState::controlled(16, 1_000, 1_000);
         assert_eq!(state.release(250), Some((266, 250)));
         state.advertised(116);
         assert_eq!(state.close(), (0, 150));
@@ -376,25 +558,113 @@ mod tests {
     fn automatic_stream_never_returns_scheduled_credit() {
         let mut state = ReceiveState::created(false, 16, 1_000, 0);
         state.open();
-        state.data_frame(900);
+        state.data_frame(0, 900);
         assert_eq!(state.close(), (900, 0));
     }
 
     #[test]
     fn figure_seven_content_length_is_an_absolute_limit() {
         let mut state = ReceiveState::controlled(16, 1_000, 0);
-        state.bytes_read(40, 1_000);
-        state.response_headers(Some(4_000));
-        assert_eq!(state.available(), 3_984);
+        state.bytes_read(40);
+        state.response_headers(40, Some(4_000));
+        assert_eq!(state.available(), 4_024);
     }
 
     #[test]
     fn figure_seven_data_length_uses_consumed_raw_bytes() {
         let mut state = ReceiveState::controlled(16, 100, 0);
-        state.bytes_read(42, 100);
-        state.data_frame(900);
+        state.bytes_read(42);
+        state.data_frame(2, 900);
         assert_eq!(state.available(), 926);
-        state.bytes_read(400, 100);
+        state.bytes_read(400);
         assert_eq!(state.available(), 926);
+    }
+
+    #[test]
+    fn exact_http3_framing_extends_a_known_body_without_advertising_the_reserve() {
+        const BODY: u64 = 131_072;
+        let mut state = ReceiveState::controlled(0, 1_000, BODY);
+        assert_eq!(state.claim(1_000), 1_000);
+        assert_eq!(state.release(BODY), Some((BODY, BODY)));
+        assert_eq!(state.available(), 0);
+        assert_eq!(state.claimable(), 0);
+        state.advertised(BODY);
+
+        state.bytes_read(11);
+        state.response_headers(11, Some(BODY));
+        assert_eq!(state.release(11), Some((BODY + 11, 11)));
+        state.advertised(BODY + 11);
+
+        for data in [32_768, 32_768, 32_768, 32_737, 29] {
+            let frame_header_bytes = if data == 29 { 2 } else { 5 };
+            state.bytes_read(frame_header_bytes);
+            state.data_frame(frame_header_bytes, data);
+            let absolute = state
+                .release(frame_header_bytes)
+                .map(|(absolute, released)| {
+                    assert_eq!(released, frame_header_bytes);
+                    absolute
+                })
+                .expect("observed DATA header becomes exact raw capacity");
+            state.advertised(absolute);
+            state.bytes_read(data);
+        }
+
+        assert_eq!(state.consumed(), BODY + 31);
+        // A pristine frame boundary with two body bytes outstanding requires
+        // the universal two-byte DATA type/length prefix.  This is the exact
+        // liveness continuation missing from the failed live attempt.
+        state.header_progress(0, true);
+        assert_eq!(state.release(2), Some((BODY + 35, 2)));
+        state.advertised(BODY + 35);
+        state.bytes_read(2);
+        state.data_frame(2, 2);
+        state.bytes_read(2);
+        assert_eq!(state.consumed(), BODY + 35);
+        assert_eq!(state.available(), 0);
+        assert_eq!(state.close(), (BODY, 0));
+    }
+
+    #[test]
+    fn pristine_data_boundary_has_two_byte_universal_prefix_or_zero_when_complete() {
+        for remaining in [1, 63, 64, 16_383, 16_384] {
+            let body = 20_000;
+            let mut state = ReceiveState::controlled(0, 1_000, body);
+            state.data_frame(2, body - remaining);
+            let before = state.available();
+            state.header_progress(0, true);
+            assert_eq!(state.available(), before + 2, "remaining={remaining}");
+        }
+
+        let mut complete = ReceiveState::controlled(0, 1_000, 20_000);
+        complete.data_frame(2, 20_000);
+        let before = complete.available();
+        complete.header_progress(0, true);
+        assert_eq!(complete.available(), before);
+    }
+
+    #[test]
+    fn unknown_length_uses_one_bounded_parser_bootstrap_then_exact_bytes() {
+        let mut state = ReceiveState::controlled(16, 1_000, 0);
+        assert_eq!(state.available(), 984);
+        assert_eq!(state.release(984), Some((1_000, 984)));
+        state.bytes_read(11);
+        state.response_headers(11, None);
+        assert_eq!(state.available(), 0);
+        state.bytes_read(5);
+        state.data_frame(5, 2_000);
+        // Once the parser announces the frame, its exact payload and header
+        // extend the raw limit without a speculative rolling allowance.
+        assert_eq!(state.release(1_016), Some((2_016, 1_016)));
+    }
+
+    #[test]
+    fn early_close_discards_only_the_unadvertised_reservation() {
+        let mut state = ReceiveState::controlled(0, 1_000, 1_000);
+        assert_eq!(state.release(1_000), Some((1_000, 1_000)));
+        state.advertised(1_000);
+        state.bytes_read(500);
+        assert_eq!(state.claimable(), 1_000);
+        assert_eq!(state.close(), (0, 0));
     }
 }

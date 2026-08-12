@@ -1319,6 +1319,44 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "qcsd")]
+    fn enable_qcsd_observations(client: &mut Http3Client) {
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .expect("enable QCSD observations");
+        drop(drain_qcsd_observations(client));
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_bytes_read_before(
+        observations: &[QcsdObservation],
+        semantic_index: usize,
+        stream_id: StreamId,
+    ) -> u64 {
+        observations[..semantic_index]
+            .iter()
+            .filter_map(|observation| {
+                if let QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(7),
+                    stream,
+                    bytes,
+                } = observation
+                    && *stream == QcsdStreamId(stream_id.as_u64())
+                {
+                    Some(*bytes)
+                } else {
+                    None
+                }
+            })
+            .sum()
+    }
+
     /// Create a http3 client with default configuration.
     pub fn default_http3_client() -> Http3Client {
         default_http3_client_param(100)
@@ -2713,6 +2751,204 @@ mod tests {
                 }
             )));
         }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_observes_every_response_headers_frame_once_with_exact_bytes() {
+        let (mut client, mut server) = connect();
+        enable_qcsd_observations(&mut client);
+        let request_stream_id = make_request_and_exchange_pkts(&mut client, &mut server, true);
+        drop(drain_qcsd_observations(&mut client));
+        setup_server_side_encoder(&mut client, &mut server);
+
+        let mut interim = Encoder::default();
+        server.encode_headers(
+            request_stream_id,
+            &[Header::new(":status", "103")],
+            &mut interim,
+        );
+        let mut final_headers = Encoder::default();
+        server.encode_headers(
+            request_stream_id,
+            &[
+                Header::new(":status", "200"),
+                Header::new("content-length", "0"),
+            ],
+            &mut final_headers,
+        );
+        let mut response = Encoder::default();
+        response.encode(interim.as_ref());
+        response.encode(final_headers.as_ref());
+        server_send_response_and_exchange_packet(
+            &mut client,
+            &mut server,
+            request_stream_id,
+            response,
+            false,
+        );
+
+        let mut trailers = Encoder::default();
+        server.encode_headers(
+            request_stream_id,
+            &[Header::new("etag", "finished")],
+            &mut trailers,
+        );
+        let expected = [
+            (u64::try_from(interim.len()).unwrap(), Some(103), None),
+            (
+                u64::try_from(final_headers.len()).unwrap(),
+                Some(200),
+                Some(0),
+            ),
+            (u64::try_from(trailers.len()).unwrap(), None, None),
+        ];
+        server_send_response_and_exchange_packet(
+            &mut client,
+            &mut server,
+            request_stream_id,
+            trailers,
+            true,
+        );
+
+        let observations = drain_qcsd_observations(&mut client);
+        assert!(observations.iter().any(|observation| {
+            matches!(
+                observation,
+                QcsdObservation::HeaderProgress {
+                    endpoint: QcsdEndpointId(7),
+                    stream,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                } if *stream == QcsdStreamId(request_stream_id.as_u64())
+            )
+        }));
+        let response_headers: Vec<_> = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, observation)| {
+                if let QcsdObservation::ResponseHeaders {
+                    endpoint: QcsdEndpointId(7),
+                    stream,
+                    frame_bytes,
+                    status,
+                    content_length,
+                } = observation
+                {
+                    assert_eq!(*stream, QcsdStreamId(request_stream_id.as_u64()));
+                    Some((index, (*frame_bytes, *status, *content_length)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            response_headers
+                .iter()
+                .map(|(_, observation)| *observation)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let mut expected_consumed = 0;
+        for ((semantic_index, _), (frame_bytes, _, _)) in response_headers.iter().zip(expected) {
+            expected_consumed += frame_bytes;
+            let consumed_before_semantic =
+                qcsd_bytes_read_before(&observations, *semantic_index, request_stream_id);
+            assert_eq!(consumed_before_semantic, expected_consumed);
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_observes_push_promise_frame_once_with_exact_bytes() {
+        let (mut client, mut server) = connect();
+        enable_qcsd_observations(&mut client);
+        let request_stream_id = make_request_and_exchange_pkts(&mut client, &mut server, true);
+        drop(drain_qcsd_observations(&mut client));
+
+        let push_id = PushId::new(0);
+        let mut encoded = Encoder::default();
+        HFrame::PushPromise {
+            push_id,
+            header_block: PUSH_PROMISE_DATA.to_vec(),
+        }
+        .encode(&mut encoded);
+        send_push_promise_and_exchange_packets(
+            &mut client,
+            &mut server,
+            request_stream_id,
+            push_id,
+        );
+
+        let observations = drain_qcsd_observations(&mut client);
+        let push_frames: Vec<_> = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, observation)| {
+                if let QcsdObservation::PushPromiseFrame {
+                    endpoint: QcsdEndpointId(7),
+                    stream,
+                    frame_bytes,
+                } = observation
+                {
+                    Some((index, *stream, *frame_bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(push_frames.len(), 1);
+        let (semantic_index, observed_stream, observed_bytes) = push_frames[0];
+        assert_eq!(observed_stream, QcsdStreamId(request_stream_id.as_u64()));
+        assert_eq!(observed_bytes, u64::try_from(encoded.len()).unwrap());
+        let consumed_before_semantic =
+            qcsd_bytes_read_before(&observations, semantic_index, request_stream_id);
+        assert_eq!(consumed_before_semantic, observed_bytes);
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_observes_ignored_request_stream_frame_once_with_exact_bytes() {
+        let (mut client, mut server) = connect();
+        enable_qcsd_observations(&mut client);
+        let request_stream_id = make_request_and_exchange_pkts(&mut client, &mut server, true);
+        drop(drain_qcsd_observations(&mut client));
+
+        // Legal unknown type 0x21 and length 1, each encoded with a
+        // noncanonical four-byte varint, plus one payload byte.
+        let extension = [0x80, 0x00, 0x00, 0x21, 0x80, 0x00, 0x00, 0x01, 0xcc];
+        server_send_response_and_exchange_packet(
+            &mut client,
+            &mut server,
+            request_stream_id,
+            extension,
+            false,
+        );
+
+        let observations = drain_qcsd_observations(&mut client);
+        let ignored: Vec<_> = observations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, observation)| {
+                if let QcsdObservation::IgnoredRequestStreamFrame {
+                    endpoint: QcsdEndpointId(7),
+                    stream,
+                    frame_bytes,
+                } = observation
+                {
+                    Some((index, *stream, *frame_bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ignored.len(), 1);
+        let (semantic_index, observed_stream, observed_bytes) = ignored[0];
+        assert_eq!(observed_stream, QcsdStreamId(request_stream_id.as_u64()));
+        assert_eq!(observed_bytes, u64::try_from(extension.len()).unwrap());
+        let consumed_before_semantic =
+            qcsd_bytes_read_before(&observations, semantic_index, request_stream_id);
+        assert_eq!(consumed_before_semantic, observed_bytes);
     }
 
     #[cfg(feature = "qcsd")]

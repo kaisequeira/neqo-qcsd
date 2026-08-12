@@ -16,6 +16,14 @@ use serde::{Deserialize, Serialize};
 use super::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
 use crate::{Direction, Packet};
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate over &T"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One per-run clock shared by all QCSD endpoints.
 ///
 /// The timestamp preserves when an adapter produced an observation, rather
@@ -184,8 +192,9 @@ pub enum QcsdObservation {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
         role: QcsdRequestRole,
-        /// Best known application response stream extent from the workload
-        /// body estimate plus its configured framing allowance.
+        /// Best known application response body extent from the workload.
+        /// Exact HTTP/3 framing is observed separately; the configured excess
+        /// remains a non-advertised reservation until then.
         ///
         /// Chaff streams continue to derive their estimate from the controller's
         /// resource manifest.
@@ -197,7 +206,19 @@ pub enum QcsdObservation {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
         min_remaining: u64,
+        /// The parser is between response DATA frames and has not consumed
+        /// any bytes of the next frame header. Controllers can combine this
+        /// with a known remaining body extent to reserve the mandatory
+        /// type-and-length prefix without guessing future frame contents.
+        #[serde(default, skip_serializing_if = "is_false")]
+        awaiting_data_frame: bool,
     },
+    /// One complete HEADERS frame on a response request stream.
+    ///
+    /// Interim and final fields are decoded when available. Trailers are
+    /// represented by `None` fields because Neqo currently ignores their
+    /// header block, while `frame_bytes` still accounts for their exact raw
+    /// extent once.
     ResponseHeaders {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
@@ -210,6 +231,20 @@ pub enum QcsdObservation {
         stream: QcsdStreamId,
         frame_header_bytes: u64,
         data_bytes: u64,
+    },
+    /// Complete `PUSH_PROMISE` framing consumed on a request stream.
+    PushPromiseFrame {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frame_bytes: u64,
+    },
+    /// Complete legal extension frames ignored on a request stream.
+    /// Known HEADERS, DATA, and `PUSH_PROMISE` frames use their typed events and
+    /// never contribute here.
+    IgnoredRequestStreamFrame {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frame_bytes: u64,
     },
     /// Raw request-stream offsets consumed by HTTP/3.
     ///
@@ -330,6 +365,29 @@ mod tests {
         ));
         let encoded = serde_json::to_value(observation).expect("serialize StreamOpened");
         assert!(encoded.get("expected_response_length").is_none());
+    }
+
+    #[test]
+    fn legacy_header_progress_defaults_to_not_awaiting_a_data_frame() {
+        let json = r#"{
+            "type":"header_progress",
+            "endpoint":1,
+            "stream":4,
+            "min_remaining":2
+        }"#;
+        let observation: QcsdObservation =
+            serde_json::from_str(json).expect("legacy HeaderProgress observation");
+        assert_eq!(
+            observation,
+            QcsdObservation::HeaderProgress {
+                endpoint: super::QcsdEndpointId(1),
+                stream: super::QcsdStreamId(4),
+                min_remaining: 2,
+                awaiting_data_frame: false,
+            }
+        );
+        let encoded = serde_json::to_value(observation).expect("serialize HeaderProgress");
+        assert!(encoded.get("awaiting_data_frame").is_none());
     }
 
     #[test]

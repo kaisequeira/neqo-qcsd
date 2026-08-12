@@ -13,7 +13,9 @@
 
 use std::{collections::HashMap, fs::File, io::Write as _, path::Path, time::Instant};
 
-use neqo_csdef::{Direction, Packet, QcsdEndpointId, QcsdSlotId, TimestampedQcsdObservation};
+use neqo_csdef::{
+    Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId, TimestampedQcsdObservation,
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -65,6 +67,7 @@ pub(super) struct TraceFiles {
     next_event_sequence: u64,
     events_flushed: bool,
     pending_slots: HashMap<QcsdSlotId, PendingSlot>,
+    incoming_target_limits: HashMap<QcsdSlotId, HashMap<(QcsdEndpointId, QcsdStreamId), u64>>,
     terminal_slots: HashMap<QcsdSlotId, Packet>,
 }
 
@@ -91,6 +94,7 @@ impl TraceFiles {
             next_event_sequence: 0,
             events_flushed: false,
             pending_slots: HashMap::new(),
+            incoming_target_limits: HashMap::new(),
             terminal_slots: HashMap::new(),
         })
     }
@@ -132,6 +136,12 @@ impl TraceFiles {
         packet: Packet,
         slot: QcsdSlotId,
     ) -> Result<(), Error> {
+        if packet.direction() != Direction::Outgoing {
+            return Err(Error::SlotInvariant(format!(
+                "incoming slot {} was registered without a receive-credit target",
+                slot.0
+            )));
+        }
         if self.terminal_slots.contains_key(&slot) {
             return Err(Error::SlotInvariant(format!(
                 "slot {} was registered after reaching a terminal state",
@@ -156,41 +166,71 @@ impl TraceFiles {
         Ok(())
     }
 
-    pub(super) fn register_incoming_sibling(
+    pub(super) fn register_incoming_action(
         &mut self,
+        now: Instant,
         endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
         packet: Packet,
         slot: QcsdSlotId,
     ) -> Result<(), Error> {
         if self.terminal_slots.contains_key(&slot) {
             return Err(Error::SlotInvariant(format!(
-                "slot {} sibling was registered after reaching a terminal state",
-                slot.0
-            )));
-        }
-        let Some(existing) = self.pending_slots.get_mut(&slot) else {
-            return Err(Error::SlotInvariant(format!(
-                "slot {} sibling was registered without its primary action",
-                slot.0
-            )));
-        };
-        if existing.packet != packet {
-            return Err(Error::SlotInvariant(format!(
-                "slot {} was reused for a different action",
+                "incoming slot {} was registered after reaching a terminal state",
                 slot.0
             )));
         }
         if packet.direction() != Direction::Incoming {
             return Err(Error::SlotInvariant(format!(
-                "outgoing slot {} was registered more than once",
+                "outgoing slot {} was reused as incoming receive credit",
                 slot.0
             )));
         }
-        // One logical incoming slot can fan out over multiple streams and can
-        // move to another endpoint after returned receive credit. The caller
-        // exposes this narrow exception only while pre-registering one drained
-        // controller action batch.
-        existing.endpoint = endpoint;
+
+        if let Some(existing) = self.pending_slots.get(&slot)
+            && existing.packet != packet
+        {
+            return Err(Error::SlotInvariant(format!(
+                "slot {} was reused for a different action",
+                slot.0
+            )));
+        }
+
+        let target = (endpoint, stream);
+        if let Some(previous_limit) = self
+            .incoming_target_limits
+            .get(&slot)
+            .and_then(|targets| targets.get(&target))
+            && absolute_limit <= *previous_limit
+        {
+            return Err(Error::SlotInvariant(format!(
+                "incoming slot {} target {}:{} receive limit {absolute_limit} did not strictly increase from {previous_limit}",
+                slot.0, endpoint.0, stream.0
+            )));
+        }
+
+        if let Some(existing) = self.pending_slots.get_mut(&slot) {
+            // One logical incoming slot can continue on the same stream, fan
+            // out over several streams, or move to another endpoint after
+            // returned receive credit. Keep its first action time while the
+            // controller incrementally realizes that one scheduled packet.
+            existing.endpoint = endpoint;
+        } else {
+            let action_time_us = self.elapsed_us(now);
+            self.pending_slots.insert(
+                slot,
+                PendingSlot {
+                    endpoint,
+                    packet,
+                    action_time_us,
+                },
+            );
+        }
+        self.incoming_target_limits
+            .entry(slot)
+            .or_default()
+            .insert(target, absolute_limit);
         Ok(())
     }
 
@@ -338,6 +378,7 @@ impl TraceFiles {
             action_time_us = pending.action_time_us;
         }
         self.pending_slots.remove(&slot);
+        self.incoming_target_limits.remove(&slot);
         self.terminal_slots.insert(slot, packet);
         writeln!(
             self.schedule,

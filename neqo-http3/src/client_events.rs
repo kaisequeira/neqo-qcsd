@@ -239,11 +239,17 @@ impl HttpRecvStreamEvents for Http3ClientEvents {
     }
 
     #[cfg(feature = "qcsd")]
-    fn qcsd_header_progress(&self, stream_id: StreamId, min_remaining: u64) {
+    fn qcsd_header_progress(
+        &self,
+        stream_id: StreamId,
+        min_remaining: u64,
+        awaiting_data_frame: bool,
+    ) {
         self.qcsd_observe(|endpoint| QcsdObservation::HeaderProgress {
             endpoint,
             stream: QcsdStreamId(stream_id.as_u64()),
             min_remaining,
+            awaiting_data_frame,
         });
     }
 
@@ -254,6 +260,24 @@ impl HttpRecvStreamEvents for Http3ClientEvents {
             stream: QcsdStreamId(stream_id.as_u64()),
             frame_header_bytes,
             data_bytes,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_push_promise_frame(&self, stream_id: StreamId, frame_bytes: u64) {
+        self.qcsd_observe(|endpoint| QcsdObservation::PushPromiseFrame {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            frame_bytes,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_ignored_request_stream_frame(&self, stream_id: StreamId, frame_bytes: u64) {
+        self.qcsd_observe(|endpoint| QcsdObservation::IgnoredRequestStreamFrame {
+            endpoint,
+            stream: QcsdStreamId(stream_id.as_u64()),
+            frame_bytes,
         });
     }
 
