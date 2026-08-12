@@ -124,7 +124,10 @@ reduce an incoming defense's desired byte budget, while only their exact
 overlap with scheduled ranges reduces credit still in flight. Unused ranges
 retire when their stream or endpoint closes; only that retired amount becomes
 eligible for a retry. Advertising `MAX_STREAM_DATA` never counts as received
-traffic.
+traffic. A bounded parser-liveness lease remains slotless at the transport
+boundary. When it is provisionally backed by an existing scheduled slot, the
+controller includes that owner as runner trace metadata so the slot's action
+time is the lease-issuance time; an unowned lease includes no slot metadata.
 
 Walkie-Talkie is the one defence whose effective initial request-stream receive
 limit is zero. The same zero is installed in the client transport parameter,
@@ -235,7 +238,7 @@ and realization observations.
 
 Intentional modernizations include typed IDs, integer microsecond durations, a
 pinned SplitMix64 FRONT generator, explicit UDP-payload sizes, same-origin
-identity-encoded credential-free chaff, and current Neqo stream keep-alives.
+credential-free chaff with frozen safe request headers, and current Neqo stream keep-alives.
 Exact historical RNG traces can be imported as Static CSV schedules. Schedule
 CSV and dependency JSON inputs remain readable, but the obsolete profile-v1
 TOML surface, clients, notebooks, worker threads, and direct core-to-Neqo
@@ -282,11 +285,12 @@ target/debug/neqo-qcsd-client run --help
 
 `probe --input-manifest` enriches browser-discovered graphs without discarding
 IDs, dependencies, resource types, or safe headers.
-Application requests support `fresh-browser`, `minimal`, and broad `custom`
-header policies; stored credentials and HTTP/3-invalid connection fields are
-rejected. Chaff always remains same-origin GET-only with
-`Accept-Encoding: identity`, no credentials, ranges, conditions, or promoted
-cross-origin redirects.
+Application requests replay the exact safe headers frozen in the manifest;
+`as-defined` and `half-duplex` change request scheduling, not those headers.
+Stored credentials and HTTP/3-invalid connection fields are rejected. Chaff
+always remains same-origin GET-only and replays the same frozen safe headers,
+including `Accept-Encoding`, while stripping credentials, ranges, conditions,
+connection-specific fields, and promoted cross-origin redirects.
 
 ### Validation
 

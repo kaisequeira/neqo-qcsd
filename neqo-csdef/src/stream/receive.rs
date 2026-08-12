@@ -25,6 +25,7 @@ pub enum ReceiveState {
         framing_bytes: u64,
         parser_lease_capacity: u64,
         parser_lease_used: u64,
+        parser_lease_exhausted: bool,
         last_parser_lease_boundary: Option<u64>,
         pending_parser_boundary: Option<u64>,
     },
@@ -40,6 +41,7 @@ pub enum ReceiveState {
         framing_bytes: u64,
         parser_lease_capacity: u64,
         parser_lease_used: u64,
+        parser_lease_exhausted: bool,
         last_parser_lease_boundary: Option<u64>,
         pending_parser_boundary: Option<u64>,
         data_length: u64,
@@ -98,6 +100,7 @@ impl ReceiveState {
                 framing_bytes: 0,
                 parser_lease_capacity: excess,
                 parser_lease_used: 0,
+                parser_lease_exhausted: excess == 0,
                 last_parser_lease_boundary: None,
                 pending_parser_boundary: None,
             }
@@ -259,7 +262,11 @@ impl ReceiveState {
     /// releases necessarily begin after it.  A boundary offset can lease once,
     /// and all leases over the stream lifetime are capped by the configured
     /// `max_stream_data_excess` value.
-    pub fn parser_lease(&mut self, pristine_data_boundary: bool) -> Option<(u64, u64)> {
+    pub fn parser_lease(
+        &mut self,
+        pristine_data_boundary: bool,
+        scheduled_backing: u64,
+    ) -> Option<(u64, u64, bool)> {
         if !pristine_data_boundary {
             return None;
         }
@@ -271,6 +278,7 @@ impl ReceiveState {
                 consumed,
                 parser_lease_capacity,
                 parser_lease_used,
+                parser_lease_exhausted,
                 last_parser_lease_boundary,
                 pending_parser_boundary,
                 ..
@@ -282,6 +290,7 @@ impl ReceiveState {
                 consumed,
                 parser_lease_capacity,
                 parser_lease_used,
+                parser_lease_exhausted,
                 last_parser_lease_boundary,
                 pending_parser_boundary,
                 ..
@@ -298,18 +307,87 @@ impl ReceiveState {
                 {
                     return None;
                 }
-                let remaining = parser_lease_capacity.saturating_sub(*parser_lease_used);
-                let increase = remaining.min(MAX_HTTP3_FRAME_HEADER_BYTES);
+                let scheduled = *parser_lease_exhausted && scheduled_backing > 0;
+                let increase = if scheduled {
+                    scheduled_backing.min(MAX_HTTP3_FRAME_HEADER_BYTES)
+                } else {
+                    if *parser_lease_exhausted {
+                        return None;
+                    }
+                    parser_lease_capacity
+                        .saturating_sub(*parser_lease_used)
+                        .min(MAX_HTTP3_FRAME_HEADER_BYTES)
+                };
                 if increase == 0 {
                     return None;
                 }
                 *last_parser_lease_boundary = Some(*consumed);
                 *pending_parser_boundary = None;
-                *parser_lease_used = parser_lease_used.saturating_add(increase);
+                if !scheduled {
+                    *parser_lease_used = parser_lease_used.saturating_add(increase);
+                    *parser_lease_exhausted |= *parser_lease_used == *parser_lease_capacity;
+                }
                 *requested_limit = requested_limit.saturating_add(increase);
-                Some((*requested_limit, increase))
+                Some((*requested_limit, increase, scheduled))
             }
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => None,
+        }
+    }
+
+    /// Reclassify consumed parser-lease bytes as scheduled raw-stream work.
+    ///
+    /// Only bytes that the controller actually debited to a live scheduling
+    /// claim may pass through this transition. They no longer consume the
+    /// stream's bounded *unowned* parser allowance, and their provisional
+    /// claim reservation becomes available for the next due slot. Merely
+    /// advertising or leaving a lease unused never replenishes either budget.
+    pub fn schedule_parser_lease_bytes(&mut self, amount: u64, recycle_unowned: bool) -> u64 {
+        match self {
+            Self::ReceivingHeaders {
+                reservation_capacity,
+                reservation_available,
+                parser_lease_used,
+                ..
+            }
+            | Self::ReceivingData {
+                reservation_capacity,
+                reservation_available,
+                parser_lease_used,
+                ..
+            } => {
+                let scheduled = amount;
+                if recycle_unowned {
+                    *parser_lease_used = parser_lease_used.saturating_sub(scheduled);
+                }
+                *reservation_available = reservation_available
+                    .saturating_add(scheduled)
+                    .min(*reservation_capacity);
+                scheduled
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => 0,
+        }
+    }
+
+    /// Whether a typed pristine boundary is retained for this exact raw
+    /// offset and has not already produced a lease.
+    pub fn has_pending_parser_boundary(&self) -> bool {
+        match self {
+            Self::ReceivingHeaders {
+                consumed,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            }
+            | Self::ReceivingData {
+                consumed,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } => {
+                *pending_parser_boundary == Some(*consumed)
+                    && *last_parser_lease_boundary != Some(*consumed)
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => false,
         }
     }
 
@@ -354,6 +432,7 @@ impl ReceiveState {
                 framing_bytes,
                 parser_lease_capacity,
                 parser_lease_used,
+                parser_lease_exhausted,
                 last_parser_lease_boundary,
                 pending_parser_boundary,
                 ..
@@ -378,6 +457,7 @@ impl ReceiveState {
                     framing_bytes,
                     parser_lease_capacity: *parser_lease_capacity,
                     parser_lease_used: *parser_lease_used,
+                    parser_lease_exhausted: *parser_lease_exhausted,
                     last_parser_lease_boundary: *last_parser_lease_boundary,
                     pending_parser_boundary: *pending_parser_boundary,
                     data_length: data,
@@ -497,6 +577,45 @@ impl ReceiveState {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Roll back one parser lease that never reached the transport. Parser
+    /// ranges are canceled in reverse order, exactly like scheduled releases.
+    /// A canceled unowned range returns its unused allowance; exhaustion stays
+    /// sticky so any later continuation still requires scheduled backing.
+    pub const fn cancel_parser_lease(
+        &mut self,
+        absolute_limit: u64,
+        increase: u64,
+        unowned: bool,
+    ) -> bool {
+        if !self.cancel_release(absolute_limit, increase) {
+            return false;
+        }
+        match self {
+            Self::ReceivingHeaders {
+                consumed,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            }
+            | Self::ReceivingData {
+                consumed,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } => {
+                if unowned {
+                    *parser_lease_used = parser_lease_used.saturating_sub(increase);
+                }
+                *last_parser_lease_boundary = None;
+                *pending_parser_boundary = Some(*consumed);
+                true
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => false,
         }
     }
 
@@ -703,7 +822,7 @@ mod tests {
         // 131,105 is two bytes ahead of consumed 131,103. Those existing raw
         // bytes remain scheduled; a disjoint parser tail begins at 131,105.
         state.header_progress(1, true);
-        assert_eq!(state.parser_lease(true), Some((BODY + 49, 16)));
+        assert_eq!(state.parser_lease(true, 0), Some((BODY + 49, 16, false)));
         assert_eq!(BODY + 33, 131_105);
         state.advertised(BODY + 49);
         state.bytes_read(2);
@@ -713,7 +832,7 @@ mod tests {
         // A later distinct DATA(0) boundary can extend the bounded lease even
         // while part of the prior lease remains unused.
         state.header_progress(1, true);
-        assert_eq!(state.parser_lease(true), Some((BODY + 65, 16)));
+        assert_eq!(state.parser_lease(true, 0), Some((BODY + 65, 16, false)));
         state.advertised(BODY + 65);
         state.bytes_read(2);
         state.data_frame(2, 0);
@@ -729,42 +848,55 @@ mod tests {
         let mut total = 0;
         for boundary in 0..63 {
             state.header_progress(1, true);
-            let (absolute, increase) = state.parser_lease(true).expect("bounded lease");
+            let (absolute, increase, scheduled) =
+                state.parser_lease(true, 0).expect("bounded lease");
+            assert!(!scheduled);
             let expected = if boundary == 62 { 8 } else { 16 };
             assert_eq!(increase, expected);
             total += increase;
             assert_eq!(absolute, 1 + total);
-            assert_eq!(state.parser_lease(true), None, "duplicate boundary");
+            assert_eq!(state.parser_lease(true, 0), None, "duplicate boundary");
             state.advertised(absolute);
             state.bytes_read(increase);
         }
         assert_eq!(total, 1_000);
-        assert_eq!(state.parser_lease(true), None, "lifetime cap");
+        state.header_progress(1, true);
+        assert_eq!(state.parser_lease(true, 0), None, "unowned lifetime cap");
+        assert_eq!(
+            state.parser_lease(true, 7),
+            Some((1_008, 7, true)),
+            "scheduled demand can continue beyond the unowned cap"
+        );
+        assert_eq!(state.parser_lease(true, 7), None, "duplicate boundary");
+        state.advertised(1_008);
+        state.bytes_read(7);
+        assert_eq!(state.schedule_parser_lease_bytes(7, false), 7);
+        assert_eq!(state.claimable(), 1_000);
     }
 
     #[test]
     fn parser_lease_requires_a_pristine_exhausted_boundary() {
         let mut exact_available = ReceiveState::controlled(0, 100, 10);
-        assert_eq!(exact_available.parser_lease(true), None);
+        assert_eq!(exact_available.parser_lease(true, 0), None);
 
         let mut outstanding = ReceiveState::controlled(1, 100, 1);
         outstanding.bytes_read(1);
         outstanding.header_progress(1, true);
-        assert_eq!(outstanding.parser_lease(true), Some((17, 16)));
-        assert_eq!(outstanding.parser_lease(false), None);
+        assert_eq!(outstanding.parser_lease(true, 0), Some((17, 16, false)));
+        assert_eq!(outstanding.parser_lease(false, 0), None);
 
         let mut unadvertised = ReceiveState::controlled(1, 100, 2);
         unadvertised.bytes_read(1);
         assert_eq!(unadvertised.release(1), Some((2, 1)));
         unadvertised.header_progress(1, true);
-        assert_eq!(unadvertised.parser_lease(true), None);
+        assert_eq!(unadvertised.parser_lease(true, 0), None);
         unadvertised.advertised(2);
-        assert_eq!(unadvertised.parser_lease(true), Some((18, 16)));
+        assert_eq!(unadvertised.parser_lease(true, 0), Some((18, 16, false)));
 
         let mut not_pristine = ReceiveState::controlled(1, 100, 1);
         not_pristine.bytes_read(1);
         not_pristine.header_progress(8, false);
-        assert_eq!(not_pristine.parser_lease(false), None);
+        assert_eq!(not_pristine.parser_lease(false, 0), None);
         assert_eq!(not_pristine.available(), 8);
     }
 

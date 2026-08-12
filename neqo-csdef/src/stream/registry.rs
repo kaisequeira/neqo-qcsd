@@ -24,6 +24,15 @@ pub struct CreditRelease {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParserLease {
+    pub endpoint: QcsdEndpointId,
+    pub stream: QcsdStreamId,
+    pub absolute_limit: u64,
+    pub increase: u64,
+    pub scheduled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocationOpportunity {
     pub endpoint: QcsdEndpointId,
     pub stream: QcsdStreamId,
@@ -204,6 +213,21 @@ impl StreamRegistry {
             .is_some_and(|state| state.receive.cancel_release(absolute_limit, increase))
     }
 
+    pub fn cancel_parser_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        increase: u64,
+        unowned: bool,
+    ) -> bool {
+        self.get_mut(endpoint, stream).is_some_and(|state| {
+            state
+                .receive
+                .cancel_parser_lease(absolute_limit, increase, unowned)
+        })
+    }
+
     pub fn open_chaff_count(&self) -> usize {
         self.streams
             .values()
@@ -230,15 +254,53 @@ impl StreamRegistry {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
         pristine_data_boundary: bool,
-    ) -> Option<CreditRelease> {
+        scheduled_backing: u64,
+    ) -> Option<ParserLease> {
         let state = self.get_mut(endpoint, stream)?;
-        let (absolute_limit, increase) = state.receive.parser_lease(pristine_data_boundary)?;
-        Some(CreditRelease {
+        let (absolute_limit, increase, scheduled) = state
+            .receive
+            .parser_lease(pristine_data_boundary, scheduled_backing)?;
+        Some(ParserLease {
             endpoint,
             stream,
             absolute_limit,
             increase,
+            scheduled,
         })
+    }
+
+    pub fn schedule_parser_lease_bytes(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        amount: u64,
+        recycle_unowned: bool,
+    ) -> u64 {
+        self.get_mut(endpoint, stream).map_or(0, |state| {
+            state
+                .receive
+                .schedule_parser_lease_bytes(amount, recycle_unowned)
+        })
+    }
+
+    pub fn has_pending_parser_boundary(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.streams
+            .get(&(endpoint, stream))
+            .is_some_and(|state| state.receive.has_pending_parser_boundary())
+    }
+
+    pub fn pending_parser_boundaries(&self) -> Vec<(QcsdEndpointId, QcsdStreamId)> {
+        let mut pending: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|(key, state)| state.receive.has_pending_parser_boundary().then_some(*key))
+            .collect();
+        pending.sort_unstable();
+        pending
     }
 
     pub fn clear_parser_boundaries(&mut self) {

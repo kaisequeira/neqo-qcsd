@@ -5,4 +5,4 @@
 
 mod manifest;
 
-pub use manifest::{Resource, ResourceManifest};
+pub use manifest::{Resource, ResourceManifest, sanitize_chaff_headers};

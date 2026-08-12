@@ -38,11 +38,12 @@ pub use dependency_tracker::{DependencyTracker, ResourceRunState};
 pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
     MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdDatagramClass, QcsdEndpointId,
-    QcsdObservation, QcsdObservationClock, QcsdRequestRole, QcsdSlotId, QcsdStreamFinish,
-    QcsdStreamId, TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
+    QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdRequestRole, QcsdSlotId,
+    QcsdStreamFinish, QcsdStreamId, TimestampedQcsdObservation, TrafficMorphingBypassReason,
+    TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
-pub use resource::{Resource, ResourceManifest};
+pub use resource::{Resource, ResourceManifest, sanitize_chaff_headers};
 pub use rng::{SplitMix64, derive};
 pub use trace::{Direction, Packet, Trace};
 

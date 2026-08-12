@@ -12,6 +12,7 @@ use neqo_common::Header;
 use neqo_csdef::{
     QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
     QcsdRequestRole, QcsdStreamId, Resource, TimestampedQcsdObservation, TrafficMorphingEgress,
+    sanitize_chaff_headers,
 };
 use neqo_transport::StreamId;
 
@@ -280,28 +281,12 @@ fn same_origin(target: &http::Uri, origin: &(String, String)) -> bool {
 }
 
 fn strict_chaff_headers(headers: Vec<(String, String)>) -> Vec<Header> {
-    let mut headers = headers
+    // Representation negotiation is part of the frozen workload: replacing
+    // Accept-Encoding changes the response body that the size estimate describes.
+    sanitize_chaff_headers(headers)
         .into_iter()
-        .filter_map(|(name, value)| {
-            let name = name.to_ascii_lowercase();
-            (!matches!(
-                name.as_str(),
-                "accept-encoding"
-                    | "authorization"
-                    | "cookie"
-                    | "if-match"
-                    | "if-modified-since"
-                    | "if-none-match"
-                    | "if-range"
-                    | "if-unmodified-since"
-                    | "proxy-authorization"
-                    | "range"
-            ))
-            .then(|| Header::new(name, value))
-        })
-        .collect::<Vec<_>>();
-    headers.push(Header::new("accept-encoding", "identity"));
-    headers
+        .map(|(name, value)| Header::new(name, value))
+        .collect()
 }
 
 #[cfg(test)]
@@ -326,27 +311,56 @@ mod tests {
     }
 
     #[test]
-    fn chaff_headers_are_identity_encoded_and_non_sensitive() {
+    fn chaff_headers_preserve_frozen_encoding_and_strip_unsafe_inputs() {
         let headers = strict_chaff_headers(vec![
             ("Accept".into(), "text/html".into()),
             ("Accept-Encoding".into(), "br, gzip".into()),
+            ("Accept-Language".into(), "en-AU,en;q=0.9".into()),
             ("Cookie".into(), "secret=1".into()),
+            ("Cookie2".into(), "secret=2".into()),
             ("Authorization".into(), "Bearer secret".into()),
+            ("Proxy-Authorization".into(), "Basic secret".into()),
+            ("If-Match".into(), "etag".into()),
             ("If-None-Match".into(), "etag".into()),
+            ("If-Modified-Since".into(), "yesterday".into()),
+            ("If-Unmodified-Since".into(), "today".into()),
+            ("If-Range".into(), "etag".into()),
             ("Range".into(), "bytes=0-99".into()),
+            ("Connection".into(), "keep-alive".into()),
+            ("Host".into(), "attacker.example".into()),
+            ("Keep-Alive".into(), "timeout=5".into()),
+            ("Proxy-Connection".into(), "keep-alive".into()),
+            ("Transfer-Encoding".into(), "chunked".into()),
+            ("Upgrade".into(), "websocket".into()),
+            ("TE".into(), "deflate".into()),
+            ("te".into(), "trailers".into()),
+            (":authority".into(), "attacker.example".into()),
+            ("bad name".into(), "unsafe".into()),
+            ("x-bad-value".into(), "unsafe\r\nvalue".into()),
         ]);
-        assert!(headers.iter().any(|header| header.name() == "accept"));
         assert_eq!(
             headers
                 .iter()
-                .filter(|header| header.name() == "accept-encoding")
-                .map(neqo_common::Header::value)
+                .map(|header| (header.name(), header.value()))
                 .collect::<Vec<_>>(),
-            vec![b"identity".as_slice()]
+            vec![
+                ("accept", b"text/html".as_slice()),
+                ("accept-encoding", b"br, gzip".as_slice()),
+                ("accept-language", b"en-AU,en;q=0.9".as_slice()),
+                ("te", b"trailers".as_slice()),
+            ]
         );
-        assert!(!headers.iter().any(|header| matches!(
-            header.name(),
-            "cookie" | "authorization" | "if-none-match" | "range"
-        )));
+    }
+
+    #[test]
+    fn chaff_headers_do_not_inject_an_encoding_policy() {
+        let headers = strict_chaff_headers(vec![("Accept".into(), "text/html".into())]);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name(), "accept");
+        assert!(
+            headers
+                .iter()
+                .all(|header| header.name() != "accept-encoding")
+        );
     }
 }

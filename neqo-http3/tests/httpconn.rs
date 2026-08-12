@@ -11,6 +11,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use neqo_common::{Datagram, event::Provider as _, qtrace};
+#[cfg(feature = "qcsd")]
+use neqo_csdef::{QcsdAction, QcsdChaffRequestId, QcsdEndpointId, Resource};
 use neqo_http3::{
     Header, Http3Client, Http3ClientEvent, Http3OrWebTransportStream, Http3Parameters, Http3Server,
     Http3ServerEvent, Http3State, Priority,
@@ -563,4 +565,75 @@ fn server_stop_sending_and_stream_combinations() {
             server_stop_sending_and_stream_test(separate_packets, stop_sending_first);
         }
     }
+}
+
+#[cfg(feature = "qcsd")]
+#[test]
+fn qcsd_chaff_dispatches_exact_frozen_safe_accept_encoding() {
+    let mut client = default_http3_client();
+    let mut server = default_http3_server();
+    let out = connect_peers(&mut client, &mut server);
+    assert_eq!(server.process(out, now()).dgram(), None);
+    drop(server.events());
+
+    client
+        .enable_qcsd(
+            QcsdEndpointId(7),
+            &"https://something.com/".parse().expect("valid origin"),
+            1_200,
+            false,
+            Duration::from_millis(100),
+        )
+        .expect("enable QCSD");
+    let stream = client
+        .apply_qcsd_action(
+            now(),
+            QcsdAction::RequestChaff {
+                endpoint: QcsdEndpointId(7),
+                resource: Resource {
+                    id: 9,
+                    url: "https://something.com/chaff".into(),
+                    kind: "Script".into(),
+                    content_length: Some(1_024),
+                    data_length: 1_024,
+                    chaff_priority: true,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: vec![
+                        ("Accept".into(), "text/javascript".into()),
+                        ("Accept-Encoding".into(), "gzip, deflate, br, zstd".into()),
+                        ("Cookie".into(), "mutable=secret".into()),
+                        ("If-None-Match".into(), "stale-etag".into()),
+                        ("Range".into(), "bytes=0-99".into()),
+                    ],
+                },
+                request_id: QcsdChaffRequestId(11),
+            },
+        )
+        .expect("dispatch chaff action")
+        .expect("chaff stream");
+    client
+        .stream_close_send(stream, now())
+        .expect("finish chaff request");
+    exchange_packets(&mut client, &mut server, false, None);
+
+    let headers = server
+        .events()
+        .find_map(|event| match event {
+            Http3ServerEvent::Headers { headers, .. } => Some(headers),
+            _ => None,
+        })
+        .expect("server decodes chaff request headers");
+    assert_eq!(
+        headers,
+        [
+            Header::new(":method", "GET"),
+            Header::new(":scheme", "https"),
+            Header::new(":authority", "something.com"),
+            Header::new(":path", "/chaff"),
+            Header::new("accept", "text/javascript"),
+            Header::new("accept-encoding", "gzip, deflate, br, zstd"),
+        ]
+    );
+    assert!(headers.iter().all(|header| header.value() != b"identity"));
 }

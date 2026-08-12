@@ -79,6 +79,30 @@ fn validate_headers(headers: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+/// Normalize and retain only frozen request headers that are safe for chaff replay.
+///
+/// Manifest loading rejects unsafe headers. This defense-in-depth sanitizer also
+/// covers actions constructed directly in code, and is shared by the runner and
+/// HTTP/3 adapter so recorded and transmitted request headers cannot diverge.
+#[must_use]
+pub fn sanitize_chaff_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            (!name.is_empty()
+                && !name.starts_with(':')
+                && name.bytes().all(is_header_name_byte)
+                && !is_connection_specific(&name, &value)
+                && !is_sensitive(&name)
+                && !is_conditional(&name)
+                && name != "range"
+                && !value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n')))
+            .then_some((name, value))
+        })
+        .collect()
+}
+
 fn is_conditional(name: &str) -> bool {
     matches!(
         name,
@@ -363,7 +387,7 @@ impl ResourceManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::ResourceManifest;
+    use super::{ResourceManifest, sanitize_chaff_headers};
 
     const LEGACY: &str = r#"{
         "nodes": [
@@ -451,5 +475,53 @@ mod tests {
             "resources":[{"id":0,"url":"https://example.com/"}]
         }"#;
         assert!(ResourceManifest::from_json(input).is_err());
+    }
+
+    #[test]
+    fn chaff_sanitizer_preserves_frozen_headers_and_strips_every_unsafe_class() {
+        let input = vec![
+            ("Accept".into(), "text/html".into()),
+            ("Accept-Encoding".into(), "gzip, deflate, br, zstd".into()),
+            ("Accept-Language".into(), "en-AU,en;q=0.9".into()),
+            ("Cookie".into(), "secret=1".into()),
+            ("Cookie2".into(), "secret=2".into()),
+            ("Authorization".into(), "Bearer secret".into()),
+            ("Proxy-Authorization".into(), "Basic secret".into()),
+            ("If-Match".into(), "etag".into()),
+            ("If-Modified-Since".into(), "yesterday".into()),
+            ("If-None-Match".into(), "etag".into()),
+            ("If-Range".into(), "etag".into()),
+            ("If-Unmodified-Since".into(), "today".into()),
+            ("Range".into(), "bytes=0-99".into()),
+            ("Connection".into(), "keep-alive".into()),
+            ("Host".into(), "attacker.example".into()),
+            ("Keep-Alive".into(), "timeout=5".into()),
+            ("Proxy-Connection".into(), "keep-alive".into()),
+            ("Transfer-Encoding".into(), "chunked".into()),
+            ("Upgrade".into(), "websocket".into()),
+            ("TE".into(), "deflate".into()),
+            ("te".into(), "trailers".into()),
+            (":authority".into(), "attacker.example".into()),
+            (String::new(), "empty-name".into()),
+            ("bad name".into(), "unsafe".into()),
+            ("x-bad-cr".into(), "unsafe\rvalue".into()),
+            ("x-bad-lf".into(), "unsafe\nvalue".into()),
+            ("x-bad-nul".into(), "unsafe\0value".into()),
+        ];
+        let expected = vec![
+            ("accept".into(), "text/html".into()),
+            ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
+            ("accept-language".into(), "en-AU,en;q=0.9".into()),
+            ("te".into(), "trailers".into()),
+        ];
+
+        let sanitized = sanitize_chaff_headers(input);
+        assert_eq!(sanitized, expected);
+        assert_eq!(sanitize_chaff_headers(sanitized.clone()), sanitized);
+        assert_eq!(
+            sanitize_chaff_headers(vec![("Accept".into(), "text/html".into())]),
+            vec![("accept".into(), "text/html".into())],
+            "the sanitizer must not invent an Accept-Encoding policy"
+        );
     }
 }

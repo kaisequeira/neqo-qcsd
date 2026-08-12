@@ -9,7 +9,7 @@ mod action;
 mod ids;
 mod observation;
 
-pub use action::QcsdAction;
+pub use action::{QcsdAction, QcsdParserLeaseOwner};
 pub use ids::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
 pub use observation::{
     MissedSlotReason, QcsdDatagramClass, QcsdObservation, QcsdObservationClock, QcsdStreamFinish,

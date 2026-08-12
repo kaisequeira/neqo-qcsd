@@ -25,6 +25,7 @@ use super::Error;
 pub(super) struct PendingSlot {
     pub(super) endpoint: QcsdEndpointId,
     pub(super) packet: Packet,
+    /// First adapter action issued for this logical scheduled slot.
     pub(super) action_time_us: u64,
 }
 
@@ -39,6 +40,7 @@ pub(super) struct PacketTraceRow<'a> {
 }
 
 pub(super) struct ScheduleTraceRow<'a> {
+    /// Terminal-event time used only when the slot had no registered action.
     pub(super) action_time_us: u64,
     pub(super) endpoint: Option<QcsdEndpointId>,
     pub(super) packet: Packet,

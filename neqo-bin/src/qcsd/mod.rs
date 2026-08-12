@@ -30,6 +30,7 @@ use neqo_csdef::{
     Packet, QcsdAction, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
     QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, Resource, ResourceManifest,
     ResourceRunState, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, derive,
+    sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -1752,6 +1753,14 @@ fn header_u64(headers: &[Header], name: &str) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
+fn sanitize_chaff_action_headers(action: &mut QcsdAction) {
+    if let QcsdAction::RequestChaff { resource, .. } = action {
+        // Sanitize before cloning the action so the adapter, action event, and
+        // response receipt all describe the same frozen request headers.
+        resource.headers = sanitize_chaff_headers(std::mem::take(&mut resource.headers));
+    }
+}
+
 const fn action_endpoint(action: &QcsdAction) -> Option<QcsdEndpointId> {
     match action {
         QcsdAction::ConfigureManualReceive { endpoint, .. }
@@ -2060,6 +2069,11 @@ const fn scheduled_action(action: &QcsdAction) -> Option<(QcsdEndpointId, Packet
             slot,
             ..
         } => Some((*endpoint, *packet, *slot)),
+        QcsdAction::LeaseParserReceive {
+            endpoint,
+            owner: Some(owner),
+            ..
+        } => Some((*endpoint, owner.packet, owner.slot)),
         _ => None,
     }
 }
@@ -2080,6 +2094,13 @@ fn register_action_batch(
                 endpoint,
                 stream,
                 absolute_limit,
+                ..
+            }
+            | QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit,
+                owner: Some(_),
                 ..
             } => Some((*endpoint, *stream, *absolute_limit)),
             QcsdAction::SendPacket { .. } => None,
@@ -2159,9 +2180,10 @@ fn apply_action(
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
-    action: QcsdAction,
+    mut action: QcsdAction,
     may_skip_terminal_sibling: bool,
 ) -> Result<(), Error> {
+    sanitize_chaff_action_headers(&mut action);
     let endpoint_id = action_endpoint(&action);
     let action_time_us = traces.elapsed_us(now);
     if record_terminal_action(traces, now, action_time_us, "recorded", &action)? {
@@ -2243,12 +2265,17 @@ fn apply_action(
                     .push_back(ScheduledOutgoing { slot, packet });
             }
             if let Some(stream_id) = chaff_stream {
-                let (resource_id, request_id, url) = match &trace_action {
+                let (resource_id, request_id, url, request_headers) = match &trace_action {
                     QcsdAction::RequestChaff {
                         resource,
                         request_id,
                         ..
-                    } => (resource.id, *request_id, resource.url.clone()),
+                    } => (
+                        resource.id,
+                        *request_id,
+                        resource.url.clone(),
+                        resource.headers.clone(),
+                    ),
                     _ => unreachable!("only chaff actions return a stream"),
                 };
                 endpoint.client.stream_close_send(stream_id, now)?;
@@ -2261,7 +2288,7 @@ fn apply_action(
                             resource_id,
                             request_id: Some(request_id),
                         },
-                        request_headers: vec![("accept-encoding".into(), "identity".into())],
+                        request_headers,
                         response_headers: Vec::new(),
                         status: None,
                         content_length: None,
@@ -2622,10 +2649,11 @@ mod tests {
     use clap::Parser as _;
     use neqo_csdef::{
         DefenseConfig, DependencyTracker, Direction, FrontConfig, MissedSlotReason, Packet,
-        QcsdAction, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-        QcsdObservationClock, QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource,
-        ResourceManifest, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
-        WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass,
+        QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId,
+        QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, StaticSchedule, TamarawConfig,
+        Trace, TrafficMorphingConfig, WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        sanitize_chaff_headers,
     };
 
     use super::{
@@ -2637,7 +2665,7 @@ mod tests {
         finish_application_record, forward_qcsd_observation, has_in_flight_application_stream, now,
         qcsd_connection_parameters, ready_request_batch, record_terminal_action,
         register_action_batch, resolve_run_config, resolve_run_config_with_workload,
-        shapes_stream_sends, terminalize_pending_slots,
+        sanitize_chaff_action_headers, shapes_stream_sends, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, wait_for_activity, write_run_json,
     };
@@ -2681,6 +2709,64 @@ mod tests {
             depends_on,
             headers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn runner_replays_frozen_safe_chaff_headers_without_mutable_state() {
+        let expected = vec![
+            ("accept".into(), "text/html".into()),
+            ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
+            ("accept-language".into(), "en-AU,en;q=0.9".into()),
+            ("te".into(), "trailers".into()),
+        ];
+        let mut action = QcsdAction::RequestChaff {
+            endpoint: QcsdEndpointId(7),
+            resource: Resource {
+                headers: vec![
+                    ("Accept".into(), "text/html".into()),
+                    ("Accept-Encoding".into(), "gzip, deflate, br, zstd".into()),
+                    ("Accept-Language".into(), "en-AU,en;q=0.9".into()),
+                    ("Cookie".into(), "secret=1".into()),
+                    ("Cookie2".into(), "secret=2".into()),
+                    ("Authorization".into(), "Bearer secret".into()),
+                    ("Proxy-Authorization".into(), "Basic secret".into()),
+                    ("If-Match".into(), "etag".into()),
+                    ("If-Modified-Since".into(), "yesterday".into()),
+                    ("If-None-Match".into(), "etag".into()),
+                    ("If-Range".into(), "etag".into()),
+                    ("If-Unmodified-Since".into(), "today".into()),
+                    ("Range".into(), "bytes=0-99".into()),
+                    ("Host".into(), "attacker.example".into()),
+                    ("Connection".into(), "keep-alive".into()),
+                    ("Keep-Alive".into(), "timeout=5".into()),
+                    ("Proxy-Connection".into(), "keep-alive".into()),
+                    ("Transfer-Encoding".into(), "chunked".into()),
+                    ("Upgrade".into(), "websocket".into()),
+                    ("TE".into(), "deflate".into()),
+                    ("te".into(), "trailers".into()),
+                    (":authority".into(), "attacker.example".into()),
+                    ("bad name".into(), "unsafe".into()),
+                    ("x-bad-value".into(), "unsafe\r\nvalue".into()),
+                ],
+                ..request(3, "https://example.com", Vec::new())
+            },
+            request_id: QcsdChaffRequestId(11),
+        };
+
+        sanitize_chaff_action_headers(&mut action);
+
+        let QcsdAction::RequestChaff { resource, .. } = action else {
+            unreachable!("test constructs a chaff action")
+        };
+        assert_eq!(resource.headers, expected);
+    }
+
+    #[test]
+    fn runner_does_not_inject_chaff_accept_encoding() {
+        assert_eq!(
+            sanitize_chaff_headers(vec![("Accept".into(), "text/html".into())]),
+            vec![("accept".into(), "text/html".into())]
+        );
     }
 
     #[test]
@@ -3616,6 +3702,7 @@ mod tests {
                 stream: QcsdStreamId(0),
                 absolute_limit: 20,
                 increase: 16,
+                owner: None,
             },
             QcsdAction::IncreaseReceiveLimit {
                 endpoint,
@@ -3666,6 +3753,104 @@ mod tests {
         assert_eq!(schedule.lines().count(), 2);
         assert!(schedule.contains("satisfied"));
         assert!(!schedule.contains("parser"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    fn owned_parser_lease_records_issuance_as_the_slot_action_time() {
+        let output = trace_output_dir("owned-parser-lease-action-time");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let endpoint = QcsdEndpointId(1);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let slot = QcsdSlotId(23);
+        let lease = QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream: QcsdStreamId(4),
+            absolute_limit: 27,
+            increase: 10,
+            owner: Some(QcsdParserLeaseOwner { packet, slot }),
+        };
+
+        assert!(
+            register_action_batch(&mut traces, started + Duration::from_micros(3), &[lease])
+                .expect("owned parser lease")
+                .is_empty()
+        );
+        assert!(traces.is_slot_pending(slot));
+        assert!(
+            record_terminal_action(
+                &mut traces,
+                started + Duration::from_micros(9),
+                9,
+                "recorded",
+                &QcsdAction::SlotSatisfied {
+                    endpoint: Some(endpoint),
+                    packet,
+                    slot,
+                },
+            )
+            .expect("terminal action")
+        );
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        assert_eq!(schedule.lines().count(), 2);
+        let fields: Vec<_> = schedule
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
+        assert_eq!(fields[4], "3");
+        assert_eq!(fields[5], "satisfied");
+        assert_eq!(fields[8], "23");
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    fn missing_adapter_terminalizes_an_owned_parser_lease_once() {
+        let output = trace_output_dir("owned-parser-lease-missing-adapter");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let endpoint = QcsdEndpointId(9);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let slot = QcsdSlotId(24);
+        let lease = QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream: QcsdStreamId(4),
+            absolute_limit: 27,
+            increase: 10,
+            owner: Some(QcsdParserLeaseOwner { packet, slot }),
+        };
+        let mut endpoints = Vec::new();
+
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            &mut traces,
+            started + Duration::from_micros(3),
+            Duration::from_micros(3),
+            vec![lease],
+        )
+        .expect("missing adapter is a terminal slot outcome");
+        traces.ensure_no_pending_slots().expect("terminal slot");
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        assert_eq!(schedule.lines().count(), 2);
+        let fields: Vec<_> = schedule
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
+        assert_eq!(fields[4], "3");
+        assert_eq!(fields[5], "missed");
+        assert_eq!(fields[7], "EndpointClosed");
+        assert_eq!(fields[8], "24");
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 

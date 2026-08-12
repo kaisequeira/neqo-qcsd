@@ -8,6 +8,18 @@ use serde::{Deserialize, Serialize};
 use super::{QcsdChaffRequestId, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
 use crate::{MissedSlotReason, Packet, Resource};
 
+/// Logical scheduled-slot ownership carried by a parser receive lease.
+///
+/// The transport action remains slotless: this metadata lets the runner trace
+/// when an already-owned scheduled slot was first exposed to the adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QcsdParserLeaseOwner {
+    /// Scheduled packet whose raw receive bytes own the lease.
+    pub packet: Packet,
+    /// Logical scheduled slot to trace from lease issuance to terminal state.
+    pub slot: QcsdSlotId,
+}
+
 /// Commands emitted by the controller for a Neqo endpoint adapter.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -32,13 +44,17 @@ pub enum QcsdAction {
     /// Grant bounded receive credit solely so HTTP/3 can classify the next
     /// request-stream frame at a pristine parser boundary.
     ///
-    /// This action deliberately has no packet or slot: bytes in its raw offset
-    /// range are parser-owned and can never satisfy scheduled incoming work.
+    /// The transport limit itself has no slot. `owner` is trace/accounting
+    /// metadata only and is present when the controller reserved this lease
+    /// for an existing scheduled slot. Granting or advertising the lease never
+    /// satisfies that slot; only consumed overlap can do so.
     LeaseParserReceive {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
         absolute_limit: u64,
         increase: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<QcsdParserLeaseOwner>,
     },
     SendPacket {
         endpoint: QcsdEndpointId,
@@ -72,4 +88,49 @@ pub enum QcsdAction {
         slot: QcsdSlotId,
     },
     DefenseComplete,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    use super::{QcsdAction, QcsdParserLeaseOwner};
+    use crate::{Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
+
+    #[test]
+    fn parser_lease_owner_is_optional_and_round_trips() {
+        let unowned = QcsdAction::LeaseParserReceive {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(4),
+            absolute_limit: 17,
+            increase: 16,
+            owner: None,
+        };
+        let unowned_json = serde_json::to_value(&unowned).expect("serialize unowned lease");
+        assert_eq!(unowned_json.get("owner"), None);
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(unowned_json).expect("deserialize unowned lease"),
+            unowned
+        );
+
+        let lease_owner = QcsdParserLeaseOwner {
+            packet: Packet::new(Duration::from_micros(3), Direction::Incoming, 10).expect("packet"),
+            slot: QcsdSlotId(9),
+        };
+        let scheduled_lease = QcsdAction::LeaseParserReceive {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(4),
+            absolute_limit: 27,
+            increase: 10,
+            owner: Some(lease_owner),
+        };
+        let owned_json = serde_json::to_value(&scheduled_lease).expect("serialize owned lease");
+        assert!(matches!(owned_json.get("owner"), Some(Value::Object(_))));
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(owned_json).expect("deserialize owned lease"),
+            scheduled_lease
+        );
+    }
 }
