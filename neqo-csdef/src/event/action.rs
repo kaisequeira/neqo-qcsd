@@ -29,6 +29,17 @@ pub enum QcsdAction {
         packet: Packet,
         slot: QcsdSlotId,
     },
+    /// Grant bounded receive credit solely so HTTP/3 can classify the next
+    /// request-stream frame at a pristine parser boundary.
+    ///
+    /// This action deliberately has no packet or slot: bytes in its raw offset
+    /// range are parser-owned and can never satisfy scheduled incoming work.
+    LeaseParserReceive {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        increase: u64,
+    },
     SendPacket {
         endpoint: QcsdEndpointId,
         packet: Packet,

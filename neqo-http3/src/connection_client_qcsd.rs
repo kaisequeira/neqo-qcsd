@@ -187,6 +187,15 @@ impl Http3Client {
                     slot,
                 )?;
             }
+            QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit,
+                ..
+            } if endpoint == own_endpoint => {
+                self.conn
+                    .qcsd_set_stream_receive_limit(StreamId::new(stream.0), absolute_limit)?;
+            }
             QcsdAction::SendPacket {
                 endpoint,
                 packet,

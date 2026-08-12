@@ -2860,6 +2860,75 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    fn qcsd_observes_final_data_zero_data_and_fin_in_raw_causal_order() {
+        let (mut client, mut server) = connect();
+        enable_qcsd_observations(&mut client);
+        let request_stream_id = make_request_and_exchange_pkts(&mut client, &mut server, true);
+        drop(drain_qcsd_observations(&mut client));
+        setup_server_side_encoder(&mut client, &mut server);
+
+        let mut headers = Encoder::default();
+        server.encode_headers(
+            request_stream_id,
+            &[
+                Header::new(":status", "200"),
+                Header::new("content-length", "1"),
+            ],
+            &mut headers,
+        );
+        let mut response = Encoder::default();
+        response.encode(headers.as_ref());
+        HFrame::Data { len: 1 }.encode(&mut response);
+        response.encode([b'x']);
+        HFrame::Data { len: 0 }.encode(&mut response);
+        server_send_response_and_exchange_packet(
+            &mut client,
+            &mut server,
+            request_stream_id,
+            response,
+            true,
+        );
+
+        let mut body = [0_u8; 1];
+        assert_eq!(
+            client
+                .read_data(now(), request_stream_id, &mut body)
+                .expect("read final DATA sequence"),
+            (1, true)
+        );
+        assert_eq!(body, [b'x']);
+
+        let observations = drain_qcsd_observations(&mut client);
+        let semantic: Vec<_> = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                QcsdObservation::DataFrame {
+                    frame_header_bytes,
+                    data_bytes,
+                    ..
+                } => Some(("data", *frame_header_bytes, *data_bytes)),
+                QcsdObservation::StreamFinished {
+                    finish: QcsdStreamFinish::Fin,
+                    ..
+                } => Some(("fin", 0, 0)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(semantic, [("data", 2, 1), ("data", 2, 0), ("fin", 0, 0)]);
+        assert_eq!(
+            observations
+                .iter()
+                .filter_map(|observation| match observation {
+                    QcsdObservation::BytesRead { bytes, .. } => Some(*bytes),
+                    _ => None,
+                })
+                .sum::<u64>(),
+            u64::try_from(headers.len()).unwrap() + 5
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_observes_push_promise_frame_once_with_exact_bytes() {
         let (mut client, mut server) = connect();
         enable_qcsd_observations(&mut client);

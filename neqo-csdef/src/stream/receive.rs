@@ -23,7 +23,10 @@ pub enum ReceiveState {
         consumed: u64,
         payload_floor: u64,
         framing_bytes: u64,
-        prospective_frame_header_bytes: u64,
+        parser_lease_capacity: u64,
+        parser_lease_used: u64,
+        last_parser_lease_boundary: Option<u64>,
+        pending_parser_boundary: Option<u64>,
     },
     /// At least one HTTP/3 DATA frame length is known.
     ReceivingData {
@@ -35,7 +38,10 @@ pub enum ReceiveState {
         consumed: u64,
         payload_floor: u64,
         framing_bytes: u64,
-        prospective_frame_header_bytes: u64,
+        parser_lease_capacity: u64,
+        parser_lease_used: u64,
+        last_parser_lease_boundary: Option<u64>,
+        pending_parser_boundary: Option<u64>,
         data_length: u64,
     },
     /// Neqo owns receive-window growth; QCSD only records response size.
@@ -90,7 +96,10 @@ impl ReceiveState {
                 consumed: 0,
                 payload_floor: expected,
                 framing_bytes: 0,
-                prospective_frame_header_bytes: 0,
+                parser_lease_capacity: excess,
+                parser_lease_used: 0,
+                last_parser_lease_boundary: None,
+                pending_parser_boundary: None,
             }
         } else {
             Self::Automatic {
@@ -203,49 +212,104 @@ impl ReceiveState {
     }
 
     pub fn header_progress(&mut self, min_remaining: u64, awaiting_data_frame: bool) {
+        // A pristine boundary does not reveal the next frame's raw extent.
+        // Its parser liveness is owned by `parser_lease`, never by scheduled
+        // capacity.  Once decoding has begun, `min_remaining` is an exact
+        // parser requirement and may safely extend the scheduled raw floor.
+        if awaiting_data_frame {
+            match self {
+                Self::ReceivingHeaders {
+                    consumed,
+                    pending_parser_boundary,
+                    ..
+                }
+                | Self::ReceivingData {
+                    consumed,
+                    pending_parser_boundary,
+                    ..
+                } => *pending_parser_boundary = Some(*consumed),
+                Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
+            }
+            return;
+        }
         match self {
             Self::ReceivingHeaders {
                 known_limit,
                 consumed,
-                payload_floor,
-                framing_bytes,
-                prospective_frame_header_bytes,
+                pending_parser_boundary,
                 ..
-            } => {
-                *prospective_frame_header_bytes = if awaiting_data_frame {
-                    prospective_data_frame_header(*payload_floor)
-                } else {
-                    0
-                };
-                *known_limit = (*known_limit).max(consumed.saturating_add(min_remaining));
-                *known_limit = (*known_limit).max(
-                    payload_floor
-                        .saturating_add(*framing_bytes)
-                        .saturating_add(*prospective_frame_header_bytes),
-                );
             }
-            Self::ReceivingData {
+            | Self::ReceivingData {
                 known_limit,
                 consumed,
-                payload_floor,
-                framing_bytes,
-                prospective_frame_header_bytes,
-                data_length,
+                pending_parser_boundary,
                 ..
             } => {
-                *prospective_frame_header_bytes = if awaiting_data_frame {
-                    prospective_data_frame_header(payload_floor.saturating_sub(*data_length))
-                } else {
-                    0
-                };
+                *pending_parser_boundary = None;
                 *known_limit = (*known_limit).max(consumed.saturating_add(min_remaining));
-                *known_limit = (*known_limit).max(
-                    payload_floor
-                        .saturating_add(*framing_bytes)
-                        .saturating_add(*prospective_frame_header_bytes),
-                );
             }
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
+        }
+    }
+
+    /// Lease one maximum HTTP/3 frame-header prefix at a pristine DATA
+    /// boundary after all exact receive capacity has been consumed.
+    ///
+    /// The returned raw range advances `requested_limit`, so later scheduled
+    /// releases necessarily begin after it.  A boundary offset can lease once,
+    /// and all leases over the stream lifetime are capped by the configured
+    /// `max_stream_data_excess` value.
+    pub fn parser_lease(&mut self, pristine_data_boundary: bool) -> Option<(u64, u64)> {
+        if !pristine_data_boundary {
+            return None;
+        }
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_capacity,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            }
+            | Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_capacity,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } => {
+                // `requested_limit > consumed` can be an advertised scheduled
+                // RAW range whose next bytes are an HTTP/3 frame header.  A
+                // parser lease is appended after that range; the controller's
+                // offset ledger therefore keeps the two ownership domains
+                // disjoint without reclassifying already advertised bytes.
+                if *requested_limit != *advertised_limit
+                    || *known_limit > *requested_limit
+                    || *pending_parser_boundary != Some(*consumed)
+                    || *last_parser_lease_boundary == Some(*consumed)
+                {
+                    return None;
+                }
+                let remaining = parser_lease_capacity.saturating_sub(*parser_lease_used);
+                let increase = remaining.min(MAX_HTTP3_FRAME_HEADER_BYTES);
+                if increase == 0 {
+                    return None;
+                }
+                *last_parser_lease_boundary = Some(*consumed);
+                *pending_parser_boundary = None;
+                *parser_lease_used = parser_lease_used.saturating_add(increase);
+                *requested_limit = requested_limit.saturating_add(increase);
+                Some((*requested_limit, increase))
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => None,
         }
     }
 
@@ -255,18 +319,18 @@ impl ReceiveState {
                 known_limit,
                 payload_floor,
                 framing_bytes,
-                prospective_frame_header_bytes,
+                pending_parser_boundary,
                 ..
             }
             | Self::ReceivingData {
                 known_limit,
                 payload_floor,
                 framing_bytes,
-                prospective_frame_header_bytes,
+                pending_parser_boundary,
                 ..
             } => {
+                *pending_parser_boundary = None;
                 *framing_bytes = framing_bytes.saturating_add(frame_bytes);
-                *prospective_frame_header_bytes = 0;
                 if let Some(content_length) = content_length {
                     *payload_floor = (*payload_floor).max(content_length);
                 }
@@ -288,8 +352,13 @@ impl ReceiveState {
                 consumed,
                 payload_floor,
                 framing_bytes,
+                parser_lease_capacity,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
                 ..
             } => {
+                *pending_parser_boundary = None;
                 let framing_bytes = framing_bytes.saturating_add(frame_header_bytes);
                 let payload_floor = (*payload_floor).max(data);
                 // The DATA payload becomes known after its frame header has
@@ -307,7 +376,10 @@ impl ReceiveState {
                     consumed: *consumed,
                     payload_floor,
                     framing_bytes,
-                    prospective_frame_header_bytes: 0,
+                    parser_lease_capacity: *parser_lease_capacity,
+                    parser_lease_used: *parser_lease_used,
+                    last_parser_lease_boundary: *last_parser_lease_boundary,
+                    pending_parser_boundary: *pending_parser_boundary,
                     data_length: data,
                 };
             }
@@ -316,14 +388,14 @@ impl ReceiveState {
                 consumed,
                 payload_floor,
                 framing_bytes,
-                prospective_frame_header_bytes,
                 data_length,
+                pending_parser_boundary,
                 ..
             } => {
+                *pending_parser_boundary = None;
                 *data_length = data_length.saturating_add(data);
                 *payload_floor = (*payload_floor).max(*data_length);
                 *framing_bytes = framing_bytes.saturating_add(frame_header_bytes);
-                *prospective_frame_header_bytes = 0;
                 *known_limit = (*known_limit)
                     .max(consumed.saturating_add(data))
                     .max(payload_floor.saturating_add(*framing_bytes));
@@ -340,13 +412,18 @@ impl ReceiveState {
             Self::ReceivingHeaders {
                 known_limit,
                 consumed,
+                pending_parser_boundary,
                 ..
             }
             | Self::ReceivingData {
                 known_limit,
                 consumed,
+                pending_parser_boundary,
                 ..
             } => {
+                if bytes > 0 {
+                    *pending_parser_boundary = None;
+                }
                 *consumed = consumed.saturating_add(bytes);
                 *known_limit = (*known_limit).max(*consumed);
             }
@@ -362,18 +439,18 @@ impl ReceiveState {
                 known_limit,
                 payload_floor,
                 framing_bytes,
-                prospective_frame_header_bytes,
+                pending_parser_boundary,
                 ..
             }
             | Self::ReceivingData {
                 known_limit,
                 payload_floor,
                 framing_bytes,
-                prospective_frame_header_bytes,
+                pending_parser_boundary,
                 ..
             } => {
+                *pending_parser_boundary = None;
                 *framing_bytes = framing_bytes.saturating_add(frame_bytes);
-                *prospective_frame_header_bytes = 0;
                 *known_limit = (*known_limit).max(payload_floor.saturating_add(*framing_bytes));
             }
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
@@ -468,15 +545,25 @@ impl ReceiveState {
         };
         (data_length, unadvertised)
     }
+
+    pub const fn clear_parser_boundary(&mut self) {
+        match self {
+            Self::ReceivingHeaders {
+                pending_parser_boundary,
+                ..
+            }
+            | Self::ReceivingData {
+                pending_parser_boundary,
+                ..
+            } => *pending_parser_boundary = None,
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
+        }
+    }
 }
 
-/// At a pristine frame boundary the sender needs at least one byte for the
-/// DATA type and one byte for the first length-varint octet.  The peer may
-/// split the remaining body arbitrarily, so no wider speculative prefix is
-/// safe until the parser observes it and reports `min_remaining`.
-const fn prospective_data_frame_header(remaining_payload: u64) -> u64 {
-    if remaining_payload == 0 { 0 } else { 2 }
-}
+/// An HTTP/3 frame type and length are each QUIC varints of at most eight
+/// bytes.  This is enough to classify the frame without leasing its payload.
+const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
 
 #[cfg(test)]
 mod tests {
@@ -611,36 +698,74 @@ mod tests {
         }
 
         assert_eq!(state.consumed(), BODY + 31);
-        // A pristine frame boundary with two body bytes outstanding requires
-        // the universal two-byte DATA type/length prefix.  This is the exact
-        // liveness continuation missing from the failed live attempt.
-        state.header_progress(0, true);
-        assert_eq!(state.release(2), Some((BODY + 35, 2)));
-        state.advertised(BODY + 35);
+        assert_eq!(BODY + 31, 131_103);
+        // Exact retained live boundary: requested/advertised raw offset
+        // 131,105 is two bytes ahead of consumed 131,103. Those existing raw
+        // bytes remain scheduled; a disjoint parser tail begins at 131,105.
+        state.header_progress(1, true);
+        assert_eq!(state.parser_lease(true), Some((BODY + 49, 16)));
+        assert_eq!(BODY + 33, 131_105);
+        state.advertised(BODY + 49);
         state.bytes_read(2);
         state.data_frame(2, 2);
         state.bytes_read(2);
         assert_eq!(state.consumed(), BODY + 35);
+        // A later distinct DATA(0) boundary can extend the bounded lease even
+        // while part of the prior lease remains unused.
+        state.header_progress(1, true);
+        assert_eq!(state.parser_lease(true), Some((BODY + 65, 16)));
+        state.advertised(BODY + 65);
+        state.bytes_read(2);
+        state.data_frame(2, 0);
+        assert_eq!(state.consumed(), BODY + 37);
         assert_eq!(state.available(), 0);
         assert_eq!(state.close(), (BODY, 0));
     }
 
     #[test]
-    fn pristine_data_boundary_has_two_byte_universal_prefix_or_zero_when_complete() {
-        for remaining in [1, 63, 64, 16_383, 16_384] {
-            let body = 20_000;
-            let mut state = ReceiveState::controlled(0, 1_000, body);
-            state.data_frame(2, body - remaining);
-            let before = state.available();
-            state.header_progress(0, true);
-            assert_eq!(state.available(), before + 2, "remaining={remaining}");
+    fn pristine_parser_lease_is_idempotent_disjoint_and_lifetime_bounded() {
+        let mut state = ReceiveState::controlled(1, 1_000, 1);
+        state.bytes_read(1);
+        let mut total = 0;
+        for boundary in 0..63 {
+            state.header_progress(1, true);
+            let (absolute, increase) = state.parser_lease(true).expect("bounded lease");
+            let expected = if boundary == 62 { 8 } else { 16 };
+            assert_eq!(increase, expected);
+            total += increase;
+            assert_eq!(absolute, 1 + total);
+            assert_eq!(state.parser_lease(true), None, "duplicate boundary");
+            state.advertised(absolute);
+            state.bytes_read(increase);
         }
+        assert_eq!(total, 1_000);
+        assert_eq!(state.parser_lease(true), None, "lifetime cap");
+    }
 
-        let mut complete = ReceiveState::controlled(0, 1_000, 20_000);
-        complete.data_frame(2, 20_000);
-        let before = complete.available();
-        complete.header_progress(0, true);
-        assert_eq!(complete.available(), before);
+    #[test]
+    fn parser_lease_requires_a_pristine_exhausted_boundary() {
+        let mut exact_available = ReceiveState::controlled(0, 100, 10);
+        assert_eq!(exact_available.parser_lease(true), None);
+
+        let mut outstanding = ReceiveState::controlled(1, 100, 1);
+        outstanding.bytes_read(1);
+        outstanding.header_progress(1, true);
+        assert_eq!(outstanding.parser_lease(true), Some((17, 16)));
+        assert_eq!(outstanding.parser_lease(false), None);
+
+        let mut unadvertised = ReceiveState::controlled(1, 100, 2);
+        unadvertised.bytes_read(1);
+        assert_eq!(unadvertised.release(1), Some((2, 1)));
+        unadvertised.header_progress(1, true);
+        assert_eq!(unadvertised.parser_lease(true), None);
+        unadvertised.advertised(2);
+        assert_eq!(unadvertised.parser_lease(true), Some((18, 16)));
+
+        let mut not_pristine = ReceiveState::controlled(1, 100, 1);
+        not_pristine.bytes_read(1);
+        not_pristine.header_progress(8, false);
+        assert_eq!(not_pristine.parser_lease(false), None);
+        assert_eq!(not_pristine.available(), 8);
     }
 
     #[test]

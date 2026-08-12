@@ -224,6 +224,32 @@ impl StreamRegistry {
                 .header_progress(min_remaining, awaiting_data_frame);
         }
     }
+
+    pub fn parser_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        pristine_data_boundary: bool,
+    ) -> Option<CreditRelease> {
+        let state = self.get_mut(endpoint, stream)?;
+        let (absolute_limit, increase) = state.receive.parser_lease(pristine_data_boundary)?;
+        Some(CreditRelease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+        })
+    }
+
+    pub fn clear_parser_boundaries(&mut self) {
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "clearing every independent stream boundary is order-insensitive"
+        )]
+        for state in self.streams.values_mut() {
+            state.receive.clear_parser_boundary();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -301,6 +301,11 @@ impl QcsdController {
     /// without polling the defense and creating replacement work during
     /// shutdown.
     pub fn abort_pending_slots(&mut self, at: Duration, reason: MissedSlotReason) {
+        // Parser leases are slotless liveness actions.  Once the run aborts
+        // they must not escape after every scheduled slot has terminalized.
+        self.actions
+            .retain(|action| !matches!(action, QcsdAction::LeaseParserReceive { .. }));
+        self.streams.clear_parser_boundaries();
         let pending = self.pending_slots();
         let incoming: HashSet<_> = self.incoming_credit_ledger.keys().copied().collect();
         // Roll back the complete unadvertised set before terminalizing any
@@ -357,6 +362,9 @@ impl QcsdController {
                 self.release_chaff_send_shaping_for(endpoint);
             }
             QcsdObservation::EndpointClosed { endpoint } => {
+                self.actions.retain(|action| {
+                    !matches!(action, QcsdAction::LeaseParserReceive { endpoint: candidate, .. } if *candidate == endpoint)
+                });
                 self.return_endpoint_claims(endpoint);
                 self.scheduler.remove_endpoint(endpoint);
                 self.endpoint_origins.remove(&endpoint);
@@ -383,6 +391,7 @@ impl QcsdController {
                 self.streams
                     .header_progress(endpoint, stream, min_remaining, awaiting_data_frame);
                 self.release_exact_claims(endpoint, stream);
+                self.try_parser_lease(endpoint, stream, awaiting_data_frame);
             }
             QcsdObservation::ResponseHeaders {
                 endpoint,
@@ -664,6 +673,10 @@ impl QcsdController {
     }
 
     fn close_stream(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId, at: Duration) {
+        self.actions.retain(|action| {
+            !matches!(action, QcsdAction::LeaseParserReceive { endpoint: candidate_endpoint, stream: candidate_stream, .. }
+                if *candidate_endpoint == endpoint && *candidate_stream == stream)
+        });
         self.application_stream_ranges.remove(&(endpoint, stream));
         self.return_stream_claims(endpoint, stream);
         let Some((state, data_length, _unadvertised)) = self.streams.close(endpoint, stream) else {
@@ -716,6 +729,31 @@ impl QcsdController {
             ranges.append(&mut advertised_ranges);
             ranges.sort_unstable_by_key(|range| (range.start, range.end, range.slot));
         }
+        // A pristine typed parser boundary may have first exposed exact
+        // scheduled capacity.  That release had to be encoded before a
+        // slotless tail could be appended safely; retry the retained boundary
+        // now that requested and advertised limits can agree.
+        self.try_parser_lease(endpoint, stream, true);
+    }
+
+    fn try_parser_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        pristine_data_boundary: bool,
+    ) {
+        let Some(lease) = self
+            .streams
+            .parser_lease(endpoint, stream, pristine_data_boundary)
+        else {
+            return;
+        };
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+        });
     }
 
     /// Convert newly exact receive capacity into continuations owned by the
@@ -1825,6 +1863,7 @@ mod tests {
                 QcsdAction::DefenseComplete => replay.complete = true,
                 QcsdAction::ConfigureManualReceive { .. }
                 | QcsdAction::ConfigureAutomaticReceive { .. }
+                | QcsdAction::LeaseParserReceive { .. }
                 | QcsdAction::ReleaseChaffSendShaping { .. }
                 | QcsdAction::RequestChaff { .. } => {}
             }
@@ -1917,6 +1956,7 @@ mod tests {
                 | QcsdAction::SlotSatisfied { slot, .. } => Some(*slot),
                 QcsdAction::ConfigureManualReceive { .. }
                 | QcsdAction::ConfigureAutomaticReceive { .. }
+                | QcsdAction::LeaseParserReceive { .. }
                 | QcsdAction::ReleaseChaffSendShaping { .. }
                 | QcsdAction::RequestChaff { .. }
                 | QcsdAction::DefenseComplete => None,
@@ -2528,10 +2568,9 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        clippy::cognitive_complexity,
-        reason = "the regression preserves both FIN/retry/batch transitions end to end"
+        reason = "the regression preserves FIN retirement and terminal accounting end to end"
     )]
-    fn walkie_talkie_fin_residual_credit_is_exact_and_admits_later_batches() {
+    fn walkie_talkie_fin_residual_credit_is_terminal_and_never_retried() {
         let config = WalkieTalkieConfig {
             molded: "walkie-talkie-golden.json".into(),
             workload_id: "real page".into(),
@@ -2696,238 +2735,36 @@ mod tests {
             Duration::from_micros(2),
         );
         controller.poll(Duration::from_micros(2));
-        let first_residual = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::IncreaseReceiveLimit {
-                    stream,
-                    absolute_limit,
-                    packet,
-                    slot,
-                    ..
-                } if packet.length() != 100 => Some((stream, absolute_limit, packet, slot)),
-                _ => None,
-            })
-            .expect("FIN creates one exact residual credit action");
-        assert_eq!(first_residual.0, QcsdStreamId(4));
-        assert_eq!(first_residual.1, 50);
-        assert_eq!(first_residual.2.length(), 50);
-        controller.observe(
-            QcsdObservation::ReceiveLimitAdvertised {
-                endpoint,
-                stream: first_residual.0,
-                absolute_limit: first_residual.1,
-                slot: Some(first_residual.3),
-            },
-            Duration::from_micros(3),
-        );
-        controller.poll(Duration::from_micros(3));
-        assert!(!controller.drain_actions().any(|action| matches!(
-            action,
-            QcsdAction::IncreaseReceiveLimit { packet, .. } if packet.length() == 50
-        )));
-
-        controller.observe(
-            QcsdObservation::BytesRead {
-                endpoint,
-                stream: QcsdStreamId(4),
-                bytes: 50,
-            },
-            Duration::from_micros(4),
-        );
-        controller.observe(
-            QcsdObservation::StreamFinished {
-                endpoint,
-                stream: QcsdStreamId(4),
-                finish: QcsdStreamFinish::Fin,
-            },
-            Duration::from_micros(4),
-        );
-        controller.poll(Duration::from_micros(4));
-        assert!(controller.can_start_application_batch());
+        let terminal_actions: Vec<_> = controller.drain_actions().collect();
         assert!(
-            !controller
-                .drain_actions()
-                .any(|action| matches!(action, QcsdAction::SendPacket { .. }))
-        );
-
-        controller.observe(
-            QcsdObservation::StreamOpened {
-                endpoint,
-                stream: QcsdStreamId(8),
-                role: QcsdRequestRole::Application,
-                expected_response_length: Some(200),
-            },
-            Duration::from_micros(5),
-        );
-        controller.observe(
-            QcsdObservation::StreamOpened {
-                endpoint,
-                stream: QcsdStreamId(12),
-                role: QcsdRequestRole::Chaff {
-                    resource_id: 7,
-                    request_id: None,
-                },
-                expected_response_length: None,
-            },
-            Duration::from_micros(5),
-        );
-        let later_stream_actions: Vec<_> = controller.drain_actions().collect();
-        assert_eq!(
-            later_stream_actions
+            terminal_actions
                 .iter()
-                .filter(|action| matches!(action, QcsdAction::ConfigureManualReceive { .. }))
-                .count(),
-            2
+                .all(|action| !matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
         );
-        assert!(later_stream_actions.iter().all(|action| !matches!(
+        assert!(terminal_actions.iter().any(|action| matches!(
             action,
-            QcsdAction::ConfigureManualReceive {
-                initial_limit,
+            QcsdAction::SlotMissed {
+                reason: MissedSlotReason::ReceiveCreditRetired,
                 ..
-            } if *initial_limit != 0
+            }
         )));
-        controller.observe(
-            QcsdObservation::ApplicationBatchStarted,
-            Duration::from_micros(5),
-        );
-        controller.observe(
-            QcsdObservation::StreamDataTransmitted {
-                endpoint,
-                stream: QcsdStreamId(8),
-                role: QcsdRequestRole::Application,
-                offset: 0,
-                bytes: 100,
-            },
-            Duration::from_micros(5),
-        );
-        controller.poll(Duration::from_micros(5));
-        let second_outgoing = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
-                _ => None,
-            })
-            .expect("batch start releases its outgoing mould slot");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot: second_outgoing.1,
-                observed_size: second_outgoing.0.length(),
-            },
-            Duration::from_micros(6),
-        );
-        controller.poll(Duration::from_micros(6));
-        let second_credit = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::IncreaseReceiveLimit {
-                    stream,
-                    absolute_limit,
-                    packet,
-                    slot,
-                    ..
-                } if packet.length() == 100 => Some((stream, absolute_limit, packet, slot)),
-                _ => None,
-            })
-            .expect("second batch incoming target");
-        assert_eq!(second_credit.0, QcsdStreamId(8));
-        assert_eq!(second_credit.1, 100);
-        controller.observe(
-            QcsdObservation::ReceiveLimitAdvertised {
-                endpoint,
-                stream: second_credit.0,
-                absolute_limit: second_credit.1,
-                slot: Some(second_credit.3),
-            },
-            Duration::from_micros(7),
-        );
-        controller.observe(
-            QcsdObservation::BytesRead {
-                endpoint,
-                stream: QcsdStreamId(8),
-                bytes: 75,
-            },
-            Duration::from_micros(7),
-        );
-        controller.observe(
-            QcsdObservation::StreamFinished {
-                endpoint,
-                stream: QcsdStreamId(8),
-                finish: QcsdStreamFinish::Fin,
-            },
-            Duration::from_micros(7),
-        );
-        controller.observe(
-            QcsdObservation::ApplicationBatchCompleted,
-            Duration::from_micros(7),
-        );
-        controller.poll(Duration::from_micros(7));
-        let second_residual = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::IncreaseReceiveLimit {
-                    stream,
-                    absolute_limit,
-                    packet,
-                    slot,
-                    ..
-                } if packet.length() != 100 => Some((stream, absolute_limit, packet, slot)),
-                _ => None,
-            })
-            .expect("the later FIN independently rearms an exact retry");
-        assert_eq!(second_residual.0, QcsdStreamId(12));
-        assert_eq!(second_residual.1, 25);
-        assert_eq!(second_residual.2.length(), 25);
-        controller.observe(
-            QcsdObservation::ReceiveLimitAdvertised {
-                endpoint,
-                stream: second_residual.0,
-                absolute_limit: second_residual.1,
-                slot: Some(second_residual.3),
-            },
-            Duration::from_micros(8),
-        );
-        controller.observe(
-            QcsdObservation::BytesRead {
-                endpoint,
-                stream: QcsdStreamId(12),
-                bytes: 25,
-            },
-            Duration::from_micros(8),
-        );
-        controller.observe(
-            QcsdObservation::StreamFinished {
-                endpoint,
-                stream: QcsdStreamId(12),
-                finish: QcsdStreamFinish::Fin,
-            },
-            Duration::from_micros(8),
-        );
-        controller.observe(
-            QcsdObservation::ApplicationComplete,
-            Duration::from_micros(8),
-        );
-        controller.poll(Duration::from_micros(8));
-
         let diagnostics = controller.defense_diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 0);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 3);
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 150);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 50);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 150);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 2);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 225);
-        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 75);
+        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 150);
+        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 0);
         assert_eq!(
             diagnostics.walkie_talkie_application_stream_crossing_bytes,
             0
         );
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 2);
+        assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
-        assert!(
-            controller
-                .drain_actions()
-                .any(|action| matches!(action, QcsdAction::DefenseComplete))
-        );
     }
 
     fn tamaraw_controller() -> QcsdController {
@@ -4227,9 +4064,9 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "the full deferred-slot lifecycle is one indivisible accounting oracle"
+        reason = "the parser-lease and scheduled-range lifecycle is one accounting oracle"
     )]
-    fn exact_framing_continues_the_same_incoming_slot_after_reserved_deferral() {
+    fn final_data_zero_data_and_fin_use_a_disjoint_parser_lease() {
         const BODY: u64 = 131_072;
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("packet");
         let mut controller = QcsdController::with_defense(
@@ -4260,7 +4097,6 @@ mod tests {
             .streams
             .get_mut(endpoint, stream)
             .expect("application stream");
-        assert_eq!(state.receive.claim(2), 2);
         state.receive.response_headers(11, Some(BODY));
         state.receive.data_frame(22, BODY - 2);
         assert_eq!(
@@ -4269,6 +4105,7 @@ mod tests {
         );
         state.receive.advertised(BODY + 33);
         state.receive.bytes_read(BODY + 31);
+        assert_eq!(state.receive.consumed(), 131_103);
 
         controller.pending_slots.insert(slot, packet);
         controller.incoming_credit_ledger.insert(
@@ -4277,12 +4114,12 @@ mod tests {
                 packet,
                 endpoint: Some(endpoint),
                 multiple_endpoints: false,
-                consumed: 1_196,
+                consumed: 1_198,
                 retired: 0,
             },
         );
         controller.scheduled_incoming_requested_bytes = 1_200;
-        controller.scheduled_incoming_consumed_bytes = 1_196;
+        controller.scheduled_incoming_consumed_bytes = 1_198;
         controller.advertised_incoming_credit.insert(
             (endpoint, stream),
             vec![AdvertisedIncomingCredit {
@@ -4291,54 +4128,69 @@ mod tests {
                 end: BODY + 33,
             }],
         );
-        controller.control.claims.push(PendingClaim {
-            slot,
-            packet,
-            endpoint,
-            stream,
-            remaining: 2,
-        });
 
-        // Retained live order at the deadlock boundary: raw=131,103,
-        // declared DATA=131,070, exact framing=33. Two body bytes remain, so a
-        // pristine next-DATA boundary raises the exact raw floor to 131,107.
+        // Exact retained live boundary: raw consumed=131,103 while the
+        // scheduled RAW range [131,103, 131,105) is already advertised. The
+        // parser tail is appended after it; StreamDataBlocked is irrelevant.
         controller.observe(
             QcsdObservation::HeaderProgress {
                 endpoint,
                 stream,
-                min_remaining: 0,
+                min_remaining: 1,
                 awaiting_data_frame: true,
             },
             Duration::from_micros(1),
         );
-        let QcsdAction::IncreaseReceiveLimit {
-            absolute_limit: continued_limit,
-            slot: continued_slot,
+        let QcsdAction::LeaseParserReceive {
+            absolute_limit: lease_limit,
+            increase,
             ..
-        } = controller
-            .next_action()
-            .expect("exact framing continuation")
+        } = controller.next_action().expect("parser liveness lease")
         else {
-            panic!("expected continued receive credit");
+            panic!("expected parser-only receive credit");
         };
-        assert_eq!(continued_slot, slot);
-        assert_eq!(continued_limit, BODY + 35);
+        assert_eq!(lease_limit, BODY + 49);
+        assert_eq!(increase, 16);
+
+        // The same raw boundary is idempotent even if HTTP/3 reports it again
+        // before the transport encodes the lease.
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint,
+                stream,
+                blocked_at: BODY + 33,
+            },
+            Duration::from_micros(1),
+        );
         assert!(controller.next_action().is_none());
 
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
                 stream,
-                absolute_limit: continued_limit,
-                slot: Some(slot),
+                absolute_limit: lease_limit,
+                slot: None,
             },
             Duration::from_micros(2),
         );
+
+        // Under the established request-stream RAW-offset contract, the two
+        // already-scheduled bytes carry the DATA(2) header and satisfy the
+        // slot. The following payload is lease-owned and cannot count twice.
         controller.observe(
             QcsdObservation::BytesRead {
                 endpoint,
                 stream,
-                bytes: 4,
+                bytes: 2,
             },
             Duration::from_micros(3),
         );
@@ -4349,11 +4201,526 @@ mod tests {
                 ..
             }) if satisfied == slot
         ));
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream,
+                frame_header_bytes: 2,
+                data_bytes: 2,
+            },
+            Duration::from_micros(3),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 2,
+            },
+            Duration::from_micros(3),
+        );
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(4),
+        );
+        let QcsdAction::LeaseParserReceive {
+            absolute_limit: zero_data_limit,
+            increase: 16,
+            ..
+        } = controller.next_action().expect("DATA(0) parser lease")
+        else {
+            panic!("expected DATA(0) parser lease");
+        };
+        assert_eq!(zero_data_limit, BODY + 65);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: zero_data_limit,
+                slot: None,
+            },
+            Duration::from_micros(4),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 2,
+            },
+            Duration::from_micros(5),
+        );
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream,
+                frame_header_bytes: 2,
+                data_bytes: 0,
+            },
+            Duration::from_micros(5),
+        );
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(5),
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(6),
+        );
+        assert!(controller.next_action().is_none());
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deferred advertisement and abort rollback are one parser-lease lifecycle oracle"
+    )]
+    fn parser_lease_retries_after_scheduled_advertisement_and_abort_clears_it() {
+        let build = || {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1).expect("packet");
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: 1,
+                    max_stream_data_excess: 16,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(StaticSchedule::new(Trace::default(), false)),
+            )
+            .expect("controller");
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(0);
+            let slot = QcsdSlotId(7);
+            ready(&mut controller, 1, "https://example.com");
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(2),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            let state = controller
+                .streams
+                .get_mut(endpoint, stream)
+                .expect("application stream");
+            state.receive.bytes_read(1);
+            assert_eq!(state.receive.release(1), Some((2, 1)));
+
+            controller.pending_slots.insert(slot, packet);
+            controller
+                .incoming_credit_ledger
+                .insert(slot, IncomingCreditLedger::new(packet));
+            controller.scheduled_incoming_requested_bytes = 1;
+            let credit = PendingCredit {
+                slot,
+                packet,
+                endpoint,
+                stream,
+                absolute_limit: 2,
+                increase: 1,
+            };
+            controller.control.credit.push(credit);
+            controller
+                .actions
+                .push_back(QcsdAction::IncreaseReceiveLimit {
+                    endpoint,
+                    stream,
+                    absolute_limit: 2,
+                    packet,
+                    slot,
+                });
+            (controller, endpoint, stream, slot)
+        };
+
+        let (mut controller, endpoint, stream, slot) = build();
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::IncreaseReceiveLimit { slot: observed, .. }) if observed == slot
+        ));
+        assert!(
+            controller.next_action().is_none(),
+            "unadvertised suffix blocks lease"
+        );
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: 2,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::LeaseParserReceive {
+                absolute_limit: 18,
+                increase: 16,
+                ..
+            })
+        ));
+        assert!(
+            controller.next_action().is_none(),
+            "retained boundary leases once"
+        );
+
+        // A second stream has an independent pristine boundary and lease cap.
+        let other = QcsdStreamId(4);
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: other,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::from_micros(1),
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, other)
+            .expect("other stream")
+            .receive
+            .bytes_read(1);
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: other,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(2),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::LeaseParserReceive {
+                stream: observed,
+                ..
+            }) if observed == other
+        ));
+        assert!(controller.next_action().is_none());
+
+        let (mut aborted, endpoint, stream, slot) = build();
+        aborted.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        aborted.abort_pending_slots(Duration::ZERO, MissedSlotReason::DeadlineExpired);
+        assert!(
+            aborted
+                .drain_actions()
+                .all(|action| !matches!(action, QcsdAction::LeaseParserReceive { .. }))
+        );
+        aborted.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: 2,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        assert!(
+            aborted
+                .drain_actions()
+                .all(|action| !matches!(action, QcsdAction::LeaseParserReceive { .. }))
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "raw lease/scheduled overlap accounting is intentionally explicit"
+    )]
+    fn unexpected_payload_inside_parser_lease_cannot_satisfy_a_slot() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 4).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 100,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        let slot = QcsdSlotId(9);
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        let state = controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("application stream");
+        state.receive.bytes_read(1);
+        state.receive.header_progress(100, false);
+        assert_eq!(state.receive.release(100), Some((101, 100)));
+        state.receive.advertised(101);
+        state.receive.bytes_read(100);
+        assert_eq!(state.receive.claim(4), 4);
+
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 4;
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 4,
+        });
+
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(1),
+        );
+        let QcsdAction::LeaseParserReceive {
+            absolute_limit: lease_limit,
+            increase: 16,
+            ..
+        } = controller.next_action().expect("parser lease")
+        else {
+            panic!("expected parser lease");
+        };
+        assert_eq!(lease_limit, 117);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: lease_limit,
+                slot: None,
+            },
+            Duration::from_micros(2),
+        );
+
+        // The two-byte header reveals a twenty-byte DATA payload.  Its exact
+        // extent can release the claim, but that scheduled raw range begins at
+        // 117, after the lease-owned [101, 117) range.
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 2,
+            },
+            Duration::from_micros(3),
+        );
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream,
+                frame_header_bytes: 2,
+                data_bytes: 20,
+            },
+            Duration::from_micros(3),
+        );
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit: scheduled_limit,
+            slot: scheduled_slot,
+            ..
+        } = controller
+            .next_action()
+            .expect("exact scheduled continuation")
+        else {
+            panic!("expected scheduled continuation");
+        };
+        assert_eq!(scheduled_slot, slot);
+        assert_eq!(scheduled_limit, 121);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: scheduled_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(4),
+        );
+
+        // One coalesced read crosses fourteen lease-owned bytes and the four
+        // scheduled raw bytes. Offset intersection assigns only the suffix.
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 18,
+            },
+            Duration::from_micros(5),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied {
+                slot: satisfied,
+                ..
+            }) if satisfied == slot
+        ));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "stream and endpoint closure are one parser-lease lifecycle oracle"
+    )]
+    fn parser_lease_actions_are_removed_on_stream_and_endpoint_close() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        ready(&mut controller, 1, "https://example.com");
+        for stream in [QcsdStreamId(0), QcsdStreamId(4)] {
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(1),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller
+                .streams
+                .get_mut(endpoint, stream)
+                .expect("opened stream")
+                .receive
+                .bytes_read(1);
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+        }
+
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream: QcsdStreamId(0),
+                finish: QcsdStreamFinish::Reset,
+            },
+            Duration::from_micros(1),
+        );
+        let leases: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::LeaseParserReceive { stream, .. } => Some(stream),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(leases, [QcsdStreamId(4)]);
+
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: QcsdStreamId(4),
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(2),
+        );
+        // The duplicate boundary is capped/idempotent and creates no action.
+        assert!(controller.next_action().is_none());
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: QcsdStreamId(8),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::from_micros(2),
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, QcsdStreamId(8))
+            .expect("opened stream")
+            .receive
+            .bytes_read(1);
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: QcsdStreamId(8),
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(2),
+        );
+        assert!(matches!(
+            controller.actions.front(),
+            Some(QcsdAction::LeaseParserReceive {
+                stream: QcsdStreamId(8),
+                ..
+            })
+        ));
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(3),
+        );
+        assert!(controller.next_action().is_none());
     }
 
     #[test]

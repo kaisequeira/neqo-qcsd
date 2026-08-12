@@ -1745,6 +1745,7 @@ const fn action_endpoint(action: &QcsdAction) -> Option<QcsdEndpointId> {
         QcsdAction::ConfigureManualReceive { endpoint, .. }
         | QcsdAction::ConfigureAutomaticReceive { endpoint, .. }
         | QcsdAction::IncreaseReceiveLimit { endpoint, .. }
+        | QcsdAction::LeaseParserReceive { endpoint, .. }
         | QcsdAction::SendPacket { endpoint, .. }
         | QcsdAction::RequestChaff { endpoint, .. }
         | QcsdAction::ReleaseChaffSendShaping { endpoint } => Some(*endpoint),
@@ -3558,6 +3559,73 @@ mod tests {
         assert!(register_action_batch(&mut outgoing, started, &[send.clone(), send]).is_err());
         drop(outgoing);
         fs::remove_dir_all(output).expect("remove outgoing trace test directory");
+    }
+
+    #[test]
+    fn parser_lease_is_not_a_schedule_slot_and_slot_has_one_terminal_row() {
+        let output = trace_output_dir("parser-lease-not-scheduled");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let endpoint = QcsdEndpointId(1);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 3).expect("packet");
+        let slot = QcsdSlotId(17);
+        let actions = [
+            QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream: QcsdStreamId(0),
+                absolute_limit: 20,
+                increase: 16,
+            },
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream: QcsdStreamId(0),
+                absolute_limit: 4,
+                packet,
+                slot,
+            },
+        ];
+        assert!(
+            register_action_batch(&mut traces, started, &actions)
+                .expect("lease plus scheduled action")
+                .is_empty()
+        );
+        assert!(traces.is_slot_pending(slot));
+        assert!(
+            record_terminal_action(
+                &mut traces,
+                started + Duration::from_micros(5),
+                5,
+                "recorded",
+                &QcsdAction::SlotSatisfied {
+                    endpoint: Some(endpoint),
+                    packet,
+                    slot,
+                },
+            )
+            .expect("one terminal action")
+        );
+        assert!(matches!(
+            record_terminal_action(
+                &mut traces,
+                started + Duration::from_micros(6),
+                6,
+                "recorded",
+                &QcsdAction::SlotSatisfied {
+                    endpoint: Some(endpoint),
+                    packet,
+                    slot,
+                },
+            ),
+            Err(Error::SlotInvariant(message))
+                if message == "slot 17 reached more than one terminal state"
+        ));
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        assert_eq!(schedule.lines().count(), 2);
+        assert!(schedule.contains("satisfied"));
+        assert!(!schedule.contains("parser"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[test]
