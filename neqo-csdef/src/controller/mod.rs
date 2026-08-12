@@ -69,6 +69,18 @@ struct AdvertisedIncomingCredit {
     end: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParserLeaseRange {
+    start: u64,
+    end: u64,
+}
+
+impl ParserLeaseRange {
+    const fn bytes(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+}
+
 impl AdvertisedIncomingCredit {
     const fn bytes(self) -> u64 {
         self.end.saturating_sub(self.start)
@@ -143,6 +155,11 @@ pub struct QcsdController {
     application_stream_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<(u64, u64)>>,
     advertised_incoming_credit:
         HashMap<(QcsdEndpointId, QcsdStreamId), Vec<AdvertisedIncomingCredit>>,
+    /// Slotless physical receive ranges granted solely to keep the HTTP/3
+    /// parser live. Bytes actually consumed inside these ranges can realize
+    /// an existing same-stream scheduling claim; merely granting a lease
+    /// cannot satisfy scheduled work.
+    parser_lease_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<ParserLeaseRange>>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
     scheduled_incoming_requested_bytes: u64,
     scheduled_incoming_consumed_bytes: u64,
@@ -228,6 +245,7 @@ impl QcsdController {
             observations: VecDeque::new(),
             application_stream_ranges: HashMap::new(),
             advertised_incoming_credit: HashMap::new(),
+            parser_lease_ranges: HashMap::new(),
             incoming_credit_ledger: HashMap::new(),
             scheduled_incoming_requested_bytes: 0,
             scheduled_incoming_consumed_bytes: 0,
@@ -305,6 +323,7 @@ impl QcsdController {
         // they must not escape after every scheduled slot has terminalized.
         self.actions
             .retain(|action| !matches!(action, QcsdAction::LeaseParserReceive { .. }));
+        self.parser_lease_ranges.clear();
         self.streams.clear_parser_boundaries();
         let pending = self.pending_slots();
         let incoming: HashSet<_> = self.incoming_credit_ledger.keys().copied().collect();
@@ -370,6 +389,8 @@ impl QcsdController {
                 self.endpoint_origins.remove(&endpoint);
                 self.streams.remove_endpoint(endpoint);
                 self.application_stream_ranges
+                    .retain(|(candidate, _), _| *candidate != endpoint);
+                self.parser_lease_ranges
                     .retain(|(candidate, _), _| *candidate != endpoint);
                 self.retire_endpoint_advertised_credit(endpoint, at);
                 self.control.reassign_endpoint(endpoint);
@@ -464,6 +485,13 @@ impl QcsdController {
                     if !cover {
                         self.push_application_bytes(at, Direction::Incoming, bytes);
                     }
+                    self.consume_parser_lease_claims(
+                        endpoint,
+                        stream,
+                        consumed_start,
+                        consumed_end,
+                        at,
+                    );
                     self.consume_advertised_credit(
                         endpoint,
                         stream,
@@ -678,6 +706,7 @@ impl QcsdController {
                 if *candidate_endpoint == endpoint && *candidate_stream == stream)
         });
         self.application_stream_ranges.remove(&(endpoint, stream));
+        self.parser_lease_ranges.remove(&(endpoint, stream));
         self.return_stream_claims(endpoint, stream);
         let Some((state, data_length, _unadvertised)) = self.streams.close(endpoint, stream) else {
             return;
@@ -748,6 +777,13 @@ impl QcsdController {
         else {
             return;
         };
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                start: lease.absolute_limit.saturating_sub(lease.increase),
+                end: lease.absolute_limit,
+            });
         self.actions.push_back(QcsdAction::LeaseParserReceive {
             endpoint,
             stream,
@@ -843,6 +879,73 @@ impl QcsdController {
         }
         for (slot, bytes) in consumed_by_slot {
             self.record_consumed_credit(slot, bytes, at);
+        }
+    }
+
+    /// Debit consumed parser-liveness offsets against scheduling ownership
+    /// that was already reserved on this stream. This preserves the public
+    /// raw request-stream byte domain: the lease bytes remain observable, but
+    /// displace an equal amount of later exact/chaff credit instead of growing
+    /// the mould. Unowned lease overlap remains raw overflow.
+    fn consume_parser_lease_claims(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        start: u64,
+        end: u64,
+        at: Duration,
+    ) {
+        let key = (endpoint, stream);
+        let mut overlap = 0_u64;
+        let remove_stream = self
+            .parser_lease_ranges
+            .get_mut(&key)
+            .is_some_and(|ranges| {
+                for range in &mut *ranges {
+                    let overlap_start = range.start.max(start);
+                    let overlap_end = range.end.min(end);
+                    overlap = overlap.saturating_add(overlap_end.saturating_sub(overlap_start));
+                    if range.start < end {
+                        range.start = end.min(range.end);
+                    }
+                }
+                ranges.retain(|range| range.bytes() > 0);
+                ranges.is_empty()
+            });
+        if remove_stream {
+            self.parser_lease_ranges.remove(&key);
+        }
+        if overlap == 0 {
+            return;
+        }
+
+        let mut indices: Vec<_> = self
+            .control
+            .claims
+            .iter()
+            .enumerate()
+            .filter_map(|(index, claim)| {
+                (claim.endpoint == endpoint && claim.stream == stream).then_some(index)
+            })
+            .collect();
+        indices.sort_unstable_by_key(|index| self.control.claims[*index].slot);
+        let mut consumed_by_slot = BTreeMap::new();
+        for index in indices {
+            if overlap == 0 {
+                break;
+            }
+            let claim = &mut self.control.claims[index];
+            let consumed = overlap.min(claim.remaining);
+            claim.remaining -= consumed;
+            overlap -= consumed;
+            if consumed > 0 {
+                let total = consumed_by_slot.entry(claim.slot).or_insert(0_u64);
+                *total = total.saturating_add(consumed);
+            }
+        }
+        self.control.claims.retain(|claim| claim.remaining > 0);
+        for (slot, consumed) in consumed_by_slot {
+            self.record_consumed_credit(slot, consumed, at);
         }
     }
 
@@ -1601,7 +1704,8 @@ mod tests {
     };
 
     use super::{
-        AdvertisedIncomingCredit, IncomingCreditLedger, PendingClaim, PendingCredit, QcsdController,
+        AdvertisedIncomingCredit, IncomingCreditLedger, ParserLeaseRange, PendingClaim,
+        PendingCredit, QcsdController,
     };
     use crate::{
         Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
@@ -4466,7 +4570,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "raw lease/scheduled overlap accounting is intentionally explicit"
     )]
-    fn unexpected_payload_inside_parser_lease_cannot_satisfy_a_slot() {
+    fn consumed_parser_lease_debits_a_claim_and_reduces_its_later_release() {
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 4).expect("packet");
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
@@ -4534,6 +4638,13 @@ mod tests {
             panic!("expected parser lease");
         };
         assert_eq!(lease_limit, 117);
+        assert_eq!(controller.control.claims[0].remaining, 4);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            0
+        );
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
@@ -4544,9 +4655,9 @@ mod tests {
             Duration::from_micros(2),
         );
 
-        // The two-byte header reveals a twenty-byte DATA payload.  Its exact
-        // extent can release the claim, but that scheduled raw range begins at
-        // 117, after the lease-owned [101, 117) range.
+        // Encoding the lease did not realize scheduled work. Reading its
+        // two-byte prefix does: those raw bytes spend two bytes of the
+        // pre-owned claim, leaving only two bytes for a later exact release.
         controller.observe(
             QcsdObservation::BytesRead {
                 endpoint,
@@ -4554,6 +4665,13 @@ mod tests {
                 bytes: 2,
             },
             Duration::from_micros(3),
+        );
+        assert_eq!(controller.control.claims[0].remaining, 2);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            2
         );
         controller.observe(
             QcsdObservation::DataFrame {
@@ -4575,7 +4693,7 @@ mod tests {
             panic!("expected scheduled continuation");
         };
         assert_eq!(scheduled_slot, slot);
-        assert_eq!(scheduled_limit, 121);
+        assert_eq!(scheduled_limit, 119);
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
@@ -4586,13 +4704,14 @@ mod tests {
             Duration::from_micros(4),
         );
 
-        // One coalesced read crosses fourteen lease-owned bytes and the four
-        // scheduled raw bytes. Offset intersection assigns only the suffix.
+        // One coalesced read crosses fourteen unowned lease bytes and the two
+        // scheduled raw bytes. Only the scheduled suffix is newly attributed;
+        // excess lease bytes remain observable raw overflow.
         controller.observe(
             QcsdObservation::BytesRead {
                 endpoint,
                 stream,
-                bytes: 18,
+                bytes: 16,
             },
             Duration::from_micros(5),
         );
@@ -4606,6 +4725,94 @@ mod tests {
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 4);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn parser_lease_claim_debit_is_lexical_claim_only_and_bounded_by_ownership() {
+        let (defense, _) = RecordingDefense::new([], DefenseMode::ChaffAndShape);
+        let mut controller =
+            QcsdController::with_defense(QcsdConfig::default(), None, Box::new(defense))
+                .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(100),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .bytes_read(100);
+
+        let early = QcsdSlotId(3);
+        let late = QcsdSlotId(9);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 4).expect("packet");
+        for slot in [early, late] {
+            controller.pending_slots.insert(slot, packet);
+            controller
+                .incoming_credit_ledger
+                .insert(slot, IncomingCreditLedger::new(packet));
+        }
+        controller.scheduled_incoming_requested_bytes = 8;
+        // Reverse insertion proves allocation is by slot identity, not Vec order.
+        controller.control.claims.push(PendingClaim {
+            slot: late,
+            packet,
+            endpoint,
+            stream,
+            remaining: 4,
+        });
+        controller.control.claims.push(PendingClaim {
+            slot: early,
+            packet,
+            endpoint,
+            stream,
+            remaining: 4,
+        });
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                start: 100,
+                end: 110,
+            }],
+        );
+
+        // Ten physical lease bytes exist, but only eight claimed bytes can be
+        // scheduled. Both claim-only slots terminalize exactly once in lexical
+        // order; the final two bytes remain raw-only overflow.
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 10,
+            },
+            Duration::from_micros(1),
+        );
+        let terminals: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::SlotSatisfied { slot, .. } => Some(slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals, [early, late]);
+        assert!(controller.control.claims.is_empty());
+        assert!(controller.pending_slots().is_empty());
+        assert!(controller.parser_lease_ranges.is_empty());
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 8);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 8);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
@@ -4655,6 +4862,7 @@ mod tests {
                 Duration::ZERO,
             );
         }
+        assert_eq!(controller.parser_lease_ranges.len(), 2);
 
         controller.observe(
             QcsdObservation::StreamFinished {
@@ -4663,6 +4871,16 @@ mod tests {
                 finish: QcsdStreamFinish::Reset,
             },
             Duration::from_micros(1),
+        );
+        assert!(
+            !controller
+                .parser_lease_ranges
+                .contains_key(&(endpoint, QcsdStreamId(0)))
+        );
+        assert!(
+            controller
+                .parser_lease_ranges
+                .contains_key(&(endpoint, QcsdStreamId(4)))
         );
         let leases: Vec<_> = controller
             .drain_actions()
@@ -4721,6 +4939,7 @@ mod tests {
             Duration::from_micros(3),
         );
         assert!(controller.next_action().is_none());
+        assert!(controller.parser_lease_ranges.is_empty());
     }
 
     #[test]

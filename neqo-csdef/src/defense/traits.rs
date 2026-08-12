@@ -73,11 +73,13 @@ pub enum SignalKind {
     /// bytes. The terminal outcome arrives only after consumption or an
     /// explicit impossibility/retirement failure.
     ReceiveCreditRequested { packet: Packet },
-    /// Exact overlap between consumed raw STREAM offsets and previously
-    /// advertised defense-scheduled receive-credit ranges.
+    /// Exact consumed raw STREAM offsets attributed to defense-owned work.
     ///
-    /// This is an internal credit-ledger signal, not a claim about payload
-    /// provenance. It excludes bytes admitted by the initial stream allowance.
+    /// This includes overlap with previously advertised scheduled ranges and
+    /// actual parser-lease bytes debited against an existing same-stream
+    /// scheduling claim. Merely encoding a parser lease cannot consume work;
+    /// unowned lease bytes and the initial stream allowance are excluded. This
+    /// is an internal credit-ledger signal, not a payload-provenance claim.
     ReceiveCreditConsumed { bytes: u64 },
     /// Previously advertised scheduled receive-credit offsets that can no
     /// longer produce payload because their stream closed before consumption.
