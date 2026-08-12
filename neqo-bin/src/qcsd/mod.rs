@@ -1270,14 +1270,8 @@ const fn shapes_stream_sends(defense: &DefenseConfig) -> bool {
 fn expected_application_response_length(
     resource: &Resource,
     max_response_bytes: u64,
-    framing_allowance: u64,
 ) -> Option<u64> {
-    (max_response_bytes > 0).then(|| {
-        resource
-            .effective_length()
-            .min(max_response_bytes)
-            .saturating_add(framing_allowance)
-    })
+    (max_response_bytes > 0).then(|| resource.effective_length().min(max_response_bytes))
 }
 
 fn traffic_morphing_endpoint_seed(seed: u64, endpoint: QcsdEndpointId) -> u64 {
@@ -1325,10 +1319,6 @@ fn activate_traffic_morphing(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "endpoint construction binds all audited transport and QCSD settings together"
-)]
 fn create_endpoints(
     spec: &RunSpec,
     start: Instant,
@@ -1354,7 +1344,6 @@ fn create_endpoints(
                 expected_response_length: expected_application_response_length(
                     resource,
                     spec.max_response_bytes,
-                    spec.config.max_stream_data_excess,
                 ),
             });
     }
@@ -2624,8 +2613,9 @@ mod tests {
     use neqo_csdef::{
         DefenseConfig, DependencyTracker, Direction, FrontConfig, MissedSlotReason, Packet,
         QcsdAction, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-        QcsdObservationClock, QcsdSlotId, QcsdStreamId, Resource, ResourceManifest, StaticSchedule,
-        TamarawConfig, Trace, TrafficMorphingConfig, WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        QcsdObservationClock, QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource,
+        ResourceManifest, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
+        WalkieTalkieConfig, WtfPad, WtfPadConfig,
     };
 
     use super::{
@@ -3061,7 +3051,7 @@ mod tests {
     }
 
     #[test]
-    fn application_length_hint_caps_body_then_adds_framing_allowance() {
+    fn application_length_hint_caps_body_without_adding_receive_reserve() {
         let mut resource = Resource {
             id: 1,
             url: "https://example.com/resource".into(),
@@ -3074,23 +3064,169 @@ mod tests {
             headers: Vec::new(),
         };
         assert_eq!(
-            expected_application_response_length(&resource, 1_048_576, 1_000),
-            Some(126_959)
+            expected_application_response_length(&resource, 1_048_576),
+            Some(125_959)
         );
         resource.data_length = 130_000;
         assert_eq!(
-            expected_application_response_length(&resource, 128_000, 1_000),
-            Some(129_000)
+            expected_application_response_length(&resource, 128_000),
+            Some(128_000)
         );
-        assert_eq!(
-            expected_application_response_length(&resource, 0, 1_000),
-            None
-        );
+        assert_eq!(expected_application_response_length(&resource, 0), None);
         resource.data_length = u64::MAX;
         assert_eq!(
-            expected_application_response_length(&resource, u64::MAX, 1_000),
+            expected_application_response_length(&resource, u64::MAX),
             Some(u64::MAX)
         );
+    }
+
+    #[test]
+    fn exact_application_response_consumes_scheduled_credit_without_retiring_reserve() {
+        let resource = Resource {
+            id: 1,
+            url: "https://example.com/resource".into(),
+            kind: "Document".into(),
+            content_length: Some(100),
+            data_length: 100,
+            chaff_priority: false,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        let expected_response_length = expected_application_response_length(&resource, 1_024);
+        assert_eq!(expected_response_length, Some(100));
+
+        // The 100-byte body occupies 131 raw request-stream bytes. The
+        // controller learns the 31 framing bytes from HTTP/3 observations;
+        // the 1,000-byte receive reserve must not become expected body work.
+        let first = Packet::new(Duration::ZERO, Direction::Incoming, 84).expect("first slot");
+        let framing =
+            Packet::new(Duration::from_micros(1), Direction::Incoming, 31).expect("framing slot");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::new([first, framing]), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint,
+                origin: "https://example.com".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+
+        controller.poll(Duration::ZERO);
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit,
+            slot,
+            ..
+        } = controller.next_action().expect("body credit")
+        else {
+            panic!("expected body receive credit");
+        };
+        assert_eq!(absolute_limit, 100);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 31,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream,
+                frame_header_bytes: 2,
+                data_bytes: 100,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 69,
+            },
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied { slot: satisfied, .. }) if satisfied == slot
+        ));
+
+        controller.poll(Duration::from_micros(1));
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit,
+            slot,
+            ..
+        } = controller.next_action().expect("framing credit")
+        else {
+            panic!("expected framing receive credit");
+        };
+        assert_eq!(absolute_limit, 131);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 31,
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(1),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied { slot: satisfied, .. }) if satisfied == slot
+        ));
+
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 115);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 115);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
