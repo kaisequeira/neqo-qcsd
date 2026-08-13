@@ -1918,8 +1918,8 @@ async fn qualify_chaff_prefix(
                     let app_stream =
                         client.fetch(loop_now, "GET", &url, &app_headers, Priority::default())?;
                     client.register_qcsd_stream(app_stream, QcsdRequestRole::Application, None)?;
-                    client.stream_close_send(app_stream, loop_now)?;
                     let app_size = client.qcsd_request_stream_bytes(app_stream)?;
+                    client.stream_close_send(app_stream, loop_now)?;
                     requests.push(PrefixRequestStream {
                         request_order: 0,
                         role: "application",
@@ -1947,8 +1947,8 @@ async fn qualify_chaff_prefix(
                             .ok_or_else(|| {
                                 Error::RunAborted("chaff request was not opened".into())
                             })?;
-                        client.stream_close_send(stream, loop_now)?;
                         let size = client.qcsd_request_stream_bytes(stream)?;
+                        client.stream_close_send(stream, loop_now)?;
                         if size != core_resource.chaff_qualification_core.request_stream_bytes {
                             return Err(Error::RunAborted(format!(
                                 "compact chaff request encoded {size} bytes, expected {}",
@@ -3272,8 +3272,8 @@ fn dispatch_ready_requests(
                 QcsdRequestRole::Application,
                 request.expected_response_length,
             )?;
-            endpoint.client.stream_close_send(stream, now)?;
             let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream)?;
+            endpoint.client.stream_close_send(stream, now)?;
             dependencies.mark_in_flight(request.resource_id)?;
             started_requests += 1;
             endpoint.streams.insert(stream, {
@@ -4177,8 +4177,8 @@ fn apply_action(
                     ),
                     _ => unreachable!("only chaff actions return a stream"),
                 };
-                endpoint.client.stream_close_send(stream_id, now)?;
                 let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream_id)?;
+                endpoint.client.stream_close_send(stream_id, now)?;
                 let qualification = chaff_manifest
                     .and_then(|manifest| manifest.qualification(resource_id))
                     .ok_or_else(|| {

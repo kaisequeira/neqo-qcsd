@@ -2699,6 +2699,41 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    fn qcsd_unshaped_regular_request_bytes_are_available_until_send_close() {
+        let (mut client, _server) = connect();
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+
+        let stream = client
+            .fetch(
+                now(),
+                "GET",
+                &Uri::from_static("https://something.com/application"),
+                &[],
+                Priority::default(),
+            )
+            .unwrap();
+        client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, None)
+            .unwrap();
+        assert!(client.qcsd_request_stream_bytes(stream).unwrap() > 0);
+
+        client.stream_close_send(stream, now()).unwrap();
+        assert_eq!(
+            client.qcsd_request_stream_bytes(stream),
+            Err(Error::InvalidStreamId)
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_chaff_non_success_responses_are_observed_without_followup() {
         for (request_id, status) in [(1, 302), (2, 404)] {
             let (mut client, mut server) = connect();
