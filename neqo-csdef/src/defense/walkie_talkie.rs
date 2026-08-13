@@ -1186,12 +1186,24 @@ impl Defense for WalkieTalkie {
 
     fn can_start_application_batch(&self) -> bool {
         if self.realization_failure.is_some() {
-            return !self.application_batch_active;
+            return false;
         }
         self.application_batches_started < self.expected_application_batches
             && !self.application_batch_active
             && !self.application_batch_assigned
             && matches!(self.turn, Turn::Outgoing { .. })
+    }
+
+    fn terminal_failure(&self) -> Option<&'static str> {
+        self.realization_failure.map(|failure| match failure {
+            RealizationFailure::ReceiveCreditRetired
+            | RealizationFailure::IncomingSlotMissed(MissedSlotReason::ReceiveCreditRetired) => {
+                "Walkie-Talkie receive credit retired before the incoming mould was realized"
+            }
+            RealizationFailure::IncomingSlotMissed(_) => {
+                "Walkie-Talkie incoming slot failed before the mould was realized"
+            }
+        })
     }
 
     fn mode(&self) -> DefenseMode {
@@ -2097,6 +2109,65 @@ mod tests {
         assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 0);
+    }
+
+    #[test]
+    fn retired_credit_aborts_before_a_later_application_batch_can_start() {
+        let mut defense = WalkieTalkie::from_json(
+            &config(100),
+            1_200,
+            &molded(
+                r#"[
+                    {"outgoing": 1, "incoming": 1},
+                    {"outgoing": 1, "incoming": 1}
+                ]"#,
+            ),
+        )
+        .expect("two-batch molded sequence");
+        application_batch_started(&mut defense, 0);
+        let outgoing = defense
+            .next_event(Duration::ZERO)
+            .expect("first outgoing cell");
+        resolve(
+            &mut defense,
+            1,
+            outgoing,
+            EventOutcome::Satisfied { observed: 100 },
+        );
+        let credit = defense
+            .next_event(Duration::from_micros(1))
+            .expect("first incoming credit");
+        resolve(
+            &mut defense,
+            2,
+            credit,
+            EventOutcome::Satisfied { observed: 100 },
+        );
+        retire_credit(&mut defense, 3, 100);
+
+        assert_eq!(
+            defense.realization_failure,
+            Some(super::RealizationFailure::ReceiveCreditRetired)
+        );
+        assert_eq!(
+            defense.terminal_failure(),
+            Some("Walkie-Talkie receive credit retired before the incoming mould was realized")
+        );
+        assert!(!defense.can_start_application_batch());
+        assert_eq!(defense.next_event(Duration::from_micros(3)), None);
+        assert_eq!(defense.next_event_at(), None);
+
+        application_batch_completed(&mut defense, 4);
+        assert!(!defense.can_start_application_batch());
+        assert_eq!(defense.next_event(Duration::from_secs(120)), None);
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.diagnostics().retried_outgoing_events, 0);
+        assert_eq!(
+            defense
+                .diagnostics()
+                .walkie_talkie_observed_application_batches,
+            1
+        );
     }
 
     #[test]

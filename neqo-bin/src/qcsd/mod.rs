@@ -926,6 +926,13 @@ fn deadline_error(
     }
 }
 
+fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
+    if let Some(failure) = controller.terminal_failure() {
+        return Err(Error::RunAborted(failure.into()));
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::future_not_send,
     clippy::too_many_lines,
@@ -1044,6 +1051,8 @@ async fn execute_run_inner(
                     traces.observation(None, &record)?;
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
+                controller.flush_defense_observations();
+                ensure_defense_realizable(&controller)?;
                 let started_requests = dispatch_ready_requests(
                     &mut endpoints,
                     spec,
@@ -1107,6 +1116,7 @@ async fn execute_run_inner(
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
                 controller.poll(defense_elapsed);
+                ensure_defense_realizable(&controller)?;
                 apply_queued_actions(
                     &mut endpoints,
                     &mut controller,
@@ -2648,12 +2658,12 @@ mod tests {
 
     use clap::Parser as _;
     use neqo_csdef::{
-        DefenseConfig, DependencyTracker, Direction, FrontConfig, MissedSlotReason, Packet,
-        QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass,
-        QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId,
-        QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, StaticSchedule, TamarawConfig,
-        Trace, TrafficMorphingConfig, WalkieTalkieConfig, WtfPad, WtfPadConfig,
-        sanitize_chaff_headers,
+        Defense, DefenseConfig, DefenseMode, DefenseSignal, DependencyTracker, Direction,
+        FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig,
+        QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
+        QcsdParserLeaseOwner, QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource,
+        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
+        WalkieTalkieConfig, WtfPad, WtfPadConfig, sanitize_chaff_headers,
     };
 
     use super::{
@@ -2661,11 +2671,12 @@ mod tests {
         RequestPolicyArg, ResourceRunState, RunCompletion, RunSpec, Socket, StaticModeArg,
         StreamRecord, StreamType, TrafficMorphingActivation, action_failure_reason,
         activate_traffic_morphing, apply_action_batch, create_endpoints, datagram_observation,
-        deadline_error, defense_parameter_provenance, expected_application_response_length,
-        finish_application_record, forward_qcsd_observation, has_in_flight_application_stream, now,
-        qcsd_connection_parameters, ready_request_batch, record_terminal_action,
-        register_action_batch, resolve_run_config, resolve_run_config_with_workload,
-        sanitize_chaff_action_headers, shapes_stream_sends, terminalize_pending_slots,
+        deadline_error, defense_parameter_provenance, ensure_defense_realizable,
+        expected_application_response_length, finish_application_record, forward_qcsd_observation,
+        has_in_flight_application_stream, now, qcsd_connection_parameters, ready_request_batch,
+        record_terminal_action, register_action_batch, resolve_run_config,
+        resolve_run_config_with_workload, sanitize_chaff_action_headers, shapes_stream_sends,
+        terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, wait_for_activity, write_run_json,
     };
@@ -3152,6 +3163,61 @@ mod tests {
         assert!(matches!(
             deadline_error(&DefenseConfig::None, false, 30),
             Error::Timeout(30)
+        ));
+    }
+
+    #[derive(Debug, Default)]
+    struct TerminalAfterObservation {
+        failed: bool,
+    }
+
+    impl Defense for TerminalAfterObservation {
+        fn observe(&mut self, signal: DefenseSignal) {
+            self.failed |= matches!(signal.kind, SignalKind::ApplicationComplete);
+        }
+
+        fn next_event(&mut self, _elapsed: Duration) -> Option<Packet> {
+            None
+        }
+
+        fn next_event_at(&self) -> Option<Duration> {
+            None
+        }
+
+        fn is_complete(&self) -> bool {
+            false
+        }
+
+        fn is_outgoing_complete(&self) -> bool {
+            false
+        }
+
+        fn terminal_failure(&self) -> Option<&'static str> {
+            self.failed
+                .then_some("synthetic terminal realization failure")
+        }
+
+        fn mode(&self) -> DefenseMode {
+            DefenseMode::ChaffAndShape
+        }
+    }
+
+    #[test]
+    fn reduced_terminal_defense_failure_is_a_prompt_typed_run_abort() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::<TerminalAfterObservation>::default(),
+        )
+        .expect("synthetic controller");
+        controller.observe(QcsdObservation::ApplicationComplete, Duration::ZERO);
+
+        ensure_defense_realizable(&controller).expect("queued signal is not reduced early");
+        controller.flush_defense_observations();
+        let error = ensure_defense_realizable(&controller).expect_err("terminal failure aborts");
+        assert!(matches!(
+            error,
+            Error::RunAborted(message) if message == "synthetic terminal realization failure"
         ));
     }
 

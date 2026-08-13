@@ -325,6 +325,14 @@ pub trait Defense: Debug {
     fn can_start_application_batch(&self) -> bool {
         true
     }
+    /// Describe an unrecoverable defense realization failure.
+    ///
+    /// The controller and runner use this prompt to abort immediately after
+    /// reducing the observation that made further realization impossible.
+    /// Finite schedule completion is not a failure and returns `None`.
+    fn terminal_failure(&self) -> Option<&'static str> {
+        None
+    }
     /// How application traffic participates in the schedule.
     fn mode(&self) -> DefenseMode;
     /// Defense-specific counters for reproducibility and failure auditing.

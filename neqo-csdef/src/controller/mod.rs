@@ -300,6 +300,21 @@ impl QcsdController {
         self.defense.can_start_application_batch()
     }
 
+    /// Reduce every queued defense observation without polling for new work.
+    ///
+    /// The runner uses this boundary before application dispatch so a terminal
+    /// realization failure caused by stream retirement cannot admit a later
+    /// application batch in the same event-loop turn.
+    pub fn flush_defense_observations(&mut self) {
+        self.drain_observations();
+    }
+
+    /// Describe an unrecoverable failure reported by the selected defense.
+    #[must_use]
+    pub fn terminal_failure(&self) -> Option<&'static str> {
+        self.defense.terminal_failure()
+    }
+
     /// Snapshot every defense event that has not reached a terminal outcome.
     ///
     /// The runner uses this at abnormal termination so events that never
@@ -3163,6 +3178,12 @@ mod tests {
                 ..
             }
         )));
+        assert!(!controller.can_start_application_batch());
+        assert_eq!(
+            controller.terminal_failure(),
+            Some("Walkie-Talkie receive credit retired before the incoming mould was realized")
+        );
+        assert_eq!(controller.next_deadline(), None);
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 200);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 150);
