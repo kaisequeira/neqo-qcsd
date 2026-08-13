@@ -1302,7 +1302,6 @@ async fn qualify_chaff_response(
                         for request_index in 0..parallel_requests {
                             let stream_id =
                                 client.qcsd_fetch_nonblocking(loop_now, &url, &headers)?;
-                            client.stream_close_send(stream_id, loop_now)?;
                             let request_stream_bytes =
                                 client.qcsd_request_stream_bytes(stream_id)?;
                             if request_stream_bytes == 0 {
@@ -1311,6 +1310,7 @@ async fn qualify_chaff_response(
                                         .into(),
                                 ));
                             }
+                            client.stream_close_send(stream_id, loop_now)?;
                             streams.insert(
                                 stream_id,
                                 QualifierStream {
