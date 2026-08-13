@@ -31,7 +31,10 @@ pub use traits::{
     CapacityAdjustment, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome,
     ReceiverContinuationDisposition, SignalKind, WalkieTalkieBurstDiagnostics,
 };
-pub use walkie_talkie::{BurstPair, WalkieTalkie};
+pub use walkie_talkie::{
+    BurstPair, HistoricalWalkieTalkieSchemaFiveDiagnostic, WalkieTalkie,
+    WalkieTalkieQualificationBinding,
+};
 pub use wtf_pad::WtfPad;
 
 /// QUIC's smallest safely shapeable UDP payload.

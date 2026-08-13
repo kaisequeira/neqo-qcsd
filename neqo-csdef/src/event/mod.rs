@@ -13,5 +13,6 @@ pub use action::{QcsdAction, QcsdParserLeaseOwner};
 pub use ids::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
 pub use observation::{
     MissedSlotReason, QcsdDatagramClass, QcsdObservation, QcsdObservationClock, QcsdStreamFinish,
-    TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
+    QcsdStreamTransmission, TimestampedQcsdObservation, TrafficMorphingBypassReason,
+    TrafficMorphingOutcome,
 };

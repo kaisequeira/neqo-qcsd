@@ -652,7 +652,12 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
                 } | QcsdObservation::StreamDataAcknowledged { .. }
             ))
     );
+    assert!(
+        client.qcsd_stream_transmissions().is_empty(),
+        "the qualifier transcript is default-disabled"
+    );
 
+    client.qcsd_enable_stream_transcript(true);
     queue_target(&mut client, 41, 1_200, true).unwrap();
     let sent_at = now();
     let request = client
@@ -668,6 +673,8 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
             role: observed_role,
             offset: 0,
             bytes: 400,
+            fin: false,
+            slot: Some(QcsdSlotId(41)),
         } if stream.0 == chaff.as_u64() && *observed_role == role
     )));
     assert!(
@@ -676,6 +683,15 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
             QcsdObservation::StreamDataAcknowledged { .. }
         ))
     );
+    let transcript = client.qcsd_stream_transmissions();
+    assert!(!transcript.is_empty());
+    assert!(transcript.iter().enumerate().all(|(sequence, entry)| {
+        entry.sequence == u64::try_from(sequence).unwrap()
+            && entry.stream.0 == chaff.as_u64()
+            && entry.slot == Some(QcsdSlotId(41))
+    }));
+    assert_eq!(transcript.iter().map(|entry| entry.bytes).sum::<u64>(), 400);
+    assert!(transcript.iter().any(|entry| entry.fin));
 
     server.process_input(request, sent_at);
     let mut received = [0; 512];
@@ -701,6 +717,54 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
             fin: true,
         } if stream.0 == chaff.as_u64() && *observed_role == role
     )));
+}
+
+#[test]
+fn natural_stream_transcript_is_targetless_and_each_packet_token_is_recorded_once() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable_stream_transcript(true);
+    let application = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(application, &[0xAA; 3_000]).unwrap();
+    client.stream_close_send(application).unwrap();
+    client
+        .qcsd_register_stream_role(application, QcsdRequestRole::Application)
+        .unwrap();
+
+    let mut sent = 0_usize;
+    while let Some(datagram) = client.process_output(now()).dgram() {
+        sent += 1;
+        server.process_input(datagram, now());
+    }
+    assert!(sent > 1, "fixture must exercise multiple packet assemblies");
+    let transcript = client.qcsd_stream_transmissions();
+    assert!(transcript.len() > 1);
+    assert!(transcript.iter().enumerate().all(|(sequence, entry)| {
+        entry.sequence == u64::try_from(sequence).unwrap()
+            && entry.stream.0 == application.as_u64()
+            && entry.slot.is_none()
+    }));
+    let mut ranges: Vec<_> = transcript
+        .iter()
+        .filter(|entry| entry.bytes > 0)
+        .map(|entry| (entry.offset, entry.offset + entry.bytes))
+        .collect();
+    ranges.sort_unstable();
+    assert_eq!(ranges.first().map(|range| range.0), Some(0));
+    assert_eq!(ranges.last().map(|range| range.1), Some(3_000));
+    assert!(ranges.windows(2).all(|pair| {
+        pair.first()
+            .zip(pair.last())
+            .is_some_and(|(first, last)| first.1 == last.0)
+    }));
+    assert_eq!(
+        transcript.iter().map(|entry| entry.bytes).sum::<u64>(),
+        3_000,
+        "cumulative recovery tokens must not be recorded twice"
+    );
+    assert!(transcript.iter().any(|entry| entry.fin));
 }
 
 #[test]

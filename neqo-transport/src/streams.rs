@@ -94,6 +94,16 @@ pub struct Streams {
 }
 
 impl Streams {
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_send_data(&mut self) -> bool {
+        self.send.qcsd_has_pending_data()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_send_data_excluding(&mut self, allowed: &[StreamId]) -> bool {
+        self.send.qcsd_has_pending_data_excluding(allowed)
+    }
+
     pub fn new(
         tps: Rc<RefCell<TransportParametersHandler>>,
         role: Role,

@@ -30,20 +30,24 @@ pub use config::{
 pub use controller::QcsdController;
 pub use defense::{
     BurstPair, Capacity, CapacityAdjustment, Defense, DefenseDiagnostics, DefenseMode,
-    DefenseSignal, EventOutcome, Front, MIN_SHAPED_PAYLOAD, ReceiverContinuationDisposition,
-    RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw, TrafficMorphing,
-    TrafficMorphingEgress, WalkieTalkie, WalkieTalkieBurstDiagnostics, WtfPad, clamp_packet_size,
+    DefenseSignal, EventOutcome, Front, HistoricalWalkieTalkieSchemaFiveDiagnostic,
+    MIN_SHAPED_PAYLOAD, ReceiverContinuationDisposition, RoundRobinScheduler, SignalKind,
+    StaticSchedule, Tamaraw, TrafficMorphing, TrafficMorphingEgress, WalkieTalkie,
+    WalkieTalkieBurstDiagnostics, WalkieTalkieQualificationBinding, WtfPad, clamp_packet_size,
 };
 pub use dependency_tracker::{DependencyTracker, ResourceRunState};
 pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
     MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdDatagramClass, QcsdEndpointId,
     QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdRequestRole, QcsdSlotId,
-    QcsdStreamFinish, QcsdStreamId, TimestampedQcsdObservation, TrafficMorphingBypassReason,
-    TrafficMorphingOutcome,
+    QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, TimestampedQcsdObservation,
+    TrafficMorphingBypassReason, TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
-pub use resource::{Resource, ResourceManifest, sanitize_chaff_headers};
+pub use resource::{
+    ChaffManifest, ChaffQualification, ExpectedChaffResponse, QualifiedChaffResource, Resource,
+    ResourceManifest, normalize_content_encoding, sanitize_chaff_headers,
+};
 pub use rng::{SplitMix64, derive};
 pub use trace::{Direction, Packet, Trace};
 

@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{Direction, Error, MissedSlotReason, Packet, Result, WalkieTalkieConfig};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const ADAPTATION: &str = "qcsd-client-only";
 const BURST_DEFINITION: &str = "global-application-batch-direction-transitions";
 const CELL_BYTE_DOMAIN: &str = "http3-request-stream-offset.bytes";
@@ -42,6 +42,17 @@ const RECEIVER_BATCH_END_RELEASE_POLICY: &str =
     "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate";
 const RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION: &str =
     "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable";
+const RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY: &str = "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged";
+const RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY: &str = "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields";
+const RECEIVER_FIRST_CELL_PREFIX_PACK_PRECONDITION: &str = "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-required-chaff-or-h3-qpack-stream-output;zero-targetless-stream-bytes";
+const RECEIVER_QUALIFICATION_BINDING_POLICY: &str = "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes";
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// Packet counts in one molded half-duplex burst pair.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,7 +76,66 @@ struct MoldedFile {
     paper_equivalent: bool,
     packet_size: u16,
     receiver_continuation: ReceiverContinuation,
+    qualification_bindings: Vec<WalkieTalkieQualificationBinding>,
     profiles: Vec<MoldedProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalMoldedFileSchemaFive {
+    adaptation: String,
+    burst_definition: String,
+    cell_byte_domain: String,
+    schema_version: u32,
+    generated_by: String,
+    matching_algorithm: String,
+    paper_equivalent: bool,
+    packet_size: u16,
+    receiver_continuation: HistoricalReceiverContinuationSchemaFive,
+    profiles: Vec<MoldedProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalReceiverContinuationSchemaFive {
+    allocation_policy: String,
+    application_order: String,
+    base_allocation_policy: String,
+    batch_end_release_policy: String,
+    causal_capacity_precondition: String,
+    cells_per_nonzero_incoming_component: u32,
+    formula: String,
+    parser_allowance_ceiling_bytes: u64,
+    prefix_consumability_precondition: String,
+    post_outgoing_loss_liveness_limitation: String,
+    provisioning_policy: String,
+    raw_headroom_bytes_per_nonzero_incoming_component: u64,
+    release_policy: String,
+    request_activation_policy: String,
+    request_prefix_delivery_precondition: String,
+    resource_precondition: String,
+    reserve_lifecycle_policy: String,
+    reserve_policy: String,
+}
+
+/// Read-only summary returned by the explicit historical schema-five parser.
+///
+/// This type deliberately contains no executable defense state or constructor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HistoricalWalkieTalkieSchemaFiveDiagnostic {
+    pub packet_size: u16,
+    pub profile_count: usize,
+    pub workload_ids: Vec<String>,
+}
+
+/// Exact raw artifact hashes bound to one schema-six workload identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalkieTalkieQualificationBinding {
+    pub workload_id: String,
+    pub chaff_qualification_sidecar_sha256: String,
+    pub prefix_pack_spec_sha256: String,
+    pub qualified_chaff_manifest_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +159,10 @@ struct ReceiverContinuation {
     resource_precondition: String,
     reserve_lifecycle_policy: String,
     reserve_policy: String,
+    qualified_chaff_manifest_policy: String,
+    qualified_chaff_response_policy: String,
+    first_cell_prefix_pack_precondition: String,
+    qualification_binding_policy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +273,25 @@ impl MoldedFile {
                 }
             }
         }
+        let binding_ids: HashSet<_> = self
+            .qualification_bindings
+            .iter()
+            .map(|binding| binding.workload_id.as_str())
+            .collect();
+        if binding_ids.len() != self.qualification_bindings.len()
+            || binding_ids != identities
+            || self.qualification_bindings.iter().any(|binding| {
+                binding.workload_id.trim().is_empty()
+                    || !is_lower_hex_sha256(&binding.chaff_qualification_sidecar_sha256)
+                    || !is_lower_hex_sha256(&binding.prefix_pack_spec_sha256)
+                    || !is_lower_hex_sha256(&binding.qualified_chaff_manifest_sha256)
+            })
+        {
+            return Err(Error::InvalidConfig(
+                "Walkie-Talkie schema-six qualification_bindings must uniquely and exactly cover every workload identity with lowercase raw SHA-256 values"
+                    .into(),
+            ));
+        }
         let selected = selected.ok_or_else(|| {
             Error::InvalidConfig(format!(
                 "Walkie-Talkie bundle contains no profile for workload {workload_id:?}"
@@ -244,6 +337,11 @@ impl ReceiverContinuation {
             || self.resource_precondition != RECEIVER_RESOURCE_PRECONDITION
             || self.reserve_lifecycle_policy != RECEIVER_RESERVE_LIFECYCLE_POLICY
             || self.reserve_policy != RECEIVER_RESERVE_POLICY
+            || self.qualified_chaff_manifest_policy != RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY
+            || self.qualified_chaff_response_policy != RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY
+            || self.first_cell_prefix_pack_precondition
+                != RECEIVER_FIRST_CELL_PREFIX_PACK_PRECONDITION
+            || self.qualification_binding_policy != RECEIVER_QUALIFICATION_BINDING_POLICY
         {
             return Err(Error::InvalidConfig(
                 "Walkie-Talkie receiver_continuation metadata does not match the supported \
@@ -273,6 +371,78 @@ impl ReceiverContinuation {
             )));
         }
         Ok(())
+    }
+}
+
+impl HistoricalReceiverContinuationSchemaFive {
+    fn validate(&self, packet_size: u16) -> Result<()> {
+        if self.allocation_policy != RECEIVER_ALLOCATION_POLICY
+            || self.application_order != RECEIVER_APPLICATION_ORDER
+            || self.base_allocation_policy != RECEIVER_BASE_ALLOCATION_POLICY
+            || self.batch_end_release_policy != RECEIVER_BATCH_END_RELEASE_POLICY
+            || self.causal_capacity_precondition != RECEIVER_CAUSAL_CAPACITY_PRECONDITION
+            || self.cells_per_nonzero_incoming_component
+                != RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT
+            || self.formula != RECEIVER_FORMULA
+            || self.parser_allowance_ceiling_bytes != RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES
+            || self.prefix_consumability_precondition != RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION
+            || self.post_outgoing_loss_liveness_limitation
+                != RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION
+            || self.provisioning_policy != RECEIVER_PROVISIONING_POLICY
+            || self.raw_headroom_bytes_per_nonzero_incoming_component
+                != RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT
+            || self.release_policy != RECEIVER_RELEASE_POLICY
+            || self.request_activation_policy != RECEIVER_REQUEST_ACTIVATION_POLICY
+            || self.request_prefix_delivery_precondition
+                != RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION
+            || self.resource_precondition != RECEIVER_RESOURCE_PRECONDITION
+            || self.reserve_lifecycle_policy != RECEIVER_RESERVE_LIFECYCLE_POLICY
+            || self.reserve_policy != RECEIVER_RESERVE_POLICY
+            || self.raw_headroom_bytes_per_nonzero_incoming_component != u64::from(packet_size)
+        {
+            return Err(Error::InvalidConfig(
+                "historical Walkie-Talkie schema-five receiver metadata is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl HistoricalMoldedFileSchemaFive {
+    fn diagnostic(self) -> Result<HistoricalWalkieTalkieSchemaFiveDiagnostic> {
+        if self.schema_version != 5
+            || self.adaptation != ADAPTATION
+            || self.paper_equivalent
+            || self.burst_definition != BURST_DEFINITION
+            || self.cell_byte_domain != CELL_BYTE_DOMAIN
+            || self.matching_algorithm != MATCHING_ALGORITHM
+            || self.generated_by.trim().is_empty()
+            || self.profiles.is_empty()
+        {
+            return Err(Error::InvalidConfig(
+                "historical Walkie-Talkie diagnostic accepts only strict schema-five artifacts"
+                    .into(),
+            ));
+        }
+        self.receiver_continuation.validate(self.packet_size)?;
+        let mut workload_ids = Vec::with_capacity(self.profiles.len().saturating_mul(2));
+        let mut identities = HashSet::new();
+        for (index, profile) in self.profiles.iter().enumerate() {
+            profile.validate(self.packet_size, index)?;
+            for identity in [&profile.real, &profile.decoy] {
+                if !identities.insert(identity.as_str()) {
+                    return Err(Error::InvalidConfig(format!(
+                        "historical Walkie-Talkie workload identity {identity:?} occurs more than once"
+                    )));
+                }
+                workload_ids.push(identity.clone());
+            }
+        }
+        Ok(HistoricalWalkieTalkieSchemaFiveDiagnostic {
+            packet_size: self.packet_size,
+            profile_count: self.profiles.len(),
+            workload_ids,
+        })
     }
 }
 
@@ -602,6 +772,7 @@ enum RealizationFailure {
 /// Walkie-Talkie half-duplex burst-molding defense.
 #[derive(Debug)]
 pub struct WalkieTalkie {
+    qualification_binding: WalkieTalkieQualificationBinding,
     molded: Vec<BurstPair>,
     source_envelope: Vec<BurstPair>,
     source_batch_ends: Vec<usize>,
@@ -643,7 +814,7 @@ pub struct WalkieTalkie {
 }
 
 impl WalkieTalkie {
-    /// Load a version-five molded sequence from `config.molded`.
+    /// Load a runnable version-six molded sequence from `config.molded`.
     ///
     /// # Errors
     ///
@@ -662,7 +833,7 @@ impl WalkieTalkie {
         )
     }
 
-    /// Load a version-five molded sequence from `path`.
+    /// Load a runnable version-six molded sequence from `path`.
     ///
     /// # Errors
     ///
@@ -684,7 +855,7 @@ impl WalkieTalkie {
         )
     }
 
-    /// Parse a version-five molded sequence.
+    /// Parse a runnable version-six molded sequence.
     ///
     /// # Errors
     ///
@@ -703,7 +874,7 @@ impl WalkieTalkie {
         )
     }
 
-    /// Parse a version-five molded sequence for an explicit parser allowance.
+    /// Parse a runnable version-six molded sequence for an explicit parser allowance.
     ///
     /// # Errors
     ///
@@ -725,6 +896,16 @@ impl WalkieTalkie {
             max_stream_data_excess,
             &config.workload_id,
         )?;
+        let qualification_binding = file
+            .qualification_bindings
+            .iter()
+            .find(|binding| binding.workload_id == config.workload_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidConfig(
+                    "selected Walkie-Talkie workload has no qualification binding".into(),
+                )
+            })?;
         let (selected_source_envelope, selected_batch_ends) = if selected.real == config.workload_id
         {
             (&selected.source_envelopes.real, &selected.batch_ends.real)
@@ -747,6 +928,7 @@ impl WalkieTalkie {
         let target_outgoing_cells = molded.iter().map(|pair| u64::from(pair.outgoing)).sum();
         let target_incoming_cells = molded.iter().map(|pair| u64::from(pair.incoming)).sum();
         Ok(Self {
+            qualification_binding,
             molded,
             source_envelope,
             source_batch_ends,
@@ -790,6 +972,27 @@ impl WalkieTalkie {
             failed_incoming_shortfall_bytes: 0,
             reserved_chaff_capacity: 0,
         })
+    }
+
+    /// Strictly parse a historical schema-five artifact for diagnostics only.
+    ///
+    /// The returned summary cannot be converted into runnable defense state.
+    /// Schema six is rejected here and schema five is rejected by every
+    /// runnable constructor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any non-schema-five or malformed historical artifact.
+    pub fn historical_schema_five_diagnostic(
+        input: &str,
+    ) -> Result<HistoricalWalkieTalkieSchemaFiveDiagnostic> {
+        serde_json::from_str::<HistoricalMoldedFileSchemaFive>(input)?.diagnostic()
+    }
+
+    /// Selected schema-six raw qualification hashes.
+    #[must_use]
+    pub const fn qualification_binding(&self) -> &WalkieTalkieQualificationBinding {
+        &self.qualification_binding
     }
 
     fn record_now(&mut self, at: Duration) {
@@ -1665,6 +1868,10 @@ mod tests {
         molded_file(&real, &real_batch_ends, &decoy, &decoy_batch_ends)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the strict schema-six fixture keeps all byte-exact contract strings together"
+    )]
     fn molded_file(
         real: &[super::BurstPair],
         real_batch_ends: &[usize],
@@ -1704,7 +1911,7 @@ mod tests {
                 "adaptation": "qcsd-client-only",
                 "burst_definition": "global-application-batch-direction-transitions",
                 "cell_byte_domain": "http3-request-stream-offset.bytes",
-                "schema_version": 5,
+                "schema_version": 6,
                 "generated_by": "{generated_by}",
                 "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
                 "paper_equivalent": false,
@@ -1727,8 +1934,26 @@ mod tests {
                     "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
                     "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
                     "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-                    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
+                    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
+                "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+                "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+                "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-required-chaff-or-h3-qpack-stream-output;zero-targetless-stream-bytes",
+                "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
                 }},
+                "qualification_bindings": [
+                    {{
+                        "workload_id": "real page",
+                        "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    }},
+                    {{
+                        "workload_id": "decoy page",
+                        "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                        "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                        "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    }}
+                ],
                 "profiles": [{{
                     "real": "real page",
                     "decoy": "decoy page",
@@ -1867,13 +2092,13 @@ mod tests {
     #[test]
     fn loader_rejects_unknown_fields_wrong_versions_and_packet_size_mismatch() {
         let unknown = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
-            r#""schema_version": 5,"#,
-            r#""schema_version": 5, "unexpected": true,"#,
+            r#""schema_version": 6,"#,
+            r#""schema_version": 6, "unexpected": true,"#,
         );
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &unknown).is_err());
 
         let wrong_version = molded(r#"[{"outgoing": 1, "incoming": 1}]"#)
-            .replace(r#""schema_version": 5"#, r#""schema_version": 4"#);
+            .replace(r#""schema_version": 6"#, r#""schema_version": 4"#);
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_version).is_err());
 
         assert!(
@@ -1928,6 +2153,44 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn schema_five_is_available_only_through_the_read_only_diagnostic_boundary() {
+        let current = molded(r#"[{"outgoing": 1, "incoming": 1}]"#);
+        let mut historical: serde_json::Value =
+            serde_json::from_str(&current).expect("schema-six fixture");
+        historical["schema_version"] = serde_json::json!(5);
+        historical
+            .as_object_mut()
+            .expect("top object")
+            .remove("qualification_bindings");
+        let receiver = historical["receiver_continuation"]
+            .as_object_mut()
+            .expect("receiver object");
+        for field in [
+            "qualified_chaff_manifest_policy",
+            "qualified_chaff_response_policy",
+            "first_cell_prefix_pack_precondition",
+            "qualification_binding_policy",
+        ] {
+            receiver.remove(field);
+        }
+        let historical = historical.to_string();
+
+        let diagnostic = WalkieTalkie::historical_schema_five_diagnostic(&historical)
+            .expect("strict historical diagnostic");
+        assert_eq!(diagnostic.packet_size, 1_200);
+        assert_eq!(diagnostic.profile_count, 1);
+        assert_eq!(diagnostic.workload_ids, ["real page", "decoy page"]);
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &historical).is_err());
+        assert!(WalkieTalkie::historical_schema_five_diagnostic(&current).is_err());
+
+        let malformed = historical.replace(
+            r#""schema_version":5"#,
+            r#""schema_version":5,"unexpected":true"#,
+        );
+        assert!(WalkieTalkie::historical_schema_five_diagnostic(&malformed).is_err());
     }
 
     #[test]
@@ -2055,6 +2318,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the overflow fixture constructs the full strict schema-six envelope"
+    )]
     fn receiver_continuation_and_scheduled_byte_overflow_are_rejected() {
         let bursts = vec![
             super::BurstPair {
@@ -2067,7 +2334,7 @@ mod tests {
             adaptation: "qcsd-client-only".into(),
             burst_definition: "global-application-batch-direction-transitions".into(),
             cell_byte_domain: "http3-request-stream-offset.bytes".into(),
-            schema_version: 5,
+            schema_version: 6,
             generated_by: "test".into(),
             matching_algorithm: "minimum-base-symmetric-mold-padding-cost-one-to-one".into(),
             paper_equivalent: false,
@@ -2117,7 +2384,29 @@ mod tests {
                 reserve_policy:
                     "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
                         .into(),
+                qualified_chaff_manifest_policy:
+                    super::RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY.into(),
+                qualified_chaff_response_policy:
+                    super::RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY.into(),
+                first_cell_prefix_pack_precondition:
+                    super::RECEIVER_FIRST_CELL_PREFIX_PACK_PRECONDITION.into(),
+                qualification_binding_policy:
+                    super::RECEIVER_QUALIFICATION_BINDING_POLICY.into(),
             },
+            qualification_bindings: vec![
+                super::WalkieTalkieQualificationBinding {
+                    workload_id: "real".into(),
+                    chaff_qualification_sidecar_sha256: "a".repeat(64),
+                    prefix_pack_spec_sha256: "b".repeat(64),
+                    qualified_chaff_manifest_sha256: "c".repeat(64),
+                },
+                super::WalkieTalkieQualificationBinding {
+                    workload_id: "decoy".into(),
+                    chaff_qualification_sidecar_sha256: "d".repeat(64),
+                    prefix_pack_spec_sha256: "e".repeat(64),
+                    qualified_chaff_manifest_sha256: "f".repeat(64),
+                },
+            ],
             profiles: vec![super::MoldedProfile {
                 real: "real".into(),
                 decoy: "decoy".into(),
@@ -2157,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_five_adapts_every_positive_incoming_component_exactly_once() {
+    fn schema_six_adapts_every_positive_incoming_component_exactly_once() {
         let input = molded_pair_from_sources(
             r#"[
                 {"outgoing": 2, "incoming": 0, "batch_end": false},
@@ -2171,7 +2460,7 @@ mod tests {
             ]"#,
         );
         let defense = WalkieTalkie::from_json(&config(1_200), 1_200, &input)
-            .expect("strict schema-five adapted mould");
+            .expect("strict schema-six adapted mould");
 
         assert_eq!(
             defense.molded,
@@ -2194,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_five_rejects_unadapted_or_overadapted_bursts() {
+    fn schema_six_rejects_unadapted_or_overadapted_bursts() {
         let input = molded_pair_from_sources(
             r#"[{"outgoing": 1, "incoming": 0, "batch_end": false},
                 {"outgoing": 0, "incoming": 2}]"#,
@@ -2227,7 +2516,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "all exact schema-five continuation fields are tested fail closed together"
+        reason = "all exact schema-six continuation fields are tested fail closed together"
     )]
     fn receiver_continuation_metadata_and_runtime_allowance_are_fail_closed() {
         let input = molded_pair_from_sources(

@@ -1921,6 +1921,40 @@ pub struct SendStreams {
 const NULL_GROUP_ID: SendGroupId = SendGroupId::new(0);
 
 impl SendStreams {
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_data(&mut self) -> bool {
+        [
+            TransmissionPriority::Critical,
+            TransmissionPriority::Important,
+            TransmissionPriority::High,
+            TransmissionPriority::Normal,
+            TransmissionPriority::Low,
+        ]
+        .into_iter()
+        .any(|priority| {
+            self.map
+                .values_mut()
+                .any(|stream| stream.has_data_at(priority))
+        })
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_data_excluding(&mut self, allowed: &[StreamId]) -> bool {
+        [
+            TransmissionPriority::Critical,
+            TransmissionPriority::Important,
+            TransmissionPriority::High,
+            TransmissionPriority::Normal,
+            TransmissionPriority::Low,
+        ]
+        .into_iter()
+        .any(|priority| {
+            self.map.iter_mut().any(|(stream_id, stream)| {
+                !allowed.contains(stream_id) && stream.has_data_at(priority)
+            })
+        })
+    }
+
     #[allow(
         clippy::allow_attributes,
         clippy::missing_errors_doc,

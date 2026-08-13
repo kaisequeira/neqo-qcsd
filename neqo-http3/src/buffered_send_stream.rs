@@ -154,6 +154,15 @@ impl BufferedStream {
             false
         }
     }
+
+    /// Bytes currently retained above transport for this stream.
+    #[must_use]
+    pub const fn buffered_len(&self) -> usize {
+        match self {
+            Self::Initialized { buf, .. } => buf.len(),
+            Self::Uninitialized => 0,
+        }
+    }
 }
 
 impl From<&BufferedStream> for Option<StreamId> {

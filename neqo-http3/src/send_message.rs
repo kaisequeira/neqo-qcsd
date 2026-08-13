@@ -214,6 +214,11 @@ impl Stream for SendMessage {
     }
 }
 impl SendStream for SendMessage {
+    #[cfg(feature = "qcsd")]
+    fn qcsd_encoded_request_bytes(&self) -> Option<u64> {
+        u64::try_from(self.stream.buffered_len()).ok()
+    }
+
     fn send_data(&mut self, conn: &mut Connection, buf: &[u8], now: Instant) -> Res<usize> {
         qtrace!("[{self}] send_body: len={}", buf.len());
 

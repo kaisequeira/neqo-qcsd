@@ -20,6 +20,77 @@ use super::Http3Client;
 use crate::{Error, Priority, Res, connection::RequestDescription};
 
 impl Http3Client {
+    /// Drive HTTP/3/QPACK send handlers into transport without constructing a
+    /// QUIC datagram. The prefix qualifier uses this while send shaping is
+    /// active to establish an exact post-SETTINGS transcript cutoff.
+    pub fn qcsd_prepare_stream_output(&mut self, now: Instant) {
+        self.process_http3(now);
+    }
+
+    /// Whether the peer's live HTTP/3 SETTINGS frame has been parsed.
+    #[must_use]
+    pub const fn qcsd_peer_settings_received(&self) -> bool {
+        self.base_handler.qcsd_peer_settings_received()
+    }
+
+    /// Whether HTTP/3/QPACK or transport retains pending STREAM output.
+    pub fn qcsd_has_pending_stream_send(&mut self) -> bool {
+        self.base_handler.qcsd_has_pending_stream_send() || self.conn.qcsd_has_pending_stream_send()
+    }
+
+    /// Whether HTTP/3/QPACK or transport retains pending STREAM output other
+    /// than the explicitly allowed request streams.
+    pub fn qcsd_has_pending_stream_send_excluding(&mut self, allowed: &[StreamId]) -> bool {
+        self.base_handler
+            .qcsd_has_pending_stream_send_excluding(allowed)
+            || self.conn.qcsd_has_pending_stream_send_excluding(allowed)
+    }
+
+    /// Exact bytes written to an HTTP/3 request stream by the production
+    /// encoder, including HTTP/3 HEADERS framing and its QPACK header block.
+    /// Bidirectional request streams have no stream-type prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `stream_id` is not an active send stream.
+    pub fn qcsd_request_stream_bytes(&self, stream_id: StreamId) -> Res<u64> {
+        let encoded = self.base_handler.qcsd_encoded_request_bytes(stream_id)?;
+        let transport = self.conn.send_stream_stats(stream_id)?.bytes_written();
+        Ok(encoded.saturating_add(transport))
+    }
+
+    /// Open a same-origin nonblocking-QPACK request for qualification without
+    /// installing shaped transport stream roles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a cross-origin target or request creation failure.
+    pub fn qcsd_fetch_nonblocking(
+        &mut self,
+        now: Instant,
+        target: &http::Uri,
+        headers: &[Header],
+    ) -> Res<StreamId> {
+        let origin = self.qcsd_origin.as_ref().ok_or(Error::InvalidInput)?;
+        if !same_origin(target, origin) {
+            return Err(Error::InvalidInput);
+        }
+        self.base_handler.request_nonblocking(
+            &mut self.conn,
+            Box::new(self.events.clone()),
+            Box::new(self.events.clone()),
+            Some(std::rc::Rc::clone(&self.push_handler)),
+            &RequestDescription {
+                method: "GET",
+                connect_type: None,
+                target,
+                headers,
+                priority: Priority::default(),
+            },
+            now,
+        )
+    }
+
     /// Enable the narrow QCSD adapter for this HTTP/3 connection.
     ///
     /// `origin` is retained to enforce that controller-generated chaff stays on the
@@ -137,6 +208,22 @@ impl Http3Client {
         observations.extend(self.conn.qcsd_timestamped_observations());
         observations.sort_by_key(TimestampedQcsdObservation::sequence);
         observations
+    }
+
+    /// Drain exact transport STREAM-frame evidence for qualification.
+    #[must_use]
+    pub fn qcsd_stream_transmissions(&mut self) -> Vec<neqo_csdef::QcsdStreamTransmission> {
+        self.conn.qcsd_stream_transmissions()
+    }
+
+    /// Enable qualifier-only all-STREAM transport evidence.
+    pub fn qcsd_enable_stream_transcript(&mut self, enabled: bool) {
+        self.conn.qcsd_enable_stream_transcript(enabled);
+    }
+
+    /// Toggle request/critical STREAM output gating for qualification phases.
+    pub const fn qcsd_enable_send_shaping(&mut self, enabled: bool) {
+        self.conn.qcsd_enable_send_shaping(enabled);
     }
 
     /// Number of scheduled QCSD output targets not yet transmitted.

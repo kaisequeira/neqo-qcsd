@@ -353,6 +353,12 @@ pub struct Connection {
     /// Transport-level target and receive-credit outcomes.
     #[cfg(feature = "qcsd")]
     qcsd_observations: VecDeque<TimestampedQcsdObservation>,
+    /// All STREAM frames encoded while QCSD instrumentation is enabled.
+    #[cfg(feature = "qcsd")]
+    qcsd_stream_transmissions: Option<VecDeque<neqo_csdef::QcsdStreamTransmission>>,
+    /// Per-connection order for the raw STREAM transcript.
+    #[cfg(feature = "qcsd")]
+    qcsd_next_stream_transmission_sequence: u64,
     /// Shared production clock for causal multi-endpoint trace ordering.
     #[cfg(feature = "qcsd")]
     qcsd_observation_clock: Option<QcsdObservationClock>,
@@ -546,6 +552,10 @@ impl Connection {
             qcsd_endpoint: None,
             #[cfg(feature = "qcsd")]
             qcsd_observations: VecDeque::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_stream_transmissions: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_next_stream_transmission_sequence: 0,
             #[cfg(feature = "qcsd")]
             qcsd_observation_clock: None,
             #[cfg(feature = "qcsd")]

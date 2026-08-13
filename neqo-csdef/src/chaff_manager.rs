@@ -314,6 +314,19 @@ mod tests {
     }
 
     #[test]
+    fn dependency_free_qualified_root_is_reusable_in_its_own_namespace() {
+        let manifest = ResourceManifest {
+            resources: vec![resource(0, 400, "https://example.com")],
+        };
+        let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];
+        let mut manager = ChaffManager::new(manifest, false);
+        let planned = manager.replenish(0, 0, 1, 400, &endpoints);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].resource.id, 0);
+        assert_eq!(manager.estimate(0), 400);
+    }
+
+    #[test]
     fn empty_resource_fallback_is_explicit_and_conservative() {
         let manifest = ResourceManifest {
             resources: vec![resource(1, 0, "https://example.com")],

@@ -85,6 +85,23 @@ pub struct TimestampedQcsdObservation {
     sequence: u64,
 }
 
+/// Exact transport STREAM-frame transmission evidence for qualification.
+///
+/// Unlike [`QcsdObservation::StreamDataTransmitted`], this transcript includes
+/// HTTP/3 and QPACK critical streams that have no application/chaff request
+/// role. It is a separate drain-only evidence channel and is never delivered
+/// to a defense controller.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QcsdStreamTransmission {
+    pub sequence: u64,
+    pub stream: QcsdStreamId,
+    pub role: Option<QcsdRequestRole>,
+    pub offset: u64,
+    pub bytes: u64,
+    pub fin: bool,
+    pub slot: Option<QcsdSlotId>,
+}
+
 impl TimestampedQcsdObservation {
     /// The typed observation payload.
     #[must_use]
@@ -326,6 +343,13 @@ pub enum QcsdObservation {
         role: QcsdRequestRole,
         offset: u64,
         bytes: u64,
+        /// Whether this transmission carried the request-stream FIN.
+        #[serde(default, skip_serializing_if = "is_false")]
+        fin: bool,
+        /// Scheduled packet target that owned this transmission. `None`
+        /// identifies targetless request-stream output explicitly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slot: Option<QcsdSlotId>,
     },
     /// One request-stream range was acknowledged by the peer. The controller
     /// activates chaff only after these observations cover `[0, FIN)` without

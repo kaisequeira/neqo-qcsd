@@ -4,7 +4,7 @@
 // option.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ops::RangeInclusive,
     time::{Duration, Instant},
 };
@@ -200,26 +200,77 @@ impl Connection {
         self.qcsd_observations.drain(..).collect()
     }
 
+    /// Drain every encoded STREAM frame, including HTTP/3 and QPACK critical
+    /// streams that do not have a registered request role.
+    #[must_use]
+    pub fn qcsd_stream_transmissions(&mut self) -> Vec<neqo_csdef::QcsdStreamTransmission> {
+        self.qcsd_stream_transmissions
+            .as_mut()
+            .map(|transmissions| transmissions.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Enable or disable the qualifier-only raw all-STREAM transcript.
+    pub fn qcsd_enable_stream_transcript(&mut self, enabled: bool) {
+        self.qcsd_stream_transmissions = enabled.then(VecDeque::new);
+        self.qcsd_next_stream_transmission_sequence = 0;
+    }
+
+    /// Whether transport retains any unsent or retransmission STREAM frame.
+    pub fn qcsd_has_pending_stream_send(&mut self) -> bool {
+        self.streams.qcsd_has_pending_send_data()
+    }
+
+    /// Whether any STREAM other than the explicitly allowed streams remains pending.
+    pub fn qcsd_has_pending_stream_send_excluding(&mut self, allowed: &[StreamId]) -> bool {
+        self.streams.qcsd_has_pending_send_data_excluding(allowed)
+    }
+
     pub(super) fn qcsd_observe_stream_transmissions(&mut self, tokens: &recovery::Tokens) {
+        let slot = self.qcsd_active_target.map(|target| target.slot);
         let transmissions: Vec<_> = tokens
             .iter()
             .filter_map(|token| {
                 let Token::Stream(StreamRecoveryToken::Stream(token)) = token else {
                     return None;
                 };
-                let role = self.qcsd_stream_roles.get(&token.stream_id()).copied()?;
                 let bytes = u64::try_from(token.length()).ok()?;
-                (bytes > 0).then_some((token.stream_id(), role, token.offset(), bytes))
+                (bytes > 0 || token.fin()).then_some((
+                    token.stream_id(),
+                    self.qcsd_stream_roles.get(&token.stream_id()).copied(),
+                    token.offset(),
+                    bytes,
+                    token.fin(),
+                ))
             })
             .collect();
-        for (stream, role, offset, bytes) in transmissions {
-            self.qcsd_observe(|endpoint| QcsdObservation::StreamDataTransmitted {
-                endpoint,
-                stream: neqo_csdef::QcsdStreamId(stream.as_u64()),
-                role,
-                offset,
-                bytes,
-            });
+        for (stream, role, offset, bytes, fin) in transmissions {
+            let stream = neqo_csdef::QcsdStreamId(stream.as_u64());
+            if let Some(transcript) = self.qcsd_stream_transmissions.as_mut() {
+                transcript.push_back(neqo_csdef::QcsdStreamTransmission {
+                    sequence: self.qcsd_next_stream_transmission_sequence,
+                    stream,
+                    role,
+                    offset,
+                    bytes,
+                    fin,
+                    slot,
+                });
+                self.qcsd_next_stream_transmission_sequence = self
+                    .qcsd_next_stream_transmission_sequence
+                    .saturating_add(1);
+            }
+            if let Some(role) = role {
+                self.qcsd_observe(|endpoint| QcsdObservation::StreamDataTransmitted {
+                    endpoint,
+                    stream,
+                    role,
+                    offset,
+                    bytes,
+                    fin,
+                    slot,
+                });
+            }
         }
     }
 
@@ -230,9 +281,6 @@ impl Connection {
         let Some(role) = self.qcsd_stream_roles.get(&token.stream_id()).copied() else {
             return;
         };
-        if !matches!(role, QcsdRequestRole::Chaff { .. }) {
-            return;
-        }
         let Ok(bytes) = u64::try_from(token.length()) else {
             return;
         };

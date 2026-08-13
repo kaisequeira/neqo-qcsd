@@ -256,6 +256,12 @@ impl Decoder {
         self.local_stream_id
     }
 
+    /// Whether decoder-stream bytes still need to be handed to transport.
+    #[must_use]
+    pub fn has_pending_send(&self) -> bool {
+        !self.send_buf.is_empty()
+    }
+
     #[must_use]
     pub fn stats(&self) -> Stats {
         self.stats.clone()

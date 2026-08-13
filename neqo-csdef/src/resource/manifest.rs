@@ -44,6 +44,85 @@ pub struct Resource {
     pub headers: Vec<(String, String)>,
 }
 
+/// Immutable response identity established for one compact chaff request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedChaffResponse {
+    /// Final HTTP status code.
+    pub status: u16,
+    /// Normalized content coding. An absent `content-encoding` field is `identity`.
+    pub content_encoding: String,
+    /// Complete response-body extent in bytes.
+    pub body_bytes: u64,
+    /// Lowercase SHA-256 of the complete response body.
+    pub body_sha256: String,
+}
+
+/// Evidence bindings for a compact, nonblocking HTTP/3 chaff request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChaffQualification {
+    /// Qualification schema version.
+    pub schema_version: u32,
+    /// Qualified request method. Schema one supports only `GET`.
+    pub method: String,
+    /// Exact production nonblocking HTTP/3 request-stream bytes, including HEADERS framing.
+    pub request_stream_bytes: u64,
+    /// Stable response identity established before a defense run.
+    pub expected_response: ExpectedChaffResponse,
+    /// SHA-256 binding the repeated response-identity qualification receipts.
+    pub response_qualification_sha256: String,
+    /// SHA-256 binding the repeated shaped first-cell prefix-pack receipts.
+    pub prefix_pack_qualification_sha256: String,
+    /// Raw SHA-256 of the acyclic numeric prefix-pack specification.
+    pub prefix_spec_sha256: String,
+}
+
+/// A resource usable only through the distinct qualified-chaff manifest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualifiedChaffResource {
+    /// Stable manifest-local identifier.
+    pub id: u32,
+    /// Absolute HTTPS URL.
+    pub url: String,
+    /// Browser-style resource type retained from the application workload.
+    #[serde(default = "default_resource_type", rename = "type")]
+    pub kind: String,
+    /// Qualified complete response-body length.
+    pub content_length: Option<u64>,
+    /// Qualified complete response-body length.
+    pub data_length: u64,
+    /// Selection priority retained from the application workload.
+    #[serde(default)]
+    pub chaff_priority: bool,
+    /// Whether the compact request was qualified successfully.
+    pub known_valid: bool,
+    /// Qualified navigation roots are dependency-free.
+    #[serde(default)]
+    pub depends_on: Vec<u32>,
+    /// Exact compact request headers qualified for this representation.
+    pub headers: Vec<(String, String)>,
+    /// Immutable request/response and evidence bindings.
+    pub chaff_qualification: ChaffQualification,
+}
+
+/// Strict, separately namespaced manifest for runtime chaff requests.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChaffManifest {
+    /// Qualified-chaff manifest schema version.
+    pub schema_version: u32,
+    /// Exact artifact discriminator preventing application-manifest confusion.
+    pub artifact_type: String,
+    /// Raw SHA-256 of the exact frozen application workload file.
+    pub application_workload_sha256: String,
+    /// Application navigation root whose request competes in the first cell.
+    pub application_resource_id: u32,
+    /// Schema one contains exactly one independently qualified navigation root.
+    pub resources: Vec<QualifiedChaffResource>,
+}
+
 fn default_resource_type() -> String {
     "Unknown".into()
 }
@@ -145,13 +224,35 @@ fn is_sensitive(name: &str) -> bool {
     )
 }
 
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Normalize a response `content-encoding` value for identity comparison.
+///
+/// An absent field is represented by `None` and normalizes to `identity`.
+/// Duplicate fields and comma-separated coding stacks are deliberately rejected
+/// by callers; schema one qualifies exactly one stable representation.
+#[must_use]
+pub fn normalize_content_encoding(value: Option<&str>) -> Option<String> {
+    let value = value.unwrap_or("identity").trim().to_ascii_lowercase();
+    (!value.is_empty()
+        && !value.contains(',')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then_some(value)
+}
+
 impl Resource {
     /// Best known reusable response size.
     #[must_use]
     pub fn effective_length(&self) -> u64 {
         self.content_length.unwrap_or(1).max(self.data_length)
     }
-
     /// Normalized `https://authority` used for exact same-origin routing.
     #[must_use]
     pub fn origin(&self) -> Option<String> {
@@ -168,6 +269,173 @@ impl Resource {
             "Document" => 2,
             _ => 1,
         }
+    }
+}
+
+impl QualifiedChaffResource {
+    fn as_resource(&self) -> Resource {
+        Resource {
+            id: self.id,
+            url: self.url.clone(),
+            kind: self.kind.clone(),
+            content_length: self.content_length,
+            data_length: self.data_length,
+            chaff_priority: self.chaff_priority,
+            known_valid: self.known_valid,
+            depends_on: self.depends_on.clone(),
+            headers: self.headers.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let resource = self.as_resource();
+        ResourceManifest {
+            resources: vec![resource.clone()],
+        }
+        .validate()?;
+        let qualification = &self.chaff_qualification;
+        if qualification.schema_version != 1 || qualification.method != "GET" {
+            return Err(Error::InvalidConfig(
+                "qualified chaff requires chaff_qualification schema_version 1 and method GET"
+                    .into(),
+            ));
+        }
+        if qualification.request_stream_bytes == 0 {
+            return Err(Error::InvalidConfig(
+                "qualified chaff request_stream_bytes must be positive".into(),
+            ));
+        }
+        let response = &qualification.expected_response;
+        if !(200..300).contains(&response.status)
+            || response.body_bytes == 0
+            || normalize_content_encoding(Some(&response.content_encoding)).as_deref()
+                != Some(response.content_encoding.as_str())
+            || !is_lower_hex_sha256(&response.body_sha256)
+        {
+            return Err(Error::InvalidConfig(
+                "qualified chaff expected_response identity is invalid or not normalized".into(),
+            ));
+        }
+        for (label, hash) in [
+            (
+                "response_qualification_sha256",
+                &qualification.response_qualification_sha256,
+            ),
+            (
+                "prefix_pack_qualification_sha256",
+                &qualification.prefix_pack_qualification_sha256,
+            ),
+            ("prefix_spec_sha256", &qualification.prefix_spec_sha256),
+        ] {
+            if !is_lower_hex_sha256(hash) {
+                return Err(Error::InvalidConfig(format!(
+                    "qualified chaff {label} must be a lowercase SHA-256"
+                )));
+            }
+        }
+        if !self.known_valid
+            || !self.depends_on.is_empty()
+            || self.content_length != Some(response.body_bytes)
+            || self.data_length != response.body_bytes
+            || resource.effective_length() != response.body_bytes
+        {
+            return Err(Error::InvalidConfig(
+                "qualified chaff root must be known-valid, dependency-free, and bind both length fields exactly to expected_response.body_bytes"
+                    .into(),
+            ));
+        }
+        let normalized_names: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        if normalized_names != ["accept", "accept-encoding", "accept-language"]
+            || self
+                .headers
+                .iter()
+                .any(|(name, _)| name != &name.to_ascii_lowercase())
+        {
+            return Err(Error::InvalidConfig(
+                "qualified chaff headers must be the exact lowercase accept, accept-encoding, accept-language projection in that order"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ChaffManifest {
+    /// Load and strictly validate a schema-one qualified-chaff manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, parsed, or validated.
+    pub fn from_json_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let input = fs::read_to_string(path)?;
+        Self::from_json(&input)
+    }
+
+    /// Parse and strictly validate a schema-one qualified-chaff manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema or any qualification binding is invalid.
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self = serde_json::from_str(input)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate the distinct single-root qualified-chaff contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong discriminator, resource count, or qualification.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 || self.artifact_type != "qcsd-qualified-chaff-manifest" {
+            return Err(Error::InvalidConfig(
+                "qualified chaff manifest requires schema_version 1 and artifact_type qcsd-qualified-chaff-manifest"
+                    .into(),
+            ));
+        }
+        if !is_lower_hex_sha256(&self.application_workload_sha256) {
+            return Err(Error::InvalidConfig(
+                "qualified chaff application_workload_sha256 must be a lowercase SHA-256".into(),
+            ));
+        }
+        if self.resources.len() != 1 {
+            return Err(Error::InvalidConfig(
+                "qualified chaff manifest schema one requires exactly one navigation root".into(),
+            ));
+        }
+        if self.resources[0].id != self.application_resource_id {
+            return Err(Error::InvalidConfig(
+                "qualified chaff root id must equal application_resource_id in its distinct namespace"
+                    .into(),
+            ));
+        }
+        self.resources[0].validate()
+    }
+
+    /// Generic resource view consumed by the transport-independent controller.
+    #[must_use]
+    pub fn resource_manifest(&self) -> ResourceManifest {
+        ResourceManifest {
+            resources: self
+                .resources
+                .iter()
+                .map(QualifiedChaffResource::as_resource)
+                .collect(),
+        }
+    }
+
+    /// Qualification associated with a manifest-local resource identifier.
+    #[must_use]
+    pub fn qualification(&self, resource_id: u32) -> Option<&ChaffQualification> {
+        self.resources
+            .iter()
+            .find(|resource| resource.id == resource_id)
+            .map(|resource| &resource.chaff_qualification)
     }
 }
 
@@ -434,7 +702,10 @@ impl ResourceManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceManifest, sanitize_chaff_headers};
+    use super::{
+        ChaffManifest, ChaffQualification, ExpectedChaffResponse, QualifiedChaffResource,
+        ResourceManifest, sanitize_chaff_headers,
+    };
 
     const LEGACY: &str = r#"{
         "nodes": [
@@ -445,6 +716,44 @@ mod tests {
         "links": [{"source":0,"target":1}]
     }"#;
 
+    fn qualified_manifest() -> ChaffManifest {
+        ChaffManifest {
+            schema_version: 1,
+            artifact_type: "qcsd-qualified-chaff-manifest".into(),
+            application_workload_sha256: "a".repeat(64),
+            application_resource_id: 0,
+            resources: vec![QualifiedChaffResource {
+                id: 0,
+                url: "https://example.com/".into(),
+                kind: "Document".into(),
+                content_length: Some(2_048),
+                data_length: 2_048,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: vec![
+                    ("accept".into(), "text/html".into()),
+                    ("accept-encoding".into(), "gzip, br".into()),
+                    ("accept-language".into(), "en-AU".into()),
+                ],
+                chaff_qualification: ChaffQualification {
+                    schema_version: 1,
+                    method: "GET".into(),
+                    request_stream_bytes: 42,
+                    expected_response: ExpectedChaffResponse {
+                        status: 200,
+                        content_encoding: "br".into(),
+                        body_bytes: 2_048,
+                        body_sha256: "b".repeat(64),
+                    },
+                    response_qualification_sha256: "c".repeat(64),
+                    prefix_pack_qualification_sha256: "d".repeat(64),
+                    prefix_spec_sha256: "e".repeat(64),
+                },
+            }],
+        }
+    }
+
     #[test]
     fn imports_legacy_dependency_graph() {
         let manifest = ResourceManifest::from_json(LEGACY).expect("valid legacy graph");
@@ -452,6 +761,98 @@ mod tests {
         assert!(manifest.resources[2].chaff_priority);
         ResourceManifest::from_json(&manifest.to_json_pretty().expect("serialize"))
             .expect("current-form round trip");
+    }
+
+    #[test]
+    fn qualified_chaff_is_a_strict_distinct_single_root_schema() {
+        let manifest = qualified_manifest();
+        manifest.validate().expect("qualified manifest");
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        assert_eq!(
+            ChaffManifest::from_json(&json).expect("round trip"),
+            manifest
+        );
+        assert!(ResourceManifest::from_json(&json).is_err());
+
+        let mut extra = serde_json::to_value(&manifest).expect("value");
+        extra["unexpected"] = serde_json::json!(true);
+        assert!(ChaffManifest::from_json(&extra.to_string()).is_err());
+    }
+
+    #[test]
+    fn qualified_chaff_rejects_unqualified_or_mutated_request_and_response_identity() {
+        let mut manifest = qualified_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .request_stream_bytes = 0;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = qualified_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .expected_response
+            .status = 404;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = qualified_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .expected_response
+            .content_encoding = "gzip, br".into();
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = qualified_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .expected_response
+            .body_sha256 = "A".repeat(64);
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = qualified_manifest();
+        manifest.resources[0].data_length = 2_047;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn qualified_chaff_requires_exact_lowercase_ael_without_changing_application_headers() {
+        for headers in [
+            vec![
+                ("Accept".into(), "text/html".into()),
+                ("accept-encoding".into(), "gzip, br".into()),
+                ("accept-language".into(), "en-AU".into()),
+            ],
+            vec![
+                ("accept-encoding".into(), "gzip, br".into()),
+                ("accept".into(), "text/html".into()),
+                ("accept-language".into(), "en-AU".into()),
+            ],
+            vec![
+                ("accept".into(), "text/html".into()),
+                ("accept-encoding".into(), "gzip, br".into()),
+                ("accept-language".into(), "en-AU".into()),
+                ("user-agent".into(), "full application header".into()),
+            ],
+        ] {
+            let mut manifest = qualified_manifest();
+            manifest.resources[0].headers = headers;
+            assert!(manifest.validate().is_err());
+        }
+
+        let application = r#"{
+            "resources":[{
+                "id":0,
+                "url":"https://example.com/",
+                "headers":[
+                    ["accept","text/html"],
+                    ["accept-encoding","gzip, br"],
+                    ["accept-language","en-AU"],
+                    ["user-agent","full application header"]
+                ]
+            }]
+        }"#;
+        let parsed = ResourceManifest::from_json(application).expect("application manifest");
+        assert_eq!(parsed.resources[0].headers.len(), 4);
+        assert_eq!(parsed.resources[0].headers[3].0, "user-agent");
     }
 
     #[test]

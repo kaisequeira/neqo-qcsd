@@ -5,4 +5,7 @@
 
 mod manifest;
 
-pub use manifest::{Resource, ResourceManifest, sanitize_chaff_headers};
+pub use manifest::{
+    ChaffManifest, ChaffQualification, ExpectedChaffResponse, QualifiedChaffResource, Resource,
+    ResourceManifest, normalize_content_encoding, sanitize_chaff_headers,
+};

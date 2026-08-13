@@ -581,6 +581,13 @@ impl Encoder {
         self.local_stream.stream_id()
     }
 
+    /// Whether encoder-stream bytes still need to be handed to transport.
+    #[must_use]
+    pub const fn has_pending_send(&self) -> bool {
+        matches!(self.local_stream, LocalStreamState::Uninitialized(_))
+            || self.next_capacity.is_some()
+    }
+
     #[cfg(test)]
     const fn blocked_stream_cnt(&self) -> u16 {
         self.blocked_stream_cnt

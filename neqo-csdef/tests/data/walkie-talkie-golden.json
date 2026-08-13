@@ -2,7 +2,7 @@
   "adaptation": "qcsd-client-only",
   "burst_definition": "global-application-batch-direction-transitions",
   "cell_byte_domain": "http3-request-stream-offset.bytes",
-  "schema_version": 5,
+  "schema_version": 6,
   "generated_by": "neqo-csdef golden fixture",
   "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
   "paper_equivalent": false,
@@ -25,8 +25,26 @@
     "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
     "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
     "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
+    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
+    "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+    "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+    "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-required-chaff-or-h3-qpack-stream-output;zero-targetless-stream-bytes",
+    "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
   },
+  "qualification_bindings": [
+    {
+      "workload_id": "real page",
+      "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "workload_id": "decoy page",
+      "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
   "profiles": [
     {
       "real": "real page",

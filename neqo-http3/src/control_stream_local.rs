@@ -102,6 +102,12 @@ impl ControlStreamLocal {
     pub fn stream_id(&self) -> Option<StreamId> {
         (&self.stream).into()
     }
+
+    #[must_use]
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn has_pending_send(&self) -> bool {
+        self.stream.has_buffered_data() || !self.outstanding_priority_update.is_empty()
+    }
 }
 
 #[test]

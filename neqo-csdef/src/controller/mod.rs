@@ -568,7 +568,11 @@ impl QcsdController {
                     );
                 }
             }
-            QcsdObservation::StreamDataBlocked { .. } => {}
+            // Application and qualified-chaff resources occupy distinct
+            // namespaces. Only a real chaff request stream completion can
+            // mutate chaff resource state.
+            QcsdObservation::StreamDataBlocked { .. }
+            | QcsdObservation::ResourceCompleted { .. } => {}
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
                 stream,
@@ -576,22 +580,16 @@ impl QcsdController {
                 slot,
             } => self.credit_advertised(endpoint, stream, absolute_limit, slot, at),
             QcsdObservation::StreamFinished {
-                endpoint, stream, ..
-            } => self.close_stream(endpoint, stream, at),
+                endpoint,
+                stream,
+                finish,
+            } => self.close_stream(endpoint, stream, finish, at),
             QcsdObservation::ChaffRequestFailed {
                 resource_id,
                 request_id,
             } => {
                 if let Some(chaff) = &mut self.chaff {
                     chaff.request_failed(resource_id, request_id);
-                }
-            }
-            QcsdObservation::ResourceCompleted {
-                resource_id,
-                success,
-            } => {
-                if let Some(chaff) = &mut self.chaff {
-                    chaff.resource_completed(resource_id, success, 0);
                 }
             }
             QcsdObservation::ApplicationBatchStarted => {
@@ -639,6 +637,7 @@ impl QcsdController {
                 role,
                 offset,
                 bytes,
+                ..
             } => {
                 let cover = matches!(role, QcsdRequestRole::Chaff { .. });
                 self.push_signal(
@@ -780,7 +779,13 @@ impl QcsdController {
         }
     }
 
-    fn close_stream(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId, at: Duration) {
+    fn close_stream(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        finish: crate::QcsdStreamFinish,
+        at: Duration,
+    ) {
         self.actions.retain(|action| {
             !matches!(action, QcsdAction::LeaseParserReceive { endpoint: candidate_endpoint, stream: candidate_stream, .. }
                 if *candidate_endpoint == endpoint && *candidate_stream == stream)
@@ -794,9 +799,10 @@ impl QcsdController {
         };
         self.retire_stream_advertised_credit(endpoint, stream, at);
         if let QcsdRequestRole::Chaff { resource_id, .. } = state.role {
-            let success = state
-                .status
-                .is_some_and(|status| (200..300).contains(&status))
+            let success = finish == crate::QcsdStreamFinish::Fin
+                && state
+                    .status
+                    .is_some_and(|status| (200..300).contains(&status))
                 && data_length > 0;
             if let Some(chaff) = &mut self.chaff {
                 chaff.resource_completed(resource_id, success, data_length);
@@ -2851,7 +2857,7 @@ mod tests {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "the schema-five replay keeps both activated reserve cohorts explicit"
+        reason = "the schema-six replay keeps both activated reserve cohorts explicit"
     )]
     fn walkie_talkie_replay() -> ControllerReplay {
         let config = WalkieTalkieConfig {
@@ -3108,7 +3114,7 @@ mod tests {
             "adaptation": "qcsd-client-only",
             "burst_definition": "global-application-batch-direction-transitions",
             "cell_byte_domain": "http3-request-stream-offset.bytes",
-            "schema_version": 5,
+            "schema_version": 6,
             "generated_by": "controller ordering test",
             "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
             "paper_equivalent": false,
@@ -3131,8 +3137,26 @@ mod tests {
                 "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
                 "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
                 "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
+                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
+                "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+                "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+                "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-required-chaff-or-h3-qpack-stream-output;zero-targetless-stream-bytes",
+                "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
             },
+            "qualification_bindings": [
+                {
+                    "workload_id": "real page",
+                    "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                },
+                {
+                    "workload_id": "decoy page",
+                    "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                }
+            ],
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
@@ -3481,6 +3505,8 @@ mod tests {
                 role: QcsdRequestRole::Application,
                 offset: 0,
                 bytes: 1_200,
+                fin: false,
+                slot: None,
             },
             Duration::ZERO,
         );
@@ -3725,7 +3751,7 @@ mod tests {
             1_000,
             include_str!("../../tests/data/walkie-talkie-continuation.json"),
         )
-        .expect("schema-five mould");
+        .expect("schema-six mould");
         let manifest = ResourceManifest {
             resources: vec![Resource {
                 id: 7,
@@ -3872,7 +3898,7 @@ mod tests {
                 1_000,
                 include_str!("../../tests/data/walkie-talkie-continuation.json"),
             )
-            .expect("schema-five mould");
+            .expect("schema-six mould");
             QcsdController::with_defense(
                 QcsdConfig {
                     max_udp_payload_size: 1_450,
@@ -3940,6 +3966,8 @@ mod tests {
             "../../tests/data/walkie-talkie-continuation.json"
         ))
         .expect("receiver-continuation fixture");
+        molded["qualification_bindings"][0]["workload_id"] = serde_json::json!("cloudflare-real");
+        molded["qualification_bindings"][1]["workload_id"] = serde_json::json!("cloudflare-decoy");
         let profile = &mut molded["profiles"][0];
         profile["real"] = serde_json::json!("cloudflare-real");
         profile["decoy"] = serde_json::json!("cloudflare-decoy");
@@ -4093,6 +4121,8 @@ mod tests {
                 role: QcsdRequestRole::Application,
                 offset: 0,
                 bytes: APPLICATION_BYTES,
+                fin: false,
+                slot: None,
             },
             Duration::ZERO,
         );
@@ -4437,7 +4467,7 @@ mod tests {
             "adaptation": "qcsd-client-only",
             "burst_definition": "global-application-batch-direction-transitions",
             "cell_byte_domain": "http3-request-stream-offset.bytes",
-            "schema_version": 5,
+            "schema_version": 6,
             "generated_by": "controller multi-origin test",
             "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
             "paper_equivalent": false,
@@ -4460,8 +4490,26 @@ mod tests {
                 "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
                 "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
                 "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
+                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
+                "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+                "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+                "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-required-chaff-or-h3-qpack-stream-output;zero-targetless-stream-bytes",
+                "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
             },
+            "qualification_bindings": [
+                {
+                    "workload_id": "real page",
+                    "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                },
+                {
+                    "workload_id": "decoy page",
+                    "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                }
+            ],
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
@@ -4862,6 +4910,8 @@ mod tests {
                 role: QcsdRequestRole::Application,
                 offset: 0,
                 bytes: 100,
+                fin: false,
+                slot: None,
             },
             Duration::ZERO,
         );
@@ -6116,6 +6166,57 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn application_id_collision_cannot_mutate_the_distinct_chaff_namespace() {
+        for application_success in [false, true] {
+            let manifest = ResourceManifest {
+                resources: vec![Resource {
+                    id: 0,
+                    url: "https://one.example/".into(),
+                    kind: "Document".into(),
+                    content_length: Some(1_200),
+                    data_length: 1_200,
+                    chaff_priority: true,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                }],
+            };
+            let trace =
+                Trace::new([
+                    Packet::new(Duration::from_millis(1), Direction::Incoming, 1_200)
+                        .expect("packet"),
+                ]);
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    max_chaff_streams: 1,
+                    low_watermark: 1_200,
+                    max_udp_payload_size: 1_200,
+                    ..QcsdConfig::default()
+                },
+                Some(manifest),
+                Box::new(StaticSchedule::new(trace, true)),
+            )
+            .expect("controller");
+            ready(&mut controller, 1, "https://one.example");
+            controller.observe(
+                QcsdObservation::ResourceCompleted {
+                    resource_id: 0,
+                    success: application_success,
+                },
+                Duration::ZERO,
+            );
+            controller.poll(Duration::ZERO);
+            assert!(controller.drain_actions().any(|action| matches!(
+                action,
+                QcsdAction::RequestChaff {
+                    resource: Resource { id: 0, .. },
+                    ..
+                }
+            )));
+        }
     }
 
     #[test]
@@ -8519,6 +8620,8 @@ mod tests {
                 role: QcsdRequestRole::Application,
                 offset: 10,
                 bytes: 25,
+                fin: false,
+                slot: None,
             },
             Duration::from_micros(7),
         );
@@ -8530,6 +8633,8 @@ mod tests {
                     role: QcsdRequestRole::Application,
                     offset: 20,
                     bytes: 20,
+                    fin: false,
+                    slot: None,
                 },
                 Duration::from_micros(at),
             );

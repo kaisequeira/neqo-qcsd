@@ -26,11 +26,12 @@ use futures::{
 use http::Uri;
 use neqo_common::{Header, event::Provider as _};
 use neqo_csdef::{
-    DefenseConfig, DefenseDiagnostics, DefenseKind, DependencyTracker, Direction, MissedSlotReason,
-    Packet, QcsdAction, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
-    QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, Resource, ResourceManifest,
-    ResourceRunState, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, derive,
-    sanitize_chaff_headers,
+    ChaffManifest, DefenseConfig, DefenseDiagnostics, DefenseKind, DependencyTracker, Direction,
+    ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig,
+    QcsdController, QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdProfile,
+    QcsdRequestRole, QcsdSlotId, QcsdStreamTransmission, Resource, ResourceManifest,
+    ResourceRunState, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
+    derive, normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -39,7 +40,7 @@ use neqo_transport::{
 };
 use neqo_udp::RecvBuf;
 use nss::{AuthenticationStatus, hash::HashAlgorithm};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
@@ -171,6 +172,48 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
     },
+    /// Qualify five concurrent compact navigation-root responses over HTTP/3.
+    QualifyChaffResponse {
+        /// Exact frozen prepared application source (A); response preparation metadata is not
+        /// used.
+        #[arg(long)]
+        workload: PathBuf,
+        /// Dependency-free application navigation root to project to AEL.
+        #[arg(long)]
+        application_resource_id: u32,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        parallel_requests: usize,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_response_bytes: u64,
+        #[arg(long, default_value_t = 1_200)]
+        packet_size: u16,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+    /// Prove the production first-cell application/chaff request prefix pack.
+    QualifyChaffPrefix {
+        /// Exact frozen prepared application source (A).
+        #[arg(long)]
+        workload: PathBuf,
+        /// Exact projected runtime workload used by defended execution (R).
+        #[arg(long)]
+        runtime_workload: PathBuf,
+        /// Acyclic compact chaff core derived from response qualification.
+        #[arg(long)]
+        chaff_core: PathBuf,
+        /// Dependency-free application navigation root competing in the cell.
+        #[arg(long)]
+        application_resource_id: u32,
+        /// Standalone immutable numeric Walkie-Talkie prefix-pack specification.
+        #[arg(long)]
+        prefix_pack_spec: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
     /// Run one built-in, static, or reactive defense from a resolved configuration.
     Run {
         /// Explicit URLs for small manual runs. Use --workload for dependency graphs.
@@ -178,6 +221,9 @@ enum Command {
         /// Versioned application workload manifest.
         #[arg(long, conflicts_with = "urls")]
         workload: Option<PathBuf>,
+        /// Exact frozen prepared source whose raw bytes bind qualified chaff.
+        #[arg(long, requires = "workload")]
+        application_workload_source: Option<PathBuf>,
         /// Complete custom configuration for thesis defenses and imported runs.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -221,7 +267,7 @@ enum Command {
         /// Workload identity selecting a Traffic Morphing or Walkie-Talkie profile.
         #[arg(long)]
         workload_id: Option<String>,
-        /// Chaff resource manifest; defaults to --workload for shaped runs.
+        /// Explicit schema-one qualified chaff manifest required by every defended run.
         #[arg(long = "chaff-manifest", visible_alias = "manifest")]
         chaff_manifest: Option<PathBuf>,
         /// Application request dispatch policy used by the campaign collector.
@@ -247,6 +293,7 @@ impl Args {
     /// failures, or when the configured run timeout expires.
     #[expect(
         clippy::future_not_send,
+        clippy::too_many_lines,
         reason = "the binary deliberately uses Tokio's current-thread runtime"
     )]
     pub async fn execute(self) -> Result<(), Error> {
@@ -272,6 +319,7 @@ impl Args {
             Command::Run {
                 urls,
                 workload,
+                application_workload_source,
                 config,
                 preset,
                 profile,
@@ -315,25 +363,51 @@ impl Args {
                     let hash = manifest_hash(&manifest)?;
                     (manifest, hash)
                 };
-                let chaff_manifest = if let Some(path) = chaff_manifest {
-                    Some(ResourceManifest::from_json_file(path)?)
-                } else if !matches!(config.defense, DefenseConfig::None) {
-                    Some(workload.clone())
+                let application_workload_source = application_workload_source
+                    .as_deref()
+                    .map(load_application_workload_source)
+                    .transpose()?;
+                let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
+                    let (manifest, raw_hash) = load_chaff_manifest(&path)?;
+                    (Some(manifest), Some(raw_hash))
                 } else {
-                    None
+                    (None, None)
                 };
                 if !matches!(config.defense, DefenseConfig::None) && chaff_manifest.is_none() {
                     return Err(Error::Argument(
-                        "shaped runs require --workload or an explicit --chaff-manifest".into(),
+                        "every defended run requires an explicit schema-one qualified --chaff-manifest"
+                            .into(),
+                    ));
+                }
+                if !matches!(config.defense, DefenseConfig::None)
+                    && application_workload_source.is_none()
+                {
+                    return Err(Error::Argument(
+                        "every defended run requires --application-workload-source binding the exact frozen prepared workload"
+                            .into(),
+                    ));
+                }
+                if matches!(config.defense, DefenseConfig::None) && chaff_manifest.is_some() {
+                    return Err(Error::Argument(
+                        "undefended runs must not supply --chaff-manifest".into(),
+                    ));
+                }
+                if matches!(config.defense, DefenseConfig::None)
+                    && application_workload_source.is_some()
+                {
+                    return Err(Error::Argument(
+                        "undefended runs must not supply --application-workload-source".into(),
                     ));
                 }
                 let spec = RunSpec {
                     method: "GET",
                     workload,
                     workload_hash,
+                    application_workload_source,
                     config,
                     defense_parameters,
                     chaff_manifest,
+                    chaff_manifest_hash,
                     request_policy,
                     seed,
                     output_dir,
@@ -341,6 +415,46 @@ impl Args {
                     timeout_seconds,
                 };
                 execute_run(spec).await.map(|_| ())
+            }
+            Command::QualifyChaffResponse {
+                workload,
+                application_resource_id,
+                output_dir,
+                parallel_requests,
+                max_response_bytes,
+                packet_size,
+                timeout_seconds,
+            } => {
+                qualify_chaff_response(
+                    &workload,
+                    application_resource_id,
+                    &output_dir,
+                    parallel_requests,
+                    max_response_bytes,
+                    packet_size,
+                    timeout_seconds,
+                )
+                .await
+            }
+            Command::QualifyChaffPrefix {
+                workload,
+                runtime_workload,
+                chaff_core,
+                application_resource_id,
+                prefix_pack_spec,
+                output_dir,
+                timeout_seconds,
+            } => {
+                qualify_chaff_prefix(
+                    &workload,
+                    &runtime_workload,
+                    &chaff_core,
+                    application_resource_id,
+                    &prefix_pack_spec,
+                    &output_dir,
+                    timeout_seconds,
+                )
+                .await
             }
         }
     }
@@ -570,9 +684,11 @@ struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
     workload_hash: String,
+    application_workload_source: Option<(ResourceManifest, String)>,
     config: QcsdConfig,
     defense_parameters: Option<DefenseParameterProvenance>,
-    chaff_manifest: Option<ResourceManifest>,
+    chaff_manifest: Option<ChaffManifest>,
+    chaff_manifest_hash: Option<String>,
     request_policy: RequestPolicyArg,
     seed: u64,
     output_dir: PathBuf,
@@ -599,8 +715,217 @@ struct ResponseResult {
     content_length: Option<u64>,
     bytes: u64,
     body_sha256: String,
+    request_stream_bytes: u64,
     complete: bool,
     outcome: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ChaffResponseResult {
+    resource_id: u32,
+    request_id: Option<u64>,
+    url: String,
+    request_headers: Vec<(String, String)>,
+    request_stream_bytes: u64,
+    expected_request_stream_bytes: Option<u64>,
+    response_headers: Vec<(String, String)>,
+    status: Option<u16>,
+    content_encoding: Option<String>,
+    bytes: u64,
+    body_sha256: Option<String>,
+    complete: bool,
+    status_match: Option<bool>,
+    content_encoding_match: Option<bool>,
+    body_bytes_match: Option<bool>,
+    body_sha256_match: Option<bool>,
+    identity_verified: Option<bool>,
+    outcome: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponseQualificationRequest {
+    request_index: usize,
+    stream_id: u64,
+    request_stream_bytes: u64,
+    status: Option<u16>,
+    content_encoding: Option<String>,
+    body_bytes: u64,
+    body_sha256: Option<String>,
+    complete: bool,
+    outcome: &'static str,
+}
+
+fn qualification_content_encoding(headers: &[Header]) -> Option<String> {
+    let fields: Vec<_> = headers
+        .iter()
+        .filter(|header| header.name().eq_ignore_ascii_case("content-encoding"))
+        .map(Header::value_utf8)
+        .collect();
+    match fields.as_slice() {
+        [] => normalize_content_encoding(None),
+        [Ok(value)] => normalize_content_encoding(Some(value)),
+        [Err(_)] | [_, _, ..] => None,
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChaffQualificationCore {
+    schema_version: u32,
+    method: String,
+    request_stream_bytes: u64,
+    expected_response: ExpectedChaffResponse,
+    response_qualification_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualifiedChaffCoreResource {
+    id: u32,
+    url: String,
+    #[serde(rename = "type")]
+    kind: String,
+    content_length: Option<u64>,
+    data_length: u64,
+    chaff_priority: bool,
+    known_valid: bool,
+    depends_on: Vec<u32>,
+    headers: Vec<(String, String)>,
+    chaff_qualification_core: ChaffQualificationCore,
+}
+
+impl QualifiedChaffCoreResource {
+    fn as_resource(&self) -> Resource {
+        Resource {
+            id: self.id,
+            url: self.url.clone(),
+            kind: self.kind.clone(),
+            content_length: self.content_length,
+            data_length: self.data_length,
+            chaff_priority: self.chaff_priority,
+            known_valid: self.known_valid,
+            depends_on: self.depends_on.clone(),
+            headers: self.headers.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualifiedChaffCore {
+    schema_version: u32,
+    artifact_type: String,
+    application_workload_sha256: String,
+    application_resource_id: u32,
+    resources: Vec<QualifiedChaffCoreResource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrefixBurst {
+    incoming: u64,
+    outgoing: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrefixNumericProfile {
+    bursts: Vec<PrefixBurst>,
+    packet_size: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrefixPackSpec {
+    schema_version: u32,
+    artifact_type: String,
+    workload_id: String,
+    packet_size: u16,
+    max_stream_data_excess: u64,
+    maximum_receiver_continuation_reserve_horizon: usize,
+    required_chaff_survivors: usize,
+    numeric_profile_sha256: String,
+    source_walkie_talkie_artifact_sha256: String,
+    numeric_profile: PrefixNumericProfile,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct QualificationPacketObservation {
+    sequence: u64,
+    phase: &'static str,
+    direction: &'static str,
+    udp_payload_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct QualificationAcknowledgement {
+    sequence: u64,
+    offset: u64,
+    bytes: u64,
+    fin: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PrefixRequestStream {
+    request_order: usize,
+    role: &'static str,
+    resource_id: u32,
+    request_id: Option<u64>,
+    stream_id: u64,
+    request_stream_bytes: u64,
+    qualified_request_stream_bytes: Option<u64>,
+    acknowledgements: Vec<QualificationAcknowledgement>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrefixStreamReceipt<'a> {
+    request_order: usize,
+    role: &'static str,
+    resource_id: u32,
+    request_id: Option<u64>,
+    stream_id: u64,
+    request_stream_bytes: u64,
+    qualified_request_stream_bytes: Option<u64>,
+    transmitted_unique_ranges: Vec<[u64; 2]>,
+    transmitted_unique_bytes: u64,
+    fin_transmitted: bool,
+    acknowledgements: &'a [QualificationAcknowledgement],
+    acknowledged_unique_ranges: Vec<[u64; 2]>,
+    acknowledged_unique_bytes: u64,
+    fin_acknowledged: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PacketStatistics {
+    incoming: PacketDirectionStats,
+    outgoing: PacketDirectionStats,
+    total: PacketDirectionStats,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedWorkloadSource {
+    preparation: serde_json::Value,
+    resources: Vec<Resource>,
+    #[serde(default)]
+    replay: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PacketDirectionStats {
+    packet_count: u64,
+    observed_udp_payload_max: usize,
+    oversized_packet_count: u64,
+}
+
+impl PacketDirectionStats {
+    fn observe(&mut self, bytes: usize, ceiling: u16) {
+        self.packet_count = self.packet_count.saturating_add(1);
+        self.observed_udp_payload_max = self.observed_udp_payload_max.max(bytes);
+        self.oversized_packet_count = self
+            .oversized_packet_count
+            .saturating_add(u64::from(bytes > usize::from(ceiling)));
+    }
 }
 
 #[derive(Debug)]
@@ -609,6 +934,8 @@ struct StreamRecord {
     url: String,
     role: QcsdRequestRole,
     request_headers: Vec<(String, String)>,
+    request_stream_bytes: u64,
+    expected_request_stream_bytes: Option<u64>,
     response_headers: Vec<(String, String)>,
     status: Option<u16>,
     content_length: Option<u64>,
@@ -616,6 +943,15 @@ struct StreamRecord {
     bytes: u64,
     complete: bool,
     outcome: &'static str,
+    expected_chaff_response: Option<ExpectedChaffIdentity>,
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedChaffIdentity {
+    status: u16,
+    content_encoding: String,
+    body_bytes: u64,
+    body_sha256: String,
 }
 
 #[derive(Debug)]
@@ -689,9 +1025,11 @@ async fn probe(
         method: "HEAD",
         workload_hash: manifest_hash(&head_manifest)?,
         workload: head_manifest,
+        application_workload_source: None,
         config: QcsdConfig::default(),
         defense_parameters: None,
         chaff_manifest: None,
+        chaff_manifest_hash: None,
         request_policy: RequestPolicyArg::AsDefined,
         seed: 0,
         output_dir: head_dir,
@@ -724,9 +1062,11 @@ async fn probe(
             method: "GET",
             workload_hash: manifest_hash(&fallback_manifest)?,
             workload: fallback_manifest,
+            application_workload_source: None,
             config: QcsdConfig::default(),
             defense_parameters: None,
             chaff_manifest: None,
+            chaff_manifest_hash: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: parent.join(format!("{stem}.probe-get")),
@@ -762,6 +1102,1080 @@ async fn probe(
     Ok(())
 }
 
+fn projected_ael(resource: &Resource) -> Result<Vec<(String, String)>, Error> {
+    if !resource.known_valid || !resource.depends_on.is_empty() {
+        return Err(Error::Argument(
+            "chaff response qualification requires a known-valid dependency-free root".into(),
+        ));
+    }
+    let projected: Vec<_> = resource
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "accept" | "accept-encoding" | "accept-language"
+            )
+        })
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    let names: Vec<_> = projected.iter().map(|(name, _)| name.as_str()).collect();
+    if names != ["accept", "accept-encoding", "accept-language"]
+        || resource.headers.iter().any(|(name, _)| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "accept" | "accept-encoding" | "accept-language"
+            ) && name != &name.to_ascii_lowercase()
+        })
+    {
+        return Err(Error::Argument(
+            "application root must project exactly one accept, accept-encoding, and accept-language header in that order"
+                .into(),
+        ));
+    }
+    Ok(projected)
+}
+
+fn validate_qualification_application_root(
+    resource: &Resource,
+    application_resource_id: u32,
+) -> Result<(), Error> {
+    if application_resource_id != 0
+        || resource.id != application_resource_id
+        || resource.kind != "Document"
+        || !resource.known_valid
+        || !resource.depends_on.is_empty()
+        || resource.origin().is_none()
+    {
+        return Err(Error::Argument(
+            "qualification requires the unique known-valid dependency-free Document navigation root with resource ID 0"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct QualifierStream {
+    request_index: usize,
+    stream_id: StreamId,
+    request_stream_bytes: u64,
+    status: Option<u16>,
+    content_encoding: Option<String>,
+    body: Vec<u8>,
+    body_bytes: u64,
+    complete: bool,
+    outcome: &'static str,
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    reason = "the dedicated qualification loop retains packet and response evidence in one lifecycle"
+)]
+async fn qualify_chaff_response(
+    workload_path: &Path,
+    application_resource_id: u32,
+    output_dir: &Path,
+    parallel_requests: usize,
+    max_response_bytes: u64,
+    packet_size: u16,
+    timeout_seconds: u64,
+) -> Result<(), Error> {
+    if parallel_requests != 5 || packet_size != 1_200 || max_response_bytes == 0 {
+        return Err(Error::Argument(
+            "response qualification requires parallel_requests=5, packet_size=1200, and positive max_response_bytes"
+                .into(),
+        ));
+    }
+    let (workload, workload_hash) = load_application_workload_source(workload_path)?;
+    let resource = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == application_resource_id)
+        .ok_or_else(|| Error::Argument("application_resource_id is absent from workload".into()))?;
+    validate_qualification_application_root(resource, application_resource_id)?;
+    let request_headers = projected_ael(resource)?;
+    let url: Uri = resource
+        .url
+        .parse()
+        .map_err(|_| Error::Argument("application root URL is invalid".into()))?;
+    if output_dir.exists() && fs::read_dir(output_dir)?.next().is_some() {
+        return Err(Error::Argument(format!(
+            "output directory must be empty: {}",
+            output_dir.display()
+        )));
+    }
+    fs::create_dir_all(output_dir)?;
+    let started_unix_ns = unix_nanos();
+    let started = now();
+    let authority = url
+        .authority()
+        .ok_or_else(|| Error::Argument("URL has no authority".into()))?;
+    let host = authority.host().to_owned();
+    let port = authority.port_u16().unwrap_or(443);
+    let remote_addr = format!("{host}:{port}")
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::Argument(format!("could not resolve {host}:{port}")))?;
+    let wildcard = match remote_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let route_probe = std::net::UdpSocket::bind(wildcard)?;
+    route_probe.connect(remote_addr)?;
+    let socket =
+        Socket::bind_for_direct_capture(SocketAddr::new(route_probe.local_addr()?.ip(), 0))?;
+    let local_addr = socket.local_addr()?;
+    let transport = Connection::new_client(
+        &host,
+        &["h3"],
+        Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8))),
+        local_addr,
+        remote_addr,
+        ConnectionParameters::default().max_udp_payload_size(u64::from(packet_size)),
+        started,
+    )?;
+    let mut client = Http3Client::new_with_conn(
+        transport,
+        Http3Parameters::default().max_concurrent_push_streams(0),
+    );
+    let origin: Uri = format!("https://{authority}")
+        .parse()
+        .map_err(|_| Error::Argument("invalid origin".into()))?;
+    client.enable_qcsd(
+        QcsdEndpointId(0),
+        &origin,
+        packet_size,
+        false,
+        Duration::from_secs(1),
+    )?;
+    let headers: Vec<_> = request_headers
+        .iter()
+        .map(|(name, value)| Header::new(name.as_str(), value.as_str()))
+        .collect();
+    let mut streams = HashMap::<StreamId, QualifierStream>::new();
+    let mut completed = Vec::<QualifierStream>::new();
+    let mut recv_buf = RecvBuf::default();
+    let mut incoming = PacketDirectionStats {
+        packet_count: 0,
+        observed_udp_payload_max: 0,
+        oversized_packet_count: 0,
+    };
+    let mut outgoing = PacketDirectionStats {
+        packet_count: 0,
+        observed_udp_payload_max: 0,
+        oversized_packet_count: 0,
+    };
+    let mut packet_observations = Vec::<QualificationPacketObservation>::new();
+    let mut next_packet_sequence = 0_u64;
+    let deadline = started + Duration::from_secs(timeout_seconds);
+    let mut opened = false;
+    let mut requests_opened_before_first_network_output = 0_usize;
+    let mut qualification_network_output_seen = false;
+    let loop_result: Result<(), Error> = async {
+        loop {
+            let loop_now = now();
+            if loop_now >= deadline {
+                return Err(Error::Timeout(timeout_seconds));
+            }
+            while let Some(datagrams) = socket.recv(local_addr, &mut recv_buf)? {
+                for datagram in datagrams {
+                    incoming.observe(datagram.len(), packet_size);
+                    packet_observations.push(QualificationPacketObservation {
+                        sequence: next_packet_sequence,
+                        phase: if opened { "qualification" } else { "handshake" },
+                        direction: "incoming",
+                        udp_payload_bytes: datagram.len(),
+                    });
+                    next_packet_sequence = next_packet_sequence.saturating_add(1);
+                    client.process_input(datagram, loop_now);
+                }
+            }
+            while let Some(event) = client.next_event() {
+                match event {
+                    Http3ClientEvent::AuthenticationNeeded => {
+                        client.authenticated(AuthenticationStatus::Ok, loop_now);
+                    }
+                    Http3ClientEvent::StateChange(Http3State::Connected) if !opened => {
+                        opened = true;
+                        for request_index in 0..parallel_requests {
+                            let stream_id =
+                                client.qcsd_fetch_nonblocking(loop_now, &url, &headers)?;
+                            client.stream_close_send(stream_id, loop_now)?;
+                            let request_stream_bytes =
+                                client.qcsd_request_stream_bytes(stream_id)?;
+                            if request_stream_bytes == 0 {
+                                return Err(Error::RunAborted(
+                                    "production nonblocking encoder produced an empty request"
+                                        .into(),
+                                ));
+                            }
+                            streams.insert(
+                                stream_id,
+                                QualifierStream {
+                                    request_index,
+                                    stream_id,
+                                    request_stream_bytes,
+                                    status: None,
+                                    content_encoding: None,
+                                    body: Vec::new(),
+                                    body_bytes: 0,
+                                    complete: false,
+                                    outcome: "in_flight",
+                                },
+                            );
+                        }
+                        requests_opened_before_first_network_output = streams.len();
+                    }
+                    Http3ClientEvent::HeaderReady {
+                        stream_id,
+                        headers,
+                        fin,
+                        ..
+                    } => {
+                        if let Some(record) = streams.get_mut(&stream_id) {
+                            record.status = header_u64(&headers, ":status")
+                                .and_then(|value| value.try_into().ok());
+                            record.content_encoding = qualification_content_encoding(&headers);
+                            if fin {
+                                record.complete = true;
+                            }
+                        }
+                        if fin && let Some(mut record) = streams.remove(&stream_id) {
+                            record.outcome = "complete";
+                            completed.push(record);
+                        }
+                    }
+                    Http3ClientEvent::DataReadable { stream_id } => {
+                        let mut buffer = vec![0_u8; 32 * 1024];
+                        loop {
+                            let (read, fin) = client.read_data(loop_now, stream_id, &mut buffer)?;
+                            let record = streams.get_mut(&stream_id).ok_or_else(|| {
+                                Error::RunAborted(
+                                    "data arrived for an unknown qualifier stream".into(),
+                                )
+                            })?;
+                            record.body_bytes = record
+                                .body_bytes
+                                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                            record.complete |= fin;
+                            if record.body_bytes > max_response_bytes {
+                                record.outcome = "response_limit";
+                                return Err(Error::RunAborted(format!(
+                                    "qualification response exceeds {max_response_bytes} bytes"
+                                )));
+                            }
+                            record.body.extend_from_slice(&buffer[..read]);
+                            if fin {
+                                let mut record = streams.remove(&stream_id).expect("present");
+                                record.outcome = "complete";
+                                completed.push(record);
+                                break;
+                            }
+                            if read == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    Http3ClientEvent::Reset { stream_id, .. } => {
+                        if let Some(mut record) = streams.remove(&stream_id) {
+                            record.outcome = "reset";
+                            completed.push(record);
+                        }
+                    }
+                    Http3ClientEvent::StateChange(Http3State::Closed(_)) => {
+                        return Err(Error::RunAborted(
+                            "HTTP/3 endpoint closed during chaff response qualification".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if completed.len() == parallel_requests {
+                return Ok(());
+            }
+            let output = client.process_multiple_output(loop_now, NonZeroUsize::MIN);
+            let delay = match output {
+                OutputBatch::DatagramBatch(batch) => {
+                    for datagram in batch.iter() {
+                        outgoing.observe(datagram.len(), packet_size);
+                        packet_observations.push(QualificationPacketObservation {
+                            sequence: next_packet_sequence,
+                            phase: if opened { "qualification" } else { "handshake" },
+                            direction: "outgoing",
+                            udp_payload_bytes: datagram.len(),
+                        });
+                        next_packet_sequence = next_packet_sequence.saturating_add(1);
+                    }
+                    qualification_network_output_seen |= opened;
+                    loop {
+                        match socket.send(&batch) {
+                            Ok(()) => break,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                socket.writable().await?;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    Duration::from_millis(1)
+                }
+                OutputBatch::Callback(delay) => delay,
+                OutputBatch::None => Duration::from_millis(10),
+            };
+            wait_for_activity([&socket], delay).await?;
+        }
+    }
+    .await;
+
+    let mut remaining: Vec<_> = streams.drain().map(|(_, record)| record).collect();
+    remaining.sort_by_key(|record| record.request_index);
+    for mut record in remaining {
+        if record.outcome == "in_flight" {
+            record.outcome = "incomplete";
+        }
+        completed.push(record);
+    }
+    completed.sort_by_key(|record| record.request_index);
+    let requests = completed
+        .iter()
+        .map(|record| {
+            Ok(ResponseQualificationRequest {
+                request_index: record.request_index,
+                stream_id: record.stream_id.as_u64(),
+                request_stream_bytes: record.request_stream_bytes,
+                status: record.status,
+                content_encoding: record.content_encoding.clone(),
+                body_bytes: record.body_bytes,
+                body_sha256: (record.complete
+                    && u64::try_from(record.body.len()).ok() == Some(record.body_bytes))
+                .then(|| sha256(&record.body))
+                .transpose()?,
+                complete: record.complete,
+                outcome: record.outcome,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let identities: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            (
+                request.status,
+                request.content_encoding.as_deref(),
+                request.body_bytes,
+                request.body_sha256.as_deref(),
+            )
+        })
+        .collect();
+    let passed = loop_result.is_ok()
+        && requests.len() == parallel_requests
+        && requests.iter().all(|request| {
+            request.complete
+                && request
+                    .status
+                    .is_some_and(|status| (200..300).contains(&status))
+                && request.content_encoding.is_some()
+                && request.body_sha256.is_some()
+        })
+        && identities
+            .windows(2)
+            .all(|pair| pair.first() == pair.last())
+        && requests.windows(2).all(|pair| {
+            pair.first().zip(pair.last()).is_some_and(|(first, last)| {
+                first.request_stream_bytes == last.request_stream_bytes
+            })
+        })
+        && incoming.oversized_packet_count == 0
+        && outgoing.oversized_packet_count == 0
+        && requests_opened_before_first_network_output == 5
+        && qualification_network_output_seen;
+    let error = loop_result.as_ref().err().map(ToString::to_string);
+    let request_stream_bytes = requests
+        .first()
+        .map(|request| request.request_stream_bytes)
+        .filter(|size| {
+            requests
+                .iter()
+                .all(|request| request.request_stream_bytes == *size)
+        });
+    let packet_log = serde_json::to_vec(&packet_observations)?;
+    atomic_write(&output_dir.join("packets.json"), &packet_log)?;
+    let packet_log_sha256 = sha256(&packet_log)?;
+    let receipt = json!({
+        "schema_version": 1,
+        "artifact_type": "qcsd-chaff-response-qualification",
+        "invocation_id": format!("{}-{local_addr}", started_unix_ns),
+        "neqo_version": env!("CARGO_PKG_VERSION"),
+        "application_workload_sha256": workload_hash,
+        "application_resource_id": application_resource_id,
+        "method": "GET",
+        "url": url.to_string(),
+        "request_headers": request_headers,
+        "parallel_requests": parallel_requests,
+        "connection_count": 1,
+        "requests_opened_before_first_network_output": requests_opened_before_first_network_output,
+        "request_stream_bytes": request_stream_bytes,
+        "max_response_bytes": max_response_bytes,
+        "udp_payload_ceiling": packet_size,
+        "started_unix_ns": started_unix_ns,
+        "ended_unix_ns": unix_nanos(),
+        "completion_status": if passed { "complete" } else { "error" },
+        "error": error,
+        "source": {
+            "neqo_base_commit": NEQO_BASE_COMMIT,
+            "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
+            "migration_commit": option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"),
+        },
+        "requests": requests,
+        "packet_observations": packet_observations,
+        "packet_log_sha256": packet_log_sha256,
+        "packets": {
+            "incoming": incoming,
+            "outgoing": outgoing,
+            "total": {
+                "packet_count": incoming.packet_count.saturating_add(outgoing.packet_count),
+                "observed_udp_payload_max": incoming.observed_udp_payload_max.max(outgoing.observed_udp_payload_max),
+                "oversized_packet_count": incoming.oversized_packet_count.saturating_add(outgoing.oversized_packet_count),
+            },
+        },
+        "passed": passed,
+    });
+    atomic_write(
+        &output_dir.join("qualification.json"),
+        serde_json::to_string_pretty(&receipt)?.as_bytes(),
+    )?;
+    if passed {
+        Ok(())
+    } else {
+        Err(loop_result.err().unwrap_or_else(|| {
+            Error::RunAborted("chaff response qualification invariants failed".into())
+        }))
+    }
+}
+
+fn merged_ranges(ranges: impl IntoIterator<Item = (u64, u64)>) -> Vec<[u64; 2]> {
+    let mut ranges: Vec<_> = ranges
+        .into_iter()
+        .filter_map(|(start, bytes)| (bytes > 0).then_some([start, start.saturating_add(bytes)]))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged = Vec::<[u64; 2]>::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range[0] <= last[1]
+        {
+            last[1] = last[1].max(range[1]);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn range_bytes(ranges: &[[u64; 2]]) -> u64 {
+    ranges.iter().fold(0_u64, |total, range| {
+        total.saturating_add(range[1].saturating_sub(range[0]))
+    })
+}
+
+fn prefix_stream_receipts<'a>(
+    requests: &'a [PrefixRequestStream],
+    transmissions: &[QcsdStreamTransmission],
+) -> Vec<PrefixStreamReceipt<'a>> {
+    requests
+        .iter()
+        .map(|request| {
+            let tx: Vec<_> = transmissions
+                .iter()
+                .filter(|transmission| transmission.stream.0 == request.stream_id)
+                .collect();
+            let transmitted_unique_ranges = merged_ranges(
+                tx.iter()
+                    .map(|transmission| (transmission.offset, transmission.bytes)),
+            );
+            let acknowledged_unique_ranges = merged_ranges(
+                request
+                    .acknowledgements
+                    .iter()
+                    .map(|ack| (ack.offset, ack.bytes)),
+            );
+            PrefixStreamReceipt {
+                request_order: request.request_order,
+                role: request.role,
+                resource_id: request.resource_id,
+                request_id: request.request_id,
+                stream_id: request.stream_id,
+                request_stream_bytes: request.request_stream_bytes,
+                qualified_request_stream_bytes: request.qualified_request_stream_bytes,
+                transmitted_unique_bytes: range_bytes(&transmitted_unique_ranges),
+                fin_transmitted: tx.iter().any(|transmission| transmission.fin),
+                transmitted_unique_ranges,
+                acknowledgements: &request.acknowledgements,
+                acknowledged_unique_bytes: range_bytes(&acknowledged_unique_ranges),
+                fin_acknowledged: request.acknowledgements.iter().any(|ack| ack.fin),
+                acknowledged_unique_ranges,
+            }
+        })
+        .collect()
+}
+
+fn prefix_receipts_pass(
+    receipts: &[PrefixStreamReceipt<'_>],
+    required_chaff_survivors: usize,
+) -> bool {
+    if receipts.len() != 6
+        || receipts
+            .iter()
+            .enumerate()
+            .any(|(index, receipt)| receipt.request_order != index)
+        || receipts
+            .iter()
+            .map(|receipt| receipt.stream_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != receipts.len()
+    {
+        return false;
+    }
+    let app = &receipts[0];
+    let app_tx_complete = app.role == "application"
+        && app.transmitted_unique_ranges == [[0, app.request_stream_bytes]]
+        && app.transmitted_unique_bytes == app.request_stream_bytes
+        && app.fin_transmitted;
+    let chaff_complete = receipts
+        .iter()
+        .skip(1)
+        .take(required_chaff_survivors)
+        .all(|receipt| {
+            receipt.role == "chaff"
+                && receipt.qualified_request_stream_bytes == Some(receipt.request_stream_bytes)
+                && receipt.transmitted_unique_ranges == [[0, receipt.request_stream_bytes]]
+                && receipt.transmitted_unique_bytes == receipt.request_stream_bytes
+                && receipt.fin_transmitted
+                && receipt.acknowledged_unique_ranges == [[0, receipt.request_stream_bytes]]
+                && receipt.acknowledged_unique_bytes == receipt.request_stream_bytes
+                && receipt.fin_acknowledged
+        });
+    app_tx_complete && chaff_complete
+}
+
+fn intentionally_pending_late_chaff(
+    requests: &[PrefixRequestStream],
+    required_chaff_survivors: usize,
+) -> Vec<StreamId> {
+    requests
+        .iter()
+        .skip(required_chaff_survivors.saturating_add(1))
+        .map(|request| StreamId::new(request.stream_id))
+        .collect()
+}
+
+fn record_prefix_observations(
+    client: &mut Http3Client,
+    requests: &mut [PrefixRequestStream],
+    transmissions: &mut Vec<QcsdStreamTransmission>,
+) -> Result<bool, Error> {
+    transmissions.extend(client.qcsd_stream_transmissions());
+    let mut slot_satisfied = false;
+    for record in client.qcsd_timestamped_observations() {
+        let sequence = record.sequence();
+        match record.into_observation() {
+            QcsdObservation::StreamDataAcknowledged {
+                stream,
+                offset,
+                bytes,
+                fin,
+                ..
+            } => {
+                let request = requests
+                    .iter_mut()
+                    .find(|request| request.stream_id == stream.0)
+                    .ok_or_else(|| {
+                        Error::RunAborted(
+                            "ACK observation referenced an unknown prefix request stream".into(),
+                        )
+                    })?;
+                request.acknowledgements.push(QualificationAcknowledgement {
+                    sequence,
+                    offset,
+                    bytes,
+                    fin,
+                });
+            }
+            QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(1),
+                observed_size: 1_200,
+                ..
+            } => slot_satisfied = true,
+            QcsdObservation::SlotMissed {
+                slot: QcsdSlotId(1),
+                reason,
+                ..
+            } => {
+                return Err(Error::RunAborted(format!(
+                    "prefix-pack target was missed: {reason:?}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(slot_satisfied)
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    reason = "the production prefix qualifier retains every bound input and wire observation in one lifecycle"
+)]
+async fn qualify_chaff_prefix(
+    application_source_path: &Path,
+    runtime_workload_path: &Path,
+    chaff_core_path: &Path,
+    application_resource_id: u32,
+    prefix_pack_spec_path: &Path,
+    output_dir: &Path,
+    timeout_seconds: u64,
+) -> Result<(), Error> {
+    let (application_source, application_source_sha256) =
+        load_application_workload_source(application_source_path)?;
+    let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
+    let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
+    let (prefix_spec, prefix_pack_spec_sha256) = load_prefix_pack_spec(prefix_pack_spec_path)?;
+    validate_prefix_pack_spec(&prefix_spec)?;
+    validate_chaff_core_binding(
+        &chaff_core,
+        &application_source,
+        &application_source_sha256,
+        application_resource_id,
+    )?;
+    let application = runtime_workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == application_resource_id)
+        .ok_or_else(|| Error::Argument("runtime application root is absent".into()))?;
+    let source_application = application_source
+        .resources
+        .iter()
+        .find(|resource| resource.id == application_resource_id)
+        .expect("validated");
+    validate_qualification_application_root(application, application_resource_id)?;
+    if runtime_workload
+        .resources
+        .iter()
+        .filter(|resource| resource.depends_on.is_empty())
+        .count()
+        != 1
+        || (
+            &application.url,
+            &application.kind,
+            application.chaff_priority,
+            application.known_valid,
+            &application.depends_on,
+            projected_ael(application)?,
+        ) != (
+            &source_application.url,
+            &source_application.kind,
+            source_application.chaff_priority,
+            source_application.known_valid,
+            &source_application.depends_on,
+            projected_ael(source_application)?,
+        )
+    {
+        return Err(Error::Argument(
+            "runtime workload and frozen source disagree on the unique navigation root request"
+                .into(),
+        ));
+    }
+    if output_dir.exists() && fs::read_dir(output_dir)?.next().is_some() {
+        return Err(Error::Argument(format!(
+            "output directory must be empty: {}",
+            output_dir.display()
+        )));
+    }
+    fs::create_dir_all(output_dir)?;
+    let started_unix_ns = unix_nanos();
+    let started = now();
+    let url: Uri = application
+        .url
+        .parse()
+        .map_err(|_| Error::Argument("runtime application root URL is invalid".into()))?;
+    let authority = url
+        .authority()
+        .ok_or_else(|| Error::Argument("application root URL has no authority".into()))?;
+    let host = authority.host().to_owned();
+    let port = authority.port_u16().unwrap_or(443);
+    let remote_addr = format!("{host}:{port}")
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::Argument(format!("could not resolve {host}:{port}")))?;
+    let wildcard = match remote_addr {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let route_probe = std::net::UdpSocket::bind(wildcard)?;
+    route_probe.connect(remote_addr)?;
+    let socket =
+        Socket::bind_for_direct_capture(SocketAddr::new(route_probe.local_addr()?.ip(), 0))?;
+    let local_addr = socket.local_addr()?;
+    let params = ConnectionParameters::default()
+        .max_stream_data(StreamType::BiDi, false, 0)
+        .max_udp_payload_size(u64::from(prefix_spec.packet_size));
+    let transport = Connection::new_client(
+        &host,
+        &["h3"],
+        Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8))),
+        local_addr,
+        remote_addr,
+        params,
+        started,
+    )?;
+    let mut client = Http3Client::new_with_conn(
+        transport,
+        Http3Parameters::default().max_concurrent_push_streams(0),
+    );
+    let origin: Uri = format!("https://{authority}")
+        .parse()
+        .map_err(|_| Error::Argument("invalid application origin".into()))?;
+    client.enable_qcsd(
+        QcsdEndpointId(0),
+        &origin,
+        prefix_spec.packet_size,
+        false,
+        Duration::from_secs(1),
+    )?;
+    let deadline = started + Duration::from_secs(timeout_seconds);
+    let mut recv_buf = RecvBuf::default();
+    let mut packet_observations = Vec::<QualificationPacketObservation>::new();
+    let mut next_packet_sequence = 0_u64;
+    let mut incoming = PacketDirectionStats {
+        packet_count: 0,
+        observed_udp_payload_max: 0,
+        oversized_packet_count: 0,
+    };
+    let mut outgoing = incoming.clone();
+    let mut peer_settings_received = false;
+    let mut warmup_stream_output_drained = false;
+    let mut packet_cutoff_sequence = 0_u64;
+    let mut requests = Vec::<PrefixRequestStream>::new();
+    let mut transmissions = Vec::<QcsdStreamTransmission>::new();
+    let mut target_queued = false;
+    let mut target_sent = false;
+    let mut target_satisfied = false;
+    let mut first_target_output_count = 0_u64;
+    let mut first_target_output_bytes = 0_u64;
+    let loop_result: Result<(), Error> = async {
+        loop {
+            let loop_now = now();
+            if loop_now >= deadline {
+                return Err(Error::Timeout(timeout_seconds));
+            }
+            while let Some(datagrams) = socket.recv(local_addr, &mut recv_buf)? {
+                for datagram in datagrams {
+                    incoming.observe(datagram.len(), prefix_spec.packet_size);
+                    packet_observations.push(QualificationPacketObservation {
+                        sequence: next_packet_sequence,
+                        phase: if target_queued {
+                            "qualification"
+                        } else {
+                            "warmup"
+                        },
+                        direction: "incoming",
+                        udp_payload_bytes: datagram.len(),
+                    });
+                    next_packet_sequence = next_packet_sequence.saturating_add(1);
+                    client.process_input(datagram, loop_now);
+                }
+            }
+            while let Some(event) = client.next_event() {
+                match event {
+                    Http3ClientEvent::AuthenticationNeeded => {
+                        client.authenticated(AuthenticationStatus::Ok, loop_now);
+                    }
+                    Http3ClientEvent::StateChange(Http3State::Closed(_)) => {
+                        return Err(Error::RunAborted(
+                            "HTTP/3 endpoint closed during prefix qualification".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if !target_queued && client.qcsd_peer_settings_received() {
+                peer_settings_received = true;
+                client.qcsd_prepare_stream_output(loop_now);
+                if !client.qcsd_has_pending_stream_send() {
+                    warmup_stream_output_drained = true;
+                    client.qcsd_enable_send_shaping(true);
+                    client.qcsd_enable_stream_transcript(true);
+                    packet_cutoff_sequence = next_packet_sequence;
+                    drop(client.qcsd_timestamped_observations());
+
+                    let app_headers =
+                        runtime_workload.application_headers(application_resource_id)?;
+                    let app_headers: Vec<_> = app_headers
+                        .iter()
+                        .map(|(name, value)| Header::new(name.as_str(), value.as_str()))
+                        .collect();
+                    let app_stream =
+                        client.fetch(loop_now, "GET", &url, &app_headers, Priority::default())?;
+                    client.register_qcsd_stream(app_stream, QcsdRequestRole::Application, None)?;
+                    client.stream_close_send(app_stream, loop_now)?;
+                    let app_size = client.qcsd_request_stream_bytes(app_stream)?;
+                    requests.push(PrefixRequestStream {
+                        request_order: 0,
+                        role: "application",
+                        resource_id: application_resource_id,
+                        request_id: None,
+                        stream_id: app_stream.as_u64(),
+                        request_stream_bytes: app_size,
+                        qualified_request_stream_bytes: None,
+                        acknowledgements: Vec::new(),
+                    });
+                    let core_resource = &chaff_core.resources[0];
+                    let compact = core_resource.as_resource();
+                    for index in 0..5_usize {
+                        let request_id =
+                            QcsdChaffRequestId(u64::try_from(index).unwrap_or(u64::MAX));
+                        let stream = client
+                            .apply_qcsd_action(
+                                loop_now,
+                                QcsdAction::RequestChaff {
+                                    endpoint: QcsdEndpointId(0),
+                                    resource: compact.clone(),
+                                    request_id,
+                                },
+                            )?
+                            .ok_or_else(|| {
+                                Error::RunAborted("chaff request was not opened".into())
+                            })?;
+                        client.stream_close_send(stream, loop_now)?;
+                        let size = client.qcsd_request_stream_bytes(stream)?;
+                        if size != core_resource.chaff_qualification_core.request_stream_bytes {
+                            return Err(Error::RunAborted(format!(
+                                "compact chaff request encoded {size} bytes, expected {}",
+                                core_resource.chaff_qualification_core.request_stream_bytes
+                            )));
+                        }
+                        requests.push(PrefixRequestStream {
+                            request_order: index.saturating_add(1),
+                            role: "chaff",
+                            resource_id: core_resource.id,
+                            request_id: Some(request_id.0),
+                            stream_id: stream.as_u64(),
+                            request_stream_bytes: size,
+                            qualified_request_stream_bytes: Some(
+                                core_resource.chaff_qualification_core.request_stream_bytes,
+                            ),
+                            acknowledgements: Vec::new(),
+                        });
+                    }
+                    let packet =
+                        Packet::new(Duration::ZERO, Direction::Outgoing, prefix_spec.packet_size)?;
+                    client.apply_qcsd_action(
+                        loop_now,
+                        QcsdAction::SendPacket {
+                            endpoint: QcsdEndpointId(0),
+                            packet,
+                            slot: QcsdSlotId(1),
+                            deadline_after_us: u64::try_from(
+                                Duration::from_secs(timeout_seconds).as_micros(),
+                            )
+                            .unwrap_or(u64::MAX),
+                            allow_stream_data: true,
+                        },
+                    )?;
+                    target_queued = true;
+                }
+            }
+
+            target_satisfied |=
+                record_prefix_observations(&mut client, &mut requests, &mut transmissions)?;
+            let receipts = prefix_stream_receipts(&requests, &transmissions);
+            let allowed_pending =
+                intentionally_pending_late_chaff(&requests, prefix_spec.required_chaff_survivors);
+            if target_satisfied
+                && prefix_receipts_pass(&receipts, prefix_spec.required_chaff_survivors)
+                && !client.qcsd_has_pending_stream_send_excluding(&allowed_pending)
+            {
+                return Ok(());
+            }
+
+            let output = client.process_multiple_output(loop_now, NonZeroUsize::MIN);
+            target_satisfied |=
+                record_prefix_observations(&mut client, &mut requests, &mut transmissions)?;
+            let delay = match output {
+                OutputBatch::DatagramBatch(batch) => {
+                    for datagram in batch.iter() {
+                        outgoing.observe(datagram.len(), prefix_spec.packet_size);
+                        packet_observations.push(QualificationPacketObservation {
+                            sequence: next_packet_sequence,
+                            phase: if target_queued {
+                                "qualification"
+                            } else {
+                                "warmup"
+                            },
+                            direction: "outgoing",
+                            udp_payload_bytes: datagram.len(),
+                        });
+                        next_packet_sequence = next_packet_sequence.saturating_add(1);
+                        if target_queued && !target_sent {
+                            first_target_output_count = first_target_output_count.saturating_add(1);
+                            first_target_output_bytes = first_target_output_bytes
+                                .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
+                        }
+                    }
+                    if target_queued {
+                        target_sent = true;
+                    }
+                    loop {
+                        match socket.send(&batch) {
+                            Ok(()) => break,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                socket.writable().await?;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    Duration::from_millis(1)
+                }
+                OutputBatch::Callback(delay) => delay,
+                OutputBatch::None => Duration::from_millis(10),
+            };
+            wait_for_activity([&socket], delay).await?;
+        }
+    }
+    .await;
+
+    let final_observation_result =
+        record_prefix_observations(&mut client, &mut requests, &mut transmissions);
+    let stream_receipts = prefix_stream_receipts(&requests, &transmissions);
+    let targetless_stream_bytes = transmissions
+        .iter()
+        .filter(|transmission| transmission.slot != Some(QcsdSlotId(1)))
+        .fold(0_u64, |total, transmission| {
+            total.saturating_add(transmission.bytes)
+        });
+    let all_streams_owned = transmissions
+        .iter()
+        .all(|transmission| transmission.slot == Some(QcsdSlotId(1)));
+    let post_slot_pending_stream_send = client.qcsd_has_pending_stream_send();
+    let allowed_pending =
+        intentionally_pending_late_chaff(&requests, prefix_spec.required_chaff_survivors);
+    let allowed_pending_late_chaff_request_orders: Vec<_> = requests
+        .iter()
+        .skip(prefix_spec.required_chaff_survivors.saturating_add(1))
+        .map(|request| request.request_order)
+        .collect();
+    let allowed_pending_late_chaff_stream_ids: Vec<_> = allowed_pending
+        .iter()
+        .map(|stream_id| stream_id.as_u64())
+        .collect();
+    let post_slot_pending_required_stream_send =
+        client.qcsd_has_pending_stream_send_excluding(&allowed_pending);
+    let passed = loop_result.is_ok()
+        && final_observation_result.is_ok()
+        && peer_settings_received
+        && warmup_stream_output_drained
+        && requests.len() == 6
+        && target_satisfied
+        && first_target_output_count == 1
+        && first_target_output_bytes == u64::from(prefix_spec.packet_size)
+        && all_streams_owned
+        && targetless_stream_bytes == 0
+        && prefix_receipts_pass(&stream_receipts, prefix_spec.required_chaff_survivors)
+        && !post_slot_pending_required_stream_send
+        && incoming.oversized_packet_count == 0
+        && outgoing.oversized_packet_count == 0;
+    let packet_log = serde_json::to_vec(&packet_observations)?;
+    atomic_write(&output_dir.join("packets.json"), &packet_log)?;
+    let packet_log_sha256 = sha256(&packet_log)?;
+    let total = PacketDirectionStats {
+        packet_count: incoming.packet_count.saturating_add(outgoing.packet_count),
+        observed_udp_payload_max: incoming
+            .observed_udp_payload_max
+            .max(outgoing.observed_udp_payload_max),
+        oversized_packet_count: incoming
+            .oversized_packet_count
+            .saturating_add(outgoing.oversized_packet_count),
+    };
+    let packets = PacketStatistics {
+        incoming,
+        outgoing,
+        total,
+    };
+    let error = loop_result
+        .as_ref()
+        .err()
+        .or_else(|| final_observation_result.as_ref().err())
+        .map(ToString::to_string);
+    let receipt = json!({
+        "schema_version": 1,
+        "artifact_type": "qcsd-chaff-prefix-pack-qualification",
+        "invocation_id": format!("{}-{local_addr}", started_unix_ns),
+        "neqo_version": env!("CARGO_PKG_VERSION"),
+        "application_workload_source_sha256": application_source_sha256,
+        "runtime_workload_sha256": runtime_workload_sha256,
+        "chaff_core_sha256": chaff_core_sha256,
+        "prefix_pack_spec_sha256": prefix_pack_spec_sha256,
+        "application_resource_id": application_resource_id,
+        "workload_id": prefix_spec.workload_id,
+        "numeric_profile_sha256": prefix_spec.numeric_profile_sha256,
+        "source_walkie_talkie_artifact_sha256": prefix_spec.source_walkie_talkie_artifact_sha256,
+        "packet_size": prefix_spec.packet_size,
+        "max_stream_data_excess": prefix_spec.max_stream_data_excess,
+        "maximum_receiver_continuation_reserve_horizon": prefix_spec.maximum_receiver_continuation_reserve_horizon,
+        "required_chaff_survivors": prefix_spec.required_chaff_survivors,
+        "max_chaff_streams": 5,
+        "connection_count": 1,
+        "peer_settings_received": peer_settings_received,
+        "warmup_stream_output_drained": warmup_stream_output_drained,
+        "packet_cutoff_sequence": packet_cutoff_sequence,
+        "requests_opened_before_first_target": requests.len(),
+        "scheduled_target": {
+            "slot_id": 1,
+            "direction": "outgoing",
+            "udp_payload_bytes": prefix_spec.packet_size,
+            "scheduled_datagrams": 1,
+            "scheduled_bytes": prefix_spec.packet_size,
+            "satisfied_datagrams": u64::from(target_satisfied),
+            "satisfied_bytes": if target_satisfied { prefix_spec.packet_size } else { 0 },
+        },
+        "streams": stream_receipts,
+        "stream_transmissions": transmissions,
+        "packet_observations": packet_observations,
+        "packet_log_sha256": packet_log_sha256,
+        "packets": packets,
+        "post_slot_pending_stream_send": post_slot_pending_stream_send,
+        "post_slot_pending_required_stream_send": post_slot_pending_required_stream_send,
+        "allowed_pending_late_chaff_request_orders": allowed_pending_late_chaff_request_orders,
+        "allowed_pending_late_chaff_stream_ids": allowed_pending_late_chaff_stream_ids,
+        "targetless_stream_bytes": targetless_stream_bytes,
+        "completion_status": if passed { "complete" } else { "error" },
+        "error": error,
+        "started_unix_ns": started_unix_ns,
+        "ended_unix_ns": unix_nanos(),
+        "source": {
+            "neqo_base_commit": NEQO_BASE_COMMIT,
+            "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
+            "migration_commit": option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"),
+        },
+        "passed": passed,
+    });
+    atomic_write(
+        &output_dir.join("qualification.json"),
+        serde_json::to_string_pretty(&receipt)?.as_bytes(),
+    )?;
+    if passed {
+        Ok(())
+    } else {
+        Err(loop_result
+            .err()
+            .or_else(|| final_observation_result.err())
+            .unwrap_or_else(|| {
+                Error::RunAborted("chaff prefix-pack qualification invariants failed".into())
+            }))
+    }
+}
+
 fn positional_manifest(urls: &[Uri]) -> ResourceManifest {
     ResourceManifest {
         resources: urls
@@ -791,6 +2205,162 @@ fn load_manifest(path: &Path) -> Result<(ResourceManifest, String), Error> {
     Ok((manifest, sha256(&bytes)?))
 }
 
+fn load_application_workload_source(path: &Path) -> Result<(ResourceManifest, String), Error> {
+    let bytes = fs::read(path)?;
+    let source: PreparedWorkloadSource = serde_json::from_slice(&bytes)?;
+    if !source.preparation.is_object() || source.replay.is_some() {
+        return Err(Error::Argument(
+            "application workload source requires preparation metadata and must not contain replay metadata"
+                .into(),
+        ));
+    }
+    let manifest = ResourceManifest {
+        resources: source.resources,
+    };
+    manifest.validate()?;
+    Ok((manifest, sha256(&bytes)?))
+}
+
+fn load_chaff_manifest(path: &Path) -> Result<(ChaffManifest, String), Error> {
+    let bytes = fs::read(path)?;
+    let manifest = ChaffManifest::from_json(std::str::from_utf8(&bytes).map_err(|_| {
+        Error::Argument(format!(
+            "qualified chaff manifest is not UTF-8: {}",
+            path.display()
+        ))
+    })?)?;
+    let raw_hash = sha256(&bytes)?;
+    Ok((manifest, raw_hash))
+}
+
+fn load_chaff_core(path: &Path) -> Result<(QualifiedChaffCore, String), Error> {
+    let bytes = fs::read(path)?;
+    let core: QualifiedChaffCore = serde_json::from_slice(&bytes)?;
+    Ok((core, sha256(&bytes)?))
+}
+
+fn load_prefix_pack_spec(path: &Path) -> Result<(PrefixPackSpec, String), Error> {
+    let bytes = fs::read(path)?;
+    let spec: PrefixPackSpec = serde_json::from_slice(&bytes)?;
+    Ok((spec, sha256(&bytes)?))
+}
+
+fn lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn maximum_receiver_continuation_reserve_horizon(bursts: &[PrefixBurst]) -> usize {
+    let mut maximum = 0_usize;
+    for (index, burst) in bursts.iter().enumerate() {
+        if burst.incoming == 0 {
+            continue;
+        }
+        let mut horizon = 0_usize;
+        for (offset, candidate) in bursts[index..].iter().enumerate() {
+            if offset > 0 && candidate.outgoing > 0 {
+                break;
+            }
+            horizon = horizon.saturating_add(usize::from(candidate.incoming > 0));
+        }
+        maximum = maximum.max(horizon);
+    }
+    maximum
+}
+
+fn prefix_numeric_profile_sha256(profile: &PrefixNumericProfile) -> Result<String, Error> {
+    // This is the exact UTF-8 produced by Python's
+    // json.dumps(value, sort_keys=True, separators=(",", ":")) for this
+    // integer-only schema. Keeping the construction explicit makes the
+    // cross-language domain separation independently auditable.
+    let canonical = serde_json::to_vec(profile)?;
+    let mut preimage = b"qcsd-walkie-talkie-numeric-profile-v1\0".to_vec();
+    preimage.extend_from_slice(&canonical);
+    sha256(&preimage)
+}
+
+fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
+    let horizon = maximum_receiver_continuation_reserve_horizon(&spec.numeric_profile.bursts);
+    if spec.schema_version != 1
+        || spec.artifact_type != "qcsd-walkie-talkie-prefix-pack-spec"
+        || spec.workload_id.trim().is_empty()
+        || spec.packet_size != 1_200
+        || spec.max_stream_data_excess != 1_000
+        || spec.numeric_profile.packet_size != spec.packet_size
+        || spec.numeric_profile.bursts.is_empty()
+        || horizon == 0
+        || spec.maximum_receiver_continuation_reserve_horizon != horizon
+        || spec.required_chaff_survivors != horizon.saturating_add(1)
+        || spec.required_chaff_survivors > 5
+        || !lower_hex_sha256(&spec.numeric_profile_sha256)
+        || !lower_hex_sha256(&spec.source_walkie_talkie_artifact_sha256)
+        || prefix_numeric_profile_sha256(&spec.numeric_profile)? != spec.numeric_profile_sha256
+    {
+        return Err(Error::Argument(
+            "prefix-pack specification schema or numeric derivation is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chaff_core_binding(
+    core: &QualifiedChaffCore,
+    workload: &ResourceManifest,
+    workload_hash: &str,
+    application_resource_id: u32,
+) -> Result<(), Error> {
+    if core.schema_version != 1
+        || core.artifact_type != "qcsd-qualified-chaff-core"
+        || core.application_workload_sha256 != workload_hash
+        || core.application_resource_id != application_resource_id
+        || core.resources.len() != 1
+    {
+        return Err(Error::Argument(
+            "qualified chaff core top-level binding is invalid".into(),
+        ));
+    }
+    let application = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == application_resource_id)
+        .ok_or_else(|| Error::Argument("application root is absent from workload".into()))?;
+    validate_qualification_application_root(application, application_resource_id)?;
+    let compact_headers = projected_ael(application)?;
+    let resource = &core.resources[0];
+    let qualification = &resource.chaff_qualification_core;
+    let response = &qualification.expected_response;
+    if resource.id != application_resource_id
+        || resource.url != application.url
+        || resource.kind != application.kind
+        || resource.chaff_priority != application.chaff_priority
+        || !resource.known_valid
+        || !resource.depends_on.is_empty()
+        || resource.headers != compact_headers
+        || qualification.schema_version != 1
+        || qualification.method != "GET"
+        || qualification.request_stream_bytes == 0
+        || !(200..300).contains(&response.status)
+        || response.body_bytes < 1_200
+        || resource.content_length != Some(response.body_bytes)
+        || resource.data_length != response.body_bytes
+        || normalize_content_encoding(Some(&response.content_encoding)).as_deref()
+            != Some(response.content_encoding.as_str())
+        || !lower_hex_sha256(&response.body_sha256)
+        || !lower_hex_sha256(&qualification.response_qualification_sha256)
+    {
+        return Err(Error::Argument(
+            "qualified chaff core root, compact request, or response binding is invalid".into(),
+        ));
+    }
+    ResourceManifest {
+        resources: vec![resource.as_resource()],
+    }
+    .validate()?;
+    Ok(())
+}
+
 fn manifest_hash(manifest: &ResourceManifest) -> Result<String, Error> {
     sha256(manifest.to_json_pretty()?.as_bytes())
 }
@@ -809,6 +2379,7 @@ fn sha256(bytes: &[u8]) -> Result<String, Error> {
 async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     spec.workload.validate()?;
     validate_workload_urls(&spec.workload)?;
+    validate_qualified_chaff_binding(&spec)?;
     validate_walkie_talkie_chaff_precondition(&spec)?;
     if spec.output_dir.exists() && fs::read_dir(&spec.output_dir)?.next().is_some() {
         return Err(Error::Argument(format!(
@@ -866,6 +2437,27 @@ fn validate_walkie_talkie_chaff_precondition(spec: &RunSpec) -> Result<(), Error
             "Walkie-Talkie receiver continuations require positive-length chaff resources; use_empty_resources is unsupported".into(),
         ));
     }
+    let binding = WalkieTalkie::new(
+        config,
+        spec.config.max_udp_payload_size,
+        spec.config.max_stream_data_excess,
+    )?
+    .qualification_binding()
+    .clone();
+    let chaff_manifest_hash = spec.chaff_manifest_hash.as_deref().ok_or_else(|| {
+        Error::Argument("Walkie-Talkie requires a raw qualified chaff manifest hash".into())
+    })?;
+    let chaff = spec.chaff_manifest.as_ref().expect("defended run gate");
+    let prefix_spec_hash = &chaff.resources[0].chaff_qualification.prefix_spec_sha256;
+    if binding.workload_id != config.workload_id
+        || binding.qualified_chaff_manifest_sha256 != chaff_manifest_hash
+        || binding.prefix_pack_spec_sha256 != *prefix_spec_hash
+    {
+        return Err(Error::Argument(
+            "Walkie-Talkie selected qualification binding does not match the exact chaff manifest and embedded prefix-pack spec hashes"
+                .into(),
+        ));
+    }
     let mut origins: Vec<_> = spec
         .workload
         .resources
@@ -875,12 +2467,105 @@ fn validate_walkie_talkie_chaff_precondition(spec: &RunSpec) -> Result<(), Error
     origins.sort_unstable();
     origins.dedup();
     let selected = spec.chaff_manifest.as_ref().and_then(|manifest| {
-        manifest.initial_chaff_selection_effective_length_for_origins(&origins)
+        manifest
+            .resource_manifest()
+            .initial_chaff_selection_effective_length_for_origins(&origins)
     });
     if selected.is_none_or(|length| length < u64::from(config.packet_size)) {
         return Err(Error::Argument(format!(
             "Walkie-Talkie initial same-origin chaff selection must provide at least {} response bytes",
             config.packet_size
+        )));
+    }
+    Ok(())
+}
+
+fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
+    let Some(chaff) = &spec.chaff_manifest else {
+        return Ok(());
+    };
+    let Some((source, source_hash)) = &spec.application_workload_source else {
+        return Err(Error::Argument(
+            "qualified chaff requires an exact application workload source binding".into(),
+        ));
+    };
+    if chaff.application_workload_sha256 != *source_hash {
+        return Err(Error::Argument(
+            "qualified chaff application_workload_sha256 does not match the exact frozen application workload source"
+                .into(),
+        ));
+    }
+    let qualified = &chaff.resources[0];
+    let application = spec
+        .workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == chaff.application_resource_id)
+        .ok_or_else(|| {
+            Error::Argument(
+                "qualified chaff application_resource_id is absent from the workload".into(),
+            )
+        })?;
+    let source_application = source
+        .resources
+        .iter()
+        .find(|resource| resource.id == chaff.application_resource_id)
+        .ok_or_else(|| {
+            Error::Argument(
+                "qualified chaff application_resource_id is absent from the frozen source".into(),
+            )
+        })?;
+    if (
+        &application.url,
+        &application.kind,
+        application.chaff_priority,
+        application.known_valid,
+        &application.depends_on,
+        projected_ael(application)?,
+    ) != (
+        &source_application.url,
+        &source_application.kind,
+        source_application.chaff_priority,
+        source_application.known_valid,
+        &source_application.depends_on,
+        projected_ael(source_application)?,
+    ) {
+        return Err(Error::Argument(
+            "runtime workload and frozen application source disagree on the qualified root request"
+                .into(),
+        ));
+    }
+    if !application.depends_on.is_empty() || application.url != qualified.url {
+        return Err(Error::Argument(
+            "qualified chaff must bind the exact dependency-free application root URL".into(),
+        ));
+    }
+    let projected: Vec<_> = application
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "accept" | "accept-encoding" | "accept-language"
+            )
+        })
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    if application.kind != qualified.kind
+        || application.chaff_priority != qualified.chaff_priority
+        || !application.known_valid
+        || projected != qualified.headers
+    {
+        return Err(Error::Argument(
+            "qualified chaff root metadata or exact AEL projection does not match its bound application root"
+                .into(),
+        ));
+    }
+    let expected = qualified.chaff_qualification.expected_response.body_bytes;
+    if expected > spec.max_response_bytes {
+        return Err(Error::Argument(format!(
+            "qualified chaff response body {expected} exceeds max_response_bytes {}",
+            spec.max_response_bytes
         )));
     }
     Ok(())
@@ -976,8 +2661,13 @@ async fn execute_run_inner(
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
     let observation_clock = QcsdObservationClock::new(process_start);
     let mut endpoints = create_endpoints(spec, process_start, &observation_clock)?;
-    let mut controller =
-        QcsdController::new(spec.config.clone(), spec.seed, spec.chaff_manifest.clone())?;
+    let mut controller = QcsdController::new(
+        spec.config.clone(),
+        spec.seed,
+        spec.chaff_manifest
+            .as_ref()
+            .map(ChaffManifest::resource_manifest),
+    )?;
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let mut defense_start = None;
     let mut application_completion = None;
@@ -1150,6 +2840,7 @@ async fn execute_run_inner(
                 apply_queued_actions(
                     &mut endpoints,
                     &mut controller,
+                    spec.chaff_manifest.as_ref(),
                     &mut traces,
                     control_now,
                     defense_elapsed,
@@ -1582,12 +3273,15 @@ fn dispatch_ready_requests(
                 request.expected_response_length,
             )?;
             endpoint.client.stream_close_send(stream, now)?;
+            let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream)?;
             dependencies.mark_in_flight(request.resource_id)?;
             started_requests += 1;
-            endpoint.streams.insert(
-                stream,
-                application_record(&request, QcsdRequestRole::Application, "in_flight"),
-            );
+            endpoint.streams.insert(stream, {
+                let mut record =
+                    application_record(&request, QcsdRequestRole::Application, "in_flight");
+                record.request_stream_bytes = request_stream_bytes;
+                record
+            });
             traces.event(
                 now,
                 Some(endpoint.id),
@@ -1638,6 +3332,8 @@ fn application_record(
         url: request.url.to_string(),
         role,
         request_headers: request.headers.clone(),
+        request_stream_bytes: 0,
+        expected_request_stream_bytes: None,
         response_headers: Vec::new(),
         status: None,
         content_length: None,
@@ -1645,9 +3341,14 @@ fn application_record(
         bytes: 0,
         complete: false,
         outcome,
+        expected_chaff_response: None,
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "HTTP/3 stream lifecycle reduction preserves terminal application and chaff evidence"
+)]
 fn handle_http_events(
     endpoint: &mut Endpoint,
     spec: &RunSpec,
@@ -1664,7 +3365,12 @@ fn handle_http_events(
                 endpoint.connected = false;
                 let streams: Vec<_> = endpoint.streams.keys().copied().collect();
                 for stream_id in streams {
-                    finish_stream(endpoint, stream_id);
+                    if let Some(record) = endpoint.streams.get_mut(&stream_id)
+                        && record.outcome == "in_flight"
+                    {
+                        record.outcome = "endpoint_closed";
+                    }
+                    finish_stream(endpoint, stream_id)?;
                 }
                 while let Some(request) = endpoint.pending.pop_front() {
                     endpoint
@@ -1680,9 +3386,13 @@ fn handle_http_events(
             Http3ClientEvent::HeaderReady {
                 stream_id,
                 headers,
+                interim,
                 fin,
-                ..
             } => {
+                if interim {
+                    continue;
+                }
+                let mut known_chaff_mismatch = false;
                 if let Some(record) = endpoint.streams.get_mut(&stream_id) {
                     record.response_headers = headers
                         .iter()
@@ -1696,10 +3406,23 @@ fn handle_http_events(
                     record.status =
                         header_u64(&headers, ":status").and_then(|value| value.try_into().ok());
                     record.content_length = header_u64(&headers, "content-length");
+                    known_chaff_mismatch = chaff_headers_contradict_qualification(record);
+                    if known_chaff_mismatch {
+                        record.outcome = "identity_mismatch";
+                    }
                     if fin {
                         record.complete = true;
-                        finish_stream(endpoint, stream_id);
                     }
+                }
+                if known_chaff_mismatch {
+                    finish_stream(endpoint, stream_id)?;
+                    return Err(Error::RunAborted(format!(
+                        "chaff response headers on stream {} contradict its qualified identity",
+                        stream_id.as_u64()
+                    )));
+                }
+                if fin {
+                    finish_stream(endpoint, stream_id)?;
                 }
             }
             Http3ClientEvent::DataReadable { stream_id } => {
@@ -1721,10 +3444,19 @@ fn handle_http_events(
                             if !too_large {
                                 record.body.extend_from_slice(&buffer[..read]);
                             }
+                        } else if let Some(expected) = &record.expected_chaff_response {
+                            too_large = record.bytes > expected.body_bytes;
+                            if !too_large {
+                                record.body.extend_from_slice(&buffer[..read]);
+                            }
                         }
                         record.complete |= fin;
                     }
                     if too_large {
+                        let chaff_overflow =
+                            endpoint.streams.get(&stream_id).is_some_and(|record| {
+                                matches!(record.role, QcsdRequestRole::Chaff { .. })
+                            });
                         if !fin {
                             endpoint.client.cancel_fetch(stream_id, 0)?;
                         }
@@ -1738,11 +3470,17 @@ fn handle_http_events(
                         if let Some(record) = endpoint.streams.get_mut(&stream_id) {
                             record.outcome = "response_limit";
                         }
-                        finish_stream(endpoint, stream_id);
+                        finish_stream(endpoint, stream_id)?;
+                        if chaff_overflow {
+                            return Err(Error::RunAborted(format!(
+                                "chaff response on stream {} exceeded its qualified body length",
+                                stream_id.as_u64()
+                            )));
+                        }
                         break;
                     }
                     if fin {
-                        finish_stream(endpoint, stream_id);
+                        finish_stream(endpoint, stream_id)?;
                         break;
                     }
                     if read == 0 {
@@ -1750,23 +3488,131 @@ fn handle_http_events(
                     }
                 }
             }
-            Http3ClientEvent::Reset { stream_id, .. } => finish_stream(endpoint, stream_id),
+            Http3ClientEvent::Reset { stream_id, .. } => {
+                if let Some(record) = endpoint.streams.get_mut(&stream_id)
+                    && record.outcome == "in_flight"
+                {
+                    record.outcome = "reset";
+                }
+                finish_stream(endpoint, stream_id)?;
+            }
             _ => {}
         }
     }
     Ok(())
 }
 
-fn finish_stream(endpoint: &mut Endpoint, stream_id: StreamId) {
+fn finish_stream(endpoint: &mut Endpoint, stream_id: StreamId) -> Result<(), Error> {
     if let Some(mut record) = endpoint.streams.remove(&stream_id) {
+        let mut result = Ok(());
         if record.role == QcsdRequestRole::Application {
             let state = finish_application_record(&mut record);
             endpoint
                 .retired_applications
                 .push((record.resource_id, state));
         }
+        if matches!(record.role, QcsdRequestRole::Chaff { .. }) {
+            result = finish_chaff_record(&mut record, stream_id);
+        }
         endpoint.completed.push(record);
+        result?;
     }
+    Ok(())
+}
+
+fn finish_chaff_record(record: &mut StreamRecord, stream_id: StreamId) -> Result<(), Error> {
+    if record.complete && record.outcome == "in_flight" {
+        let verified = chaff_response_result(record)?.identity_verified == Some(true);
+        if verified {
+            record.outcome = "succeeded";
+        } else {
+            record.outcome = "identity_mismatch";
+            return Err(Error::RunAborted(format!(
+                "completed chaff response on stream {} did not match its qualified identity",
+                stream_id.as_u64()
+            )));
+        }
+    } else if record.outcome == "in_flight" {
+        record.outcome = "incomplete";
+    }
+    Ok(())
+}
+
+fn response_content_encoding(headers: &[(String, String)]) -> Option<String> {
+    let values: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if values.len() > 1 {
+        return None;
+    }
+    normalize_content_encoding(values.first().copied())
+}
+
+fn chaff_headers_contradict_qualification(record: &StreamRecord) -> bool {
+    let Some(expected) = record.expected_chaff_response.as_ref() else {
+        return matches!(record.role, QcsdRequestRole::Chaff { .. });
+    };
+    matches!(record.role, QcsdRequestRole::Chaff { .. })
+        && (record.status != Some(expected.status)
+            || response_content_encoding(&record.response_headers).as_deref()
+                != Some(expected.content_encoding.as_str()))
+}
+
+fn chaff_response_result(record: &StreamRecord) -> Result<ChaffResponseResult, Error> {
+    let QcsdRequestRole::Chaff { request_id, .. } = record.role else {
+        return Err(Error::SlotInvariant(
+            "application stream cannot produce a chaff response receipt".into(),
+        ));
+    };
+    let expected = record.expected_chaff_response.as_ref();
+    let status = record.complete.then_some(record.status).flatten();
+    let encoding = (record.complete && !record.response_headers.is_empty())
+        .then(|| response_content_encoding(&record.response_headers))
+        .flatten();
+    let body_fully_retained = u64::try_from(record.body.len()).ok() == Some(record.bytes);
+    let body_sha256 = (record.complete && body_fully_retained)
+        .then(|| sha256(&record.body))
+        .transpose()?;
+    let (status_match, encoding_match, bytes_match, hash_match, verified) = if record.complete {
+        let status_match = expected.is_some_and(|expected| record.status == Some(expected.status));
+        let encoding_match = expected.is_some_and(|expected| {
+            encoding.as_deref() == Some(expected.content_encoding.as_str())
+        });
+        let bytes_match = expected.is_some_and(|expected| record.bytes == expected.body_bytes);
+        let hash_match = expected
+            .is_some_and(|expected| body_sha256.as_deref() == Some(expected.body_sha256.as_str()));
+        (
+            Some(status_match),
+            Some(encoding_match),
+            Some(bytes_match),
+            Some(hash_match),
+            Some(status_match && encoding_match && bytes_match && hash_match),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
+    Ok(ChaffResponseResult {
+        resource_id: record.resource_id,
+        request_id: request_id.map(|id| id.0),
+        url: record.url.clone(),
+        request_headers: record.request_headers.clone(),
+        request_stream_bytes: record.request_stream_bytes,
+        expected_request_stream_bytes: record.expected_request_stream_bytes,
+        response_headers: record.response_headers.clone(),
+        status,
+        content_encoding: encoding,
+        bytes: record.bytes,
+        body_sha256,
+        complete: record.complete,
+        status_match,
+        content_encoding_match: encoding_match,
+        body_bytes_match: bytes_match,
+        body_sha256_match: hash_match,
+        identity_verified: verified,
+        outcome: record.outcome,
+    })
 }
 
 fn finish_application_record(record: &mut StreamRecord) -> ResourceRunState {
@@ -2170,6 +4016,7 @@ fn register_action_batch(
 fn apply_action_batch(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
+    chaff_manifest: Option<&ChaffManifest>,
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
@@ -2182,6 +4029,7 @@ fn apply_action_batch(
         apply_action(
             endpoints,
             controller,
+            chaff_manifest,
             traces,
             now,
             defense_elapsed,
@@ -2195,6 +4043,7 @@ fn apply_action_batch(
 fn apply_queued_actions(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
+    chaff_manifest: Option<&ChaffManifest>,
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
@@ -2206,17 +4055,27 @@ fn apply_queued_actions(
         }
         // Actions emitted while this batch is applied remain queued and are
         // pre-registered as a fresh batch on the next iteration.
-        apply_action_batch(endpoints, controller, traces, now, defense_elapsed, actions)?;
+        apply_action_batch(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            now,
+            defense_elapsed,
+            actions,
+        )?;
     }
 }
 
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "action dispatch records every transport and trace outcome in one exhaustive reducer"
 )]
 fn apply_action(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
+    chaff_manifest: Option<&ChaffManifest>,
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
@@ -2319,6 +4178,50 @@ fn apply_action(
                     _ => unreachable!("only chaff actions return a stream"),
                 };
                 endpoint.client.stream_close_send(stream_id, now)?;
+                let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream_id)?;
+                let qualification = chaff_manifest
+                    .and_then(|manifest| manifest.qualification(resource_id))
+                    .ok_or_else(|| {
+                        Error::RunAborted(
+                            "chaff request lacks a schema-one qualification binding".into(),
+                        )
+                    })?;
+                if request_stream_bytes != qualification.request_stream_bytes {
+                    endpoint.streams.insert(
+                        stream_id,
+                        StreamRecord {
+                            resource_id,
+                            url,
+                            role: QcsdRequestRole::Chaff {
+                                resource_id,
+                                request_id: Some(request_id),
+                            },
+                            request_headers,
+                            request_stream_bytes,
+                            expected_request_stream_bytes: Some(qualification.request_stream_bytes),
+                            response_headers: Vec::new(),
+                            status: None,
+                            content_length: None,
+                            body: Vec::new(),
+                            bytes: 0,
+                            complete: false,
+                            outcome: "request_size_mismatch",
+                            expected_chaff_response: Some(ExpectedChaffIdentity {
+                                status: qualification.expected_response.status,
+                                content_encoding: qualification
+                                    .expected_response
+                                    .content_encoding
+                                    .clone(),
+                                body_bytes: qualification.expected_response.body_bytes,
+                                body_sha256: qualification.expected_response.body_sha256.clone(),
+                            }),
+                        },
+                    );
+                    return Err(Error::RunAborted(format!(
+                        "chaff request stream encoded {request_stream_bytes} bytes, expected qualified size {}",
+                        qualification.request_stream_bytes
+                    )));
+                }
                 endpoint.streams.insert(
                     stream_id,
                     StreamRecord {
@@ -2329,6 +4232,8 @@ fn apply_action(
                             request_id: Some(request_id),
                         },
                         request_headers,
+                        request_stream_bytes,
+                        expected_request_stream_bytes: Some(qualification.request_stream_bytes),
                         response_headers: Vec::new(),
                         status: None,
                         content_length: None,
@@ -2336,6 +4241,17 @@ fn apply_action(
                         bytes: 0,
                         complete: false,
                         outcome: "in_flight",
+                        expected_chaff_response: chaff_manifest
+                            .and_then(|manifest| manifest.qualification(resource_id))
+                            .map(|qualification| ExpectedChaffIdentity {
+                                status: qualification.expected_response.status,
+                                content_encoding: qualification
+                                    .expected_response
+                                    .content_encoding
+                                    .clone(),
+                                body_bytes: qualification.expected_response.body_bytes,
+                                body_sha256: qualification.expected_response.body_sha256.clone(),
+                            }),
                     },
                 );
                 // Apply manual receive control before the newly created chaff
@@ -2555,6 +4471,7 @@ fn response_result(record: &StreamRecord) -> Result<ResponseResult, Error> {
         content_length: record.content_length,
         bytes: record.bytes,
         body_sha256: hex::encode(nss::hash::hash(&HashAlgorithm::SHA2_256, &record.body)?),
+        request_stream_bytes: record.request_stream_bytes,
         complete: record.complete,
         outcome: record.outcome,
     })
@@ -2573,7 +4490,7 @@ fn collect_responses(endpoints: &mut [Endpoint]) -> Result<Vec<ResponseResult>, 
         endpoint
             .completed
             .extend(endpoint.streams.drain().map(|(_, mut record)| {
-                if record.role == QcsdRequestRole::Application && record.outcome == "in_flight" {
+                if record.outcome == "in_flight" {
                     record.outcome = "incomplete";
                 }
                 record
@@ -2588,6 +4505,17 @@ fn collect_responses(endpoints: &mut [Endpoint]) -> Result<Vec<ResponseResult>, 
     Ok(responses)
 }
 
+fn collect_chaff_responses(endpoints: &[Endpoint]) -> Result<Vec<ChaffResponseResult>, Error> {
+    let mut responses = endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.completed.iter())
+        .filter(|record| matches!(record.role, QcsdRequestRole::Chaff { .. }))
+        .map(chaff_response_result)
+        .collect::<Result<Vec<_>, _>>()?;
+    responses.sort_by_key(|response| (response.resource_id, response.request_id));
+    Ok(responses)
+}
+
 fn write_run_json(
     spec: &RunSpec,
     endpoints: &[Endpoint],
@@ -2595,6 +4523,7 @@ fn write_run_json(
     started_unix_ns: u128,
     completion: &RunCompletion<'_>,
 ) -> Result<(), Error> {
+    let chaff_responses = collect_chaff_responses(endpoints)?;
     let endpoint_data: Vec<_> = endpoints
         .iter()
         .map(|endpoint| {
@@ -2624,6 +4553,8 @@ fn write_run_json(
         "method": spec.method,
         "request_policy": spec.request_policy,
         "workload_hash_sha256": spec.workload_hash,
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash)| hash),
+        "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
         "started_unix_ns": started_unix_ns,
@@ -2635,6 +4566,7 @@ fn write_run_json(
         "error": completion.error,
         "endpoints": endpoint_data,
         "responses": responses,
+        "chaff_responses": chaff_responses,
     });
     atomic_write(
         &spec.output_dir.join("run.json"),
@@ -2688,25 +4620,27 @@ mod tests {
 
     use clap::Parser as _;
     use neqo_csdef::{
-        Defense, DefenseConfig, DefenseMode, DefenseSignal, DependencyTracker, Direction,
-        FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig,
-        QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
-        QcsdParserLeaseOwner, QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource,
-        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
+        ChaffManifest, ChaffQualification, Defense, DefenseConfig, DefenseMode, DefenseSignal,
+        DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig, MissedSlotReason, Packet,
+        QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass,
+        QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId,
+        QcsdStreamFinish, QcsdStreamId, QualifiedChaffResource, Resource, ResourceManifest,
+        SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
         WalkieTalkieConfig, WtfPad, WtfPadConfig, sanitize_chaff_headers,
     };
 
     use super::{
-        ApplicationBatchLifecycle, Args, DefenseArg, Error, Preset, ProfileArg, QcsdRequestRole,
-        RequestPolicyArg, ResourceRunState, RunCompletion, RunSpec, Socket, StaticModeArg,
-        StreamRecord, StreamType, TrafficMorphingActivation, action_failure_reason,
-        activate_traffic_morphing, apply_action_batch, create_endpoints, datagram_observation,
-        deadline_error, defense_parameter_provenance, ensure_defense_realizable,
-        expected_application_response_length, finish_application_record, forward_qcsd_observation,
-        has_in_flight_application_stream, now, qcsd_connection_parameters, ready_request_batch,
+        ApplicationBatchLifecycle, Args, DefenseArg, Error, ExpectedChaffIdentity, Preset,
+        ProfileArg, QcsdRequestRole, RequestPolicyArg, ResourceRunState, RunCompletion, RunSpec,
+        Socket, StaticModeArg, StreamRecord, StreamType, TrafficMorphingActivation,
+        action_failure_reason, activate_traffic_morphing, apply_action_batch, create_endpoints,
+        datagram_observation, deadline_error, defense_parameter_provenance,
+        ensure_defense_realizable, expected_application_response_length, finish_application_record,
+        finish_chaff_record, forward_qcsd_observation, has_in_flight_application_stream, now,
+        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
         record_terminal_action, register_action_batch, resolve_run_config,
-        resolve_run_config_with_workload, sanitize_chaff_action_headers, shapes_stream_sends,
-        terminalize_pending_slots,
+        resolve_run_config_with_workload, sanitize_chaff_action_headers, sha256,
+        shapes_stream_sends, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_walkie_talkie_chaff_precondition,
         wait_for_activity, write_run_json,
@@ -2729,6 +4663,8 @@ mod tests {
             url: "https://example.com/resource".into(),
             role: QcsdRequestRole::Application,
             request_headers: Vec::new(),
+            request_stream_bytes: 0,
+            expected_request_stream_bytes: None,
             response_headers: Vec::new(),
             status,
             content_length: None,
@@ -2736,6 +4672,79 @@ mod tests {
             bytes: 0,
             complete,
             outcome: "in_flight",
+            expected_chaff_response: None,
+        }
+    }
+
+    fn chaff(body: &[u8], complete: bool) -> StreamRecord {
+        test_fixture::fixture_init();
+        StreamRecord {
+            resource_id: 0,
+            url: "https://example.com/".into(),
+            role: QcsdRequestRole::Chaff {
+                resource_id: 0,
+                request_id: Some(QcsdChaffRequestId(7)),
+            },
+            request_headers: vec![
+                ("accept".into(), "text/html".into()),
+                ("accept-encoding".into(), "gzip".into()),
+                ("accept-language".into(), "en".into()),
+            ],
+            request_stream_bytes: 23,
+            expected_request_stream_bytes: Some(23),
+            response_headers: vec![(":status".into(), "200".into())],
+            status: Some(200),
+            content_length: Some(u64::try_from(body.len()).expect("body length")),
+            body: body.to_vec(),
+            bytes: u64::try_from(body.len()).expect("body length"),
+            complete,
+            outcome: "in_flight",
+            expected_chaff_response: Some(ExpectedChaffIdentity {
+                status: 200,
+                content_encoding: "identity".into(),
+                body_bytes: u64::try_from(body.len()).expect("body length"),
+                body_sha256: sha256(body).expect("hash body"),
+            }),
+        }
+    }
+
+    fn qualified_chaff_manifest(resources: Vec<Resource>) -> ChaffManifest {
+        let resources: Vec<QualifiedChaffResource> = resources
+            .into_iter()
+            .map(|resource| QualifiedChaffResource {
+                id: resource.id,
+                url: resource.url,
+                kind: resource.kind,
+                content_length: resource.content_length,
+                data_length: resource.data_length,
+                chaff_priority: resource.chaff_priority,
+                known_valid: resource.known_valid,
+                depends_on: resource.depends_on,
+                headers: resource.headers,
+                chaff_qualification: ChaffQualification {
+                    schema_version: 1,
+                    method: "GET".into(),
+                    request_stream_bytes: 1,
+                    expected_response: ExpectedChaffResponse {
+                        status: 200,
+                        content_encoding: "identity".into(),
+                        body_bytes: 1,
+                        body_sha256: "a".repeat(64),
+                    },
+                    response_qualification_sha256: "b".repeat(64),
+                    prefix_pack_qualification_sha256: "c".repeat(64),
+                    prefix_spec_sha256: "d".repeat(64),
+                },
+            })
+            .collect();
+        ChaffManifest {
+            schema_version: 1,
+            artifact_type: "qcsd-qualified-chaff-manifest".into(),
+            application_workload_sha256: "e".repeat(64),
+            application_resource_id: resources
+                .first()
+                .map_or(0, |resource: &QualifiedChaffResource| resource.id),
+            resources,
         }
     }
 
@@ -2831,6 +4840,7 @@ mod tests {
             method: "GET",
             workload: workload.clone(),
             workload_hash: "preflight".into(),
+            application_workload_source: None,
             config: QcsdConfig {
                 use_empty_resources,
                 defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
@@ -2840,7 +4850,8 @@ mod tests {
                 ..QcsdConfig::default()
             },
             defense_parameters: None,
-            chaff_manifest: Some(ResourceManifest { resources }),
+            chaff_manifest: Some(qualified_chaff_manifest(resources)),
+            chaff_manifest_hash: Some("f".repeat(64)),
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: trace_output_dir("walkie-preflight"),
@@ -2890,9 +4901,11 @@ mod tests {
                 resources: vec![request(1, "https://example.com", Vec::new())],
             },
             workload_hash: "frozen-workload-hash".into(),
+            application_workload_source: None,
             config: QcsdConfig::default(),
             defense_parameters: None,
             chaff_manifest: None,
+            chaff_manifest_hash: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.clone(),
@@ -3069,9 +5082,11 @@ mod tests {
                 ],
             },
             workload_hash: "activation-test".into(),
+            application_workload_source: None,
             config,
             defense_parameters: None,
             chaff_manifest: None,
+            chaff_manifest_hash: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0x5eed,
             output_dir: output.clone(),
@@ -3997,6 +6012,7 @@ mod tests {
         apply_action_batch(
             &mut endpoints,
             &mut controller,
+            None,
             &mut traces,
             started + Duration::from_micros(3),
             Duration::from_micros(3),
@@ -4152,6 +6168,7 @@ mod tests {
         apply_action_batch(
             &mut endpoints,
             &mut controller,
+            None,
             &mut traces,
             started,
             Duration::ZERO,
@@ -4162,6 +6179,7 @@ mod tests {
             apply_action_batch(
                 &mut endpoints,
                 &mut controller,
+                None,
                 &mut traces,
                 started,
                 Duration::ZERO,
@@ -4329,6 +6347,127 @@ mod tests {
             ResourceRunState::Failed
         );
         assert_eq!(record.outcome, "failed");
+    }
+
+    #[test]
+    fn completed_qualified_chaff_is_succeeded_only_after_exact_identity_match() {
+        let mut record = chaff(b"compact body", true);
+        finish_chaff_record(&mut record, neqo_transport::StreamId::new(4))
+            .expect("exact qualified identity");
+
+        assert_eq!(record.outcome, "succeeded");
+        let receipt = super::chaff_response_result(&record).expect("receipt");
+        assert_eq!(receipt.identity_verified, Some(true));
+        assert_eq!(receipt.status_match, Some(true));
+        assert_eq!(receipt.content_encoding_match, Some(true));
+        assert_eq!(receipt.body_bytes_match, Some(true));
+        assert_eq!(receipt.body_sha256_match, Some(true));
+    }
+
+    #[test]
+    fn completed_chaff_mismatch_is_terminal_and_preserves_identity_evidence() {
+        let mut record = chaff(b"compact body", true);
+        record.status = Some(404);
+        assert!(finish_chaff_record(&mut record, neqo_transport::StreamId::new(8)).is_err());
+
+        assert_eq!(record.outcome, "identity_mismatch");
+        let receipt = super::chaff_response_result(&record).expect("receipt");
+        assert_eq!(receipt.status, Some(404));
+        assert_eq!(receipt.status_match, Some(false));
+        assert_eq!(receipt.identity_verified, Some(false));
+        assert!(receipt.body_sha256.is_some());
+    }
+
+    #[test]
+    fn malformed_or_duplicate_chaff_content_encoding_is_not_identity() {
+        for response_headers in [
+            vec![("content-encoding".into(), "gzip, br".into())],
+            vec![
+                ("content-encoding".into(), "gzip".into()),
+                ("content-encoding".into(), "br".into()),
+            ],
+        ] {
+            let mut record = chaff(b"compact body", true);
+            record.response_headers = response_headers;
+            assert!(finish_chaff_record(&mut record, neqo_transport::StreamId::new(12)).is_err());
+            let receipt = super::chaff_response_result(&record).expect("total receipt");
+            assert_eq!(receipt.content_encoding, None);
+            assert_eq!(receipt.content_encoding_match, Some(false));
+            assert_eq!(receipt.identity_verified, Some(false));
+            assert_eq!(record.outcome, "identity_mismatch");
+        }
+    }
+
+    #[test]
+    fn partial_chaff_termination_keeps_null_identity_fields_and_exact_outcome() {
+        for outcome in ["in_flight", "reset", "endpoint_closed"] {
+            let mut record = chaff(b"prefix", false);
+            record.outcome = outcome;
+            finish_chaff_record(&mut record, neqo_transport::StreamId::new(16))
+                .expect("partial response is not an identity contradiction");
+            assert_eq!(
+                record.outcome,
+                if outcome == "in_flight" {
+                    "incomplete"
+                } else {
+                    outcome
+                }
+            );
+            let receipt = super::chaff_response_result(&record).expect("partial receipt");
+            assert_eq!(receipt.status, None);
+            assert_eq!(receipt.content_encoding, None);
+            assert_eq!(receipt.body_sha256, None);
+            assert_eq!(receipt.status_match, None);
+            assert_eq!(receipt.content_encoding_match, None);
+            assert_eq!(receipt.body_bytes_match, None);
+            assert_eq!(receipt.body_sha256_match, None);
+            assert_eq!(receipt.identity_verified, None);
+        }
+    }
+
+    #[test]
+    fn fin_overflow_preserves_response_limit_cause() {
+        let mut record = chaff(b"one byte too many", true);
+        record.outcome = "response_limit";
+        record
+            .expected_chaff_response
+            .as_mut()
+            .expect("expected identity")
+            .body_bytes = record.bytes.saturating_sub(1);
+        finish_chaff_record(&mut record, neqo_transport::StreamId::new(20))
+            .expect("caller owns the terminal overflow error");
+
+        assert_eq!(record.outcome, "response_limit");
+        let receipt = super::chaff_response_result(&record).expect("overflow receipt");
+        assert_eq!(receipt.body_bytes_match, Some(false));
+        assert_eq!(receipt.identity_verified, Some(false));
+    }
+
+    #[test]
+    fn response_qualification_distinguishes_absent_invalid_and_duplicate_content_encoding() {
+        assert_eq!(qualification_content_encoding(&[]), Some("identity".into()));
+        assert_eq!(
+            qualification_content_encoding(&[neqo_common::Header::new("content-encoding", "Br")]),
+            Some("br".into())
+        );
+        assert_eq!(
+            qualification_content_encoding(&[neqo_common::Header::new("content-encoding", [0xff])]),
+            None
+        );
+        assert_eq!(
+            qualification_content_encoding(&[
+                neqo_common::Header::new("content-encoding", "gzip"),
+                neqo_common::Header::new("content-encoding", "br"),
+            ]),
+            None
+        );
+        assert_eq!(
+            qualification_content_encoding(&[neqo_common::Header::new(
+                "content-encoding",
+                "gzip, br"
+            )]),
+            None
+        );
     }
 
     #[test]

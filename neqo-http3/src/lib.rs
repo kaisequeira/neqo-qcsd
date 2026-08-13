@@ -600,6 +600,13 @@ trait HttpRecvStreamEvents: RecvStreamEvents {
 }
 
 trait SendStream: Stream {
+    /// HTTP/3 bytes encoded for this request stream but not necessarily moved
+    /// into the transport send buffer yet.
+    #[cfg(feature = "qcsd")]
+    fn qcsd_encoded_request_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// # Errors
     ///
     /// Error may occur during sending data, e.g. protocol error, etc.

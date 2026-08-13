@@ -392,12 +392,9 @@ impl RecvMessage {
         }
     }
 
-    #[cfg_attr(
-        feature = "qcsd",
-        expect(
-            clippy::too_many_lines,
-            reason = "keeping this state machine in one place makes transitions auditable"
-        )
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeping this state machine in one place makes transitions auditable"
     )]
     fn receive_internal(
         &mut self,

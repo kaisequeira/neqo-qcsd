@@ -465,6 +465,29 @@ impl Http3Connection {
         }
     }
 
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn qcsd_peer_settings_received(&self) -> bool {
+        matches!(self.settings_state, Http3RemoteSettingsState::Received(_))
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_stream_send(&self) -> bool {
+        self.has_data_to_send()
+            || self.control_stream_local.has_pending_send()
+            || self.qpack_encoder.borrow().has_pending_send()
+            || self.qpack_decoder.borrow().has_pending_send()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_stream_send_excluding(&self, allowed: &[StreamId]) -> bool {
+        self.streams_with_pending_data
+            .iter()
+            .any(|stream| !allowed.contains(stream))
+            || self.control_stream_local.has_pending_send()
+            || self.qpack_encoder.borrow().has_pending_send()
+            || self.qpack_decoder.borrow().has_pending_send()
+    }
+
     /// This is called when a [`neqo_transport::ConnectionEvent::NewStream`]
     /// event is received.  This registers the stream with a
     /// [`NewStreamHeadReader`] handler.
@@ -1951,6 +1974,14 @@ impl Http3Connection {
     #[must_use]
     pub fn send_streams_mut(&mut self) -> &mut HashMap<StreamId, Box<dyn SendStream>> {
         &mut self.send_streams
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_encoded_request_bytes(&self, stream_id: StreamId) -> Res<u64> {
+        self.send_streams
+            .get(&stream_id)
+            .and_then(|stream| stream.qcsd_encoded_request_bytes())
+            .ok_or(Error::InvalidStreamId)
     }
 
     #[must_use]
