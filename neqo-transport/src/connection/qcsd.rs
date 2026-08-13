@@ -226,6 +226,11 @@ impl Connection {
         self.streams.qcsd_has_pending_send_data_excluding(allowed)
     }
 
+    /// Whether one exact stream retains unsent or retransmission STREAM data.
+    pub fn qcsd_has_pending_stream_send_for(&mut self, stream_id: StreamId) -> bool {
+        self.streams.qcsd_has_pending_send_data_for(stream_id)
+    }
+
     pub(super) fn qcsd_observe_stream_transmissions(&mut self, tokens: &recovery::Tokens) {
         let slot = self.qcsd_active_target.map(|target| target.slot);
         let transmissions: Vec<_> = tokens

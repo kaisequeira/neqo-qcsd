@@ -488,6 +488,28 @@ impl Http3Connection {
             || self.qpack_decoder.borrow().has_pending_send()
     }
 
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_required_prefix_handler_send(
+        &self,
+        allowed_late_requests: &[StreamId],
+    ) -> bool {
+        self.streams_with_pending_data
+            .iter()
+            .any(|stream| !allowed_late_requests.contains(stream))
+            || self.control_stream_local.has_pending_send()
+            || self.qpack_encoder.borrow().has_pending_send()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_qpack_decoder_stream_id(&self) -> Option<StreamId> {
+        self.qpack_decoder.borrow().local_stream_id()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_qpack_decoder_handler_pending(&self) -> bool {
+        self.qpack_decoder.borrow().has_pending_send()
+    }
+
     /// This is called when a [`neqo_transport::ConnectionEvent::NewStream`]
     /// event is received.  This registers the stream with a
     /// [`NewStreamHeadReader`] handler.

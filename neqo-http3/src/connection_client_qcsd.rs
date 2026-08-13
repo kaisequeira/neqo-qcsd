@@ -46,6 +46,52 @@ impl Http3Client {
             || self.conn.qcsd_has_pending_stream_send_excluding(allowed)
     }
 
+    /// Whether request-causal STREAM output remains after the prefix target.
+    ///
+    /// Late chaff request streams are explicitly allowed by the qualification
+    /// specification.  Post-warmup QPACK decoder output is non-request-causal
+    /// and is excluded by its fixed critical stream role.  HTTP/3 control,
+    /// QPACK encoder, required request, and any unknown transport stream output
+    /// remain blocking.
+    pub fn qcsd_has_pending_required_prefix_stream_send(
+        &mut self,
+        allowed_late_requests: &[StreamId],
+    ) -> bool {
+        let Some(decoder_stream) = self.base_handler.qcsd_qpack_decoder_stream_id() else {
+            return true;
+        };
+        let mut transport_exclusions = allowed_late_requests.to_vec();
+        if !transport_exclusions.contains(&decoder_stream) {
+            transport_exclusions.push(decoder_stream);
+        }
+        self.base_handler
+            .qcsd_has_pending_required_prefix_handler_send(allowed_late_requests)
+            || self
+                .conn
+                .qcsd_has_pending_stream_send_excluding(&transport_exclusions)
+    }
+
+    /// The exact client QPACK decoder stream whose post-warmup output is
+    /// excluded from the causal request-prefix completion predicate.
+    #[must_use]
+    pub fn qcsd_qpack_decoder_stream_id(&self) -> Option<StreamId> {
+        self.base_handler.qcsd_qpack_decoder_stream_id()
+    }
+
+    /// Whether post-warmup QPACK decoder instructions remain buffered in the
+    /// HTTP/3 handler rather than handed to transport.
+    #[must_use]
+    pub fn qcsd_qpack_decoder_handler_pending(&self) -> bool {
+        self.base_handler.qcsd_qpack_decoder_handler_pending()
+    }
+
+    /// Whether post-warmup QPACK decoder STREAM data remains pending in
+    /// transport.
+    pub fn qcsd_qpack_decoder_transport_pending(&mut self) -> bool {
+        self.qcsd_qpack_decoder_stream_id()
+            .is_some_and(|stream| self.conn.qcsd_has_pending_stream_send_for(stream))
+    }
+
     /// Exact bytes written to an HTTP/3 request stream by the production
     /// encoder, including HTTP/3 HEADERS framing and its QPACK header block.
     /// Bidirectional request streams have no stream-type prefix.

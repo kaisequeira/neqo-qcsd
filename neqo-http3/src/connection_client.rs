@@ -2734,6 +2734,94 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    fn qcsd_required_prefix_predicate_excludes_only_qpack_decoder_output() {
+        let (mut client, mut server) = connect();
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            if !client.qcsd_has_pending_stream_send() {
+                break;
+            }
+            let output = client.process_output(now());
+            let output = server.conn.process(output.dgram(), now());
+            drop(client.process(output.dgram(), now()));
+        }
+        assert!(!client.qcsd_has_pending_stream_send());
+        client.qcsd_enable_send_shaping(true);
+        assert_eq!(
+            client.qcsd_qpack_decoder_stream_id(),
+            Some(StreamId::new(10))
+        );
+
+        // A shaped application request blocks unless it is explicitly in the
+        // late-request set.
+        let request = make_request(&mut client, false, &[]);
+        assert!(client.qcsd_has_pending_required_prefix_stream_send(&[]));
+        assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+
+        // A queued control-stream PRIORITY_UPDATE remains request-causal even
+        // when the request itself is explicitly late.
+        assert!(
+            client
+                .priority_update(request, Priority::new(6, false))
+                .unwrap()
+        );
+        assert!(client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+
+        // Flush the request and control update before inducing peer-response
+        // decoder feedback.
+        client.qcsd_enable_send_shaping(false);
+        let output = client.process_output(now());
+        let output = server.conn.process(output.dgram(), now());
+        drop(client.process(output.dgram(), now()));
+        assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+        client.qcsd_enable_send_shaping(true);
+
+        // Server dynamic-table response headers generate client QPACK decoder
+        // feedback.  That exact fixed critical role remains visible in the broad
+        // diagnostic but is excluded from the causal request-prefix predicate.
+        setup_server_side_encoder(&mut client, &mut server);
+        server
+            .encoder
+            .borrow_mut()
+            .send_and_insert(&mut server.conn, b"content-length", b"1234")
+            .unwrap();
+        let encoder_update = server.conn.process_output(now()).dgram();
+        client.process(encoder_update, now());
+        let headers = [
+            Header::new(":status", "200"),
+            Header::new("content-length", "1234"),
+        ];
+        let encoded =
+            server
+                .encoder
+                .borrow_mut()
+                .encode_header_block(&mut server.conn, &headers, request);
+        let mut frame = Encoder::default();
+        HFrame::Headers {
+            header_block: encoded.to_vec(),
+        }
+        .encode(&mut frame);
+        _ = server.conn.stream_send(request, frame.as_ref()).unwrap();
+        let response = server.conn.process_output(now()).dgram();
+        client.process(response, now());
+        assert!(client.qcsd_has_pending_stream_send());
+        assert!(
+            client.qcsd_qpack_decoder_handler_pending()
+                || client.qcsd_qpack_decoder_transport_pending()
+        );
+        assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_chaff_non_success_responses_are_observed_without_followup() {
         for (request_id, status) in [(1, 302), (2, 404)] {
             let (mut client, mut server) = connect();

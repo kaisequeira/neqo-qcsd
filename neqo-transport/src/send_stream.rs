@@ -1955,6 +1955,23 @@ impl SendStreams {
         })
     }
 
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_has_pending_data_for(&mut self, stream_id: StreamId) -> bool {
+        [
+            TransmissionPriority::Critical,
+            TransmissionPriority::Important,
+            TransmissionPriority::High,
+            TransmissionPriority::Normal,
+            TransmissionPriority::Low,
+        ]
+        .into_iter()
+        .any(|priority| {
+            self.map
+                .get_mut(&stream_id)
+                .is_some_and(|stream| stream.has_data_at(priority))
+        })
+    }
+
     #[allow(
         clippy::allow_attributes,
         clippy::missing_errors_doc,

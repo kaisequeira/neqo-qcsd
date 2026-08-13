@@ -1451,7 +1451,11 @@ async fn qualify_chaff_response(
                 OutputBatch::Callback(delay) => delay,
                 OutputBatch::None => Duration::from_millis(10),
             };
-            wait_for_activity([&socket], delay).await?;
+            wait_for_activity(
+                [&socket],
+                bounded_qualification_wait(delay, deadline, timeout_seconds)?,
+            )
+            .await?;
         }
     }
     .await;
@@ -2022,7 +2026,7 @@ async fn qualify_chaff_prefix(
                 intentionally_pending_late_chaff(&requests, prefix_spec.required_chaff_survivors);
             if target_satisfied
                 && prefix_receipts_pass(&receipts, prefix_spec.required_chaff_survivors)
-                && !client.qcsd_has_pending_stream_send_excluding(&allowed_pending)
+                && !client.qcsd_has_pending_required_prefix_stream_send(&allowed_pending)
             {
                 return Ok(());
             }
@@ -2068,7 +2072,11 @@ async fn qualify_chaff_prefix(
                 OutputBatch::Callback(delay) => delay,
                 OutputBatch::None => Duration::from_millis(10),
             };
-            wait_for_activity([&socket], delay).await?;
+            wait_for_activity(
+                [&socket],
+                bounded_qualification_wait(delay, deadline, timeout_seconds)?,
+            )
+            .await?;
         }
     }
     .await;
@@ -2097,8 +2105,11 @@ async fn qualify_chaff_prefix(
         .iter()
         .map(|stream_id| stream_id.as_u64())
         .collect();
-    let post_slot_pending_required_stream_send =
-        client.qcsd_has_pending_stream_send_excluding(&allowed_pending);
+    let qpack_decoder_stream_id = client.qcsd_qpack_decoder_stream_id().map(StreamId::as_u64);
+    let qpack_decoder_handler_pending = client.qcsd_qpack_decoder_handler_pending();
+    let qpack_decoder_transport_pending = client.qcsd_qpack_decoder_transport_pending();
+    let post_slot_pending_required_prefix_stream_send =
+        client.qcsd_has_pending_required_prefix_stream_send(&allowed_pending);
     let passed = loop_result.is_ok()
         && final_observation_result.is_ok()
         && peer_settings_received
@@ -2110,7 +2121,7 @@ async fn qualify_chaff_prefix(
         && all_streams_owned
         && targetless_stream_bytes == 0
         && prefix_receipts_pass(&stream_receipts, prefix_spec.required_chaff_survivors)
-        && !post_slot_pending_required_stream_send
+        && !post_slot_pending_required_prefix_stream_send
         && incoming.oversized_packet_count == 0
         && outgoing.oversized_packet_count == 0;
     let packet_log = serde_json::to_vec(&packet_observations)?;
@@ -2135,7 +2146,7 @@ async fn qualify_chaff_prefix(
         .err()
         .or_else(|| final_observation_result.as_ref().err())
         .map(ToString::to_string);
-    let receipt = json!({
+    let mut receipt = json!({
         "schema_version": 1,
         "artifact_type": "qcsd-chaff-prefix-pack-qualification",
         "invocation_id": format!("{}-{local_addr}", started_unix_ns),
@@ -2173,7 +2184,7 @@ async fn qualify_chaff_prefix(
         "packet_log_sha256": packet_log_sha256,
         "packets": packets,
         "post_slot_pending_stream_send": post_slot_pending_stream_send,
-        "post_slot_pending_required_stream_send": post_slot_pending_required_stream_send,
+        "post_slot_pending_required_prefix_stream_send": post_slot_pending_required_prefix_stream_send,
         "allowed_pending_late_chaff_request_orders": allowed_pending_late_chaff_request_orders,
         "allowed_pending_late_chaff_stream_ids": allowed_pending_late_chaff_stream_ids,
         "targetless_stream_bytes": targetless_stream_bytes,
@@ -2188,6 +2199,21 @@ async fn qualify_chaff_prefix(
         },
         "passed": passed,
     });
+    let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+        Error::RunAborted("prefix qualification receipt is not a JSON object".into())
+    })?;
+    receipt_object.insert(
+        "qpack_decoder_stream_id".into(),
+        json!(qpack_decoder_stream_id),
+    );
+    receipt_object.insert(
+        "qpack_decoder_handler_pending".into(),
+        json!(qpack_decoder_handler_pending),
+    );
+    receipt_object.insert(
+        "qpack_decoder_transport_pending".into(),
+        json!(qpack_decoder_transport_pending),
+    );
     atomic_write(
         &output_dir.join("qualification.json"),
         serde_json::to_string_pretty(&receipt)?.as_bytes(),
@@ -4355,6 +4381,18 @@ async fn wait_for_activity<'a>(
     Ok(())
 }
 
+fn bounded_qualification_wait(
+    delay: Duration,
+    deadline: Instant,
+    timeout_seconds: u64,
+) -> Result<Duration, Error> {
+    let remaining = deadline.saturating_duration_since(now());
+    if remaining.is_zero() {
+        return Err(Error::Timeout(timeout_seconds));
+    }
+    Ok(delay.min(remaining))
+}
+
 fn datagram_observation(
     endpoint: QcsdEndpointId,
     direction: Direction,
@@ -4663,10 +4701,10 @@ mod tests {
         ProfileArg, QcsdRequestRole, QualifierStream, RequestPolicyArg, ResourceRunState,
         RunCompletion, RunSpec, Socket, StaticModeArg, StreamRecord, StreamType,
         TrafficMorphingActivation, action_failure_reason, activate_traffic_morphing,
-        apply_action_batch, create_endpoints, datagram_observation, deadline_error,
-        defense_parameter_provenance, drain_qualifier_stream_data, ensure_defense_realizable,
-        expected_application_response_length, finish_application_record, finish_chaff_record,
-        forward_qcsd_observation, has_in_flight_application_stream, now,
+        apply_action_batch, bounded_qualification_wait, create_endpoints, datagram_observation,
+        deadline_error, defense_parameter_provenance, drain_qualifier_stream_data,
+        ensure_defense_realizable, expected_application_response_length, finish_application_record,
+        finish_chaff_record, forward_qcsd_observation, has_in_flight_application_stream, now,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
         record_terminal_action, register_action_batch, resolve_run_config,
         resolve_run_config_with_workload, sanitize_chaff_action_headers, sha256,
@@ -7027,5 +7065,18 @@ mod tests {
         .await
         .expect("readiness should beat the timeout")
         .expect("readiness wait");
+    }
+
+    #[test]
+    fn qualification_wait_is_capped_by_its_inner_deadline() {
+        let deadline = now() + Duration::from_millis(25);
+        let bounded = bounded_qualification_wait(Duration::from_secs(60), deadline, 30)
+            .expect("positive remaining deadline");
+        assert!(bounded <= Duration::from_millis(25));
+        assert!(bounded > Duration::ZERO);
+        assert!(matches!(
+            bounded_qualification_wait(Duration::from_secs(60), now(), 30),
+            Err(Error::Timeout(30))
+        ));
     }
 }
