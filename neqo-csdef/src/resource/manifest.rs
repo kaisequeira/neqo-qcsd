@@ -64,15 +64,21 @@ pub struct ExpectedChaffResponse {
 pub struct ChaffQualification {
     /// Qualification schema version.
     pub schema_version: u32,
-    /// Qualified request method. Schema one supports only `GET`.
+    /// Qualified request method. Current and historical schemas support only `GET`.
     pub method: String,
     /// Exact production nonblocking HTTP/3 request-stream bytes, including HEADERS framing.
     pub request_stream_bytes: u64,
+    /// Concurrent request count covered by response qualification for all defenses.
+    ///
+    /// Explicit in every current schema-two artifact.
+    pub qualified_parallel_chaff_streams: usize,
+    /// Exact one-shot request count covered by Walkie-Talkie prefix qualification.
+    pub walkie_talkie_required_chaff_streams: usize,
     /// Stable response identity established before a defense run.
     pub expected_response: ExpectedChaffResponse,
     /// SHA-256 binding the repeated response-identity qualification receipts.
     pub response_qualification_sha256: String,
-    /// SHA-256 binding the repeated shaped first-cell prefix-pack receipts.
+    /// SHA-256 binding the repeated shaped staged prefix-pack receipts.
     pub prefix_pack_qualification_sha256: String,
     /// Raw SHA-256 of the acyclic numeric prefix-pack specification.
     pub prefix_spec_sha256: String,
@@ -98,7 +104,7 @@ pub struct QualifiedChaffResource {
     pub chaff_priority: bool,
     /// Whether the compact request was qualified successfully.
     pub known_valid: bool,
-    /// Qualified navigation roots are dependency-free.
+    /// Qualified selected-resource projections are dependency-free.
     #[serde(default)]
     pub depends_on: Vec<u32>,
     /// Exact compact request headers qualified for this representation.
@@ -117,9 +123,19 @@ pub struct ChaffManifest {
     pub artifact_type: String,
     /// Raw SHA-256 of the exact frozen application workload file.
     pub application_workload_sha256: String,
-    /// Application navigation root whose request competes in the first cell.
+    /// Application navigation root bound to staged activation component zero.
     pub application_resource_id: u32,
-    /// Schema one contains exactly one independently qualified navigation root.
+    /// Frozen application-source resource selected for compact chaff replay.
+    ///
+    /// This identity is independent of `application_resource_id`; Cloudflare's
+    /// selected resource happens to be the root, while other workloads select a
+    /// larger same-origin subresource.
+    pub selected_chaff_resource_id: u32,
+    /// Maximum concurrent chaff-request cohort response-qualified for any defense.
+    pub qualified_parallel_chaff_streams: usize,
+    /// Exact one-shot chaff-request cohort used by Walkie-Talkie.
+    pub walkie_talkie_required_chaff_streams: usize,
+    /// Exactly one independently qualified, dependency-free chaff projection.
     pub resources: Vec<QualifiedChaffResource>,
 }
 
@@ -235,7 +251,7 @@ fn is_lower_hex_sha256(value: &str) -> bool {
 ///
 /// An absent field is represented by `None` and normalizes to `identity`.
 /// Duplicate fields and comma-separated coding stacks are deliberately rejected
-/// by callers; schema one qualifies exactly one stable representation.
+/// by callers; qualification accepts exactly one stable representation.
 #[must_use]
 pub fn normalize_content_encoding(value: Option<&str>) -> Option<String> {
     let value = value.unwrap_or("identity").trim().to_ascii_lowercase();
@@ -287,16 +303,26 @@ impl QualifiedChaffResource {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(
+        &self,
+        schema_version: u32,
+        qualified_parallel_chaff_streams: usize,
+        walkie_talkie_required_chaff_streams: usize,
+    ) -> Result<()> {
         let resource = self.as_resource();
         ResourceManifest {
             resources: vec![resource.clone()],
         }
         .validate()?;
         let qualification = &self.chaff_qualification;
-        if qualification.schema_version != 1 || qualification.method != "GET" {
+        if qualification.schema_version != schema_version
+            || qualification.method != "GET"
+            || qualification.qualified_parallel_chaff_streams != qualified_parallel_chaff_streams
+            || qualification.walkie_talkie_required_chaff_streams
+                != walkie_talkie_required_chaff_streams
+        {
             return Err(Error::InvalidConfig(
-                "qualified chaff requires chaff_qualification schema_version 1 and method GET"
+                "qualified chaff qualification schema, method, or required stream count is invalid"
                     .into(),
             ));
         }
@@ -308,6 +334,7 @@ impl QualifiedChaffResource {
         let response = &qualification.expected_response;
         if !(200..300).contains(&response.status)
             || response.body_bytes == 0
+            || (schema_version == 2 && response.body_bytes < 1_200)
             || normalize_content_encoding(Some(&response.content_encoding)).as_deref()
                 != Some(response.content_encoding.as_str())
             || !is_lower_hex_sha256(&response.body_sha256)
@@ -340,7 +367,7 @@ impl QualifiedChaffResource {
             || resource.effective_length() != response.body_bytes
         {
             return Err(Error::InvalidConfig(
-                "qualified chaff root must be known-valid, dependency-free, and bind both length fields exactly to expected_response.body_bytes"
+                "qualified chaff resource must be known-valid, dependency-free, and bind both length fields exactly to expected_response.body_bytes"
                     .into(),
             ));
         }
@@ -365,7 +392,7 @@ impl QualifiedChaffResource {
 }
 
 impl ChaffManifest {
-    /// Load and strictly validate a schema-one qualified-chaff manifest.
+    /// Load and strictly validate a current schema-two qualified-chaff manifest.
     ///
     /// # Errors
     ///
@@ -375,7 +402,7 @@ impl ChaffManifest {
         Self::from_json(&input)
     }
 
-    /// Parse and strictly validate a schema-one qualified-chaff manifest.
+    /// Parse and strictly validate a current schema-two qualified-chaff manifest.
     ///
     /// # Errors
     ///
@@ -386,15 +413,73 @@ impl ChaffManifest {
         Ok(manifest)
     }
 
-    /// Validate the distinct single-root qualified-chaff contract.
+    /// Parse a frozen schema-one manifest for historical audit code only.
+    ///
+    /// Current defended execution must use [`Self::from_json`], which rejects
+    /// schema one even when this historical representation is otherwise valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact is not the exact historical schema.
+    pub fn from_historical_schema_one_json(input: &str) -> Result<Self> {
+        let mut value: serde_json::Value = serde_json::from_str(input)?;
+        let top = value.as_object_mut().ok_or_else(|| {
+            Error::InvalidConfig("historical qualified chaff manifest must be an object".into())
+        })?;
+        for field in [
+            "selected_chaff_resource_id",
+            "qualified_parallel_chaff_streams",
+            "walkie_talkie_required_chaff_streams",
+        ] {
+            if top.contains_key(field) {
+                return Err(Error::InvalidConfig(format!(
+                    "historical schema one must not contain schema-two field {field}"
+                )));
+            }
+        }
+        top.insert("selected_chaff_resource_id".into(), 0.into());
+        top.insert("qualified_parallel_chaff_streams".into(), 0.into());
+        top.insert("walkie_talkie_required_chaff_streams".into(), 0.into());
+        let resources = top
+            .get_mut("resources")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| {
+                Error::InvalidConfig("historical qualified chaff resources must be an array".into())
+            })?;
+        for resource in resources {
+            let qualification = resource
+                .as_object_mut()
+                .and_then(|resource| resource.get_mut("chaff_qualification"))
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    Error::InvalidConfig("historical chaff qualification must be an object".into())
+                })?;
+            for field in [
+                "qualified_parallel_chaff_streams",
+                "walkie_talkie_required_chaff_streams",
+            ] {
+                if qualification.contains_key(field) {
+                    return Err(Error::InvalidConfig(format!(
+                        "historical schema one qualification must not contain schema-two field {field}"
+                    )));
+                }
+                qualification.insert(field.into(), 0.into());
+            }
+        }
+        let manifest: Self = serde_json::from_value(value)?;
+        manifest.validate_historical_schema_one()?;
+        Ok(manifest)
+    }
+
+    /// Validate the distinct schema-two selected-resource chaff contract.
     ///
     /// # Errors
     ///
     /// Returns an error for a wrong discriminator, resource count, or qualification.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 || self.artifact_type != "qcsd-qualified-chaff-manifest" {
+        if self.schema_version != 2 || self.artifact_type != "qcsd-qualified-chaff-manifest" {
             return Err(Error::InvalidConfig(
-                "qualified chaff manifest requires schema_version 1 and artifact_type qcsd-qualified-chaff-manifest"
+                "current qualified chaff manifest requires schema_version 2 and artifact_type qcsd-qualified-chaff-manifest"
                     .into(),
             ));
         }
@@ -403,18 +488,45 @@ impl ChaffManifest {
                 "qualified chaff application_workload_sha256 must be a lowercase SHA-256".into(),
             ));
         }
-        if self.resources.len() != 1 {
+        if self.application_resource_id != 0
+            || !(5..=20).contains(&self.qualified_parallel_chaff_streams)
+            || !(1..=20).contains(&self.walkie_talkie_required_chaff_streams)
+            || self.qualified_parallel_chaff_streams
+                != self.walkie_talkie_required_chaff_streams.max(5)
+        {
             return Err(Error::InvalidConfig(
-                "qualified chaff manifest schema one requires exactly one navigation root".into(),
-            ));
-        }
-        if self.resources[0].id != self.application_resource_id {
-            return Err(Error::InvalidConfig(
-                "qualified chaff root id must equal application_resource_id in its distinct namespace"
+                "qualified chaff manifest requires root id zero, exact Walkie-Talkie streams in 1..=20, and response-qualified parallel streams equal max(5, Walkie-Talkie streams)"
                     .into(),
             ));
         }
-        self.resources[0].validate()
+        if self.resources.len() != 1 || self.resources[0].id != self.selected_chaff_resource_id {
+            return Err(Error::InvalidConfig(
+                "qualified chaff manifest requires exactly one resource matching selected_chaff_resource_id"
+                    .into(),
+            ));
+        }
+        self.resources[0].validate(
+            2,
+            self.qualified_parallel_chaff_streams,
+            self.walkie_talkie_required_chaff_streams,
+        )
+    }
+
+    fn validate_historical_schema_one(&self) -> Result<()> {
+        if self.schema_version != 1
+            || self.artifact_type != "qcsd-qualified-chaff-manifest"
+            || !is_lower_hex_sha256(&self.application_workload_sha256)
+            || self.resources.len() != 1
+            || self.resources[0].id != self.application_resource_id
+            || self.selected_chaff_resource_id != 0
+            || self.qualified_parallel_chaff_streams != 0
+            || self.walkie_talkie_required_chaff_streams != 0
+        {
+            return Err(Error::InvalidConfig(
+                "historical qualified chaff manifest is not exact schema one".into(),
+            ));
+        }
+        self.resources[0].validate(1, 0, 0)
     }
 
     /// Generic resource view consumed by the transport-independent controller.
@@ -718,14 +830,17 @@ mod tests {
 
     fn qualified_manifest() -> ChaffManifest {
         ChaffManifest {
-            schema_version: 1,
+            schema_version: 2,
             artifact_type: "qcsd-qualified-chaff-manifest".into(),
             application_workload_sha256: "a".repeat(64),
             application_resource_id: 0,
+            selected_chaff_resource_id: 6,
+            qualified_parallel_chaff_streams: 20,
+            walkie_talkie_required_chaff_streams: 20,
             resources: vec![QualifiedChaffResource {
-                id: 0,
-                url: "https://example.com/".into(),
-                kind: "Document".into(),
+                id: 6,
+                url: "https://example.com/font.woff2".into(),
+                kind: "Font".into(),
                 content_length: Some(2_048),
                 data_length: 2_048,
                 chaff_priority: true,
@@ -737,9 +852,11 @@ mod tests {
                     ("accept-language".into(), "en-AU".into()),
                 ],
                 chaff_qualification: ChaffQualification {
-                    schema_version: 1,
+                    schema_version: 2,
                     method: "GET".into(),
                     request_stream_bytes: 42,
+                    qualified_parallel_chaff_streams: 20,
+                    walkie_talkie_required_chaff_streams: 20,
                     expected_response: ExpectedChaffResponse {
                         status: 200,
                         content_encoding: "br".into(),
@@ -764,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_chaff_is_a_strict_distinct_single_root_schema() {
+    fn qualified_chaff_is_a_strict_distinct_selected_resource_schema() {
         let manifest = qualified_manifest();
         manifest.validate().expect("qualified manifest");
         let json = serde_json::to_string(&manifest).expect("serialize");
@@ -774,9 +891,45 @@ mod tests {
         );
         assert!(ResourceManifest::from_json(&json).is_err());
 
+        let mut historical = manifest.clone();
+        historical.schema_version = 1;
+        historical.selected_chaff_resource_id = 0;
+        historical.qualified_parallel_chaff_streams = 0;
+        historical.walkie_talkie_required_chaff_streams = 0;
+        historical.resources[0].id = 0;
+        historical.resources[0].chaff_qualification.schema_version = 1;
+        historical.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 0;
+        historical.resources[0]
+            .chaff_qualification
+            .walkie_talkie_required_chaff_streams = 0;
+        let mut historical_value = serde_json::to_value(&historical).expect("historical value");
+        let historical_object = historical_value.as_object_mut().expect("object");
+        historical_object.remove("selected_chaff_resource_id");
+        historical_object.remove("qualified_parallel_chaff_streams");
+        historical_object.remove("walkie_talkie_required_chaff_streams");
+        let historical_qualification = historical_object["resources"][0]["chaff_qualification"]
+            .as_object_mut()
+            .expect("qualification object");
+        historical_qualification.remove("qualified_parallel_chaff_streams");
+        historical_qualification.remove("walkie_talkie_required_chaff_streams");
+        let historical_json =
+            serde_json::to_string(&historical_value).expect("serialize historical");
+        assert!(ChaffManifest::from_json(&historical_json).is_err());
+        ChaffManifest::from_historical_schema_one_json(&historical_json)
+            .expect("explicit historical parser accepts schema one");
+
         let mut extra = serde_json::to_value(&manifest).expect("value");
         extra["unexpected"] = serde_json::json!(true);
         assert!(ChaffManifest::from_json(&extra.to_string()).is_err());
+
+        let mut missing_selected = serde_json::to_value(&manifest).expect("value");
+        missing_selected
+            .as_object_mut()
+            .expect("object")
+            .remove("selected_chaff_resource_id");
+        assert!(ChaffManifest::from_json(&missing_selected.to_string()).is_err());
     }
 
     #[test]
@@ -810,6 +963,28 @@ mod tests {
 
         let mut manifest = qualified_manifest();
         manifest.resources[0].data_length = 2_047;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn qualified_chaff_separates_cross_mode_response_concurrency_from_walkie_talkie_count() {
+        let mut manifest = qualified_manifest();
+        manifest.qualified_parallel_chaff_streams = 5;
+        manifest.walkie_talkie_required_chaff_streams = 3;
+        manifest.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 5;
+        manifest.resources[0]
+            .chaff_qualification
+            .walkie_talkie_required_chaff_streams = 3;
+        manifest.validate().expect("cross-mode five, WT three");
+
+        manifest.qualified_parallel_chaff_streams = 3;
+        assert!(manifest.validate().is_err());
+        manifest.qualified_parallel_chaff_streams = 5;
+        manifest.resources[0]
+            .chaff_qualification
+            .walkie_talkie_required_chaff_streams = 4;
         assert!(manifest.validate().is_err());
     }
 

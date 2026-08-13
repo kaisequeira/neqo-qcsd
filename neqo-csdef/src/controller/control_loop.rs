@@ -48,6 +48,10 @@ pub(super) struct PendingClaim {
 pub(super) struct ControlLoop {
     pub next_slot_id: u64,
     pub last_incoming_boundary_us: Option<u64>,
+    /// A one-shot defense emitted its complete initial `RequestChaff` batch.
+    /// Once latched, the application-level chaff manager is never invoked to
+    /// replenish that defense, even when initial streams later complete.
+    pub chaff_preprovisioned_to_stream_limit: bool,
     pub incoming: Vec<PendingIncoming>,
     pub outgoing: Vec<PendingOutgoing>,
     pub credit: Vec<PendingCredit>,
@@ -58,11 +62,12 @@ pub(super) struct ControlLoop {
     /// stream.
     pub receiver_continuations: HashMap<QcsdSlotId, ReceiverContinuationDisposition>,
     /// Peer-ACK-activated pristine streams protected from ordinary allocation
-    /// for the current Walkie-Talkie component and its no-outgoing horizon.
+    /// for all remaining Walkie-Talkie receiver continuations.
     pub receiver_continuation_reserves: Vec<(QcsdEndpointId, QcsdStreamId)>,
-    /// The current incoming component observed its complete H+1 activated
-    /// survivor cohort immediately before its first ordinary base allocation.
-    /// The extra nonreserve may then be consumed without re-running the gate.
+    /// The complete all-future H+1 activated survivor cohort was observed
+    /// immediately before the schedule's first ordinary base allocation. The
+    /// extra nonreserve may then be consumed without re-running the gate after
+    /// later positive outgoing components.
     pub receiver_continuation_survivor_gate_open: bool,
     /// Incoming slots already classified as terminal must not be resolved a
     /// second time if a delayed observation arrives for an old offset range.

@@ -31,7 +31,7 @@ use neqo_csdef::{
     QcsdController, QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdProfile,
     QcsdRequestRole, QcsdSlotId, QcsdStreamTransmission, Resource, ResourceManifest,
     ResourceRunState, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
-    derive, normalize_content_encoding, sanitize_chaff_headers,
+    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -172,18 +172,20 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
     },
-    /// Qualify five concurrent compact navigation-root responses over HTTP/3.
+    /// Qualify the exact concurrent compact selected-resource cohort over HTTP/3.
     QualifyChaffResponse {
-        /// Exact frozen prepared application source (A); response preparation metadata is not
-        /// used.
+        /// Exact frozen prepared source; response identities select and verify the live resource.
         #[arg(long)]
         workload: PathBuf,
-        /// Dependency-free application navigation root to project to AEL.
+        /// Application navigation root identity; current qualification requires zero.
         #[arg(long)]
         application_resource_id: u32,
+        /// Deterministically selected same-origin application resource to project to AEL.
+        #[arg(long)]
+        selected_chaff_resource_id: u32,
         #[arg(long)]
         output_dir: PathBuf,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long)]
         parallel_requests: usize,
         #[arg(long, default_value_t = 1_048_576)]
         max_response_bytes: u64,
@@ -192,9 +194,9 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
     },
-    /// Prove the production first-cell application/chaff request prefix pack.
+    /// Prove every production Walkie-Talkie request-prefix activation stage.
     QualifyChaffPrefix {
-        /// Exact frozen prepared application source (A).
+        /// Exact frozen prepared source whose response identities bind every component batch.
         #[arg(long)]
         workload: PathBuf,
         /// Exact projected runtime workload used by defended execution (R).
@@ -203,10 +205,10 @@ enum Command {
         /// Acyclic compact chaff core derived from response qualification.
         #[arg(long)]
         chaff_core: PathBuf,
-        /// Dependency-free application navigation root competing in the cell.
+        /// Dependency-free application navigation root bound to activation component zero.
         #[arg(long)]
         application_resource_id: u32,
-        /// Standalone immutable numeric Walkie-Talkie prefix-pack specification.
+        /// Immutable every-component Walkie-Talkie staged prefix-pack specification.
         #[arg(long)]
         prefix_pack_spec: PathBuf,
         #[arg(long)]
@@ -267,7 +269,7 @@ enum Command {
         /// Workload identity selecting a Traffic Morphing or Walkie-Talkie profile.
         #[arg(long)]
         workload_id: Option<String>,
-        /// Explicit schema-one qualified chaff manifest required by every defended run.
+        /// Explicit current schema-two qualified chaff manifest required by every defended run.
         #[arg(long = "chaff-manifest", visible_alias = "manifest")]
         chaff_manifest: Option<PathBuf>,
         /// Application request dispatch policy used by the campaign collector.
@@ -337,7 +339,7 @@ impl Args {
                 max_response_bytes,
                 timeout_seconds,
             } => {
-                let config = resolve_run_config_with_workload(
+                let mut config = resolve_run_config_with_workload(
                     config.as_deref(),
                     preset,
                     profile,
@@ -350,7 +352,6 @@ impl Args {
                     workload_id.as_deref(),
                 )?;
                 config.validate()?;
-                let defense_parameters = defense_parameter_provenance(&config)?;
                 if urls.is_empty() == workload.is_none() {
                     return Err(Error::Argument(
                         "provide exactly one of positional URLs or --workload".into(),
@@ -373,9 +374,15 @@ impl Args {
                 } else {
                     (None, None)
                 };
+                if !matches!(config.defense, DefenseConfig::None)
+                    && let Some(chaff) = &chaff_manifest
+                {
+                    bind_qualified_chaff_stream_limits(&mut config, chaff)?;
+                }
+                let defense_parameters = defense_parameter_provenance(&config)?;
                 if !matches!(config.defense, DefenseConfig::None) && chaff_manifest.is_none() {
                     return Err(Error::Argument(
-                        "every defended run requires an explicit schema-one qualified --chaff-manifest"
+                        "every defended run requires an explicit current schema-two qualified --chaff-manifest"
                             .into(),
                     ));
                 }
@@ -419,6 +426,7 @@ impl Args {
             Command::QualifyChaffResponse {
                 workload,
                 application_resource_id,
+                selected_chaff_resource_id,
                 output_dir,
                 parallel_requests,
                 max_response_bytes,
@@ -428,6 +436,7 @@ impl Args {
                 qualify_chaff_response(
                     &workload,
                     application_resource_id,
+                    selected_chaff_resource_id,
                     &output_dir,
                     parallel_requests,
                     max_response_bytes,
@@ -680,11 +689,32 @@ fn defense_parameter_provenance(
     }))
 }
 
+fn bind_qualified_chaff_stream_limits(
+    config: &mut QcsdConfig,
+    chaff: &ChaffManifest,
+) -> Result<(), Error> {
+    if matches!(config.defense, DefenseConfig::WalkieTalkie(_)) {
+        config.max_chaff_streams = chaff.walkie_talkie_required_chaff_streams;
+        config.validate()?;
+    }
+    if config.max_chaff_streams > chaff.qualified_parallel_chaff_streams {
+        return Err(Error::Argument(format!(
+            "configured max_chaff_streams {} exceeds response-qualified parallel cohort {}",
+            config.max_chaff_streams, chaff.qualified_parallel_chaff_streams
+        )));
+    }
+    Ok(())
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
     workload_hash: String,
-    application_workload_source: Option<(ResourceManifest, String)>,
+    application_workload_source: Option<(
+        ResourceManifest,
+        String,
+        BTreeMap<u32, PreparedExpectedResponse>,
+    )>,
     config: QcsdConfig,
     defense_parameters: Option<DefenseParameterProvenance>,
     chaff_manifest: Option<ChaffManifest>,
@@ -774,6 +804,8 @@ struct ChaffQualificationCore {
     schema_version: u32,
     method: String,
     request_stream_bytes: u64,
+    qualified_parallel_chaff_streams: usize,
+    walkie_talkie_required_chaff_streams: usize,
     expected_response: ExpectedChaffResponse,
     response_qualification_sha256: String,
 }
@@ -817,6 +849,9 @@ struct QualifiedChaffCore {
     artifact_type: String,
     application_workload_sha256: String,
     application_resource_id: u32,
+    selected_chaff_resource_id: u32,
+    qualified_parallel_chaff_streams: usize,
+    walkie_talkie_required_chaff_streams: usize,
     resources: Vec<QualifiedChaffCoreResource>,
 }
 
@@ -846,7 +881,33 @@ struct PrefixPackSpec {
     required_chaff_survivors: usize,
     numeric_profile_sha256: String,
     source_walkie_talkie_artifact_sha256: String,
+    application_resource_id: u32,
+    selected_chaff_resource_id: u32,
+    selected_chaff_body_bytes: u64,
+    required_chaff_streams: usize,
+    stream_activation_stages: Vec<StreamActivationStage>,
     numeric_profile: PrefixNumericProfile,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StreamActivationStage {
+    component_index: usize,
+    application_resource_ids: Vec<u32>,
+    exact_target_cells: u64,
+    outgoing_cells: u64,
+    symmetric_incoming_cells: u64,
+    adapted_incoming_cells: u64,
+    application_body_floor_bytes: u64,
+    base_chaff_bytes: u64,
+    continuation_bytes: u64,
+    required_active_chaff_streams: usize,
+    newly_required_chaff_streams: usize,
+    future_continuation_reserves: usize,
+    exact_capacity_before_bytes: u64,
+    ordinary_capacity_before_bytes: u64,
+    exact_capacity_after_bytes: u64,
+    early_continuation_required: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -868,6 +929,7 @@ struct QualificationAcknowledgement {
 #[derive(Debug, Serialize)]
 struct PrefixRequestStream {
     request_order: usize,
+    opening_stage_index: usize,
     role: &'static str,
     resource_id: u32,
     request_id: Option<u64>,
@@ -880,6 +942,7 @@ struct PrefixRequestStream {
 #[derive(Debug, Serialize)]
 struct PrefixStreamReceipt<'a> {
     request_order: usize,
+    opening_stage_index: usize,
     role: &'static str,
     resource_id: u32,
     request_id: Option<u64>,
@@ -909,6 +972,15 @@ struct PreparedWorkloadSource {
     resources: Vec<Resource>,
     #[serde(default)]
     replay: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedExpectedResponse {
+    resource_id: u32,
+    status: u16,
+    bytes: u64,
+    body_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1103,9 +1175,9 @@ async fn probe(
 }
 
 fn projected_ael(resource: &Resource) -> Result<Vec<(String, String)>, Error> {
-    if !resource.known_valid || !resource.depends_on.is_empty() {
+    if !resource.known_valid {
         return Err(Error::Argument(
-            "chaff response qualification requires a known-valid dependency-free root".into(),
+            "chaff response qualification requires a known-valid resource".into(),
         ));
     }
     let projected: Vec<_> = resource
@@ -1129,7 +1201,7 @@ fn projected_ael(resource: &Resource) -> Result<Vec<(String, String)>, Error> {
         })
     {
         return Err(Error::Argument(
-            "application root must project exactly one accept, accept-encoding, and accept-language header in that order"
+            "application resource must project exactly one accept, accept-encoding, and accept-language header in that order"
                 .into(),
         ));
     }
@@ -1153,6 +1225,43 @@ fn validate_qualification_application_root(
         ));
     }
     Ok(())
+}
+
+fn deterministic_selected_chaff_resource<'a>(
+    workload: &'a ResourceManifest,
+    expected: &'a BTreeMap<u32, PreparedExpectedResponse>,
+    application: &Resource,
+) -> Result<(&'a Resource, &'a PreparedExpectedResponse), Error> {
+    let application_origin = application.origin().ok_or_else(|| {
+        Error::Argument("application navigation root has no valid HTTPS origin".into())
+    })?;
+    let mut candidates: Vec<_> = workload
+        .resources
+        .iter()
+        .filter_map(|resource| {
+            let response = expected.get(&resource.id)?;
+            (resource.known_valid
+                && resource.origin().as_deref() == Some(application_origin.as_str())
+                && response.bytes >= 1_200
+                && projected_ael(resource).is_ok())
+            .then_some((resource, response))
+        })
+        .collect();
+    candidates.sort_by(
+        |(left_resource, left_response), (right_resource, right_response)| {
+            right_response
+                .bytes
+                .cmp(&left_response.bytes)
+                .then_with(|| left_resource.id.cmp(&right_resource.id))
+                .then_with(|| left_resource.url.cmp(&right_resource.url))
+        },
+    );
+    candidates.into_iter().next().ok_or_else(|| {
+        Error::Argument(
+            "prepared workload has no deterministic known-valid same-origin one-cell chaff resource"
+                .into(),
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -1220,31 +1329,56 @@ fn drain_qualifier_stream_data(
 
 #[expect(
     clippy::future_not_send,
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the dedicated qualification loop retains packet and response evidence in one lifecycle"
 )]
 async fn qualify_chaff_response(
     workload_path: &Path,
     application_resource_id: u32,
+    selected_chaff_resource_id: u32,
     output_dir: &Path,
     parallel_requests: usize,
     max_response_bytes: u64,
     packet_size: u16,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    if parallel_requests != 5 || packet_size != 1_200 || max_response_bytes == 0 {
+    if !(5..=20).contains(&parallel_requests) || packet_size != 1_200 || max_response_bytes == 0 {
         return Err(Error::Argument(
-            "response qualification requires parallel_requests=5, packet_size=1200, and positive max_response_bytes"
+            "response qualification requires 5..=20 parallel_requests, packet_size=1200, and positive max_response_bytes"
                 .into(),
         ));
     }
-    let (workload, workload_hash) = load_application_workload_source(workload_path)?;
-    let resource = workload
+    let (workload, workload_hash, expected_responses) =
+        load_application_workload_source(workload_path)?;
+    let application = workload
         .resources
         .iter()
         .find(|resource| resource.id == application_resource_id)
-        .ok_or_else(|| Error::Argument("application_resource_id is absent from workload".into()))?;
-    validate_qualification_application_root(resource, application_resource_id)?;
+        .ok_or_else(|| {
+            Error::Argument("application_resource_id 0 is absent from workload".into())
+        })?;
+    validate_qualification_application_root(application, application_resource_id)?;
+    let (deterministic, prepared_selected) =
+        deterministic_selected_chaff_resource(&workload, &expected_responses, application)?;
+    if deterministic.id != selected_chaff_resource_id {
+        return Err(Error::Argument(format!(
+            "selected_chaff_resource_id {selected_chaff_resource_id} is not deterministic source {}",
+            deterministic.id
+        )));
+    }
+    let resource = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == selected_chaff_resource_id)
+        .ok_or_else(|| {
+            Error::Argument("selected_chaff_resource_id is absent from workload".into())
+        })?;
+    if resource.origin().is_none() || resource.origin() != application.origin() {
+        return Err(Error::Argument(
+            "selected chaff resource must share the navigation root's exact HTTPS origin".into(),
+        ));
+    }
     let request_headers = projected_ael(resource)?;
     let url: Uri = resource
         .url
@@ -1508,6 +1642,9 @@ async fn qualify_chaff_response(
                     .is_some_and(|status| (200..300).contains(&status))
                 && request.content_encoding.is_some()
                 && request.body_sha256.is_some()
+                && request.status == Some(prepared_selected.status)
+                && request.body_bytes == prepared_selected.bytes
+                && request.body_sha256.as_deref() == Some(prepared_selected.body_sha256.as_str())
         })
         && identities
             .windows(2)
@@ -1519,7 +1656,7 @@ async fn qualify_chaff_response(
         })
         && incoming.oversized_packet_count == 0
         && outgoing.oversized_packet_count == 0
-        && requests_opened_before_first_network_output == 5
+        && requests_opened_before_first_network_output == parallel_requests
         && qualification_network_output_seen;
     let error = loop_result.as_ref().err().map(ToString::to_string);
     let request_stream_bytes = requests
@@ -1534,12 +1671,14 @@ async fn qualify_chaff_response(
     atomic_write(&output_dir.join("packets.json"), &packet_log)?;
     let packet_log_sha256 = sha256(&packet_log)?;
     let receipt = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "qcsd-chaff-response-qualification",
         "invocation_id": format!("{}-{local_addr}", started_unix_ns),
         "neqo_version": env!("CARGO_PKG_VERSION"),
         "application_workload_sha256": workload_hash,
         "application_resource_id": application_resource_id,
+        "selected_chaff_resource_id": selected_chaff_resource_id,
+        "qualified_parallel_chaff_streams": parallel_requests,
         "method": "GET",
         "url": url.to_string(),
         "request_headers": request_headers,
@@ -1633,6 +1772,7 @@ fn prefix_stream_receipts<'a>(
             );
             PrefixStreamReceipt {
                 request_order: request.request_order,
+                opening_stage_index: request.opening_stage_index,
                 role: request.role,
                 resource_id: request.resource_id,
                 request_id: request.request_id,
@@ -1653,9 +1793,9 @@ fn prefix_stream_receipts<'a>(
 
 fn prefix_receipts_pass(
     receipts: &[PrefixStreamReceipt<'_>],
-    required_chaff_survivors: usize,
+    required_active_chaff_streams: usize,
 ) -> bool {
-    if receipts.len() != 6
+    if receipts.is_empty()
         || receipts
             .iter()
             .enumerate()
@@ -1669,18 +1809,20 @@ fn prefix_receipts_pass(
     {
         return false;
     }
-    let app = &receipts[0];
-    let app_tx_complete = app.role == "application"
-        && app.transmitted_unique_ranges == [[0, app.request_stream_bytes]]
-        && app.transmitted_unique_bytes == app.request_stream_bytes
-        && app.fin_transmitted;
+    let app_tx_complete = receipts
+        .iter()
+        .filter(|receipt| receipt.role == "application")
+        .all(|receipt| {
+            receipt.transmitted_unique_ranges == [[0, receipt.request_stream_bytes]]
+                && receipt.transmitted_unique_bytes == receipt.request_stream_bytes
+                && receipt.fin_transmitted
+        });
     let chaff_complete = receipts
         .iter()
-        .skip(1)
-        .take(required_chaff_survivors)
+        .filter(|receipt| receipt.role == "chaff")
+        .take(required_active_chaff_streams)
         .all(|receipt| {
-            receipt.role == "chaff"
-                && receipt.qualified_request_stream_bytes == Some(receipt.request_stream_bytes)
+            receipt.qualified_request_stream_bytes == Some(receipt.request_stream_bytes)
                 && receipt.transmitted_unique_ranges == [[0, receipt.request_stream_bytes]]
                 && receipt.transmitted_unique_bytes == receipt.request_stream_bytes
                 && receipt.fin_transmitted
@@ -1688,27 +1830,51 @@ fn prefix_receipts_pass(
                 && receipt.acknowledged_unique_bytes == receipt.request_stream_bytes
                 && receipt.fin_acknowledged
         });
-    app_tx_complete && chaff_complete
+    app_tx_complete
+        && chaff_complete
+        && receipts
+            .iter()
+            .filter(|receipt| receipt.role == "chaff")
+            .count()
+            >= required_active_chaff_streams
 }
 
 fn intentionally_pending_late_chaff(
     requests: &[PrefixRequestStream],
-    required_chaff_survivors: usize,
+    required_active_chaff_streams: usize,
 ) -> Vec<StreamId> {
     requests
         .iter()
-        .skip(required_chaff_survivors.saturating_add(1))
+        .filter(|request| request.role == "chaff")
+        .skip(required_active_chaff_streams)
         .map(|request| StreamId::new(request.stream_id))
         .collect()
+}
+
+fn prefix_targetless_stream_bytes(
+    transmissions: &[QcsdStreamTransmission],
+    scheduled_slots: &BTreeSet<u64>,
+) -> u64 {
+    transmissions
+        .iter()
+        .filter(|transmission| {
+            transmission
+                .slot
+                .is_none_or(|slot| !scheduled_slots.contains(&slot.0))
+        })
+        .fold(0_u64, |total, transmission| {
+            total.saturating_add(transmission.bytes)
+        })
 }
 
 fn record_prefix_observations(
     client: &mut Http3Client,
     requests: &mut [PrefixRequestStream],
     transmissions: &mut Vec<QcsdStreamTransmission>,
-) -> Result<bool, Error> {
+    scheduled_slots: &BTreeSet<u64>,
+    satisfied_slots: &mut BTreeSet<u64>,
+) -> Result<(), Error> {
     transmissions.extend(client.qcsd_stream_transmissions());
-    let mut slot_satisfied = false;
     for record in client.qcsd_timestamped_observations() {
         let sequence = record.sequence();
         match record.into_observation() {
@@ -1735,23 +1901,130 @@ fn record_prefix_observations(
                 });
             }
             QcsdObservation::SlotSatisfied {
-                slot: QcsdSlotId(1),
-                observed_size: 1_200,
+                slot,
+                observed_size,
                 ..
-            } => slot_satisfied = true,
-            QcsdObservation::SlotMissed {
-                slot: QcsdSlotId(1),
-                reason,
-                ..
-            } => {
+            } if scheduled_slots.contains(&slot.0) && observed_size == 1_200 => {
+                satisfied_slots.insert(slot.0);
+            }
+            QcsdObservation::SlotSatisfied { slot, .. } => {
                 return Err(Error::RunAborted(format!(
-                    "prefix-pack target was missed: {reason:?}"
+                    "unexpected or wrong-sized prefix-pack slot satisfaction: {}",
+                    slot.0
+                )));
+            }
+            QcsdObservation::SlotMissed { slot, reason, .. }
+                if scheduled_slots.contains(&slot.0) =>
+            {
+                return Err(Error::RunAborted(format!(
+                    "prefix-pack target {} was missed: {reason:?}",
+                    slot.0
                 )));
             }
             _ => {}
         }
     }
-    Ok(slot_satisfied)
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct PrefixActivationStageReceipt {
+    stage_index: usize,
+    component_index: usize,
+    application_resource_ids: Vec<u32>,
+    application_request_orders: Vec<usize>,
+    application_stream_ids: Vec<u64>,
+    target_slot_ids: Vec<u64>,
+    exact_target_cells: u64,
+    scheduled_target_bytes: u64,
+    required_active_chaff_streams: usize,
+    newly_required_chaff_streams: usize,
+    peer_acknowledged_active_chaff_streams: usize,
+    newly_peer_acknowledged_request_orders: Vec<usize>,
+    newly_peer_acknowledged_stream_ids: Vec<u64>,
+    allowed_pending_chaff_request_orders: Vec<usize>,
+    allowed_pending_chaff_stream_ids: Vec<u64>,
+    targetless_stream_bytes_at_gate: u64,
+    pending_required_prefix_stream_send: bool,
+    passed: bool,
+}
+
+fn queue_prefix_stage_targets(
+    client: &mut Http3Client,
+    now: Instant,
+    stage: &StreamActivationStage,
+    packet_size: u16,
+    timeout_seconds: u64,
+    next_slot_id: &mut u64,
+    scheduled_slots: &mut BTreeSet<u64>,
+) -> Result<Vec<u64>, Error> {
+    let mut slots = Vec::new();
+    for _ in 0..stage.exact_target_cells {
+        let slot_id = *next_slot_id;
+        *next_slot_id = next_slot_id.saturating_add(1);
+        let packet = Packet::new(Duration::ZERO, Direction::Outgoing, packet_size)?;
+        client.apply_qcsd_action(
+            now,
+            QcsdAction::SendPacket {
+                endpoint: QcsdEndpointId(0),
+                packet,
+                slot: QcsdSlotId(slot_id),
+                deadline_after_us: u64::try_from(Duration::from_secs(timeout_seconds).as_micros())
+                    .unwrap_or(u64::MAX),
+                allow_stream_data: true,
+            },
+        )?;
+        scheduled_slots.insert(slot_id);
+        slots.push(slot_id);
+    }
+    Ok(slots)
+}
+
+fn open_prefix_application_stage(
+    client: &mut Http3Client,
+    now: Instant,
+    workload: &ResourceManifest,
+    stage_index: usize,
+    resource_ids: &[u32],
+    requests: &mut Vec<PrefixRequestStream>,
+) -> Result<(), Error> {
+    for resource_id in resource_ids {
+        let resource = workload
+            .resources
+            .iter()
+            .find(|resource| resource.id == *resource_id)
+            .ok_or_else(|| {
+                Error::Argument(format!(
+                    "activation-stage application resource {resource_id} is absent"
+                ))
+            })?;
+        let url: Uri = resource.url.parse().map_err(|_| {
+            Error::Argument(format!(
+                "activation-stage application resource {resource_id} has an invalid URL"
+            ))
+        })?;
+        let headers = workload.application_headers(*resource_id)?;
+        let headers: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| Header::new(name.as_str(), value.as_str()))
+            .collect();
+        let stream = client.fetch(now, "GET", &url, &headers, Priority::default())?;
+        client.register_qcsd_stream(stream, QcsdRequestRole::Application, None)?;
+        let size = client.qcsd_request_stream_bytes(stream)?;
+        client.stream_close_send(stream, now)?;
+        requests.push(PrefixRequestStream {
+            request_order: requests.len(),
+            opening_stage_index: stage_index,
+            role: "application",
+            resource_id: *resource_id,
+            request_id: None,
+            stream_id: stream.as_u64(),
+            request_stream_bytes: size,
+            qualified_request_stream_bytes: None,
+            acknowledgements: Vec::new(),
+        });
+    }
+    Ok(())
 }
 
 #[expect(
@@ -1768,17 +2041,28 @@ async fn qualify_chaff_prefix(
     output_dir: &Path,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let (application_source, application_source_sha256) =
+    let (application_source, application_source_sha256, prepared_expected_responses) =
         load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
     let (prefix_spec, prefix_pack_spec_sha256) = load_prefix_pack_spec(prefix_pack_spec_path)?;
     validate_prefix_pack_spec(&prefix_spec)?;
+    validate_prefix_prepared_response_binding(
+        &prefix_spec,
+        &application_source,
+        &prepared_expected_responses,
+    )?;
+    if application_resource_id != prefix_spec.application_resource_id {
+        return Err(Error::Argument(
+            "CLI application_resource_id does not match the hash-bound prefix specification".into(),
+        ));
+    }
     validate_chaff_core_binding(
         &chaff_core,
         &application_source,
         &application_source_sha256,
-        application_resource_id,
+        &prefix_spec,
+        &prepared_expected_responses,
     )?;
     let application = runtime_workload
         .resources
@@ -1817,6 +2101,52 @@ async fn qualify_chaff_prefix(
             "runtime workload and frozen source disagree on the unique navigation root request"
                 .into(),
         ));
+    }
+    let application_origin = application.origin().expect("validated root origin");
+    for resource_id in prefix_spec
+        .stream_activation_stages
+        .iter()
+        .flat_map(|stage| &stage.application_resource_ids)
+    {
+        let runtime_resource = runtime_workload
+            .resources
+            .iter()
+            .find(|resource| resource.id == *resource_id)
+            .ok_or_else(|| {
+                Error::Argument(format!(
+                    "runtime workload lacks activation-stage resource {resource_id}"
+                ))
+            })?;
+        let source_resource = application_source
+            .resources
+            .iter()
+            .find(|resource| resource.id == *resource_id)
+            .ok_or_else(|| {
+                Error::Argument(format!(
+                    "frozen source lacks activation-stage resource {resource_id}"
+                ))
+            })?;
+        if runtime_resource.origin().as_deref() != Some(application_origin.as_str())
+            || (
+                &runtime_resource.url,
+                &runtime_resource.kind,
+                runtime_resource.chaff_priority,
+                runtime_resource.known_valid,
+                &runtime_resource.depends_on,
+                &runtime_resource.headers,
+            ) != (
+                &source_resource.url,
+                &source_resource.kind,
+                source_resource.chaff_priority,
+                source_resource.known_valid,
+                &source_resource.depends_on,
+                &source_resource.headers,
+            )
+        {
+            return Err(Error::Argument(format!(
+                "runtime and frozen activation-stage resource {resource_id} disagree or are not same-origin"
+            )));
+        }
     }
     if output_dir.exists() && fs::read_dir(output_dir)?.next().is_some() {
         return Err(Error::Argument(format!(
@@ -1890,11 +2220,13 @@ async fn qualify_chaff_prefix(
     let mut packet_cutoff_sequence = 0_u64;
     let mut requests = Vec::<PrefixRequestStream>::new();
     let mut transmissions = Vec::<QcsdStreamTransmission>::new();
-    let mut target_queued = false;
-    let mut target_sent = false;
-    let mut target_satisfied = false;
-    let mut first_target_output_count = 0_u64;
-    let mut first_target_output_bytes = 0_u64;
+    let mut qualification_started = false;
+    let mut current_stage_index = 0_usize;
+    let mut current_stage_slots = Vec::<u64>::new();
+    let mut scheduled_slots = BTreeSet::<u64>::new();
+    let mut satisfied_slots = BTreeSet::<u64>::new();
+    let mut next_slot_id = 1_u64;
+    let mut activation_stage_receipts = Vec::<PrefixActivationStageReceipt>::new();
     let loop_result: Result<(), Error> = async {
         loop {
             let loop_now = now();
@@ -1906,7 +2238,7 @@ async fn qualify_chaff_prefix(
                     incoming.observe(datagram.len(), prefix_spec.packet_size);
                     packet_observations.push(QualificationPacketObservation {
                         sequence: next_packet_sequence,
-                        phase: if target_queued {
+                        phase: if qualification_started {
                             "qualification"
                         } else {
                             "warmup"
@@ -1931,7 +2263,7 @@ async fn qualify_chaff_prefix(
                     _ => {}
                 }
             }
-            if !target_queued && client.qcsd_peer_settings_received() {
+            if !qualification_started && client.qcsd_peer_settings_received() {
                 peer_settings_received = true;
                 client.qcsd_prepare_stream_output(loop_now);
                 if !client.qcsd_has_pending_stream_send() {
@@ -1941,30 +2273,18 @@ async fn qualify_chaff_prefix(
                     packet_cutoff_sequence = next_packet_sequence;
                     drop(client.qcsd_timestamped_observations());
 
-                    let app_headers =
-                        runtime_workload.application_headers(application_resource_id)?;
-                    let app_headers: Vec<_> = app_headers
-                        .iter()
-                        .map(|(name, value)| Header::new(name.as_str(), value.as_str()))
-                        .collect();
-                    let app_stream =
-                        client.fetch(loop_now, "GET", &url, &app_headers, Priority::default())?;
-                    client.register_qcsd_stream(app_stream, QcsdRequestRole::Application, None)?;
-                    let app_size = client.qcsd_request_stream_bytes(app_stream)?;
-                    client.stream_close_send(app_stream, loop_now)?;
-                    requests.push(PrefixRequestStream {
-                        request_order: 0,
-                        role: "application",
-                        resource_id: application_resource_id,
-                        request_id: None,
-                        stream_id: app_stream.as_u64(),
-                        request_stream_bytes: app_size,
-                        qualified_request_stream_bytes: None,
-                        acknowledgements: Vec::new(),
-                    });
+                    let first_stage = &prefix_spec.stream_activation_stages[0];
+                    open_prefix_application_stage(
+                        &mut client,
+                        loop_now,
+                        &runtime_workload,
+                        0,
+                        &first_stage.application_resource_ids,
+                        &mut requests,
+                    )?;
                     let core_resource = &chaff_core.resources[0];
                     let compact = core_resource.as_resource();
-                    for index in 0..5_usize {
+                    for index in 0..prefix_spec.required_chaff_streams {
                         let request_id =
                             QcsdChaffRequestId(u64::try_from(index).unwrap_or(u64::MAX));
                         let stream = client
@@ -1988,7 +2308,8 @@ async fn qualify_chaff_prefix(
                             )));
                         }
                         requests.push(PrefixRequestStream {
-                            request_order: index.saturating_add(1),
+                            request_order: requests.len(),
+                            opening_stage_index: 0,
                             role: "chaff",
                             resource_id: core_resource.id,
                             request_id: Some(request_id.0),
@@ -2000,47 +2321,180 @@ async fn qualify_chaff_prefix(
                             acknowledgements: Vec::new(),
                         });
                     }
-                    let packet =
-                        Packet::new(Duration::ZERO, Direction::Outgoing, prefix_spec.packet_size)?;
-                    client.apply_qcsd_action(
+                    current_stage_slots = queue_prefix_stage_targets(
+                        &mut client,
                         loop_now,
-                        QcsdAction::SendPacket {
-                            endpoint: QcsdEndpointId(0),
-                            packet,
-                            slot: QcsdSlotId(1),
-                            deadline_after_us: u64::try_from(
-                                Duration::from_secs(timeout_seconds).as_micros(),
-                            )
-                            .unwrap_or(u64::MAX),
-                            allow_stream_data: true,
-                        },
+                        first_stage,
+                        prefix_spec.packet_size,
+                        timeout_seconds,
+                        &mut next_slot_id,
+                        &mut scheduled_slots,
                     )?;
-                    target_queued = true;
+                    qualification_started = true;
                 }
             }
 
-            target_satisfied |=
-                record_prefix_observations(&mut client, &mut requests, &mut transmissions)?;
-            let receipts = prefix_stream_receipts(&requests, &transmissions);
-            let allowed_pending =
-                intentionally_pending_late_chaff(&requests, prefix_spec.required_chaff_survivors);
-            if target_satisfied
-                && prefix_receipts_pass(&receipts, prefix_spec.required_chaff_survivors)
-                && !client.qcsd_has_pending_required_prefix_stream_send(&allowed_pending)
-            {
-                return Ok(());
+            record_prefix_observations(
+                &mut client,
+                &mut requests,
+                &mut transmissions,
+                &scheduled_slots,
+                &mut satisfied_slots,
+            )?;
+            if qualification_started {
+                let stage = &prefix_spec.stream_activation_stages[current_stage_index];
+                let current_targets_satisfied = current_stage_slots
+                    .iter()
+                    .all(|slot_id| satisfied_slots.contains(slot_id));
+                let receipts = prefix_stream_receipts(&requests, &transmissions);
+                let allowed_pending = intentionally_pending_late_chaff(
+                    &requests,
+                    stage.required_active_chaff_streams,
+                );
+                let pending_required =
+                    client.qcsd_has_pending_required_prefix_stream_send(&allowed_pending);
+                if current_targets_satisfied
+                    && prefix_receipts_pass(&receipts, stage.required_active_chaff_streams)
+                    && !pending_required
+                {
+                    let active_chaff: Vec<_> = receipts
+                        .iter()
+                        .filter(|receipt| {
+                            receipt.role == "chaff"
+                                && receipt.acknowledged_unique_ranges
+                                    == [[0, receipt.request_stream_bytes]]
+                                && receipt.fin_acknowledged
+                        })
+                        .collect();
+                    let previously_required =
+                        current_stage_index.checked_sub(1).map_or(0, |previous| {
+                            prefix_spec.stream_activation_stages[previous]
+                                .required_active_chaff_streams
+                        });
+                    let newly_activated: Vec<_> = active_chaff
+                        .iter()
+                        .filter(|receipt| {
+                            receipt
+                                .request_id
+                                .and_then(|id| usize::try_from(id).ok())
+                                .is_some_and(|id| {
+                                    (previously_required..stage.required_active_chaff_streams)
+                                        .contains(&id)
+                                })
+                        })
+                        .collect();
+                    let allowed_pending_orders: Vec<_> = requests
+                        .iter()
+                        .filter(|request| {
+                            allowed_pending.contains(&StreamId::new(request.stream_id))
+                        })
+                        .map(|request| request.request_order)
+                        .collect();
+                    let targetless_at_gate =
+                        prefix_targetless_stream_bytes(&transmissions, &scheduled_slots);
+                    let active_required_count = active_chaff
+                        .iter()
+                        .filter(|receipt| {
+                            receipt
+                                .request_id
+                                .and_then(|id| usize::try_from(id).ok())
+                                .is_some_and(|id| id < stage.required_active_chaff_streams)
+                        })
+                        .count();
+                    let stage_passed = active_required_count == stage.required_active_chaff_streams
+                        && newly_activated.len() == stage.newly_required_chaff_streams
+                        && targetless_at_gate == 0
+                        && !pending_required;
+                    activation_stage_receipts.push(PrefixActivationStageReceipt {
+                        stage_index: current_stage_index,
+                        component_index: stage.component_index,
+                        application_resource_ids: stage.application_resource_ids.clone(),
+                        application_request_orders: requests
+                            .iter()
+                            .filter(|request| {
+                                request.role == "application"
+                                    && request.opening_stage_index == current_stage_index
+                            })
+                            .map(|request| request.request_order)
+                            .collect(),
+                        application_stream_ids: requests
+                            .iter()
+                            .filter(|request| {
+                                request.role == "application"
+                                    && request.opening_stage_index == current_stage_index
+                            })
+                            .map(|request| request.stream_id)
+                            .collect(),
+                        target_slot_ids: current_stage_slots.clone(),
+                        exact_target_cells: stage.exact_target_cells,
+                        scheduled_target_bytes: stage
+                            .exact_target_cells
+                            .saturating_mul(u64::from(prefix_spec.packet_size)),
+                        required_active_chaff_streams: stage.required_active_chaff_streams,
+                        newly_required_chaff_streams: stage.newly_required_chaff_streams,
+                        peer_acknowledged_active_chaff_streams: active_required_count,
+                        newly_peer_acknowledged_request_orders: newly_activated
+                            .iter()
+                            .map(|receipt| receipt.request_order)
+                            .collect(),
+                        newly_peer_acknowledged_stream_ids: newly_activated
+                            .iter()
+                            .map(|receipt| receipt.stream_id)
+                            .collect(),
+                        allowed_pending_chaff_request_orders: allowed_pending_orders,
+                        allowed_pending_chaff_stream_ids: allowed_pending
+                            .iter()
+                            .map(|stream| stream.as_u64())
+                            .collect(),
+                        targetless_stream_bytes_at_gate: targetless_at_gate,
+                        pending_required_prefix_stream_send: pending_required,
+                        passed: stage_passed,
+                    });
+                    if !stage_passed {
+                        return Err(Error::RunAborted(
+                            "prefix stage activation or target ownership invariant failed".into(),
+                        ));
+                    }
+                    if current_stage_index + 1 == prefix_spec.stream_activation_stages.len() {
+                        return Ok(());
+                    }
+                    current_stage_index = current_stage_index.saturating_add(1);
+                    let next_stage = &prefix_spec.stream_activation_stages[current_stage_index];
+                    open_prefix_application_stage(
+                        &mut client,
+                        loop_now,
+                        &runtime_workload,
+                        current_stage_index,
+                        &next_stage.application_resource_ids,
+                        &mut requests,
+                    )?;
+                    current_stage_slots = queue_prefix_stage_targets(
+                        &mut client,
+                        loop_now,
+                        next_stage,
+                        prefix_spec.packet_size,
+                        timeout_seconds,
+                        &mut next_slot_id,
+                        &mut scheduled_slots,
+                    )?;
+                }
             }
 
             let output = client.process_multiple_output(loop_now, NonZeroUsize::MIN);
-            target_satisfied |=
-                record_prefix_observations(&mut client, &mut requests, &mut transmissions)?;
+            record_prefix_observations(
+                &mut client,
+                &mut requests,
+                &mut transmissions,
+                &scheduled_slots,
+                &mut satisfied_slots,
+            )?;
             let delay = match output {
                 OutputBatch::DatagramBatch(batch) => {
                     for datagram in batch.iter() {
                         outgoing.observe(datagram.len(), prefix_spec.packet_size);
                         packet_observations.push(QualificationPacketObservation {
                             sequence: next_packet_sequence,
-                            phase: if target_queued {
+                            phase: if qualification_started {
                                 "qualification"
                             } else {
                                 "warmup"
@@ -2049,14 +2503,6 @@ async fn qualify_chaff_prefix(
                             udp_payload_bytes: datagram.len(),
                         });
                         next_packet_sequence = next_packet_sequence.saturating_add(1);
-                        if target_queued && !target_sent {
-                            first_target_output_count = first_target_output_count.saturating_add(1);
-                            first_target_output_bytes = first_target_output_bytes
-                                .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
-                        }
-                    }
-                    if target_queued {
-                        target_sent = true;
                     }
                     loop {
                         match socket.send(&batch) {
@@ -2081,24 +2527,26 @@ async fn qualify_chaff_prefix(
     }
     .await;
 
-    let final_observation_result =
-        record_prefix_observations(&mut client, &mut requests, &mut transmissions);
+    let final_observation_result = record_prefix_observations(
+        &mut client,
+        &mut requests,
+        &mut transmissions,
+        &scheduled_slots,
+        &mut satisfied_slots,
+    );
     let stream_receipts = prefix_stream_receipts(&requests, &transmissions);
-    let targetless_stream_bytes = transmissions
-        .iter()
-        .filter(|transmission| transmission.slot != Some(QcsdSlotId(1)))
-        .fold(0_u64, |total, transmission| {
-            total.saturating_add(transmission.bytes)
-        });
-    let all_streams_owned = transmissions
-        .iter()
-        .all(|transmission| transmission.slot == Some(QcsdSlotId(1)));
+    let targetless_stream_bytes = prefix_targetless_stream_bytes(&transmissions, &scheduled_slots);
+    let all_streams_owned = transmissions.iter().all(|transmission| {
+        transmission
+            .slot
+            .is_some_and(|slot| scheduled_slots.contains(&slot.0))
+    });
     let post_slot_pending_stream_send = client.qcsd_has_pending_stream_send();
     let allowed_pending =
-        intentionally_pending_late_chaff(&requests, prefix_spec.required_chaff_survivors);
+        intentionally_pending_late_chaff(&requests, prefix_spec.required_chaff_streams);
     let allowed_pending_late_chaff_request_orders: Vec<_> = requests
         .iter()
-        .skip(prefix_spec.required_chaff_survivors.saturating_add(1))
+        .filter(|request| allowed_pending.contains(&StreamId::new(request.stream_id)))
         .map(|request| request.request_order)
         .collect();
     let allowed_pending_late_chaff_stream_ids: Vec<_> = allowed_pending
@@ -2114,13 +2562,17 @@ async fn qualify_chaff_prefix(
         && final_observation_result.is_ok()
         && peer_settings_received
         && warmup_stream_output_drained
-        && requests.len() == 6
-        && target_satisfied
-        && first_target_output_count == 1
-        && first_target_output_bytes == u64::from(prefix_spec.packet_size)
+        && requests
+            .iter()
+            .filter(|request| request.role == "chaff")
+            .count()
+            == prefix_spec.required_chaff_streams
+        && satisfied_slots == scheduled_slots
+        && activation_stage_receipts.len() == prefix_spec.stream_activation_stages.len()
+        && activation_stage_receipts.iter().all(|stage| stage.passed)
         && all_streams_owned
         && targetless_stream_bytes == 0
-        && prefix_receipts_pass(&stream_receipts, prefix_spec.required_chaff_survivors)
+        && prefix_receipts_pass(&stream_receipts, prefix_spec.required_chaff_streams)
         && !post_slot_pending_required_prefix_stream_send
         && incoming.oversized_packet_count == 0
         && outgoing.oversized_packet_count == 0;
@@ -2147,7 +2599,7 @@ async fn qualify_chaff_prefix(
         .or_else(|| final_observation_result.as_ref().err())
         .map(ToString::to_string);
     let mut receipt = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "qcsd-chaff-prefix-pack-qualification",
         "invocation_id": format!("{}-{local_addr}", started_unix_ns),
         "neqo_version": env!("CARGO_PKG_VERSION"),
@@ -2156,6 +2608,9 @@ async fn qualify_chaff_prefix(
         "chaff_core_sha256": chaff_core_sha256,
         "prefix_pack_spec_sha256": prefix_pack_spec_sha256,
         "application_resource_id": application_resource_id,
+        "selected_chaff_resource_id": prefix_spec.selected_chaff_resource_id,
+        "selected_chaff_body_bytes": prefix_spec.selected_chaff_body_bytes,
+        "required_chaff_streams": prefix_spec.required_chaff_streams,
         "workload_id": prefix_spec.workload_id,
         "numeric_profile_sha256": prefix_spec.numeric_profile_sha256,
         "source_walkie_talkie_artifact_sha256": prefix_spec.source_walkie_talkie_artifact_sha256,
@@ -2163,21 +2618,16 @@ async fn qualify_chaff_prefix(
         "max_stream_data_excess": prefix_spec.max_stream_data_excess,
         "maximum_receiver_continuation_reserve_horizon": prefix_spec.maximum_receiver_continuation_reserve_horizon,
         "required_chaff_survivors": prefix_spec.required_chaff_survivors,
-        "max_chaff_streams": 5,
+    });
+    let evidence = json!({
         "connection_count": 1,
         "peer_settings_received": peer_settings_received,
         "warmup_stream_output_drained": warmup_stream_output_drained,
         "packet_cutoff_sequence": packet_cutoff_sequence,
-        "requests_opened_before_first_target": requests.len(),
-        "scheduled_target": {
-            "slot_id": 1,
-            "direction": "outgoing",
-            "udp_payload_bytes": prefix_spec.packet_size,
-            "scheduled_datagrams": 1,
-            "scheduled_bytes": prefix_spec.packet_size,
-            "satisfied_datagrams": u64::from(target_satisfied),
-            "satisfied_bytes": if target_satisfied { prefix_spec.packet_size } else { 0 },
-        },
+        "requests_opened": requests.len(),
+        "scheduled_target_slot_ids": scheduled_slots,
+        "satisfied_target_slot_ids": satisfied_slots,
+        "activation_stage_receipts": activation_stage_receipts,
         "streams": stream_receipts,
         "stream_transmissions": transmissions,
         "packet_observations": packet_observations,
@@ -2188,6 +2638,8 @@ async fn qualify_chaff_prefix(
         "allowed_pending_late_chaff_request_orders": allowed_pending_late_chaff_request_orders,
         "allowed_pending_late_chaff_stream_ids": allowed_pending_late_chaff_stream_ids,
         "targetless_stream_bytes": targetless_stream_bytes,
+    });
+    let completion = json!({
         "completion_status": if passed { "complete" } else { "error" },
         "error": error,
         "started_unix_ns": started_unix_ns,
@@ -2202,6 +2654,18 @@ async fn qualify_chaff_prefix(
     let receipt_object = receipt.as_object_mut().ok_or_else(|| {
         Error::RunAborted("prefix qualification receipt is not a JSON object".into())
     })?;
+    let serde_json::Value::Object(evidence) = evidence else {
+        return Err(Error::RunAborted(
+            "prefix qualification evidence is not a JSON object".into(),
+        ));
+    };
+    receipt_object.extend(evidence);
+    let serde_json::Value::Object(completion) = completion else {
+        return Err(Error::RunAborted(
+            "prefix qualification completion is not a JSON object".into(),
+        ));
+    };
+    receipt_object.extend(completion);
     receipt_object.insert(
         "qpack_decoder_stream_id".into(),
         json!(qpack_decoder_stream_id),
@@ -2259,7 +2723,16 @@ fn load_manifest(path: &Path) -> Result<(ResourceManifest, String), Error> {
     Ok((manifest, sha256(&bytes)?))
 }
 
-fn load_application_workload_source(path: &Path) -> Result<(ResourceManifest, String), Error> {
+fn load_application_workload_source(
+    path: &Path,
+) -> Result<
+    (
+        ResourceManifest,
+        String,
+        BTreeMap<u32, PreparedExpectedResponse>,
+    ),
+    Error,
+> {
     let bytes = fs::read(path)?;
     let source: PreparedWorkloadSource = serde_json::from_slice(&bytes)?;
     if !source.preparation.is_object() || source.replay.is_some() {
@@ -2268,11 +2741,37 @@ fn load_application_workload_source(path: &Path) -> Result<(ResourceManifest, St
                 .into(),
         ));
     }
+    let expected = source
+        .preparation
+        .get("expected_responses")
+        .ok_or_else(|| {
+            Error::Argument(
+                "prepared application source lacks preparation.expected_responses".into(),
+            )
+        })?
+        .clone();
+    let expected: Vec<PreparedExpectedResponse> = serde_json::from_value(expected)?;
+    let mut by_id = BTreeMap::new();
+    for response in expected {
+        if !(200..300).contains(&response.status)
+            || !lower_hex_sha256(&response.body_sha256)
+            || by_id.insert(response.resource_id, response).is_some()
+        {
+            return Err(Error::Argument(
+                "prepared expected response identities are invalid or duplicated".into(),
+            ));
+        }
+    }
+    if by_id.is_empty() {
+        return Err(Error::Argument(
+            "prepared expected response identities are empty".into(),
+        ));
+    }
     let manifest = ResourceManifest {
         resources: source.resources,
     };
     manifest.validate()?;
-    Ok((manifest, sha256(&bytes)?))
+    Ok((manifest, sha256(&bytes)?, by_id))
 }
 
 fn load_chaff_manifest(path: &Path) -> Result<(ChaffManifest, String), Error> {
@@ -2306,22 +2805,8 @@ fn lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn maximum_receiver_continuation_reserve_horizon(bursts: &[PrefixBurst]) -> usize {
-    let mut maximum = 0_usize;
-    for (index, burst) in bursts.iter().enumerate() {
-        if burst.incoming == 0 {
-            continue;
-        }
-        let mut horizon = 0_usize;
-        for (offset, candidate) in bursts[index..].iter().enumerate() {
-            if offset > 0 && candidate.outgoing > 0 {
-                break;
-            }
-            horizon = horizon.saturating_add(usize::from(candidate.incoming > 0));
-        }
-        maximum = maximum.max(horizon);
-    }
-    maximum
+fn all_future_receiver_continuation_reserve_horizon(bursts: &[PrefixBurst]) -> usize {
+    bursts.iter().filter(|burst| burst.incoming > 0).count()
 }
 
 fn prefix_numeric_profile_sha256(profile: &PrefixNumericProfile) -> Result<String, Error> {
@@ -2336,8 +2821,8 @@ fn prefix_numeric_profile_sha256(profile: &PrefixNumericProfile) -> Result<Strin
 }
 
 fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
-    let horizon = maximum_receiver_continuation_reserve_horizon(&spec.numeric_profile.bursts);
-    if spec.schema_version != 1
+    let horizon = all_future_receiver_continuation_reserve_horizon(&spec.numeric_profile.bursts);
+    if spec.schema_version != 2
         || spec.artifact_type != "qcsd-walkie-talkie-prefix-pack-spec"
         || spec.workload_id.trim().is_empty()
         || spec.packet_size != 1_200
@@ -2347,7 +2832,10 @@ fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
         || horizon == 0
         || spec.maximum_receiver_continuation_reserve_horizon != horizon
         || spec.required_chaff_survivors != horizon.saturating_add(1)
-        || spec.required_chaff_survivors > 5
+        || spec.application_resource_id != 0
+        || spec.selected_chaff_body_bytes < u64::from(spec.packet_size)
+        || !(spec.required_chaff_survivors..=20).contains(&spec.required_chaff_streams)
+        || spec.stream_activation_stages.len() != spec.numeric_profile.bursts.len()
         || !lower_hex_sha256(&spec.numeric_profile_sha256)
         || !lower_hex_sha256(&spec.source_walkie_talkie_artifact_sha256)
         || prefix_numeric_profile_sha256(&spec.numeric_profile)? != spec.numeric_profile_sha256
@@ -2356,19 +2844,236 @@ fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
             "prefix-pack specification schema or numeric derivation is invalid".into(),
         ));
     }
+    validate_prefix_capacity_plan(spec)
+}
+
+fn validate_prefix_capacity_plan(spec: &PrefixPackSpec) -> Result<(), Error> {
+    if spec.stream_activation_stages.len() != spec.numeric_profile.bursts.len() {
+        return Err(Error::Argument(
+            "prefix capacity plan must cover every numeric component exactly once".into(),
+        ));
+    }
+    let mut previous_active = 0_usize;
+    let mut previous_exact_capacity_after = 0_u64;
+    let mut application_ids = BTreeSet::new();
+    for (stage_index, stage) in spec.stream_activation_stages.iter().enumerate() {
+        let burst = &spec.numeric_profile.bursts[stage_index];
+        let expected_future_reserves = spec.numeric_profile.bursts[stage_index..]
+            .iter()
+            .filter(|candidate| candidate.incoming > 0)
+            .count();
+        let expected_symmetric = stage
+            .adapted_incoming_cells
+            .saturating_sub(u64::from(stage.adapted_incoming_cells > 0));
+        let expected_base_chaff_bytes = stage
+            .symmetric_incoming_cells
+            .checked_mul(u64::from(spec.packet_size))
+            .ok_or_else(|| Error::Argument("prefix base capacity overflows u64".into()))?
+            .saturating_sub(stage.application_body_floor_bytes);
+        let expected_continuation_bytes =
+            u64::from(spec.packet_size) * u64::from(stage.adapted_incoming_cells > 0);
+        let newly_required_bytes = u64::try_from(stage.newly_required_chaff_streams)
+            .ok()
+            .and_then(|count| count.checked_mul(spec.selected_chaff_body_bytes))
+            .ok_or_else(|| Error::Argument("new chaff capacity overflows u64".into()))?;
+        let expected_exact_before = previous_exact_capacity_after
+            .checked_add(newly_required_bytes)
+            .ok_or_else(|| Error::Argument("exact chaff capacity overflows u64".into()))?;
+        let reserved_bytes = u64::try_from(expected_future_reserves)
+            .ok()
+            .and_then(|count| count.checked_mul(spec.selected_chaff_body_bytes))
+            .ok_or_else(|| Error::Argument("future reserve capacity overflows u64".into()))?;
+        let Some(expected_ordinary_before) = expected_exact_before.checked_sub(reserved_bytes)
+        else {
+            return Err(Error::Argument(format!(
+                "component {stage_index} lacks its exact future continuation reserves"
+            )));
+        };
+        let Some(expected_exact_after) = expected_exact_before
+            .checked_sub(expected_base_chaff_bytes)
+            .and_then(|capacity| capacity.checked_sub(expected_continuation_bytes))
+        else {
+            return Err(Error::Argument(format!(
+                "component {stage_index} consumes more exact chaff capacity than is available"
+            )));
+        };
+        let consumed_reserve = usize::from(stage.adapted_incoming_cells > 0);
+        let remaining_reserve_bytes =
+            u64::try_from(expected_future_reserves.saturating_sub(consumed_reserve))
+                .ok()
+                .and_then(|count| count.checked_mul(spec.selected_chaff_body_bytes))
+                .ok_or_else(|| {
+                    Error::Argument("remaining reserve capacity overflows u64".into())
+                })?;
+        if stage.exact_target_cells == 0
+            || stage.component_index != stage_index
+            || stage.exact_target_cells != stage.outgoing_cells
+            || stage.outgoing_cells != burst.outgoing
+            || stage.adapted_incoming_cells != burst.incoming
+            || stage.symmetric_incoming_cells != expected_symmetric
+            || stage.required_active_chaff_streams < previous_active
+            || stage.required_active_chaff_streams > spec.required_chaff_streams
+            || stage.newly_required_chaff_streams
+                != stage
+                    .required_active_chaff_streams
+                    .saturating_sub(previous_active)
+            || stage.future_continuation_reserves != expected_future_reserves
+            || (stage_index == 0
+                && (stage.application_resource_ids.as_slice() != [spec.application_resource_id]
+                    || stage.required_active_chaff_streams != spec.required_chaff_survivors))
+            || stage
+                .application_resource_ids
+                .iter()
+                .any(|resource_id| !application_ids.insert(*resource_id))
+            || stage.base_chaff_bytes != expected_base_chaff_bytes
+            || stage.continuation_bytes != expected_continuation_bytes
+            || stage.exact_capacity_before_bytes != expected_exact_before
+            || stage.ordinary_capacity_before_bytes != expected_ordinary_before
+            || stage.exact_capacity_after_bytes != expected_exact_after
+            || stage.early_continuation_required
+                != (expected_base_chaff_bytes > expected_ordinary_before)
+            || expected_exact_after < remaining_reserve_bytes
+        {
+            return Err(Error::Argument(
+                "prefix activation stage ordering, target, cohort, or application batch is invalid"
+                    .into(),
+            ));
+        }
+        previous_active = stage.required_active_chaff_streams;
+        previous_exact_capacity_after = expected_exact_after;
+    }
+    if previous_active != spec.required_chaff_streams {
+        return Err(Error::Argument(
+            "final prefix activation stage must prove the exact required chaff cohort".into(),
+        ));
+    }
     Ok(())
 }
 
+fn validate_prefix_prepared_response_binding(
+    spec: &PrefixPackSpec,
+    workload: &ResourceManifest,
+    expected: &BTreeMap<u32, PreparedExpectedResponse>,
+) -> Result<(), Error> {
+    let application_batches = application_resource_batches(workload)?;
+    let application = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == spec.application_resource_id)
+        .ok_or_else(|| Error::Argument("application navigation root is absent".into()))?;
+    let (selected_resource, selected) =
+        deterministic_selected_chaff_resource(workload, expected, application)?;
+    if selected_resource.id != spec.selected_chaff_resource_id
+        || selected.bytes != spec.selected_chaff_body_bytes
+    {
+        return Err(Error::Argument(
+            "prefix spec selected chaff identity or body length is not the deterministic frozen source"
+                .into(),
+        ));
+    }
+    for (stage_index, stage) in spec.stream_activation_stages.iter().enumerate() {
+        let expected_ids = application_batches
+            .get(stage_index)
+            .map_or(&[][..], Vec::as_slice);
+        if stage.application_resource_ids != expected_ids {
+            return Err(Error::Argument(format!(
+                "component {stage_index} application_resource_ids do not equal the frozen dependency batch"
+            )));
+        }
+        let mut body_floor = 0_u64;
+        for resource_id in &stage.application_resource_ids {
+            if !workload
+                .resources
+                .iter()
+                .any(|resource| resource.id == *resource_id)
+            {
+                return Err(Error::Argument(format!(
+                    "activation-stage resource {resource_id} is absent from the frozen source"
+                )));
+            }
+            let response = expected.get(resource_id).ok_or_else(|| {
+                Error::Argument(format!(
+                    "activation-stage resource {resource_id} lacks a prepared response identity"
+                ))
+            })?;
+            body_floor = body_floor.checked_add(response.bytes).ok_or_else(|| {
+                Error::Argument("activation-stage application body floor overflows u64".into())
+            })?;
+        }
+        if body_floor != stage.application_body_floor_bytes {
+            return Err(Error::Argument(format!(
+                "component {} application_body_floor_bytes is {}, expected exact prepared body sum {body_floor}",
+                stage.component_index, stage.application_body_floor_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn application_resource_batches(workload: &ResourceManifest) -> Result<Vec<Vec<u32>>, Error> {
+    let mut depths = BTreeMap::<u32, usize>::new();
+    while depths.len() < workload.resources.len() {
+        let before = depths.len();
+        for resource in &workload.resources {
+            if depths.contains_key(&resource.id) {
+                continue;
+            }
+            let depth = if resource.depends_on.is_empty() {
+                Some(0)
+            } else {
+                resource
+                    .depends_on
+                    .iter()
+                    .map(|dependency| depths.get(dependency).copied())
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|values| values.into_iter().max())
+                    .map(|maximum| maximum.saturating_add(1))
+            };
+            if let Some(depth) = depth {
+                depths.insert(resource.id, depth);
+            }
+        }
+        if depths.len() == before {
+            return Err(Error::Argument(
+                "frozen application dependency graph is cyclic or unresolved".into(),
+            ));
+        }
+    }
+    let maximum = depths.values().copied().max().unwrap_or(0);
+    let mut batches = vec![Vec::new(); maximum.saturating_add(1)];
+    for (resource_id, depth) in depths {
+        batches[depth].push(resource_id);
+    }
+    for batch in &mut batches {
+        batch.sort_unstable();
+    }
+    if batches.first().map(Vec::as_slice) != Some(&[0]) {
+        return Err(Error::Argument(
+            "frozen application dependency batch zero must contain only navigation root zero"
+                .into(),
+        ));
+    }
+    Ok(batches)
+}
+
+#[expect(
+    clippy::suspicious_operation_groupings,
+    reason = "the canonical core deliberately maps differently named selected-resource and prepared-response fields"
+)]
 fn validate_chaff_core_binding(
     core: &QualifiedChaffCore,
     workload: &ResourceManifest,
     workload_hash: &str,
-    application_resource_id: u32,
+    spec: &PrefixPackSpec,
+    expected: &BTreeMap<u32, PreparedExpectedResponse>,
 ) -> Result<(), Error> {
-    if core.schema_version != 1
+    if core.schema_version != 2
         || core.artifact_type != "qcsd-qualified-chaff-core"
         || core.application_workload_sha256 != workload_hash
-        || core.application_resource_id != application_resource_id
+        || core.application_resource_id != spec.application_resource_id
+        || core.selected_chaff_resource_id != spec.selected_chaff_resource_id
+        || core.qualified_parallel_chaff_streams != spec.required_chaff_streams.max(5)
+        || core.walkie_talkie_required_chaff_streams != spec.required_chaff_streams
         || core.resources.len() != 1
     {
         return Err(Error::Argument(
@@ -2378,25 +3083,45 @@ fn validate_chaff_core_binding(
     let application = workload
         .resources
         .iter()
-        .find(|resource| resource.id == application_resource_id)
+        .find(|resource| resource.id == spec.application_resource_id)
         .ok_or_else(|| Error::Argument("application root is absent from workload".into()))?;
-    validate_qualification_application_root(application, application_resource_id)?;
-    let compact_headers = projected_ael(application)?;
+    validate_qualification_application_root(application, spec.application_resource_id)?;
+    let selected = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == spec.selected_chaff_resource_id)
+        .ok_or_else(|| Error::Argument("selected chaff resource is absent from workload".into()))?;
+    if selected.origin().is_none() || selected.origin() != application.origin() {
+        return Err(Error::Argument(
+            "selected chaff resource does not share the navigation root origin".into(),
+        ));
+    }
+    let compact_headers = projected_ael(selected)?;
     let resource = &core.resources[0];
     let qualification = &resource.chaff_qualification_core;
     let response = &qualification.expected_response;
-    if resource.id != application_resource_id
-        || resource.url != application.url
-        || resource.kind != application.kind
-        || resource.chaff_priority != application.chaff_priority
+    let prepared_selected = expected
+        .get(&spec.selected_chaff_resource_id)
+        .ok_or_else(|| Error::Argument("selected prepared response identity is absent".into()))?;
+    if (resource.id != spec.selected_chaff_resource_id)
+        || resource.url != selected.url
+        || resource.kind != selected.kind
+        || resource.chaff_priority != selected.chaff_priority
         || !resource.known_valid
         || !resource.depends_on.is_empty()
         || resource.headers != compact_headers
-        || qualification.schema_version != 1
+        || qualification.schema_version != 2
         || qualification.method != "GET"
         || qualification.request_stream_bytes == 0
+        || qualification.qualified_parallel_chaff_streams != core.qualified_parallel_chaff_streams
+        || qualification.walkie_talkie_required_chaff_streams
+            != core.walkie_talkie_required_chaff_streams
         || !(200..300).contains(&response.status)
         || response.body_bytes < 1_200
+        || (response.body_bytes != spec.selected_chaff_body_bytes)
+        || response.status != prepared_selected.status
+        || response.body_bytes != prepared_selected.bytes
+        || response.body_sha256 != prepared_selected.body_sha256
         || resource.content_length != Some(response.body_bytes)
         || resource.data_length != response.body_bytes
         || normalize_content_encoding(Some(&response.content_encoding)).as_deref()
@@ -2502,13 +3227,15 @@ fn validate_walkie_talkie_chaff_precondition(spec: &RunSpec) -> Result<(), Error
         Error::Argument("Walkie-Talkie requires a raw qualified chaff manifest hash".into())
     })?;
     let chaff = spec.chaff_manifest.as_ref().expect("defended run gate");
-    let prefix_spec_hash = &chaff.resources[0].chaff_qualification.prefix_spec_sha256;
-    if binding.workload_id != config.workload_id
-        || binding.qualified_chaff_manifest_sha256 != chaff_manifest_hash
-        || binding.prefix_pack_spec_sha256 != *prefix_spec_hash
-    {
+    if !walkie_talkie_qualification_binding_matches(
+        &binding,
+        &config.workload_id,
+        chaff_manifest_hash,
+        chaff,
+        spec.config.max_chaff_streams,
+    ) {
         return Err(Error::Argument(
-            "Walkie-Talkie selected qualification binding does not match the exact chaff manifest and embedded prefix-pack spec hashes"
+            "Walkie-Talkie selected qualification binding does not match the exact chaff manifest resource identities, stream counts, or embedded prefix-pack spec hashes"
                 .into(),
         ));
     }
@@ -2534,11 +3261,37 @@ fn validate_walkie_talkie_chaff_precondition(spec: &RunSpec) -> Result<(), Error
     Ok(())
 }
 
+fn walkie_talkie_qualification_binding_matches(
+    binding: &WalkieTalkieQualificationBinding,
+    workload_id: &str,
+    chaff_manifest_hash: &str,
+    chaff: &ChaffManifest,
+    effective_max_chaff_streams: usize,
+) -> bool {
+    let Some(resource) = chaff.resources.first() else {
+        return false;
+    };
+    binding.workload_id == workload_id
+        && binding.qualified_chaff_manifest_sha256 == chaff_manifest_hash
+        && binding.prefix_pack_spec_sha256 == resource.chaff_qualification.prefix_spec_sha256
+        && binding.application_resource_id == chaff.application_resource_id
+        && binding.selected_chaff_resource_id == chaff.selected_chaff_resource_id
+        && binding.qualified_parallel_chaff_streams == chaff.qualified_parallel_chaff_streams
+        && binding.walkie_talkie_required_chaff_streams
+            == chaff.walkie_talkie_required_chaff_streams
+        && effective_max_chaff_streams == chaff.walkie_talkie_required_chaff_streams
+}
+
+#[expect(
+    clippy::suspicious_operation_groupings,
+    clippy::too_many_lines,
+    reason = "the runtime gate compares one qualified manifest against its frozen source and prepared response identities"
+)]
 fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash)) = &spec.application_workload_source else {
+    let Some((source, source_hash, expected_responses)) = &spec.application_workload_source else {
         return Err(Error::Argument(
             "qualified chaff requires an exact application workload source binding".into(),
         ));
@@ -2550,7 +3303,15 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         ));
     }
     let qualified = &chaff.resources[0];
-    let application = spec
+    let prepared_selected = expected_responses
+        .get(&chaff.selected_chaff_resource_id)
+        .ok_or_else(|| {
+            Error::Argument(
+                "qualified chaff selected resource lacks a frozen prepared response identity"
+                    .into(),
+            )
+        })?;
+    let application_root = spec
         .workload
         .resources
         .iter()
@@ -2560,7 +3321,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
                 "qualified chaff application_resource_id is absent from the workload".into(),
             )
         })?;
-    let source_application = source
+    let source_application_root = source
         .resources
         .iter()
         .find(|resource| resource.id == chaff.application_resource_id)
@@ -2570,52 +3331,100 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
             )
         })?;
     if (
-        &application.url,
-        &application.kind,
-        application.chaff_priority,
-        application.known_valid,
-        &application.depends_on,
-        projected_ael(application)?,
+        &application_root.url,
+        &application_root.kind,
+        application_root.chaff_priority,
+        application_root.known_valid,
+        &application_root.depends_on,
+        &application_root.headers,
     ) != (
-        &source_application.url,
-        &source_application.kind,
-        source_application.chaff_priority,
-        source_application.known_valid,
-        &source_application.depends_on,
-        projected_ael(source_application)?,
+        &source_application_root.url,
+        &source_application_root.kind,
+        source_application_root.chaff_priority,
+        source_application_root.known_valid,
+        &source_application_root.depends_on,
+        &source_application_root.headers,
     ) {
         return Err(Error::Argument(
-            "runtime workload and frozen application source disagree on the qualified root request"
+            "runtime workload and frozen application source disagree on the navigation root request"
                 .into(),
         ));
     }
-    if !application.depends_on.is_empty() || application.url != qualified.url {
-        return Err(Error::Argument(
-            "qualified chaff must bind the exact dependency-free application root URL".into(),
-        ));
-    }
-    let projected: Vec<_> = application
-        .headers
-        .iter()
-        .filter(|(name, _)| {
-            matches!(
-                name.to_ascii_lowercase().as_str(),
-                "accept" | "accept-encoding" | "accept-language"
-            )
-        })
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-        .collect();
-    if application.kind != qualified.kind
-        || application.chaff_priority != qualified.chaff_priority
-        || !application.known_valid
-        || projected != qualified.headers
+    validate_qualification_application_root(application_root, chaff.application_resource_id)?;
+    let (deterministic_selected, deterministic_response) =
+        deterministic_selected_chaff_resource(source, expected_responses, source_application_root)?;
+    if deterministic_selected.id != chaff.selected_chaff_resource_id
+        || deterministic_response.resource_id != chaff.selected_chaff_resource_id
     {
         return Err(Error::Argument(
-            "qualified chaff root metadata or exact AEL projection does not match its bound application root"
+            "qualified chaff manifest does not select the deterministic frozen same-origin resource"
+                .into(),
+        ));
+    }
+    let selected = spec
+        .workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == chaff.selected_chaff_resource_id)
+        .ok_or_else(|| {
+            Error::Argument(
+                "qualified chaff selected_chaff_resource_id is absent from the workload".into(),
+            )
+        })?;
+    let source_selected = source
+        .resources
+        .iter()
+        .find(|resource| resource.id == chaff.selected_chaff_resource_id)
+        .ok_or_else(|| {
+            Error::Argument(
+                "qualified chaff selected_chaff_resource_id is absent from the frozen source"
+                    .into(),
+            )
+        })?;
+    if (
+        &selected.url,
+        &selected.kind,
+        selected.chaff_priority,
+        selected.known_valid,
+        &selected.depends_on,
+        projected_ael(selected)?,
+    ) != (
+        &source_selected.url,
+        &source_selected.kind,
+        source_selected.chaff_priority,
+        source_selected.known_valid,
+        &source_selected.depends_on,
+        projected_ael(source_selected)?,
+    ) {
+        return Err(Error::Argument(
+            "runtime workload and frozen application source disagree on the selected chaff request"
+                .into(),
+        ));
+    }
+    if selected.origin().is_none()
+        || selected.origin() != application_root.origin()
+        || selected.url != qualified.url
+        || selected.kind != qualified.kind
+        || selected.chaff_priority != qualified.chaff_priority
+        || !selected.known_valid
+        || projected_ael(selected)? != qualified.headers
+    {
+        return Err(Error::Argument(
+            "qualified chaff selected-resource metadata, origin, or exact AEL projection is invalid"
                 .into(),
         ));
     }
     let expected = qualified.chaff_qualification.expected_response.body_bytes;
+    let identity = &qualified.chaff_qualification.expected_response;
+    if identity.status != prepared_selected.status
+        || (identity.body_bytes != prepared_selected.bytes)
+        || identity.body_sha256 != prepared_selected.body_sha256
+    {
+        return Err(Error::Argument(
+            "qualified chaff response identity does not match frozen prepared status, body length, and body SHA-256"
+                .into(),
+        ));
+    }
     if expected > spec.max_response_bytes {
         return Err(Error::Argument(format!(
             "qualified chaff response body {expected} exceeds max_response_bytes {}",
@@ -4237,7 +5046,7 @@ fn apply_action(
                     .and_then(|manifest| manifest.qualification(resource_id))
                     .ok_or_else(|| {
                         Error::RunAborted(
-                            "chaff request lacks a schema-one qualification binding".into(),
+                            "chaff request lacks a current schema-two qualification binding".into(),
                         )
                     })?;
                 if request_stream_bytes != qualification.request_stream_bytes {
@@ -4619,7 +5428,7 @@ fn write_run_json(
         "method": spec.method,
         "request_policy": spec.request_policy,
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash)| hash),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _)| hash),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -4677,7 +5486,7 @@ fn now() -> Instant {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         fs,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         path::PathBuf,
@@ -4691,27 +5500,31 @@ mod tests {
         DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig, MissedSlotReason, Packet,
         QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass,
         QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId,
-        QcsdStreamFinish, QcsdStreamId, QualifiedChaffResource, Resource, ResourceManifest,
-        SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
-        WalkieTalkieConfig, WtfPad, WtfPadConfig, sanitize_chaff_headers,
+        QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource,
+        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
+        WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig,
+        sanitize_chaff_headers,
     };
 
     use super::{
-        ApplicationBatchLifecycle, Args, DefenseArg, Error, ExpectedChaffIdentity, Preset,
-        ProfileArg, QcsdRequestRole, QualifierStream, RequestPolicyArg, ResourceRunState,
-        RunCompletion, RunSpec, Socket, StaticModeArg, StreamRecord, StreamType,
-        TrafficMorphingActivation, action_failure_reason, activate_traffic_morphing,
-        apply_action_batch, bounded_qualification_wait, create_endpoints, datagram_observation,
-        deadline_error, defense_parameter_provenance, drain_qualifier_stream_data,
-        ensure_defense_realizable, expected_application_response_length, finish_application_record,
-        finish_chaff_record, forward_qcsd_observation, has_in_flight_application_stream, now,
-        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
-        record_terminal_action, register_action_batch, resolve_run_config,
+        ApplicationBatchLifecycle, Args, DefenseArg, Error, ExpectedChaffIdentity, PrefixBurst,
+        PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt, Preset, ProfileArg,
+        QcsdRequestRole, QualificationAcknowledgement, QualifierStream, RequestPolicyArg,
+        ResourceRunState, RunCompletion, RunSpec, Socket, StaticModeArg, StreamActivationStage,
+        StreamRecord, StreamType, TrafficMorphingActivation, action_failure_reason,
+        activate_traffic_morphing, apply_action_batch, bind_qualified_chaff_stream_limits,
+        bounded_qualification_wait, create_endpoints, datagram_observation, deadline_error,
+        defense_parameter_provenance, drain_qualifier_stream_data, ensure_defense_realizable,
+        expected_application_response_length, finish_application_record, finish_chaff_record,
+        forward_qcsd_observation, has_in_flight_application_stream, now, prefix_receipts_pass,
+        prefix_targetless_stream_bytes, qcsd_connection_parameters, qualification_content_encoding,
+        ready_request_batch, record_terminal_action, register_action_batch, resolve_run_config,
         resolve_run_config_with_workload, sanitize_chaff_action_headers, sha256,
         shapes_stream_sends, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
-        traffic_morphing_endpoint_seed, validate_walkie_talkie_chaff_precondition,
-        wait_for_activity, write_run_json,
+        traffic_morphing_endpoint_seed, validate_prefix_capacity_plan,
+        validate_walkie_talkie_chaff_precondition, wait_for_activity,
+        walkie_talkie_qualification_binding_matches, write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -4790,9 +5603,11 @@ mod tests {
                 depends_on: resource.depends_on,
                 headers: resource.headers,
                 chaff_qualification: ChaffQualification {
-                    schema_version: 1,
+                    schema_version: 2,
                     method: "GET".into(),
                     request_stream_bytes: 1,
+                    qualified_parallel_chaff_streams: 5,
+                    walkie_talkie_required_chaff_streams: 5,
                     expected_response: ExpectedChaffResponse {
                         status: 200,
                         content_encoding: "identity".into(),
@@ -4806,12 +5621,15 @@ mod tests {
             })
             .collect();
         ChaffManifest {
-            schema_version: 1,
+            schema_version: 2,
             artifact_type: "qcsd-qualified-chaff-manifest".into(),
             application_workload_sha256: "e".repeat(64),
-            application_resource_id: resources
+            application_resource_id: 0,
+            selected_chaff_resource_id: resources
                 .first()
                 .map_or(0, |resource: &QualifiedChaffResource| resource.id),
+            qualified_parallel_chaff_streams: 5,
+            walkie_talkie_required_chaff_streams: 5,
             resources,
         }
     }
@@ -4886,6 +5704,101 @@ mod tests {
             sanitize_chaff_headers(vec![("Accept".into(), "text/html".into())]),
             vec![("accept".into(), "text/html".into())]
         );
+    }
+
+    #[test]
+    fn qualified_manifest_rewrites_walkie_talkie_limit_before_provenance_use() {
+        let resource = Resource {
+            id: 6,
+            url: "https://example.com/font.woff2".into(),
+            kind: "Font".into(),
+            content_length: Some(1),
+            data_length: 1,
+            chaff_priority: false,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        let mut manifest = qualified_chaff_manifest(vec![resource]);
+        manifest.qualified_parallel_chaff_streams = 20;
+        manifest.walkie_talkie_required_chaff_streams = 20;
+        manifest.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 20;
+        manifest.resources[0]
+            .chaff_qualification
+            .walkie_talkie_required_chaff_streams = 20;
+        let mut config = QcsdConfig {
+            max_chaff_streams: 5,
+            defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
+            ..QcsdConfig::default()
+        };
+
+        bind_qualified_chaff_stream_limits(&mut config, &manifest)
+            .expect("hash-bound exact stream count");
+        assert_eq!(config.max_chaff_streams, 20);
+
+        manifest.qualified_parallel_chaff_streams = 5;
+        manifest.walkie_talkie_required_chaff_streams = 3;
+        manifest.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 5;
+        manifest.resources[0]
+            .chaff_qualification
+            .walkie_talkie_required_chaff_streams = 3;
+        config.max_chaff_streams = 20;
+        bind_qualified_chaff_stream_limits(&mut config, &manifest)
+            .expect("WT replaces a common ceiling before checking qualified concurrency");
+        assert_eq!(config.max_chaff_streams, 3);
+    }
+
+    #[test]
+    fn walkie_talkie_binding_requires_exact_resource_ids_and_stream_counts() {
+        let resource = Resource {
+            id: 6,
+            url: "https://example.com/font.woff2".into(),
+            kind: "Font".into(),
+            content_length: Some(1_200),
+            data_length: 1_200,
+            chaff_priority: false,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        let manifest = qualified_chaff_manifest(vec![resource]);
+        let binding = WalkieTalkieQualificationBinding {
+            workload_id: "workload".into(),
+            chaff_qualification_sidecar_sha256: "a".repeat(64),
+            prefix_pack_spec_sha256: "d".repeat(64),
+            qualified_chaff_manifest_sha256: "f".repeat(64),
+            application_resource_id: 0,
+            selected_chaff_resource_id: 6,
+            qualified_parallel_chaff_streams: 5,
+            walkie_talkie_required_chaff_streams: 5,
+        };
+        let matches = |binding: &WalkieTalkieQualificationBinding| {
+            walkie_talkie_qualification_binding_matches(
+                binding,
+                "workload",
+                &"f".repeat(64),
+                &manifest,
+                5,
+            )
+        };
+        assert!(matches(&binding));
+
+        let mut mutated = binding.clone();
+        mutated.application_resource_id = 1;
+        assert!(!matches(&mutated));
+        mutated = binding.clone();
+        mutated.selected_chaff_resource_id = 7;
+        assert!(!matches(&mutated));
+        mutated = binding.clone();
+        mutated.qualified_parallel_chaff_streams = 6;
+        assert!(!matches(&mutated));
+        mutated = binding;
+        mutated.walkie_talkie_required_chaff_streams = 4;
+        assert!(!matches(&mutated));
     }
 
     #[test]
@@ -7078,5 +7991,187 @@ mod tests {
             bounded_qualification_wait(Duration::from_secs(60), now(), 30),
             Err(Error::Timeout(30))
         ));
+    }
+
+    fn two_stage_prefix_spec() -> PrefixPackSpec {
+        PrefixPackSpec {
+            schema_version: 2,
+            artifact_type: "qcsd-walkie-talkie-prefix-pack-spec".into(),
+            workload_id: "capacity-test".into(),
+            packet_size: 1_200,
+            max_stream_data_excess: 1_000,
+            maximum_receiver_continuation_reserve_horizon: 2,
+            required_chaff_survivors: 3,
+            numeric_profile_sha256: "a".repeat(64),
+            source_walkie_talkie_artifact_sha256: "b".repeat(64),
+            application_resource_id: 0,
+            selected_chaff_resource_id: 6,
+            selected_chaff_body_bytes: 10_000,
+            required_chaff_streams: 4,
+            numeric_profile: PrefixNumericProfile {
+                bursts: vec![
+                    PrefixBurst {
+                        incoming: 2,
+                        outgoing: 1,
+                    },
+                    PrefixBurst {
+                        incoming: 2,
+                        outgoing: 1,
+                    },
+                ],
+                packet_size: 1_200,
+            },
+            stream_activation_stages: vec![
+                StreamActivationStage {
+                    component_index: 0,
+                    application_resource_ids: vec![0],
+                    exact_target_cells: 1,
+                    outgoing_cells: 1,
+                    symmetric_incoming_cells: 1,
+                    adapted_incoming_cells: 2,
+                    application_body_floor_bytes: 200,
+                    base_chaff_bytes: 1_000,
+                    continuation_bytes: 1_200,
+                    required_active_chaff_streams: 3,
+                    newly_required_chaff_streams: 3,
+                    future_continuation_reserves: 2,
+                    exact_capacity_before_bytes: 30_000,
+                    ordinary_capacity_before_bytes: 10_000,
+                    exact_capacity_after_bytes: 27_800,
+                    early_continuation_required: false,
+                },
+                StreamActivationStage {
+                    component_index: 1,
+                    application_resource_ids: vec![1],
+                    exact_target_cells: 1,
+                    outgoing_cells: 1,
+                    symmetric_incoming_cells: 1,
+                    adapted_incoming_cells: 2,
+                    application_body_floor_bytes: 1_200,
+                    base_chaff_bytes: 0,
+                    continuation_bytes: 1_200,
+                    required_active_chaff_streams: 4,
+                    newly_required_chaff_streams: 1,
+                    future_continuation_reserves: 1,
+                    exact_capacity_before_bytes: 37_800,
+                    ordinary_capacity_before_bytes: 27_800,
+                    exact_capacity_after_bytes: 36_600,
+                    early_continuation_required: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn prefix_capacity_plan_covers_every_component_and_checks_exact_recurrence() {
+        let spec = two_stage_prefix_spec();
+        validate_prefix_capacity_plan(&spec).expect("valid exact recurrence");
+
+        let mut one_adapted_cell = two_stage_prefix_spec();
+        one_adapted_cell.numeric_profile.bursts[1].incoming = 1;
+        one_adapted_cell.stream_activation_stages[1].adapted_incoming_cells = 1;
+        one_adapted_cell.stream_activation_stages[1].symmetric_incoming_cells = 0;
+        validate_prefix_capacity_plan(&one_adapted_cell)
+            .expect("one adapted incoming cell has zero symmetric base cells");
+        one_adapted_cell.stream_activation_stages[1].symmetric_incoming_cells = 1;
+        assert!(validate_prefix_capacity_plan(&one_adapted_cell).is_err());
+
+        let mut mutated = two_stage_prefix_spec();
+        mutated.stream_activation_stages[1].ordinary_capacity_before_bytes += 1;
+        assert!(validate_prefix_capacity_plan(&mutated).is_err());
+
+        let mut sparse = two_stage_prefix_spec();
+        sparse.stream_activation_stages.pop();
+        assert!(validate_prefix_capacity_plan(&sparse).is_err());
+    }
+
+    #[test]
+    fn prefix_stage_gate_allows_later_cohort_to_begin_early_but_not_activate_early() {
+        let app_acks = Vec::<QualificationAcknowledgement>::new();
+        let chaff_acks: Vec<_> = (0..4)
+            .map(|index| {
+                vec![QualificationAcknowledgement {
+                    sequence: index,
+                    offset: 0,
+                    bytes: 10,
+                    fin: true,
+                }]
+            })
+            .collect();
+        let mut receipts = vec![PrefixStreamReceipt {
+            request_order: 0,
+            opening_stage_index: 0,
+            role: "application",
+            resource_id: 0,
+            request_id: None,
+            stream_id: 0,
+            request_stream_bytes: 10,
+            qualified_request_stream_bytes: None,
+            transmitted_unique_ranges: vec![[0, 10]],
+            transmitted_unique_bytes: 10,
+            fin_transmitted: true,
+            acknowledgements: &app_acks,
+            acknowledged_unique_ranges: Vec::new(),
+            acknowledged_unique_bytes: 0,
+            fin_acknowledged: false,
+        }];
+        for (index, acknowledgements) in chaff_acks.iter().enumerate().take(4) {
+            let complete = index < 3;
+            receipts.push(PrefixStreamReceipt {
+                request_order: index + 1,
+                opening_stage_index: 0,
+                role: "chaff",
+                resource_id: 6,
+                request_id: Some(u64::try_from(index).expect("small index")),
+                stream_id: u64::try_from(index + 1).expect("small index"),
+                request_stream_bytes: 10,
+                qualified_request_stream_bytes: Some(10),
+                transmitted_unique_ranges: vec![[0, if complete { 10 } else { 5 }]],
+                transmitted_unique_bytes: if complete { 10 } else { 5 },
+                fin_transmitted: complete,
+                acknowledgements,
+                acknowledged_unique_ranges: vec![[0, 10]],
+                acknowledged_unique_bytes: 10,
+                fin_acknowledged: true,
+            });
+        }
+        assert!(prefix_receipts_pass(&receipts, 3));
+        assert!(!prefix_receipts_pass(&receipts, 4));
+        receipts[4].transmitted_unique_ranges = vec![[0, 10]];
+        receipts[4].transmitted_unique_bytes = 10;
+        receipts[4].fin_transmitted = true;
+        assert!(prefix_receipts_pass(&receipts, 4));
+    }
+
+    #[test]
+    fn prefix_stream_ownership_rejects_none_or_undeclared_slots() {
+        let slots = BTreeSet::from([1, 2]);
+        let transmission = |slot| QcsdStreamTransmission {
+            sequence: 0,
+            stream: QcsdStreamId(7),
+            role: None,
+            offset: 0,
+            bytes: 5,
+            fin: false,
+            slot,
+        };
+        assert_eq!(
+            prefix_targetless_stream_bytes(
+                &[
+                    transmission(Some(QcsdSlotId(1))),
+                    transmission(Some(QcsdSlotId(2)))
+                ],
+                &slots,
+            ),
+            0
+        );
+        assert_eq!(
+            prefix_targetless_stream_bytes(&[transmission(None)], &slots),
+            5
+        );
+        assert_eq!(
+            prefix_targetless_stream_bytes(&[transmission(Some(QcsdSlotId(99)))], &slots),
+            5
+        );
     }
 }

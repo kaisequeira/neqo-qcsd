@@ -339,9 +339,13 @@ pub trait Defense: Debug {
     fn pending_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
         None
     }
-    /// Whether the controller must provision chaff requests to its configured
-    /// stream limit before due outgoing targets are dispatched.
-    fn preprovision_chaff_to_stream_limit(&self) -> bool {
+    /// Whether the controller must provision one initial chaff-request batch
+    /// to its configured stream limit before due outgoing targets are
+    /// dispatched, then permanently disable application-level replenishment.
+    ///
+    /// Transport retransmission of that initial batch remains transport-owned.
+    /// Defenses returning `false` retain the ordinary low-watermark replenisher.
+    fn preprovision_chaff_once_to_stream_limit(&self) -> bool {
         false
     }
     /// Whether ordinary base allocation may use only peer-ACK-activated chaff.
@@ -349,9 +353,8 @@ pub trait Defense: Debug {
     fn base_chaff_requires_peer_acknowledgment(&self) -> bool {
         false
     }
-    /// Number of pristine activated streams that must be protected across the
-    /// current incoming component and any consecutive nonzero incoming
-    /// components reached before another positive outgoing component.
+    /// Number of distinct pristine activated streams that must be protected
+    /// for every nonzero incoming component remaining in the fixed schedule.
     fn receiver_continuation_reserve_horizon(&self) -> usize {
         0
     }

@@ -12,37 +12,45 @@
     "application_order": "after-symmetric-elementwise-mold",
     "base_allocation_policy": "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims",
     "batch_end_release_policy": "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate",
-    "causal_capacity_precondition": "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start",
+    "causal_capacity_precondition": "every-molded-component-outgoing>0;effective-configured-max-chaff-streams>=total-receiver-continuation-reserve-horizon+1;schema-two-stateful-stage-capacity-recurrence-proves-higher-priority-due-application-stream-frames-plus-cumulative-one-shot-chaff-request-stream-frames-through-fin-fit-within-each-exact-full-molded-outgoing-target-through-final-component",
     "cells_per_nonzero_incoming_component": 1,
-    "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+    "formula": "symmetric_incoming=adapted_incoming-1-if-adapted_incoming>0-else-0",
     "parser_allowance_ceiling_bytes": 1000,
     "prefix_consumability_precondition": "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable",
-    "post_outgoing_loss_liveness_limitation": "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee",
-    "provisioning_policy": "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions",
+    "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
+    "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
     "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
-    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling",
+    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
     "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
-    "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
-    "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
-    "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
-    "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
-    "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
-    "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-or-required-chaff-request-stream-output;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
-    "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
+    "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
+    "resource_precondition": "schema-two-qualified-manifest-selects-known-valid-same-origin-source-resource;derived-selected-resource-projection-dependency-free-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component;required-chaff-streams-defines-effective-configured-max-chaff-streams",
+    "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-from-initial-peer-acknowledged-preprovisioned-cohort-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-all-future-horizon-reserve-before-further-base-allocation",
+    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-all-remaining-nonzero-incoming-components-before-first-base-allocation-and-retain-distinct-reserves-across-later-positive-outgoing-components",
+    "qualified_chaff_manifest_policy": "schema-two-qualified-navigation-root-and-selected-source-resource;explicit-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams;selected-source-resource-known-valid-same-origin;derived-selected-resource-projection-dependency-free;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+    "qualified_chaff_response_policy": "three-independent-staged-qualified-parallel-chaff-streams=max-five-and-walkie-talkie-required-chaff-streams-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-selected-resource-compact-status-normalized-content-encoding-body-bytes-body-sha256;one-shot-controller-config-uses-exact-walkie-talkie-required-chaff-streams;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+    "staged_prefix_pack_precondition": "schema-two-every-component-staged-prefix-pack-after-peer-settings-and-drained-h3-control-qpack-warmup;each-molded-component-is-an-exact-declared-full-packet-target;opens-exact-bound-application-resources-and-cumulative-copies-of-selected-qualified-resource;active-chaff-cohort-is-nondecreasing-and-zero-delta-stages-are-allowed;all-post-cutoff-stream-transmissions-owned-by-one-of-exact-declared-stage-targets;each-stage-gate-requires-cumulative-application-requests-transmitted-contiguously-through-fin-and-required-active-chaff-requests-transmitted-contiguously-through-fin-and-peer-acknowledged-before-dependent-base-allocation;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
+    "qualification_binding_policy": "schema-six-raw-sha256-per-workload-binds-schema-two-chaff-qualification-sidecar-prefix-pack-spec-and-qualified-chaff-manifest;runtime-requires-exact-current-artifact-hashes-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams"
   },
   "qualification_bindings": [
     {
       "workload_id": "bootstrap-like-real",
       "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "application_resource_id": 0,
+      "selected_chaff_resource_id": 0,
+      "qualified_parallel_chaff_streams": 5,
+      "walkie_talkie_required_chaff_streams": 5
     },
     {
       "workload_id": "bootstrap-like-decoy",
       "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-      "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "application_resource_id": 0,
+      "selected_chaff_resource_id": 0,
+      "qualified_parallel_chaff_streams": 5,
+      "walkie_talkie_required_chaff_streams": 5
     }
   ],
   "profiles": [

@@ -21,31 +21,55 @@ const CELL_BYTE_DOMAIN: &str = "http3-request-stream-offset.bytes";
 const MATCHING_ALGORITHM: &str = "minimum-base-symmetric-mold-padding-cost-one-to-one";
 const RECEIVER_APPLICATION_ORDER: &str = "after-symmetric-elementwise-mold";
 const RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT: u32 = 1;
-const RECEIVER_FORMULA: &str =
-    "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0";
+const RECEIVER_FORMULA: &str = "symmetric_incoming=adapted_incoming-1-if-adapted_incoming>0-else-0";
 const RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES: u64 = 1_000;
 const RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT: u64 = 1_200;
 const RECEIVER_ALLOCATION_POLICY: &str =
     "single-peer-acknowledged-pristine-header-phase-controlled-chaff-stream-whole-cell";
 const RECEIVER_BASE_ALLOCATION_POLICY: &str = "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims";
-const RECEIVER_CAUSAL_CAPACITY_PRECONDITION: &str = "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start";
+const RECEIVER_CAUSAL_CAPACITY_PRECONDITION: &str = "every-molded-component-outgoing>0;effective-configured-max-chaff-streams>=total-receiver-continuation-reserve-horizon+1;schema-two-stateful-stage-capacity-recurrence-proves-higher-priority-due-application-stream-frames-plus-cumulative-one-shot-chaff-request-stream-frames-through-fin-fit-within-each-exact-full-molded-outgoing-target-through-final-component";
 const RECEIVER_REQUEST_ACTIVATION_POLICY: &str = "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells";
-const RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION: &str = "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1";
-const RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION: &str = "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee";
-const RECEIVER_RESOURCE_PRECONDITION: &str = "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component";
-const RECEIVER_PROVISIONING_POLICY: &str =
-    "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions";
-const RECEIVER_RESERVE_POLICY: &str = "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component";
-const RECEIVER_RESERVE_LIFECYCLE_POLICY: &str = "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation";
-const RECEIVER_RELEASE_POLICY: &str = "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling";
+const RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION: &str = "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule";
+const RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION: &str = "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee";
+const RECEIVER_RESOURCE_PRECONDITION: &str = "schema-two-qualified-manifest-selects-known-valid-same-origin-source-resource;derived-selected-resource-projection-dependency-free-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component;required-chaff-streams-defines-effective-configured-max-chaff-streams";
+const RECEIVER_PROVISIONING_POLICY: &str = "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch";
+const RECEIVER_RESERVE_POLICY: &str = "reserve-deterministic-acknowledged-pristine-candidates-for-all-remaining-nonzero-incoming-components-before-first-base-allocation-and-retain-distinct-reserves-across-later-positive-outgoing-components";
+const RECEIVER_RESERVE_LIFECYCLE_POLICY: &str = "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-from-initial-peer-acknowledged-preprovisioned-cohort-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-all-future-horizon-reserve-before-further-base-allocation";
+const RECEIVER_RELEASE_POLICY: &str = "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once";
 const RECEIVER_BATCH_END_RELEASE_POLICY: &str =
     "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate";
 const RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION: &str =
     "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable";
-const RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY: &str = "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged";
-const RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY: &str = "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields";
-const RECEIVER_FIRST_CELL_PREFIX_PACK_PRECONDITION: &str = "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-or-required-chaff-request-stream-output;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes";
-const RECEIVER_QUALIFICATION_BINDING_POLICY: &str = "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes";
+const RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY: &str = "schema-two-qualified-navigation-root-and-selected-source-resource;explicit-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams;selected-source-resource-known-valid-same-origin;derived-selected-resource-projection-dependency-free;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged";
+const RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY: &str = "three-independent-staged-qualified-parallel-chaff-streams=max-five-and-walkie-talkie-required-chaff-streams-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-selected-resource-compact-status-normalized-content-encoding-body-bytes-body-sha256;one-shot-controller-config-uses-exact-walkie-talkie-required-chaff-streams;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields";
+const RECEIVER_STAGED_PREFIX_PACK_PRECONDITION: &str = "schema-two-every-component-staged-prefix-pack-after-peer-settings-and-drained-h3-control-qpack-warmup;each-molded-component-is-an-exact-declared-full-packet-target;opens-exact-bound-application-resources-and-cumulative-copies-of-selected-qualified-resource;active-chaff-cohort-is-nondecreasing-and-zero-delta-stages-are-allowed;all-post-cutoff-stream-transmissions-owned-by-one-of-exact-declared-stage-targets;each-stage-gate-requires-cumulative-application-requests-transmitted-contiguously-through-fin-and-required-active-chaff-requests-transmitted-contiguously-through-fin-and-peer-acknowledged-before-dependent-base-allocation;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes";
+const RECEIVER_QUALIFICATION_BINDING_POLICY: &str = "schema-six-raw-sha256-per-workload-binds-schema-two-chaff-qualification-sidecar-prefix-pack-spec-and-qualified-chaff-manifest;runtime-requires-exact-current-artifact-hashes-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams";
+
+// Schema five is a frozen read-only audit oracle. These literals must remain
+// independent of the runnable schema-six receiver-liveness contract.
+const HISTORICAL_SCHEMA_FIVE_ALLOCATION_POLICY: &str =
+    "single-peer-acknowledged-pristine-header-phase-controlled-chaff-stream-whole-cell";
+const HISTORICAL_SCHEMA_FIVE_APPLICATION_ORDER: &str = "after-symmetric-elementwise-mold";
+const HISTORICAL_SCHEMA_FIVE_BASE_ALLOCATION_POLICY: &str = "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims";
+const HISTORICAL_SCHEMA_FIVE_BATCH_END_RELEASE_POLICY: &str =
+    "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate";
+const HISTORICAL_SCHEMA_FIVE_CAUSAL_CAPACITY_PRECONDITION: &str = "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start";
+const HISTORICAL_SCHEMA_FIVE_CELLS_PER_NONZERO_INCOMING_COMPONENT: u32 = 1;
+const HISTORICAL_SCHEMA_FIVE_FORMULA: &str =
+    "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0";
+const HISTORICAL_SCHEMA_FIVE_PARSER_ALLOWANCE_CEILING_BYTES: u64 = 1_000;
+const HISTORICAL_SCHEMA_FIVE_PREFIX_CONSUMABILITY_PRECONDITION: &str =
+    "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable";
+const HISTORICAL_SCHEMA_FIVE_REQUEST_PREFIX_DELIVERY_PRECONDITION: &str = "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1";
+const HISTORICAL_SCHEMA_FIVE_POST_OUTGOING_LOSS_LIVENESS_LIMITATION: &str = "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee";
+const HISTORICAL_SCHEMA_FIVE_PROVISIONING_POLICY: &str =
+    "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions";
+const HISTORICAL_SCHEMA_FIVE_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT: u64 = 1_200;
+const HISTORICAL_SCHEMA_FIVE_RESERVE_POLICY: &str = "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component";
+const HISTORICAL_SCHEMA_FIVE_RESERVE_LIFECYCLE_POLICY: &str = "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation";
+const HISTORICAL_SCHEMA_FIVE_RELEASE_POLICY: &str = "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling";
+const HISTORICAL_SCHEMA_FIVE_REQUEST_ACTIVATION_POLICY: &str = "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells";
+const HISTORICAL_SCHEMA_FIVE_RESOURCE_PRECONDITION: &str = "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component";
 
 fn is_lower_hex_sha256(value: &str) -> bool {
     value.len() == 64
@@ -128,7 +152,8 @@ pub struct HistoricalWalkieTalkieSchemaFiveDiagnostic {
     pub workload_ids: Vec<String>,
 }
 
-/// Exact raw artifact hashes bound to one schema-six workload identity.
+/// Exact artifact hashes, resource identities, and qualified stream counts for
+/// one schema-six workload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalkieTalkieQualificationBinding {
@@ -136,6 +161,10 @@ pub struct WalkieTalkieQualificationBinding {
     pub chaff_qualification_sidecar_sha256: String,
     pub prefix_pack_spec_sha256: String,
     pub qualified_chaff_manifest_sha256: String,
+    pub application_resource_id: u32,
+    pub selected_chaff_resource_id: u32,
+    pub qualified_parallel_chaff_streams: usize,
+    pub walkie_talkie_required_chaff_streams: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +190,7 @@ struct ReceiverContinuation {
     reserve_policy: String,
     qualified_chaff_manifest_policy: String,
     qualified_chaff_response_policy: String,
-    first_cell_prefix_pack_precondition: String,
+    staged_prefix_pack_precondition: String,
     qualification_binding_policy: String,
 }
 
@@ -285,10 +314,14 @@ impl MoldedFile {
                     || !is_lower_hex_sha256(&binding.chaff_qualification_sidecar_sha256)
                     || !is_lower_hex_sha256(&binding.prefix_pack_spec_sha256)
                     || !is_lower_hex_sha256(&binding.qualified_chaff_manifest_sha256)
+                    || binding.application_resource_id != 0
+                    || !(1..=20).contains(&binding.walkie_talkie_required_chaff_streams)
+                    || binding.qualified_parallel_chaff_streams
+                        != binding.walkie_talkie_required_chaff_streams.max(5)
             })
         {
             return Err(Error::InvalidConfig(
-                "Walkie-Talkie schema-six qualification_bindings must uniquely and exactly cover every workload identity with lowercase raw SHA-256 values"
+                "Walkie-Talkie schema-six qualification_bindings must uniquely and exactly cover every workload identity with lowercase raw SHA-256 values and valid schema-two resource and stream-count bindings"
                     .into(),
             ));
         }
@@ -297,16 +330,13 @@ impl MoldedFile {
                 "Walkie-Talkie bundle contains no profile for workload {workload_id:?}"
             ))
         })?;
-        let unit_incoming_first_fixture =
+        let unit_zero_outgoing_fixture =
             cfg!(test) && self.generated_by == "unit-test-incoming-first-fixture";
-        if selected
-            .bursts
-            .first()
-            .is_none_or(|pair| pair.outgoing == 0)
-            && !unit_incoming_first_fixture
+        if (selected.bursts.is_empty() || selected.bursts.iter().any(|pair| pair.outgoing == 0))
+            && !unit_zero_outgoing_fixture
         {
             return Err(Error::InvalidConfig(
-                "Walkie-Talkie first molded component must contain outgoing cells".into(),
+                "every Walkie-Talkie molded component must contain outgoing cells".into(),
             ));
         }
         Ok(selected)
@@ -339,8 +369,7 @@ impl ReceiverContinuation {
             || self.reserve_policy != RECEIVER_RESERVE_POLICY
             || self.qualified_chaff_manifest_policy != RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY
             || self.qualified_chaff_response_policy != RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY
-            || self.first_cell_prefix_pack_precondition
-                != RECEIVER_FIRST_CELL_PREFIX_PACK_PRECONDITION
+            || self.staged_prefix_pack_precondition != RECEIVER_STAGED_PREFIX_PACK_PRECONDITION
             || self.qualification_binding_policy != RECEIVER_QUALIFICATION_BINDING_POLICY
         {
             return Err(Error::InvalidConfig(
@@ -376,28 +405,31 @@ impl ReceiverContinuation {
 
 impl HistoricalReceiverContinuationSchemaFive {
     fn validate(&self, packet_size: u16) -> Result<()> {
-        if self.allocation_policy != RECEIVER_ALLOCATION_POLICY
-            || self.application_order != RECEIVER_APPLICATION_ORDER
-            || self.base_allocation_policy != RECEIVER_BASE_ALLOCATION_POLICY
-            || self.batch_end_release_policy != RECEIVER_BATCH_END_RELEASE_POLICY
-            || self.causal_capacity_precondition != RECEIVER_CAUSAL_CAPACITY_PRECONDITION
+        if self.allocation_policy != HISTORICAL_SCHEMA_FIVE_ALLOCATION_POLICY
+            || self.application_order != HISTORICAL_SCHEMA_FIVE_APPLICATION_ORDER
+            || self.base_allocation_policy != HISTORICAL_SCHEMA_FIVE_BASE_ALLOCATION_POLICY
+            || self.batch_end_release_policy != HISTORICAL_SCHEMA_FIVE_BATCH_END_RELEASE_POLICY
+            || self.causal_capacity_precondition
+                != HISTORICAL_SCHEMA_FIVE_CAUSAL_CAPACITY_PRECONDITION
             || self.cells_per_nonzero_incoming_component
-                != RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT
-            || self.formula != RECEIVER_FORMULA
-            || self.parser_allowance_ceiling_bytes != RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES
-            || self.prefix_consumability_precondition != RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION
+                != HISTORICAL_SCHEMA_FIVE_CELLS_PER_NONZERO_INCOMING_COMPONENT
+            || self.formula != HISTORICAL_SCHEMA_FIVE_FORMULA
+            || self.parser_allowance_ceiling_bytes
+                != HISTORICAL_SCHEMA_FIVE_PARSER_ALLOWANCE_CEILING_BYTES
+            || self.prefix_consumability_precondition
+                != HISTORICAL_SCHEMA_FIVE_PREFIX_CONSUMABILITY_PRECONDITION
             || self.post_outgoing_loss_liveness_limitation
-                != RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION
-            || self.provisioning_policy != RECEIVER_PROVISIONING_POLICY
+                != HISTORICAL_SCHEMA_FIVE_POST_OUTGOING_LOSS_LIVENESS_LIMITATION
+            || self.provisioning_policy != HISTORICAL_SCHEMA_FIVE_PROVISIONING_POLICY
             || self.raw_headroom_bytes_per_nonzero_incoming_component
-                != RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT
-            || self.release_policy != RECEIVER_RELEASE_POLICY
-            || self.request_activation_policy != RECEIVER_REQUEST_ACTIVATION_POLICY
+                != HISTORICAL_SCHEMA_FIVE_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT
+            || self.release_policy != HISTORICAL_SCHEMA_FIVE_RELEASE_POLICY
+            || self.request_activation_policy != HISTORICAL_SCHEMA_FIVE_REQUEST_ACTIVATION_POLICY
             || self.request_prefix_delivery_precondition
-                != RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION
-            || self.resource_precondition != RECEIVER_RESOURCE_PRECONDITION
-            || self.reserve_lifecycle_policy != RECEIVER_RESERVE_LIFECYCLE_POLICY
-            || self.reserve_policy != RECEIVER_RESERVE_POLICY
+                != HISTORICAL_SCHEMA_FIVE_REQUEST_PREFIX_DELIVERY_PRECONDITION
+            || self.resource_precondition != HISTORICAL_SCHEMA_FIVE_RESOURCE_PRECONDITION
+            || self.reserve_lifecycle_policy != HISTORICAL_SCHEMA_FIVE_RESERVE_LIFECYCLE_POLICY
+            || self.reserve_policy != HISTORICAL_SCHEMA_FIVE_RESERVE_POLICY
             || self.raw_headroom_bytes_per_nonzero_incoming_component != u64::from(packet_size)
         {
             return Err(Error::InvalidConfig(
@@ -1417,7 +1449,6 @@ impl WalkieTalkie {
                 || receiver_continuation_pending
                     && credits_to_emit == 0
                     && initial_credits_awaiting == 0
-                    && credited_bytes_outstanding <= self.receiver_parser_allowance_ceiling_bytes
                     && self.batch_gate_open(index)
                 || observed_remaining_bytes == 0
                     && !receiver_continuation_pending
@@ -1559,12 +1590,9 @@ impl Defense for WalkieTalkie {
                     credits_to_emit: 0,
                     receiver_continuation_pending,
                     initial_credits_awaiting,
-                    credited_bytes_outstanding,
                     ..
                 } if *receiver_continuation_pending
                     && *initial_credits_awaiting == 0
-                    && *credited_bytes_outstanding
-                        <= self.receiver_parser_allowance_ceiling_bytes
                     && batch_gate_open =>
                 {
                     self.incoming_capacity_reserved = self
@@ -1608,7 +1636,7 @@ impl Defense for WalkieTalkie {
         })
     }
 
-    fn preprovision_chaff_to_stream_limit(&self) -> bool {
+    fn preprovision_chaff_once_to_stream_limit(&self) -> bool {
         true
     }
 
@@ -1620,35 +1648,14 @@ impl Defense for WalkieTalkie {
         let Turn::Incoming { index, .. } = self.turn else {
             return 0;
         };
-        let mut horizon = 0;
-        for (offset, pair) in self.molded[index..].iter().enumerate() {
-            if offset > 0 && pair.outgoing > 0 {
-                break;
-            }
-            horizon += usize::from(pair.incoming > 0);
-        }
-        horizon
+        self.molded[index..]
+            .iter()
+            .filter(|pair| pair.incoming > 0)
+            .count()
     }
 
     fn max_receiver_continuation_reserve_horizon(&self) -> usize {
-        self.molded
-            .iter()
-            .enumerate()
-            .map(|(index, pair)| {
-                if pair.incoming == 0 {
-                    return 0;
-                }
-                let mut horizon = 0;
-                for (offset, candidate) in self.molded[index..].iter().enumerate() {
-                    if offset > 0 && candidate.outgoing > 0 {
-                        break;
-                    }
-                    horizon += usize::from(candidate.incoming > 0);
-                }
-                horizon
-            })
-            .max()
-            .unwrap_or(0)
+        self.molded.iter().filter(|pair| pair.incoming > 0).count()
     }
 
     fn receiver_continuation_cell_bytes(&self) -> Option<u64> {
@@ -1895,10 +1902,11 @@ mod tests {
         let total_scheduled_bytes = bursts.iter().fold(0_u64, |total, pair| {
             total + (u64::from(pair.outgoing) + u64::from(pair.incoming)) * 1_200
         });
-        // Production parsing rejects an incoming-first artifact. A small set
-        // of defense-state unit tests intentionally start inside an incoming
-        // turn; give only those cfg(test) fixtures an explicit bypass marker.
-        let generated_by = if bursts.first().is_some_and(|pair| pair.outgoing == 0) {
+        // Production parsing requires every component to provide a declared
+        // staged outgoing carrier. A small set of defense-state unit tests
+        // intentionally exercise zero-outgoing turns; give only those
+        // cfg(test) fixtures an explicit bypass marker.
+        let generated_by = if bursts.iter().any(|pair| pair.outgoing == 0) {
             "unit-test-incoming-first-fixture"
         } else {
             "test"
@@ -1921,37 +1929,45 @@ mod tests {
                     "application_order": "after-symmetric-elementwise-mold",
                     "base_allocation_policy": "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims",
                     "batch_end_release_policy": "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate",
-                    "causal_capacity_precondition": "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start",
+                    "causal_capacity_precondition": "every-molded-component-outgoing>0;effective-configured-max-chaff-streams>=total-receiver-continuation-reserve-horizon+1;schema-two-stateful-stage-capacity-recurrence-proves-higher-priority-due-application-stream-frames-plus-cumulative-one-shot-chaff-request-stream-frames-through-fin-fit-within-each-exact-full-molded-outgoing-target-through-final-component",
                     "cells_per_nonzero_incoming_component": 1,
-                    "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+                    "formula": "symmetric_incoming=adapted_incoming-1-if-adapted_incoming>0-else-0",
                     "parser_allowance_ceiling_bytes": 1000,
                     "prefix_consumability_precondition": "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable",
-                    "post_outgoing_loss_liveness_limitation": "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee",
-                    "provisioning_policy": "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions",
+                    "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
+                    "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
                     "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
-                    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling",
+                    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                     "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
-                    "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
-                    "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
-                    "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-                    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
-                "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
-                "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
-                "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-or-required-chaff-request-stream-output;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
-                "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
+                    "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
+                    "resource_precondition": "schema-two-qualified-manifest-selects-known-valid-same-origin-source-resource;derived-selected-resource-projection-dependency-free-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component;required-chaff-streams-defines-effective-configured-max-chaff-streams",
+                    "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-from-initial-peer-acknowledged-preprovisioned-cohort-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-all-future-horizon-reserve-before-further-base-allocation",
+                    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-all-remaining-nonzero-incoming-components-before-first-base-allocation-and-retain-distinct-reserves-across-later-positive-outgoing-components",
+                "qualified_chaff_manifest_policy": "schema-two-qualified-navigation-root-and-selected-source-resource;explicit-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams;selected-source-resource-known-valid-same-origin;derived-selected-resource-projection-dependency-free;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+                "qualified_chaff_response_policy": "three-independent-staged-qualified-parallel-chaff-streams=max-five-and-walkie-talkie-required-chaff-streams-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-selected-resource-compact-status-normalized-content-encoding-body-bytes-body-sha256;one-shot-controller-config-uses-exact-walkie-talkie-required-chaff-streams;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+                    "staged_prefix_pack_precondition": "schema-two-every-component-staged-prefix-pack-after-peer-settings-and-drained-h3-control-qpack-warmup;each-molded-component-is-an-exact-declared-full-packet-target;opens-exact-bound-application-resources-and-cumulative-copies-of-selected-qualified-resource;active-chaff-cohort-is-nondecreasing-and-zero-delta-stages-are-allowed;all-post-cutoff-stream-transmissions-owned-by-one-of-exact-declared-stage-targets;each-stage-gate-requires-cumulative-application-requests-transmitted-contiguously-through-fin-and-required-active-chaff-requests-transmitted-contiguously-through-fin-and-peer-acknowledged-before-dependent-base-allocation;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
+                "qualification_binding_policy": "schema-six-raw-sha256-per-workload-binds-schema-two-chaff-qualification-sidecar-prefix-pack-spec-and-qualified-chaff-manifest;runtime-requires-exact-current-artifact-hashes-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams"
                 }},
                 "qualification_bindings": [
                     {{
                         "workload_id": "real page",
                         "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                        "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                        "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                        "application_resource_id": 0,
+                        "selected_chaff_resource_id": 0,
+                        "qualified_parallel_chaff_streams": 5,
+                        "walkie_talkie_required_chaff_streams": 5
                     }},
                     {{
                         "workload_id": "decoy page",
                         "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                         "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                        "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                        "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                        "application_resource_id": 0,
+                        "selected_chaff_resource_id": 0,
+                        "qualified_parallel_chaff_streams": 5,
+                        "walkie_talkie_required_chaff_streams": 5
                     }}
                 ],
                 "profiles": [{{
@@ -2171,11 +2187,73 @@ mod tests {
         for field in [
             "qualified_chaff_manifest_policy",
             "qualified_chaff_response_policy",
-            "first_cell_prefix_pack_precondition",
+            "staged_prefix_pack_precondition",
             "qualification_binding_policy",
         ] {
             receiver.remove(field);
         }
+        // Schema five remains a byte-for-byte historical audit format even
+        // when the runnable schema-six contract advances.
+        receiver.insert(
+            "allocation_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_ALLOCATION_POLICY),
+        );
+        receiver.insert(
+            "application_order".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_APPLICATION_ORDER),
+        );
+        receiver.insert(
+            "base_allocation_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_BASE_ALLOCATION_POLICY),
+        );
+        receiver.insert(
+            "batch_end_release_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_BATCH_END_RELEASE_POLICY),
+        );
+        receiver.insert(
+            "causal_capacity_precondition".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_CAUSAL_CAPACITY_PRECONDITION),
+        );
+        receiver.insert(
+            "post_outgoing_loss_liveness_limitation".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_POST_OUTGOING_LOSS_LIVENESS_LIMITATION),
+        );
+        receiver.insert(
+            "provisioning_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_PROVISIONING_POLICY),
+        );
+        receiver.insert(
+            "formula".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_FORMULA),
+        );
+        receiver.insert(
+            "prefix_consumability_precondition".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_PREFIX_CONSUMABILITY_PRECONDITION),
+        );
+        receiver.insert(
+            "release_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_RELEASE_POLICY),
+        );
+        receiver.insert(
+            "request_activation_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_REQUEST_ACTIVATION_POLICY),
+        );
+        receiver.insert(
+            "request_prefix_delivery_precondition".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_REQUEST_PREFIX_DELIVERY_PRECONDITION),
+        );
+        receiver.insert(
+            "resource_precondition".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_RESOURCE_PRECONDITION),
+        );
+        receiver.insert(
+            "reserve_lifecycle_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_RESERVE_LIFECYCLE_POLICY),
+        );
+        receiver.insert(
+            "reserve_policy".into(),
+            serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_RESERVE_POLICY),
+        );
         let historical = historical.to_string();
 
         let diagnostic = WalkieTalkie::historical_schema_five_diagnostic(&historical)
@@ -2318,6 +2396,52 @@ mod tests {
     }
 
     #[test]
+    fn qualification_resource_and_stream_count_bindings_are_strict() {
+        let input = molded(r#"[{"outgoing": 1, "incoming": 1}]"#);
+        let defense =
+            WalkieTalkie::from_json(&config(1_200), 1_200, &input).expect("valid binding");
+        let binding = defense.qualification_binding();
+        assert_eq!(binding.application_resource_id, 0);
+        assert_eq!(binding.selected_chaff_resource_id, 0);
+        assert_eq!(binding.qualified_parallel_chaff_streams, 5);
+        assert_eq!(binding.walkie_talkie_required_chaff_streams, 5);
+
+        let valid: serde_json::Value = serde_json::from_str(&input).expect("valid JSON");
+        for (field, mutation) in [
+            ("application_resource_id", serde_json::json!(1)),
+            ("selected_chaff_resource_id", serde_json::json!(-1)),
+            ("qualified_parallel_chaff_streams", serde_json::json!(4)),
+            (
+                "walkie_talkie_required_chaff_streams",
+                serde_json::json!(21),
+            ),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["qualification_bindings"][0][field] = mutation;
+            assert!(
+                WalkieTalkie::from_json(&config(1_200), 1_200, &malformed.to_string()).is_err(),
+                "invalid qualification binding {field} must fail closed"
+            );
+        }
+        for field in [
+            "application_resource_id",
+            "selected_chaff_resource_id",
+            "qualified_parallel_chaff_streams",
+            "walkie_talkie_required_chaff_streams",
+        ] {
+            let mut malformed = valid.clone();
+            malformed["qualification_bindings"][0]
+                .as_object_mut()
+                .expect("qualification binding object")
+                .remove(field);
+            assert!(
+                WalkieTalkie::from_json(&config(1_200), 1_200, &malformed.to_string()).is_err(),
+                "missing qualification binding {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "the overflow fixture constructs the full strict schema-six envelope"
@@ -2351,45 +2475,33 @@ mod tests {
                     "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate"
                         .into(),
                 causal_capacity_precondition:
-                    "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start"
-                        .into(),
+                    super::RECEIVER_CAUSAL_CAPACITY_PRECONDITION.into(),
                 cells_per_nonzero_incoming_component: 1,
-                formula: "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0"
-                    .into(),
+                formula: super::RECEIVER_FORMULA.into(),
                 parser_allowance_ceiling_bytes: 1_000,
                 prefix_consumability_precondition:
                     "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable"
                         .into(),
                 post_outgoing_loss_liveness_limitation:
-                    "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee"
-                        .into(),
-                provisioning_policy:
-                    "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions".into(),
+                    super::RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION.into(),
+                provisioning_policy: super::RECEIVER_PROVISIONING_POLICY.into(),
                 raw_headroom_bytes_per_nonzero_incoming_component: 1_200,
-                release_policy:
-                    "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling"
-                        .into(),
+                release_policy: super::RECEIVER_RELEASE_POLICY.into(),
                 request_activation_policy:
                     "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells"
                         .into(),
                 request_prefix_delivery_precondition:
-                    "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1"
-                        .into(),
-                resource_precondition:
-                    "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component"
-                        .into(),
+                    super::RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION.into(),
+                resource_precondition: super::RECEIVER_RESOURCE_PRECONDITION.into(),
                 reserve_lifecycle_policy:
-                    "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation"
-                        .into(),
-                reserve_policy:
-                    "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
-                        .into(),
+                    super::RECEIVER_RESERVE_LIFECYCLE_POLICY.into(),
+                reserve_policy: super::RECEIVER_RESERVE_POLICY.into(),
                 qualified_chaff_manifest_policy:
                     super::RECEIVER_QUALIFIED_CHAFF_MANIFEST_POLICY.into(),
                 qualified_chaff_response_policy:
                     super::RECEIVER_QUALIFIED_CHAFF_RESPONSE_POLICY.into(),
-                first_cell_prefix_pack_precondition:
-                    super::RECEIVER_FIRST_CELL_PREFIX_PACK_PRECONDITION.into(),
+                staged_prefix_pack_precondition:
+                    super::RECEIVER_STAGED_PREFIX_PACK_PRECONDITION.into(),
                 qualification_binding_policy:
                     super::RECEIVER_QUALIFICATION_BINDING_POLICY.into(),
             },
@@ -2399,12 +2511,20 @@ mod tests {
                     chaff_qualification_sidecar_sha256: "a".repeat(64),
                     prefix_pack_spec_sha256: "b".repeat(64),
                     qualified_chaff_manifest_sha256: "c".repeat(64),
+                    application_resource_id: 0,
+                    selected_chaff_resource_id: 0,
+                    qualified_parallel_chaff_streams: 5,
+                    walkie_talkie_required_chaff_streams: 5,
                 },
                 super::WalkieTalkieQualificationBinding {
                     workload_id: "decoy".into(),
                     chaff_qualification_sidecar_sha256: "d".repeat(64),
                     prefix_pack_spec_sha256: "e".repeat(64),
                     qualified_chaff_manifest_sha256: "f".repeat(64),
+                    application_resource_id: 0,
+                    selected_chaff_resource_id: 0,
+                    qualified_parallel_chaff_streams: 5,
+                    walkie_talkie_required_chaff_streams: 5,
                 },
             ],
             profiles: vec![super::MoldedProfile {
@@ -2592,6 +2712,22 @@ mod tests {
                 serde_json::json!("leak-reserve"),
             ),
             ("reserve_policy", serde_json::json!("none")),
+            (
+                "qualified_chaff_manifest_policy",
+                serde_json::json!("optional-qualified-manifest"),
+            ),
+            (
+                "qualified_chaff_response_policy",
+                serde_json::json!("single-qualification"),
+            ),
+            (
+                "staged_prefix_pack_precondition",
+                serde_json::json!("first-cell-only"),
+            ),
+            (
+                "qualification_binding_policy",
+                serde_json::json!("hashes-only"),
+            ),
         ] {
             let mut malformed = valid.clone();
             malformed["receiver_continuation"][field] = mutation;
@@ -2620,6 +2756,10 @@ mod tests {
             "resource_precondition",
             "reserve_lifecycle_policy",
             "reserve_policy",
+            "qualified_chaff_manifest_policy",
+            "qualified_chaff_response_policy",
+            "staged_prefix_pack_precondition",
+            "qualification_binding_policy",
         ] {
             let mut malformed = valid.clone();
             malformed["receiver_continuation"]
@@ -2639,6 +2779,19 @@ mod tests {
             .remove("receiver_continuation");
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &missing.to_string()).is_err());
 
+        let mut stale_prefix_key = valid.clone();
+        let receiver = stale_prefix_key["receiver_continuation"]
+            .as_object_mut()
+            .expect("receiver continuation object");
+        let staged = receiver
+            .remove("staged_prefix_pack_precondition")
+            .expect("current staged prefix field");
+        receiver.insert("first_cell_prefix_pack_precondition".into(), staged);
+        assert!(
+            WalkieTalkie::from_json(&config(1_200), 1_200, &stale_prefix_key.to_string()).is_err(),
+            "the stale first-cell schema key must fail closed"
+        );
+
         let mut unknown = valid;
         unknown["receiver_continuation"]
             .as_object_mut()
@@ -2654,10 +2807,23 @@ mod tests {
             WalkieTalkie::from_json(&config(1_200), 1_200, &incoming_first.to_string()).is_err(),
             "production artifacts must begin with an outgoing carrier component"
         );
+
+        let mut later_zero: serde_json::Value = serde_json::from_str(&molded(
+            r#"[
+                {"outgoing": 1, "incoming": 1, "batch_end": false},
+                {"outgoing": 0, "incoming": 1}
+            ]"#,
+        ))
+        .expect("later-zero unit fixture");
+        later_zero["generated_by"] = serde_json::json!("external-generator");
+        assert!(
+            WalkieTalkie::from_json(&config(1_200), 1_200, &later_zero.to_string()).is_err(),
+            "every production component must own an exact staged outgoing carrier"
+        );
     }
 
     #[test]
-    fn receiver_continuation_waits_for_base_ack_batch_end_and_parser_ceiling() {
+    fn receiver_continuation_waits_for_base_request_and_batch_end_not_global_debt() {
         let mut before_start = WalkieTalkie::from_json(
             &config(1_200),
             1_200,
@@ -2695,37 +2861,15 @@ mod tests {
             at: Duration::from_micros(1),
             kind: SignalKind::ReceiveCreditRequested { packet: first },
         });
-        defense.observe(DefenseSignal {
-            at: Duration::from_micros(1),
-            kind: SignalKind::PayloadBytes {
-                direction: Direction::Incoming,
-                bytes: 199,
-                cover: false,
-            },
-        });
-        defense.observe(DefenseSignal {
-            at: Duration::from_micros(1),
-            kind: SignalKind::ReceiveCreditConsumed { bytes: 199 },
-        });
+        // The requested base cell remains wholly in flight: 1,200 bytes is
+        // deliberately above the 1,000-byte coalescing ceiling. Only the
+        // application batch gate still blocks the distinct continuation.
         assert_eq!(defense.next_event(Duration::from_micros(1)), None);
-
-        defense.observe(DefenseSignal {
-            at: Duration::from_micros(2),
-            kind: SignalKind::PayloadBytes {
-                direction: Direction::Incoming,
-                bytes: 1,
-                cover: false,
-            },
-        });
-        defense.observe(DefenseSignal {
-            at: Duration::from_micros(2),
-            kind: SignalKind::ReceiveCreditConsumed { bytes: 1 },
-        });
-        assert_eq!(defense.next_event(Duration::from_micros(2)), None);
-        application_batch_completed(&mut defense, 3);
+        application_batch_completed(&mut defense, 2);
+        assert_eq!(defense.next_event_at(), Some(Duration::from_micros(2)));
         let continuation = defense
-            .next_event(Duration::from_micros(3))
-            .expect("continuation at the validated ceiling");
+            .next_event(Duration::from_micros(2))
+            .expect("distinct continuation despite high live base debt");
         assert_eq!(continuation.direction(), Direction::Incoming);
         assert_eq!(
             defense.last_incoming_event_receiver_continuation(),
@@ -2733,6 +2877,37 @@ mod tests {
                 cell_bytes: 1_200,
                 parser_ceiling_bytes: 1_000,
             })
+        );
+    }
+
+    #[test]
+    fn receiver_reserve_horizon_counts_all_future_incoming_components() {
+        let mut defense = WalkieTalkie::from_json(
+            &config(1_200),
+            1_200,
+            &molded(
+                r#"[
+                    {"outgoing": 1, "incoming": 1, "batch_end": false},
+                    {"outgoing": 2, "incoming": 1, "batch_end": false},
+                    {"outgoing": 1, "incoming": 1}
+                ]"#,
+            ),
+        )
+        .expect("three-component molded sequence");
+        assert_eq!(defense.max_receiver_continuation_reserve_horizon(), 3);
+
+        application_batch_started(&mut defense, 0);
+        let outgoing = defense.next_event(Duration::ZERO).expect("first outgoing");
+        resolve(
+            &mut defense,
+            1,
+            outgoing,
+            EventOutcome::Satisfied { observed: 1_200 },
+        );
+        assert_eq!(
+            defense.receiver_continuation_reserve_horizon(),
+            3,
+            "later positive outgoing components must not shorten the initial reserve horizon"
         );
     }
 
@@ -3253,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_completion_never_regrants_credit_that_is_still_in_flight() {
+    fn batch_completion_releases_one_continuation_while_base_credit_is_in_flight() {
         let mut defense = WalkieTalkie::from_json(
             &config(1_200),
             1_200,
@@ -3282,9 +3457,18 @@ mod tests {
         application_bytes(&mut defense, 2, Direction::Incoming, 50);
         application_batch_completed(&mut defense, 3);
 
-        // The base credit remains in flight and the held continuation is not
-        // eligible while that outstanding base exceeds the parser ceiling.
-        // Batch completion cannot duplicate either allocation.
+        // The two requested base cells still have 2,350 bytes outstanding.
+        // The held cell is a distinct prefix, so high/split global debt no
+        // longer suppresses it. It remains one-shot.
+        let continuation = defense
+            .next_event(Duration::from_micros(3))
+            .expect("one distinct continuation while base remains in flight");
+        assert_eq!(continuation.direction(), Direction::Incoming);
+        assert!(
+            defense
+                .last_incoming_event_receiver_continuation()
+                .is_some()
+        );
         assert_eq!(defense.next_event(Duration::from_micros(3)), None);
         retire_credit(&mut defense, 4, 50);
         assert_eq!(

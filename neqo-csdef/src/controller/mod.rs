@@ -1704,6 +1704,10 @@ impl QcsdController {
     }
 
     fn refresh_receiver_continuation_reserves(&mut self) {
+        // An allocated tagged continuation is no longer in `control.incoming`,
+        // so removing its oldest reserve cannot refill it on a later poll.
+        // Only a failed unadvertised allocation is requeued here; in that case
+        // rebuilding the full current horizon is the required rollback.
         let Some(disposition) = self.defense.pending_receiver_continuation().or_else(|| {
             self.control.incoming.iter().find_map(|pending| {
                 self.control
@@ -1923,7 +1927,14 @@ impl QcsdController {
                     .fold(0_u64, |total, (_, ledger)| {
                         total.saturating_add(ledger.unresolved())
                     });
-                let opportunity = (live_base_outstanding <= disposition.parser_ceiling_bytes)
+                // Preserve the established coalesced-tail path when all live
+                // base debt fits on one nonreserve stream below the parser
+                // ceiling. Otherwise release the exact oldest pristine
+                // reserve. The fallback is independent of aggregate base debt:
+                // it starts a distinct response prefix rather than extending
+                // the live base prefix.
+                let coalesced = (live_base_outstanding > 0
+                    && live_base_outstanding <= disposition.parser_ceiling_bytes)
                     .then(|| {
                         endpoint_order.iter().find_map(|endpoint| {
                             self.streams
@@ -1935,30 +1946,37 @@ impl QcsdController {
                                 )
                                 .into_iter()
                                 .find(|opportunity| {
-                                    let reserved = self
+                                    !self
                                         .control
                                         .receiver_continuation_reserves
-                                        .contains(&(opportunity.endpoint, opportunity.stream));
-                                    let unresolved = self.advertised_unresolved_on_stream(
-                                        opportunity.endpoint,
-                                        opportunity.stream,
-                                    );
-                                    if live_base_outstanding == 0 {
-                                        self.control
-                                            .receiver_continuation_reserves
-                                            .first()
-                                            .is_some_and(|key| {
-                                                *key == (opportunity.endpoint, opportunity.stream)
-                                            })
-                                            && reserved
-                                            && unresolved == 0
-                                    } else {
-                                        !reserved && unresolved == live_base_outstanding
-                                    }
+                                        .contains(&(opportunity.endpoint, opportunity.stream))
+                                        && self.advertised_unresolved_on_stream(
+                                            opportunity.endpoint,
+                                            opportunity.stream,
+                                        ) == live_base_outstanding
                                 })
                         })
                     })
                     .flatten();
+                let opportunity = coalesced.or_else(|| {
+                    let &(reserved_endpoint, reserved_stream) =
+                        self.control.receiver_continuation_reserves.first()?;
+                    self.streams
+                        .receiver_continuation_opportunities(
+                            reserved_endpoint,
+                            required,
+                            0,
+                            disposition.parser_ceiling_bytes,
+                        )
+                        .into_iter()
+                        .find(|opportunity| {
+                            opportunity.stream == reserved_stream
+                                && self.advertised_unresolved_on_stream(
+                                    opportunity.endpoint,
+                                    opportunity.stream,
+                                ) == 0
+                        })
+                });
                 if let Some(opportunity) = opportunity {
                     let release = self
                         .streams
@@ -1994,7 +2012,6 @@ impl QcsdController {
                         "a held continuation must retain its component reserve"
                     );
                     self.control.receiver_continuation_reserves.remove(0);
-                    self.control.receiver_continuation_survivor_gate_open = false;
                 } else {
                     // This event is a causal receiver continuation, not an
                     // ordinary best-effort scheduling slot. Retain it even in
@@ -2306,12 +2323,22 @@ impl QcsdController {
                     .map(|origin| (*endpoint, origin.clone()))
             })
             .collect();
-        let requests = if before_due_outgoing && self.defense.preprovision_chaff_to_stream_limit() {
-            chaff.preprovision_to_limit(
+        let requests = if self.defense.preprovision_chaff_once_to_stream_limit() {
+            if !before_due_outgoing
+                || self.control.chaff_preprovisioned_to_stream_limit
+                || endpoints.is_empty()
+            {
+                return;
+            }
+            let requests = chaff.preprovision_to_limit(
                 self.streams.open_chaff_count(),
                 self.config.max_chaff_streams,
                 &endpoints,
-            )
+            );
+            if !requests.is_empty() {
+                self.control.chaff_preprovisioned_to_stream_limit = true;
+            }
+            requests
         } else {
             chaff.replenish(
                 self.streams.aggregate_capacity().chaff_incoming,
@@ -3109,7 +3136,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the regression keeps the cross-layer receive-credit ordering explicit"
     )]
-    fn completing_natural_read_stays_in_its_incoming_mould_component() {
+    fn horizon_two_reserves_survive_across_a_positive_outgoing_component() {
         let molded = r#"{
             "adaptation": "qcsd-client-only",
             "burst_definition": "global-application-batch-direction-transitions",
@@ -3124,37 +3151,45 @@ mod tests {
                 "application_order": "after-symmetric-elementwise-mold",
                 "base_allocation_policy": "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims",
                 "batch_end_release_policy": "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate",
-                "causal_capacity_precondition": "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start",
+                "causal_capacity_precondition": "every-molded-component-outgoing>0;effective-configured-max-chaff-streams>=total-receiver-continuation-reserve-horizon+1;schema-two-stateful-stage-capacity-recurrence-proves-higher-priority-due-application-stream-frames-plus-cumulative-one-shot-chaff-request-stream-frames-through-fin-fit-within-each-exact-full-molded-outgoing-target-through-final-component",
                 "cells_per_nonzero_incoming_component": 1,
-                "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+                "formula": "symmetric_incoming=adapted_incoming-1-if-adapted_incoming>0-else-0",
                 "parser_allowance_ceiling_bytes": 1000,
                 "prefix_consumability_precondition": "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable",
-                "post_outgoing_loss_liveness_limitation": "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee",
-                "provisioning_policy": "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions",
+                "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
+                "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
                 "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
-                "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling",
+                "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                 "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
-                "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
-                "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
-                "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
-                "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
-                "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
-                "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-or-required-chaff-request-stream-output;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
-                "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
+                "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
+                "resource_precondition": "schema-two-qualified-manifest-selects-known-valid-same-origin-source-resource;derived-selected-resource-projection-dependency-free-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component;required-chaff-streams-defines-effective-configured-max-chaff-streams",
+                "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-from-initial-peer-acknowledged-preprovisioned-cohort-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-all-future-horizon-reserve-before-further-base-allocation",
+                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-all-remaining-nonzero-incoming-components-before-first-base-allocation-and-retain-distinct-reserves-across-later-positive-outgoing-components",
+                "qualified_chaff_manifest_policy": "schema-two-qualified-navigation-root-and-selected-source-resource;explicit-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams;selected-source-resource-known-valid-same-origin;derived-selected-resource-projection-dependency-free;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+                "qualified_chaff_response_policy": "three-independent-staged-qualified-parallel-chaff-streams=max-five-and-walkie-talkie-required-chaff-streams-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-selected-resource-compact-status-normalized-content-encoding-body-bytes-body-sha256;one-shot-controller-config-uses-exact-walkie-talkie-required-chaff-streams;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+                "staged_prefix_pack_precondition": "schema-two-every-component-staged-prefix-pack-after-peer-settings-and-drained-h3-control-qpack-warmup;each-molded-component-is-an-exact-declared-full-packet-target;opens-exact-bound-application-resources-and-cumulative-copies-of-selected-qualified-resource;active-chaff-cohort-is-nondecreasing-and-zero-delta-stages-are-allowed;all-post-cutoff-stream-transmissions-owned-by-one-of-exact-declared-stage-targets;each-stage-gate-requires-cumulative-application-requests-transmitted-contiguously-through-fin-and-required-active-chaff-requests-transmitted-contiguously-through-fin-and-peer-acknowledged-before-dependent-base-allocation;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
+                "qualification_binding_policy": "schema-six-raw-sha256-per-workload-binds-schema-two-chaff-qualification-sidecar-prefix-pack-spec-and-qualified-chaff-manifest;runtime-requires-exact-current-artifact-hashes-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams"
             },
             "qualification_bindings": [
                 {
                     "workload_id": "real page",
                     "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "application_resource_id": 0,
+                    "selected_chaff_resource_id": 0,
+                    "qualified_parallel_chaff_streams": 5,
+                    "walkie_talkie_required_chaff_streams": 5
                 },
                 {
                     "workload_id": "decoy page",
                     "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                     "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                    "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "application_resource_id": 0,
+                    "selected_chaff_resource_id": 0,
+                    "qualified_parallel_chaff_streams": 5,
+                    "walkie_talkie_required_chaff_streams": 5
                 }
             ],
             "profiles": [{
@@ -3224,6 +3259,7 @@ mod tests {
         let stream = QcsdStreamId(0);
         let nonreserved_chaff_stream = QcsdStreamId(4);
         let continuation_stream = QcsdStreamId(8);
+        let later_continuation_stream = QcsdStreamId(12);
         ready(&mut controller, 1, "https://example.com");
         for (stream, role, expected_response_length) in [
             (stream, QcsdRequestRole::Application, Some(2_400)),
@@ -3237,6 +3273,14 @@ mod tests {
             ),
             (
                 continuation_stream,
+                QcsdRequestRole::Chaff {
+                    resource_id: 7,
+                    request_id: None,
+                },
+                Some(2_400),
+            ),
+            (
+                later_continuation_stream,
                 QcsdRequestRole::Chaff {
                     resource_id: 7,
                     request_id: None,
@@ -3269,6 +3313,16 @@ mod tests {
             Duration::ZERO,
             endpoint,
             continuation_stream,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+        );
+        acknowledge_chaff_request(
+            &mut controller,
+            Duration::ZERO,
+            endpoint,
+            later_continuation_stream,
             QcsdRequestRole::Chaff {
                 resource_id: 7,
                 request_id: None,
@@ -3343,7 +3397,7 @@ mod tests {
                     absolute_limit,
                     slot,
                     ..
-                } if stream == continuation_stream => Some((absolute_limit, slot)),
+                } if stream == later_continuation_stream => Some((absolute_limit, slot)),
                 _ => None,
             })
             .expect("non-batch-end continuation is released before the next outgoing turn");
@@ -3351,7 +3405,7 @@ mod tests {
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
-                stream: continuation_stream,
+                stream: later_continuation_stream,
                 absolute_limit: continuation_limit,
                 slot: Some(continuation_slot),
             },
@@ -3360,12 +3414,18 @@ mod tests {
         controller.observe(
             QcsdObservation::BytesRead {
                 endpoint,
-                stream: continuation_stream,
+                stream: later_continuation_stream,
                 bytes: 1_200,
             },
             Duration::from_micros(3),
         );
         controller.poll(Duration::from_micros(3));
+        assert!(controller.control.receiver_continuation_survivor_gate_open);
+        assert_eq!(
+            controller.control.receiver_continuation_reserves,
+            [(endpoint, continuation_stream)],
+            "the distinct later-component reserve survives the first continuation"
+        );
 
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 1_200);
@@ -3374,11 +3434,78 @@ mod tests {
             0
         );
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
-        assert!(controller.drain_actions().any(|action| matches!(
-            action,
-            QcsdAction::SendPacket { packet, .. }
-                if packet.direction() == Direction::Outgoing
-        )));
+        let (second_outgoing, second_outgoing_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::SendPacket { packet, slot, .. }
+                    if packet.direction() == Direction::Outgoing =>
+                {
+                    Some((packet, slot))
+                }
+                _ => None,
+            })
+            .expect("positive outgoing component between the two continuations");
+        controller.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot: second_outgoing_slot,
+                observed_size: second_outgoing.length(),
+            },
+            Duration::from_micros(4),
+        );
+        controller.poll(Duration::from_micros(4));
+        let (second_base_limit, second_base_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream: candidate,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if candidate == stream => Some((absolute_limit, slot)),
+                _ => None,
+            })
+            .expect("second component base credit");
+        assert_eq!(second_base_limit, 2_400);
+        assert_eq!(
+            controller.control.receiver_continuation_reserves,
+            [(endpoint, continuation_stream)],
+            "the future reserve stays pristine across the later positive outgoing component"
+        );
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: second_base_limit,
+                slot: Some(second_base_slot),
+            },
+            Duration::from_micros(5),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 1_200,
+            },
+            Duration::from_micros(5),
+        );
+        controller.observe(
+            QcsdObservation::ApplicationBatchCompleted,
+            Duration::from_micros(5),
+        );
+        controller.poll(Duration::from_micros(5));
+        let second_continuation_stream = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream: candidate, ..
+                } if candidate == continuation_stream => Some(candidate),
+                _ => None,
+            })
+            .expect("second component consumes its original distinct reserve");
+        assert_eq!(second_continuation_stream, continuation_stream);
+        assert!(controller.control.receiver_continuation_reserves.is_empty());
+        assert!(controller.control.receiver_continuation_survivor_gate_open);
     }
 
     #[test]
@@ -3950,6 +4077,216 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
+        reason = "one-shot provisioning and continuation rollback are one causal lifecycle oracle"
+    )]
+    fn walkie_talkie_one_shot_batch_survives_unadvertised_reserve_loss_and_rollback() {
+        const CELL: u64 = 1_200;
+        let mut molded: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/data/walkie-talkie-continuation.json"
+        ))
+        .expect("receiver-continuation fixture");
+        let profile = &mut molded["profiles"][0];
+        profile["source_envelopes"] = serde_json::json!({
+            "real": [{"outgoing": 1, "incoming": 1}],
+            "decoy": [{"outgoing": 1, "incoming": 1}]
+        });
+        profile["batch_ends"] = serde_json::json!({"real": [0], "decoy": [0]});
+        profile["molded_batch_ends"] = serde_json::json!([0]);
+        profile["matching_cost_packets"] = serde_json::json!(2);
+        profile["total_scheduled_bytes"] = serde_json::json!(3_600);
+        profile["bursts"] = serde_json::json!([{"outgoing": 1, "incoming": 2}]);
+
+        let config = WalkieTalkieConfig {
+            molded: "one-shot-rollback.json".into(),
+            workload_id: "bootstrap-like-real".into(),
+            packet_size: 1_200,
+        };
+        let defense = WalkieTalkie::from_json(&config, 1_200, &molded.to_string())
+            .expect("one-component Walkie-Talkie mould");
+        let manifest = ResourceManifest {
+            resources: vec![Resource {
+                id: 7,
+                url: "https://example.com/chaff".into(),
+                kind: "Image".into(),
+                content_length: Some(2 * CELL),
+                data_length: 2 * CELL,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            }],
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 1,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                low_watermark: 0,
+                max_chaff_streams: 3,
+                max_udp_payload_size: 1_200,
+                drop_unsatisfied_events: false,
+                tail_wait_us: 0,
+                defense: DefenseConfig::WalkieTalkie(config),
+                ..QcsdConfig::default()
+            },
+            Some(manifest),
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let application = QcsdStreamId(0);
+        let chaff_streams = [QcsdStreamId(4), QcsdStreamId(8), QcsdStreamId(12)];
+        ready(&mut controller, 1, "https://example.com");
+        controller.request_chaff_if_needed(true);
+        let request_ids: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::RequestChaff {
+                    resource,
+                    request_id,
+                    ..
+                } => {
+                    assert_eq!(resource.id, 7);
+                    Some(request_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(request_ids.len(), 3);
+        assert!(controller.control.chaff_preprovisioned_to_stream_limit);
+
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: application,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(CELL),
+            },
+            Duration::ZERO,
+        );
+        for (stream, request_id) in chaff_streams.into_iter().zip(request_ids) {
+            let role = QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: Some(request_id),
+            };
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role,
+                    expected_response_length: None,
+                },
+                Duration::ZERO,
+            );
+            acknowledge_chaff_request(&mut controller, Duration::ZERO, endpoint, stream, role);
+        }
+        controller.drain_actions().for_each(drop);
+        controller.observe(QcsdObservation::ApplicationBatchStarted, Duration::ZERO);
+        controller.observe(
+            QcsdObservation::StreamDataTransmitted {
+                endpoint,
+                stream: application,
+                role: QcsdRequestRole::Application,
+                offset: 0,
+                bytes: 1,
+                fin: false,
+                slot: None,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let (outgoing, outgoing_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
+                _ => None,
+            })
+            .expect("outgoing carrier");
+        controller.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot: outgoing_slot,
+                observed_size: outgoing.length(),
+            },
+            Duration::from_micros(1),
+        );
+        controller.poll(Duration::from_micros(1));
+        let (base_limit, base_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if stream == application => Some((absolute_limit, slot)),
+                _ => None,
+            })
+            .expect("base credit");
+        assert_eq!(base_limit, CELL);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: application,
+                absolute_limit: base_limit,
+                slot: Some(base_slot),
+            },
+            Duration::from_micros(2),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: application,
+                bytes: CELL,
+            },
+            Duration::from_micros(2),
+        );
+        controller.observe(
+            QcsdObservation::ApplicationBatchCompleted,
+            Duration::from_micros(2),
+        );
+        controller.poll(Duration::from_micros(2));
+        let (first_stream, first_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { stream, slot, .. } => Some((stream, slot)),
+                _ => None,
+            })
+            .expect("first reserve release");
+        assert_eq!(first_stream, QcsdStreamId(12));
+
+        // Losing the unadvertised selected stream rolls its whole cell back
+        // and requeues the same tagged continuation. The next poll selects an
+        // older member of the initial cohort without requesting new chaff.
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream: first_stream,
+                finish: QcsdStreamFinish::Reset,
+            },
+            Duration::from_micros(3),
+        );
+        controller.poll(Duration::from_micros(3));
+        let retry_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(
+            !retry_actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::RequestChaff { .. }))
+        );
+        assert!(retry_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit {
+                stream: QcsdStreamId(8),
+                slot,
+                ..
+            } if *slot == first_slot
+        )));
+        assert!(controller.control.chaff_preprovisioned_to_stream_limit);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "the literal Cloudflare one-byte-tail geometry remains explicit"
     )]
     fn receiver_continuation_skips_active_cloudflare_chaff_and_retries_fresh() {
@@ -4231,20 +4568,14 @@ mod tests {
                 Duration::from_micros(2),
             );
         }
-        for (stream, bytes) in [
-            (application, APPLICATION_BYTES),
-            (bulk, BULK_CHAFF_BYTES),
-            (active, ACTIVE_OFFSET),
-        ] {
-            controller.observe(
-                QcsdObservation::BytesRead {
-                    endpoint,
-                    stream,
-                    bytes,
-                },
-                Duration::from_micros(2),
-            );
-        }
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: application,
+                bytes: APPLICATION_BYTES,
+            },
+            Duration::from_micros(2),
+        );
         controller.poll(Duration::from_micros(2));
         assert!(controller.drain_actions().all(|action| !matches!(
             action,
@@ -4299,12 +4630,34 @@ mod tests {
             .expect("held continuation is released whole");
         assert_eq!(continuation_stream, replacement);
         assert_eq!(continuation_limit, CELL);
+        let live_base_outstanding = controller
+            .incoming_credit_ledger
+            .iter()
+            .filter(|(slot, _)| **slot != continuation_slot)
+            .fold(0_u64, |total, (_, ledger)| {
+                total.saturating_add(ledger.unresolved())
+            });
+        assert_eq!(
+            live_base_outstanding,
+            BASE_BYTES.saturating_sub(APPLICATION_BYTES)
+        );
+        assert!(live_base_outstanding > 1_000);
         assert!(
             controller
                 .control
                 .receiver_continuations
                 .contains_key(&continuation_slot)
         );
+        for (stream, bytes) in [(bulk, BULK_CHAFF_BYTES), (active, ACTIVE_OFFSET)] {
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes,
+                },
+                Duration::from_micros(4),
+            );
+        }
         let active_state = controller
             .streams
             .get_mut(endpoint, active)
@@ -4477,37 +4830,45 @@ mod tests {
                 "application_order": "after-symmetric-elementwise-mold",
                 "base_allocation_policy": "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims",
                 "batch_end_release_policy": "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate",
-                "causal_capacity_precondition": "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start",
+                "causal_capacity_precondition": "every-molded-component-outgoing>0;effective-configured-max-chaff-streams>=total-receiver-continuation-reserve-horizon+1;schema-two-stateful-stage-capacity-recurrence-proves-higher-priority-due-application-stream-frames-plus-cumulative-one-shot-chaff-request-stream-frames-through-fin-fit-within-each-exact-full-molded-outgoing-target-through-final-component",
                 "cells_per_nonzero_incoming_component": 1,
-                "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+                "formula": "symmetric_incoming=adapted_incoming-1-if-adapted_incoming>0-else-0",
                 "parser_allowance_ceiling_bytes": 1000,
                 "prefix_consumability_precondition": "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable",
-                "post_outgoing_loss_liveness_limitation": "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee",
-                "provisioning_policy": "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions",
+                "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
+                "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
                 "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
-                "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling",
+                "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                 "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
-                "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
-                "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
-                "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
-                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component",
-                "qualified_chaff_manifest_policy": "distinct-schema-one-qualified-navigation-root-only;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
-                "qualified_chaff_response_policy": "three-independent-five-way-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-compact-status-normalized-content-encoding-body-bytes-body-sha256;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
-                "first_cell_prefix_pack_precondition": "three-independent-production-nonblocking-qpack-runs-after-peer-settings-and-drained-h3-control-qpack-warmup-open-one-full-application-root-plus-five-qualified-compact-chaff-requests-before-exactly-one-1200-byte-molded-packet-target;all-post-cutoff-stream-transmissions-owned-by-sole-target;application-and-maximum-receiver-continuation-reserve-horizon+1-chaff-request-streams-contiguous-through-fin;required-chaff-peer-acknowledged-through-fin;no-pending-application-or-required-chaff-request-stream-output;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
-                "qualification_binding_policy": "raw-sha256-per-workload-binds-chaff-qualification-sidecar-prefix-pack-spec-and-final-qualified-chaff-manifest;runtime-requires-exact-final-manifest-and-embedded-prefix-spec-hashes"
+                "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
+                "resource_precondition": "schema-two-qualified-manifest-selects-known-valid-same-origin-source-resource;derived-selected-resource-projection-dependency-free-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component;required-chaff-streams-defines-effective-configured-max-chaff-streams",
+                "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-from-initial-peer-acknowledged-preprovisioned-cohort-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-all-future-horizon-reserve-before-further-base-allocation",
+                "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-all-remaining-nonzero-incoming-components-before-first-base-allocation-and-retain-distinct-reserves-across-later-positive-outgoing-components",
+                "qualified_chaff_manifest_policy": "schema-two-qualified-navigation-root-and-selected-source-resource;explicit-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams;selected-source-resource-known-valid-same-origin;derived-selected-resource-projection-dependency-free;exact-lowercase-accept-accept-encoding-accept-language-projection;application-request-headers-unchanged",
+                "qualified_chaff_response_policy": "three-independent-staged-qualified-parallel-chaff-streams=max-five-and-walkie-talkie-required-chaff-streams-concurrent-unshaped-production-nonblocking-qpack-qualifications-derive-selected-resource-compact-status-normalized-content-encoding-body-bytes-body-sha256;one-shot-controller-config-uses-exact-walkie-talkie-required-chaff-streams;runtime-complete-responses-must-match-derived-identity;runtime-partial-responses-have-null-identity-match-fields",
+                "staged_prefix_pack_precondition": "schema-two-every-component-staged-prefix-pack-after-peer-settings-and-drained-h3-control-qpack-warmup;each-molded-component-is-an-exact-declared-full-packet-target;opens-exact-bound-application-resources-and-cumulative-copies-of-selected-qualified-resource;active-chaff-cohort-is-nondecreasing-and-zero-delta-stages-are-allowed;all-post-cutoff-stream-transmissions-owned-by-one-of-exact-declared-stage-targets;each-stage-gate-requires-cumulative-application-requests-transmitted-contiguously-through-fin-and-required-active-chaff-requests-transmitted-contiguously-through-fin-and-peer-acknowledged-before-dependent-base-allocation;no-pending-request-causal-h3-control-or-qpack-encoder-stream-output;post-warmup-qpack-decoder-stream-output-recorded-and-excluded;zero-targetless-stream-bytes",
+                "qualification_binding_policy": "schema-six-raw-sha256-per-workload-binds-schema-two-chaff-qualification-sidecar-prefix-pack-spec-and-qualified-chaff-manifest;runtime-requires-exact-current-artifact-hashes-application-resource-id-selected-chaff-resource-id-and-required-chaff-streams"
             },
             "qualification_bindings": [
                 {
                     "workload_id": "real page",
                     "chaff_qualification_sidecar_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "prefix_pack_spec_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    "qualified_chaff_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "application_resource_id": 0,
+                    "selected_chaff_resource_id": 0,
+                    "qualified_parallel_chaff_streams": 5,
+                    "walkie_talkie_required_chaff_streams": 5
                 },
                 {
                     "workload_id": "decoy page",
                     "chaff_qualification_sidecar_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                     "prefix_pack_spec_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                    "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    "qualified_chaff_manifest_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "application_resource_id": 0,
+                    "selected_chaff_resource_id": 0,
+                    "qualified_parallel_chaff_streams": 5,
+                    "walkie_talkie_required_chaff_streams": 5
                 }
             ],
             "profiles": [{
@@ -4863,6 +5224,14 @@ mod tests {
                 },
                 None,
             ),
+            (
+                QcsdStreamId(12),
+                QcsdRequestRole::Chaff {
+                    resource_id: 7,
+                    request_id: None,
+                },
+                None,
+            ),
         ] {
             controller.observe(
                 QcsdObservation::StreamOpened {
@@ -4874,7 +5243,7 @@ mod tests {
                 Duration::ZERO,
             );
         }
-        for stream in [QcsdStreamId(4), QcsdStreamId(8)] {
+        for stream in [QcsdStreamId(4), QcsdStreamId(8), QcsdStreamId(12)] {
             acknowledge_chaff_request(
                 &mut controller,
                 Duration::ZERO,
@@ -4892,7 +5261,7 @@ mod tests {
                 .iter()
                 .filter(|action| matches!(action, QcsdAction::ConfigureManualReceive { .. }))
                 .count(),
-            3
+            4
         );
         assert!(initial_actions.iter().all(|action| !matches!(
             action,
