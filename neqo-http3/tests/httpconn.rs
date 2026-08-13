@@ -585,6 +585,7 @@ fn qcsd_chaff_dispatches_exact_frozen_safe_accept_encoding() {
             Duration::from_millis(100),
         )
         .expect("enable QCSD");
+    let dynamic_references_before = client.qpack_encoder_stats().dynamic_table_references;
     let stream = client
         .apply_qcsd_action(
             now(),
@@ -615,6 +616,11 @@ fn qcsd_chaff_dispatches_exact_frozen_safe_accept_encoding() {
     client
         .stream_close_send(stream, now())
         .expect("finish chaff request");
+    assert_eq!(
+        client.qpack_encoder_stats().dynamic_table_references,
+        dynamic_references_before,
+        "the chaff path must not create a QPACK dynamic dependency"
+    );
     exchange_packets(&mut client, &mut server, false, None);
 
     let headers = server

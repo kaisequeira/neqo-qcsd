@@ -116,6 +116,7 @@ pub struct SendMessage {
     stream_type: Http3StreamType,
     stream: BufferedStream,
     encoder: Rc<RefCell<qpack::Encoder>>,
+    qpack_nonblocking: bool,
     conn_events: Box<dyn SendStreamEvents>,
 }
 
@@ -127,6 +128,44 @@ impl SendMessage {
         encoder: Rc<RefCell<qpack::Encoder>>,
         conn_events: Box<dyn SendStreamEvents>,
     ) -> Self {
+        Self::new_with_qpack_policy(
+            message_type,
+            stream_type,
+            stream_id,
+            encoder,
+            conn_events,
+            false,
+        )
+    }
+
+    /// Construct a request stream whose first header block uses only QPACK
+    /// static references and literals.
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn new_nonblocking(
+        message_type: MessageType,
+        stream_type: Http3StreamType,
+        stream_id: StreamId,
+        encoder: Rc<RefCell<qpack::Encoder>>,
+        conn_events: Box<dyn SendStreamEvents>,
+    ) -> Self {
+        Self::new_with_qpack_policy(
+            message_type,
+            stream_type,
+            stream_id,
+            encoder,
+            conn_events,
+            true,
+        )
+    }
+
+    fn new_with_qpack_policy(
+        message_type: MessageType,
+        stream_type: Http3StreamType,
+        stream_id: StreamId,
+        encoder: Rc<RefCell<qpack::Encoder>>,
+        conn_events: Box<dyn SendStreamEvents>,
+        qpack_nonblocking: bool,
+    ) -> Self {
         qdebug!("Create a request stream_id={stream_id}");
         Self {
             state: MessageState::WaitingForHeaders,
@@ -135,6 +174,7 @@ impl SendMessage {
             stream_type,
             stream: BufferedStream::new(stream_id),
             encoder,
+            qpack_nonblocking,
             conn_events,
         }
     }
@@ -149,9 +189,14 @@ impl SendMessage {
         headers: &[Header],
         conn: &mut Connection,
         stream_id: StreamId,
+        qpack_nonblocking: bool,
     ) {
         qdebug!("Encoding headers");
-        let header_block = qpack_encoder.encode_header_block(conn, headers, stream_id);
+        let header_block = if qpack_nonblocking {
+            qpack_encoder.encode_header_block_nonblocking(headers)
+        } else {
+            qpack_encoder.encode_header_block(conn, headers, stream_id)
+        };
         let hframe = HFrame::Headers {
             header_block: header_block.to_vec(),
         };
@@ -321,7 +366,14 @@ impl HttpSendStream for SendMessage {
         self.state.new_headers(headers, self.message_type)?;
         let stream_id = self.stream_id();
         self.stream.encode_with(|e| {
-            Self::encode(e, &mut self.encoder.borrow_mut(), headers, conn, stream_id);
+            Self::encode(
+                e,
+                &mut self.encoder.borrow_mut(),
+                headers,
+                conn,
+                stream_id,
+                self.qpack_nonblocking,
+            );
         });
         Ok(())
     }

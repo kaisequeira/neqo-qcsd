@@ -17,7 +17,7 @@ use neqo_csdef::{
 use neqo_transport::StreamId;
 
 use super::Http3Client;
-use crate::{Error, Priority, Res};
+use crate::{Error, Priority, Res, connection::RequestDescription};
 
 impl Http3Client {
     /// Enable the narrow QCSD adapter for this HTTP/3 connection.
@@ -252,7 +252,20 @@ impl Http3Client {
         }
         let headers = strict_chaff_headers(resource.headers);
         let resource_id = resource.id;
-        let stream_id = match self.fetch(now, "GET", &target, &headers, Priority::default()) {
+        let stream_id = match self.base_handler.request_nonblocking(
+            &mut self.conn,
+            Box::new(self.events.clone()),
+            Box::new(self.events.clone()),
+            Some(std::rc::Rc::clone(&self.push_handler)),
+            &RequestDescription {
+                method: "GET",
+                connect_type: None,
+                target: &target,
+                headers: &headers,
+                priority: Priority::default(),
+            },
+            now,
+        ) {
             Ok(stream_id) => stream_id,
             Err(error) => {
                 self.events

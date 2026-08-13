@@ -4133,7 +4133,13 @@ impl Connection {
         for acked in acked_packets {
             for token in acked.tokens() {
                 match token {
-                    recovery::Token::Stream(stream_token) => self.streams.acked(stream_token),
+                    recovery::Token::Stream(stream_token) => {
+                        #[cfg(feature = "qcsd")]
+                        if let recovery::StreamRecoveryToken::Stream(token) = stream_token {
+                            self.qcsd_observe_stream_acknowledgment(token);
+                        }
+                        self.streams.acked(stream_token);
+                    }
                     recovery::Token::Ack(at) => self.acks.acked(at),
                     recovery::Token::Crypto(ct) => self.crypto.acked(ct),
                     recovery::Token::NewToken(seqno) => self.new_token.acked(*seqno),

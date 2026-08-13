@@ -215,6 +215,53 @@ enum ManifestInput {
 }
 
 impl ResourceManifest {
+    fn initial_chaff_selection_matching(&self, origins: Option<&[String]>) -> Option<&Resource> {
+        let eligible = self.resources.iter().filter(|resource| {
+            resource.known_valid
+                && resource.depends_on.is_empty()
+                && resource.effective_length() > 0
+                && origins.is_none_or(|origins| {
+                    resource
+                        .origin()
+                        .is_some_and(|origin| origins.contains(&origin))
+                })
+        });
+        let priority_only = eligible.clone().any(|resource| resource.chaff_priority);
+        eligible
+            .filter(|resource| !priority_only || resource.chaff_priority)
+            .max_by_key(|resource| {
+                (
+                    resource.effective_length(),
+                    resource.type_rank(),
+                    resource.id,
+                )
+            })
+    }
+
+    /// Initial selected chaff length restricted to the complete endpoint-origin set.
+    #[must_use]
+    pub fn initial_chaff_selection_effective_length_for_origins(
+        &self,
+        origins: &[String],
+    ) -> Option<u64> {
+        self.initial_chaff_selection_matching(Some(origins))
+            .map(Resource::effective_length)
+    }
+
+    /// Whether build-time manifest structure contains a possible response of
+    /// at least `minimum_length` before any dependency completes.
+    ///
+    /// Origin filtering and priority-only selection require the complete run
+    /// endpoint set and are validated synchronously by the runner.
+    #[must_use]
+    pub fn has_structural_initial_chaff_candidate(&self, minimum_length: u64) -> bool {
+        self.resources.iter().any(|resource| {
+            resource.known_valid
+                && resource.depends_on.is_empty()
+                && resource.effective_length() >= minimum_length
+        })
+    }
+
     /// Load either the current resource shape or the published QCSD graph shape.
     ///
     /// # Errors

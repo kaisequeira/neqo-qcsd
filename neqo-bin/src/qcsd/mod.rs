@@ -809,6 +809,7 @@ fn sha256(bytes: &[u8]) -> Result<String, Error> {
 async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     spec.workload.validate()?;
     validate_workload_urls(&spec.workload)?;
+    validate_walkie_talkie_chaff_precondition(&spec)?;
     if spec.output_dir.exists() && fs::read_dir(&spec.output_dir)?.next().is_some() {
         return Err(Error::Argument(format!(
             "output directory must be empty: {}",
@@ -854,6 +855,35 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
         )?;
     }
     result
+}
+
+fn validate_walkie_talkie_chaff_precondition(spec: &RunSpec) -> Result<(), Error> {
+    let DefenseConfig::WalkieTalkie(config) = &spec.config.defense else {
+        return Ok(());
+    };
+    if spec.config.use_empty_resources {
+        return Err(Error::Argument(
+            "Walkie-Talkie receiver continuations require positive-length chaff resources; use_empty_resources is unsupported".into(),
+        ));
+    }
+    let mut origins: Vec<_> = spec
+        .workload
+        .resources
+        .iter()
+        .filter_map(Resource::origin)
+        .collect();
+    origins.sort_unstable();
+    origins.dedup();
+    let selected = spec.chaff_manifest.as_ref().and_then(|manifest| {
+        manifest.initial_chaff_selection_effective_length_for_origins(&origins)
+    });
+    if selected.is_none_or(|length| length < u64::from(config.packet_size)) {
+        return Err(Error::Argument(format!(
+            "Walkie-Talkie initial same-origin chaff selection must provide at least {} response bytes",
+            config.packet_size
+        )));
+    }
+    Ok(())
 }
 
 fn run_artifact_is_terminal(output_dir: &Path) -> bool {
@@ -2678,7 +2708,8 @@ mod tests {
         resolve_run_config_with_workload, sanitize_chaff_action_headers, shapes_stream_sends,
         terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
-        traffic_morphing_endpoint_seed, wait_for_activity, write_run_json,
+        traffic_morphing_endpoint_seed, validate_walkie_talkie_chaff_precondition,
+        wait_for_activity, write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -2777,6 +2808,76 @@ mod tests {
         assert_eq!(
             sanitize_chaff_headers(vec![("Accept".into(), "text/html".into())]),
             vec![("accept".into(), "text/html".into())]
+        );
+    }
+
+    #[test]
+    fn walkie_talkie_chaff_preflight_filters_origins_before_priority_selection() {
+        let workload = ResourceManifest {
+            resources: vec![request(1, "https://match.example", Vec::new())],
+        };
+        let chaff = |id, origin: &str, length, priority| Resource {
+            id,
+            url: format!("{origin}/{id}"),
+            kind: "Image".into(),
+            content_length: Some(length),
+            data_length: length,
+            chaff_priority: priority,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        let spec = |resources, use_empty_resources| RunSpec {
+            method: "GET",
+            workload: workload.clone(),
+            workload_hash: "preflight".into(),
+            config: QcsdConfig {
+                use_empty_resources,
+                defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
+                    packet_size: 1_200,
+                    ..WalkieTalkieConfig::default()
+                }),
+                ..QcsdConfig::default()
+            },
+            defense_parameters: None,
+            chaff_manifest: Some(ResourceManifest { resources }),
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 0,
+            output_dir: trace_output_dir("walkie-preflight"),
+            max_response_bytes: 1,
+            timeout_seconds: 1,
+        };
+
+        validate_walkie_talkie_chaff_precondition(&spec(
+            vec![
+                chaff(7, "https://other.example", 1_199, true),
+                chaff(8, "https://match.example", 1_200, false),
+            ],
+            false,
+        ))
+        .expect("unmatched priority resource cannot suppress matching fallback");
+
+        assert!(
+            validate_walkie_talkie_chaff_precondition(&spec(
+                vec![
+                    chaff(7, "https://match.example", 1_199, true),
+                    chaff(8, "https://match.example", 1_200, false),
+                ],
+                false,
+            ))
+            .is_err()
+        );
+        validate_walkie_talkie_chaff_precondition(&spec(
+            vec![chaff(7, "https://match.example", 1_200, true)],
+            false,
+        ))
+        .expect("selected same-origin resource supplies one whole cell");
+        assert!(
+            validate_walkie_talkie_chaff_precondition(&spec(
+                vec![chaff(7, "https://match.example", 0, true)],
+                true,
+            ))
+            .is_err()
         );
     }
 

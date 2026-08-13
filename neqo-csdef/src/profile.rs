@@ -294,7 +294,7 @@ mod tests {
         let front = QcsdProfile::Live
             .resolve(DefenseKind::Front)
             .expect("live FRONT");
-        assert_eq!(front.max_chaff_streams, 2);
+        assert_eq!(front.max_chaff_streams, 5);
         assert_eq!(front.max_udp_payload_size, 1_200);
         assert_eq!(
             front.defense,

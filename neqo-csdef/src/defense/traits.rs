@@ -127,9 +127,19 @@ pub struct DefenseSignal {
 /// continuation event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiverContinuationDisposition {
+    /// Exact size of the whole continuation cell.
+    pub cell_bytes: u64,
     /// Maximum advertised raw prefix that may still count as pristine for the
     /// prepared receiver-liveness contract.
     pub parser_ceiling_bytes: u64,
+}
+
+/// Capacity visible to a defense after controller-private reservations have
+/// been removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityAdjustment {
+    /// Exact chaff response capacity protected from ordinary allocation.
+    pub reserved_chaff_bytes: u64,
 }
 
 /// Per-mould Walkie-Talkie realization recorded in the terminal run artifact.
@@ -322,6 +332,39 @@ pub trait Defense: Debug {
     fn last_incoming_event_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
         None
     }
+    /// Whether the current incoming component still requires a dedicated
+    /// receiver-continuation stream. The controller queries this before base
+    /// allocation so the candidate cannot be consumed before the held event is
+    /// emitted.
+    fn pending_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
+        None
+    }
+    /// Whether the controller must provision chaff requests to its configured
+    /// stream limit before due outgoing targets are dispatched.
+    fn preprovision_chaff_to_stream_limit(&self) -> bool {
+        false
+    }
+    /// Whether ordinary base allocation may use only peer-ACK-activated chaff.
+    /// Application streams and other defenses retain their existing behavior.
+    fn base_chaff_requires_peer_acknowledgment(&self) -> bool {
+        false
+    }
+    /// Number of pristine activated streams that must be protected across the
+    /// current incoming component and any consecutive nonzero incoming
+    /// components reached before another positive outgoing component.
+    fn receiver_continuation_reserve_horizon(&self) -> usize {
+        0
+    }
+    /// Maximum reserve horizon across the complete fixed schedule.
+    fn max_receiver_continuation_reserve_horizon(&self) -> usize {
+        0
+    }
+    /// Exact continuation-cell size used for static controller preflight.
+    fn receiver_continuation_cell_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Observe controller-private capacity withheld from ordinary scheduling.
+    fn observe_capacity_adjustment(&mut self, _adjustment: CapacityAdjustment) {}
     /// Time of the next event relative to defense start.
     fn next_event_at(&self) -> Option<Duration>;
     /// Whether no events remain.

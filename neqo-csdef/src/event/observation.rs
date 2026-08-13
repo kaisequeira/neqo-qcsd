@@ -327,6 +327,18 @@ pub enum QcsdObservation {
         offset: u64,
         bytes: u64,
     },
+    /// One request-stream range was acknowledged by the peer. The controller
+    /// activates chaff only after these observations cover `[0, FIN)` without
+    /// gaps; transmission alone is insufficient because it can be lost.
+    StreamDataAcknowledged {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        role: QcsdRequestRole,
+        offset: u64,
+        bytes: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        fin: bool,
+    },
     SlotSatisfied {
         endpoint: QcsdEndpointId,
         slot: QcsdSlotId,

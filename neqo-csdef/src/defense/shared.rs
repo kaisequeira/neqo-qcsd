@@ -160,6 +160,18 @@ impl RoundRobinScheduler {
         order
     }
 
+    /// Inspect the next cyclic incoming endpoint order without advancing it.
+    #[must_use]
+    pub fn incoming_order(&self) -> Vec<QcsdEndpointId> {
+        if self.endpoints.is_empty() {
+            return Vec::new();
+        }
+        let start = self.incoming_cursor;
+        (0..self.endpoints.len())
+            .map(|offset| self.endpoints[(start + offset) % self.endpoints.len()])
+            .collect()
+    }
+
     /// Endpoints in deterministic scheduling order.
     #[must_use]
     pub fn endpoints(&self) -> &[QcsdEndpointId] {

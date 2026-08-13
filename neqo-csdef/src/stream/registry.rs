@@ -9,10 +9,74 @@ use super::ReceiveState;
 use crate::{Capacity, DefenseMode, QcsdEndpointId, QcsdRequestRole, QcsdStreamId};
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "public stream facts coexist with private fail-closed request-ACK evidence"
+)]
 pub struct StreamState {
     pub role: QcsdRequestRole,
     pub receive: ReceiveState,
     pub status: Option<u16>,
+    request_acknowledged_ranges: Vec<(u64, u64)>,
+    request_acknowledged_final_size: Option<u64>,
+    request_acknowledgment_invalid: bool,
+}
+
+impl StreamState {
+    fn record_request_acknowledgment(&mut self, offset: u64, bytes: u64, fin: bool) -> u64 {
+        let Some(end) = offset.checked_add(bytes) else {
+            self.request_acknowledgment_invalid = true;
+            return 0;
+        };
+        if self
+            .request_acknowledged_final_size
+            .is_some_and(|final_size| end > final_size)
+        {
+            self.request_acknowledgment_invalid = true;
+            return 0;
+        }
+        if fin {
+            if self
+                .request_acknowledged_final_size
+                .is_some_and(|final_size| final_size != end)
+                || self
+                    .request_acknowledged_ranges
+                    .last()
+                    .is_some_and(|(_, acknowledged_end)| *acknowledged_end > end)
+            {
+                self.request_acknowledgment_invalid = true;
+                return 0;
+            }
+            self.request_acknowledged_final_size = Some(end);
+        }
+        if end <= offset {
+            return 0;
+        }
+        let before = covered_range_bytes(&self.request_acknowledged_ranges);
+        self.request_acknowledged_ranges.push((offset, end));
+        self.request_acknowledged_ranges.sort_unstable();
+        merge_ranges(&mut self.request_acknowledged_ranges);
+        covered_range_bytes(&self.request_acknowledged_ranges).saturating_sub(before)
+    }
+
+    /// Whether the peer acknowledged the complete request-stream range through
+    /// its FIN. A response stream is not causally usable before this evidence
+    /// is contiguous and internally consistent.
+    pub fn chaff_request_activated(&self) -> bool {
+        if !matches!(self.role, QcsdRequestRole::Chaff { .. })
+            || self.request_acknowledgment_invalid
+        {
+            return false;
+        }
+        self.request_acknowledged_final_size
+            .is_some_and(|final_size| {
+                final_size > 0
+                    && self
+                        .request_acknowledged_ranges
+                        .first()
+                        .is_some_and(|(start, end)| *start == 0 && *end == final_size)
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +134,9 @@ impl StreamRegistry {
                 role,
                 receive,
                 status: None,
+                request_acknowledged_ranges: Vec::new(),
+                request_acknowledged_final_size: None,
+                request_acknowledgment_invalid: false,
             },
         );
     }
@@ -80,6 +147,26 @@ impl StreamRegistry {
         stream: QcsdStreamId,
     ) -> Option<&mut StreamState> {
         self.streams.get_mut(&(endpoint, stream))
+    }
+
+    /// Record unique request-stream bytes only when the transport observation
+    /// matches the registered chaff role exactly.
+    pub fn record_chaff_request_acknowledgment(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        role: QcsdRequestRole,
+        offset: u64,
+        bytes: u64,
+        fin: bool,
+    ) -> u64 {
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return 0;
+        };
+        if state.role != role || !matches!(role, QcsdRequestRole::Chaff { .. }) {
+            return 0;
+        }
+        state.record_request_acknowledgment(offset, bytes, fin)
     }
 
     pub fn remove_endpoint(&mut self, endpoint: QcsdEndpointId) {
@@ -170,9 +257,34 @@ impl StreamRegistry {
         opportunities
     }
 
+    /// Ordinary allocation opportunities excluding protected continuation
+    /// reserves. Other opportunities preserve the ordinary allocator's
+    /// existing semantics; peer acknowledgment is special to continuation
+    /// reservation and release.
+    pub fn allocation_opportunities_excluding(
+        &self,
+        endpoint: QcsdEndpointId,
+        mode: DefenseMode,
+        excluded: &[(QcsdEndpointId, QcsdStreamId)],
+        require_peer_acknowledged_chaff: bool,
+    ) -> Vec<AllocationOpportunity> {
+        self.allocation_opportunities(endpoint, mode)
+            .into_iter()
+            .filter(|opportunity| {
+                !excluded.contains(&(opportunity.endpoint, opportunity.stream))
+                    && (!require_peer_acknowledged_chaff
+                        || matches!(opportunity.role, QcsdRequestRole::Application)
+                        || self
+                            .streams
+                            .get(&(opportunity.endpoint, opportunity.stream))
+                            .is_some_and(StreamState::chaff_request_activated))
+            })
+            .collect()
+    }
+
     /// Deterministic exact-capacity opportunities for a held receiver
-    /// continuation. Only pristine controlled chaff streams are eligible;
-    /// provisional framing claims are never exposed to this path.
+    /// continuation. Only peer-ACK-activated pristine controlled chaff streams
+    /// are eligible; provisional framing claims are never exposed to this path.
     pub fn receiver_continuation_opportunities(
         &self,
         endpoint: QcsdEndpointId,
@@ -186,6 +298,7 @@ impl StreamRegistry {
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
                     && matches!(state.role, QcsdRequestRole::Chaff { .. })
+                    && state.chaff_request_activated()
                     && state.status.is_none()
                     && state.receive.has_receiver_continuation_capacity(
                         required,
@@ -203,6 +316,45 @@ impl StreamRegistry {
             .collect();
         opportunities.sort_unstable_by_key(|opportunity| opportunity.stream);
         opportunities
+    }
+
+    /// Select one deterministic peer-ACK-activated pristine candidate for a future
+    /// zero-outstanding continuation. Endpoint order remains controller-owned;
+    /// stream order is stable within an endpoint.
+    pub fn receiver_continuation_reserve_opportunities(
+        &self,
+        endpoint: QcsdEndpointId,
+        required: u64,
+        parser_ceiling: u64,
+    ) -> Vec<AllocationOpportunity> {
+        self.receiver_continuation_opportunities(endpoint, required, 0, parser_ceiling)
+    }
+
+    pub fn is_receiver_continuation_reserve(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        required: u64,
+        parser_ceiling: u64,
+    ) -> bool {
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            matches!(state.role, QcsdRequestRole::Chaff { .. })
+                && state.chaff_request_activated()
+                && state.status.is_none()
+                && state
+                    .receive
+                    .has_receiver_continuation_capacity(required, 0, parser_ceiling)
+        })
+    }
+
+    pub fn reserved_exact_capacity(&self, reserves: &[(QcsdEndpointId, QcsdStreamId)]) -> u64 {
+        reserves.iter().fold(0_u64, |total, key| {
+            total.saturating_add(
+                self.streams
+                    .get(key)
+                    .map_or(0, |state| state.receive.available()),
+            )
+        })
     }
 
     pub fn release_stream(
@@ -349,6 +501,26 @@ impl StreamRegistry {
     }
 }
 
+fn covered_range_bytes(ranges: &[(u64, u64)]) -> u64 {
+    ranges.iter().fold(0_u64, |total, (start, end)| {
+        total.saturating_add(end.saturating_sub(*start))
+    })
+}
+
+fn merge_ranges(ranges: &mut Vec<(u64, u64)>) {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        if let Some((_, merged_end)) = merged.last_mut()
+            && start <= *merged_end
+        {
+            *merged_end = (*merged_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    *ranges = merged;
+}
+
 #[cfg(test)]
 mod tests {
     use super::StreamRegistry;
@@ -467,9 +639,25 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "every ineligible continuation stream class is preserved in one registry oracle"
+    )]
     fn pristine_chaff_opportunity_skips_application_active_chaff_and_claims() {
         let endpoint = QcsdEndpointId(1);
         let mut registry = StreamRegistry::default();
+        let active_role = QcsdRequestRole::Chaff {
+            resource_id: 7,
+            request_id: None,
+        };
+        let pristine_role = QcsdRequestRole::Chaff {
+            resource_id: 8,
+            request_id: None,
+        };
+        let claimed_role = QcsdRequestRole::Chaff {
+            resource_id: 9,
+            request_id: None,
+        };
         registry.open(
             endpoint,
             QcsdStreamId(0),
@@ -482,14 +670,22 @@ mod tests {
         registry.open(
             endpoint,
             QcsdStreamId(20),
-            QcsdRequestRole::Chaff {
-                resource_id: 7,
-                request_id: None,
-            },
+            active_role,
             true,
             0,
             1_000,
             13_527,
+        );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(20),
+                active_role,
+                0,
+                123,
+                true,
+            ),
+            123
         );
         let active = registry
             .release_stream(endpoint, QcsdStreamId(20), 3_093)
@@ -503,10 +699,7 @@ mod tests {
         registry.open(
             endpoint,
             QcsdStreamId(24),
-            QcsdRequestRole::Chaff {
-                resource_id: 8,
-                request_id: None,
-            },
+            pristine_role,
             true,
             0,
             1_000,
@@ -515,17 +708,83 @@ mod tests {
         registry.open(
             endpoint,
             QcsdStreamId(28),
-            QcsdRequestRole::Chaff {
-                resource_id: 9,
-                request_id: None,
-            },
+            claimed_role,
             true,
             0,
             1_000,
             13_390,
         );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(28),
+                claimed_role,
+                0,
+                100,
+                true,
+            ),
+            100
+        );
         assert_eq!(registry.claim_stream(endpoint, QcsdStreamId(28), 1), 1);
 
+        // Merely opening a response stream is not evidence that its request
+        // was peer-acknowledged. A mismatched role is fail-closed too.
+        assert!(
+            registry
+                .receiver_continuation_opportunities(endpoint, 1_200, 0, 1_000)
+                .is_empty()
+        );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(24),
+                active_role,
+                0,
+                100,
+                true,
+            ),
+            0
+        );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(24),
+                pristine_role,
+                0,
+                100,
+                false,
+            ),
+            100
+        );
+        assert!(
+            registry
+                .receiver_continuation_opportunities(endpoint, 1_200, 0, 1_000)
+                .is_empty()
+        );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(24),
+                pristine_role,
+                100,
+                0,
+                true,
+            ),
+            0
+        );
+        // Retransmitted overlap contributes no new request bytes but the
+        // original peer-ACK activation remains valid.
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(24),
+                pristine_role,
+                25,
+                50,
+                false,
+            ),
+            0
+        );
         let opportunities = registry.receiver_continuation_opportunities(endpoint, 1_200, 0, 1_000);
         assert_eq!(opportunities.len(), 1);
         assert_eq!(opportunities[0].stream, QcsdStreamId(24));
@@ -537,5 +796,185 @@ mod tests {
             .expect("whole continuation release");
         assert_eq!(continuation.absolute_limit, 1_200);
         assert_eq!(continuation.increase, 1_200);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "gap, FIN, conflict, overflow, and zero-size activation cases remain explicit"
+    )]
+    fn request_acknowledgment_activation_is_gap_free_positive_and_fail_closed() {
+        let endpoint = QcsdEndpointId(1);
+        let mut registry = StreamRegistry::default();
+        for stream in [32_u64, 36, 40, 44] {
+            registry.open(
+                endpoint,
+                QcsdStreamId(stream),
+                QcsdRequestRole::Chaff {
+                    resource_id: u32::try_from(stream).expect("small test id"),
+                    request_id: None,
+                },
+                true,
+                0,
+                1_000,
+                2_400,
+            );
+        }
+
+        let role = |resource_id| QcsdRequestRole::Chaff {
+            resource_id,
+            request_id: None,
+        };
+
+        // FIN can arrive before an earlier ACK range; only the completed union
+        // activates the response stream.
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(32),
+                role(32),
+                100,
+                100,
+                true,
+            ),
+            100
+        );
+        assert!(
+            !registry
+                .get_mut(endpoint, QcsdStreamId(32))
+                .expect("gap stream")
+                .chaff_request_activated()
+        );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(32),
+                role(32),
+                0,
+                100,
+                false,
+            ),
+            100
+        );
+        assert!(
+            registry
+                .get_mut(endpoint, QcsdStreamId(32))
+                .expect("completed stream")
+                .chaff_request_activated()
+        );
+
+        // Conflicting final sizes permanently invalidate otherwise complete
+        // evidence instead of replacing the first final size.
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(36),
+                role(36),
+                0,
+                100,
+                true,
+            ),
+            100
+        );
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(36),
+                role(36),
+                0,
+                101,
+                true,
+            ),
+            0
+        );
+        assert!(
+            !registry
+                .get_mut(endpoint, QcsdStreamId(36))
+                .expect("conflicting FIN stream")
+                .chaff_request_activated()
+        );
+
+        // Offset overflow is invalid evidence even if a later valid-looking
+        // complete range arrives.
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(40),
+                role(40),
+                u64::MAX,
+                1,
+                false,
+            ),
+            0
+        );
+        _ = registry.record_chaff_request_acknowledgment(
+            endpoint,
+            QcsdStreamId(40),
+            role(40),
+            0,
+            100,
+            true,
+        );
+        assert!(
+            !registry
+                .get_mut(endpoint, QcsdStreamId(40))
+                .expect("overflow stream")
+                .chaff_request_activated()
+        );
+
+        // A zero-byte FIN is observable transport evidence, but it cannot be
+        // an HTTP/3 request capable of causing a response.
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(
+                endpoint,
+                QcsdStreamId(44),
+                role(44),
+                0,
+                0,
+                true,
+            ),
+            0
+        );
+        assert!(
+            !registry
+                .get_mut(endpoint, QcsdStreamId(44))
+                .expect("empty FIN stream")
+                .chaff_request_activated()
+        );
+    }
+
+    #[test]
+    fn ordinary_allocation_keeps_unacknowledged_nonreserved_chaff() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let mut registry = StreamRegistry::default();
+        registry.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            0,
+            1_000,
+            2_400,
+        );
+
+        let opportunities = registry.allocation_opportunities_excluding(
+            endpoint,
+            DefenseMode::ChaffOnly,
+            &[],
+            false,
+        );
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities[0].stream, stream);
+        assert_eq!(opportunities[0].exact, 2_400);
+        assert!(
+            registry
+                .allocation_opportunities_excluding(endpoint, DefenseMode::ChaffOnly, &[], true,)
+                .is_empty(),
+            "Walkie-Talkie may not stage base credit on unacknowledged chaff"
+        );
     }
 }

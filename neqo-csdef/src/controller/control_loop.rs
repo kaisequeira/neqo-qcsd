@@ -57,6 +57,13 @@ pub(super) struct ControlLoop {
     /// the event can never fragment or fall back to an active/application
     /// stream.
     pub receiver_continuations: HashMap<QcsdSlotId, ReceiverContinuationDisposition>,
+    /// Peer-ACK-activated pristine streams protected from ordinary allocation
+    /// for the current Walkie-Talkie component and its no-outgoing horizon.
+    pub receiver_continuation_reserves: Vec<(QcsdEndpointId, QcsdStreamId)>,
+    /// The current incoming component observed its complete H+1 activated
+    /// survivor cohort immediately before its first ordinary base allocation.
+    /// The extra nonreserve may then be consumed without re-running the gate.
+    pub receiver_continuation_survivor_gate_open: bool,
     /// Incoming slots already classified as terminal must not be resolved a
     /// second time if a delayed observation arrives for an old offset range.
     pub terminal_incoming: HashSet<QcsdSlotId>,

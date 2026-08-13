@@ -549,6 +549,7 @@ fn shaped_slot_sends_application_before_chaff() {
             role: QcsdRequestRole::Application,
             offset: 0,
             bytes,
+            ..
         } if stream.0 == application.as_u64() && *bytes > 0
     )));
     assert!(!observations.iter().any(|observation| matches!(
@@ -620,6 +621,86 @@ fn chaff_can_finish_after_outgoing_shaping_is_released() {
     let (read, _) = server.stream_recv(chaff, &mut buffer).unwrap();
     assert_eq!(read, 400);
     assert!(buffer[..read].iter().all(|byte| *byte == 0xCC));
+}
+
+#[test]
+fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let chaff = client.stream_create(StreamType::BiDi).unwrap();
+    let role = QcsdRequestRole::Chaff {
+        resource_id: 1,
+        request_id: None,
+    };
+    client.stream_send(chaff, &[0xCC; 400]).unwrap();
+    client.stream_close_send(chaff).unwrap();
+    client.qcsd_register_stream_role(chaff, role).unwrap();
+
+    // Locally queued chaff data, including FIN, cannot cross without a molded
+    // outgoing target while stream-send shaping is active.
+    assert!(client.process_output(now()).dgram().is_none());
+    assert!(
+        !drain_observations(&mut client)
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                QcsdObservation::StreamDataTransmitted {
+                    role: QcsdRequestRole::Chaff { .. },
+                    ..
+                } | QcsdObservation::StreamDataAcknowledged { .. }
+            ))
+    );
+
+    queue_target(&mut client, 41, 1_200, true).unwrap();
+    let sent_at = now();
+    let request = client
+        .process_output(sent_at)
+        .dgram()
+        .expect("molded target carries the chaff request");
+    let transmitted = drain_observations(&mut client);
+    assert!(transmitted.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::StreamDataTransmitted {
+            endpoint: QcsdEndpointId(7),
+            stream,
+            role: observed_role,
+            offset: 0,
+            bytes: 400,
+        } if stream.0 == chaff.as_u64() && *observed_role == role
+    )));
+    assert!(
+        !transmitted.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::StreamDataAcknowledged { .. }
+        ))
+    );
+
+    server.process_input(request, sent_at);
+    let mut received = [0; 512];
+    let (read, fin) = server.stream_recv(chaff, &mut received).unwrap();
+    assert_eq!(read, 400);
+    assert!(fin);
+    let ack_at = sent_at + DEFAULT_RTT;
+    let acknowledgment = server
+        .process_output(ack_at)
+        .dgram()
+        .expect("delayed peer acknowledgment");
+    client.process_input(acknowledgment, ack_at);
+
+    let acknowledged = drain_observations(&mut client);
+    assert!(acknowledged.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::StreamDataAcknowledged {
+            endpoint: QcsdEndpointId(7),
+            stream,
+            role: observed_role,
+            offset: 0,
+            bytes: 400,
+            fin: true,
+        } if stream.0 == chaff.as_u64() && *observed_role == role
+    )));
 }
 
 #[test]

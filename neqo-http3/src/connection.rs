@@ -915,6 +915,34 @@ impl Http3Connection {
             push_handler,
             request,
             now,
+            false,
+        )?;
+        Ok(id)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn request_nonblocking<T>(
+        &mut self,
+        conn: &mut Connection,
+        send_events: Box<dyn SendStreamEvents>,
+        recv_events: Box<dyn HttpRecvStreamEvents>,
+        push_handler: Option<Rc<RefCell<PushController>>>,
+        request: &RequestDescription<T>,
+        now: Instant,
+    ) -> Res<StreamId>
+    where
+        T: RequestTarget,
+    {
+        let id = self.create_bidi_transport_stream(conn)?;
+        self.request_with_stream(
+            id,
+            conn,
+            send_events,
+            recv_events,
+            push_handler,
+            request,
+            now,
+            true,
         )?;
         Ok(id)
     }
@@ -947,6 +975,7 @@ impl Http3Connection {
         push_handler: Option<Rc<RefCell<PushController>>>,
         request: &RequestDescription<T>,
         now: Instant,
+        qpack_nonblocking: bool,
     ) -> Res<()>
     where
         T: RequestTarget,
@@ -959,13 +988,35 @@ impl Http3Connection {
             Http3StreamType::Http
         };
 
-        let mut send_message = SendMessage::new(
-            MessageType::Request,
-            stream_type,
-            stream_id,
-            Rc::clone(&self.qpack_encoder),
-            send_events,
-        );
+        #[cfg(feature = "qcsd")]
+        let mut send_message = if qpack_nonblocking {
+            SendMessage::new_nonblocking(
+                MessageType::Request,
+                stream_type,
+                stream_id,
+                Rc::clone(&self.qpack_encoder),
+                send_events,
+            )
+        } else {
+            SendMessage::new(
+                MessageType::Request,
+                stream_type,
+                stream_id,
+                Rc::clone(&self.qpack_encoder),
+                send_events,
+            )
+        };
+        #[cfg(not(feature = "qcsd"))]
+        let mut send_message = {
+            debug_assert!(!qpack_nonblocking);
+            SendMessage::new(
+                MessageType::Request,
+                stream_type,
+                stream_id,
+                Rc::clone(&self.qpack_encoder),
+                send_events,
+            )
+        };
 
         send_message
             .http_stream()

@@ -9,12 +9,12 @@ use std::{collections::HashSet, fs, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Capacity, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome,
-    ReceiverContinuationDisposition, SignalKind, WalkieTalkieBurstDiagnostics,
+    Capacity, CapacityAdjustment, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal,
+    EventOutcome, ReceiverContinuationDisposition, SignalKind, WalkieTalkieBurstDiagnostics,
 };
 use crate::{Direction, Error, MissedSlotReason, Packet, Result, WalkieTalkieConfig};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const ADAPTATION: &str = "qcsd-client-only";
 const BURST_DEFINITION: &str = "global-application-batch-direction-transitions";
 const CELL_BYTE_DOMAIN: &str = "http3-request-stream-offset.bytes";
@@ -26,8 +26,18 @@ const RECEIVER_FORMULA: &str =
 const RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES: u64 = 1_000;
 const RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT: u64 = 1_200;
 const RECEIVER_ALLOCATION_POLICY: &str =
-    "single-pristine-header-phase-controlled-chaff-stream-whole-cell";
-const RECEIVER_RELEASE_POLICY: &str = "after-all-base-events-controller-requested-and-request-signals-observed;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-fresh-stream;outstanding-at-or-below-parser-ceiling";
+    "single-peer-acknowledged-pristine-header-phase-controlled-chaff-stream-whole-cell";
+const RECEIVER_BASE_ALLOCATION_POLICY: &str = "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims";
+const RECEIVER_CAUSAL_CAPACITY_PRECONDITION: &str = "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start";
+const RECEIVER_REQUEST_ACTIVATION_POLICY: &str = "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells";
+const RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION: &str = "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1";
+const RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION: &str = "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee";
+const RECEIVER_RESOURCE_PRECONDITION: &str = "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component";
+const RECEIVER_PROVISIONING_POLICY: &str =
+    "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions";
+const RECEIVER_RESERVE_POLICY: &str = "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component";
+const RECEIVER_RESERVE_LIFECYCLE_POLICY: &str = "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation";
+const RECEIVER_RELEASE_POLICY: &str = "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling";
 const RECEIVER_BATCH_END_RELEASE_POLICY: &str =
     "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate";
 const RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION: &str =
@@ -63,13 +73,22 @@ struct MoldedFile {
 struct ReceiverContinuation {
     allocation_policy: String,
     application_order: String,
+    base_allocation_policy: String,
     batch_end_release_policy: String,
+    causal_capacity_precondition: String,
     cells_per_nonzero_incoming_component: u32,
     formula: String,
     parser_allowance_ceiling_bytes: u64,
     prefix_consumability_precondition: String,
+    post_outgoing_loss_liveness_limitation: String,
+    provisioning_policy: String,
     raw_headroom_bytes_per_nonzero_incoming_component: u64,
     release_policy: String,
+    request_activation_policy: String,
+    request_prefix_delivery_precondition: String,
+    resource_precondition: String,
+    reserve_lifecycle_policy: String,
+    reserve_policy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,11 +199,24 @@ impl MoldedFile {
                 }
             }
         }
-        selected.ok_or_else(|| {
+        let selected = selected.ok_or_else(|| {
             Error::InvalidConfig(format!(
                 "Walkie-Talkie bundle contains no profile for workload {workload_id:?}"
             ))
-        })
+        })?;
+        let unit_incoming_first_fixture =
+            cfg!(test) && self.generated_by == "unit-test-incoming-first-fixture";
+        if selected
+            .bursts
+            .first()
+            .is_none_or(|pair| pair.outgoing == 0)
+            && !unit_incoming_first_fixture
+        {
+            return Err(Error::InvalidConfig(
+                "Walkie-Talkie first molded component must contain outgoing cells".into(),
+            ));
+        }
+        Ok(selected)
     }
 }
 
@@ -192,15 +224,26 @@ impl ReceiverContinuation {
     fn validate(&self, packet_size: u16, max_stream_data_excess: u64) -> Result<()> {
         if self.allocation_policy != RECEIVER_ALLOCATION_POLICY
             || self.application_order != RECEIVER_APPLICATION_ORDER
+            || self.base_allocation_policy != RECEIVER_BASE_ALLOCATION_POLICY
             || self.batch_end_release_policy != RECEIVER_BATCH_END_RELEASE_POLICY
+            || self.causal_capacity_precondition != RECEIVER_CAUSAL_CAPACITY_PRECONDITION
             || self.cells_per_nonzero_incoming_component
                 != RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT
             || self.formula != RECEIVER_FORMULA
             || self.parser_allowance_ceiling_bytes != RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES
             || self.prefix_consumability_precondition != RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION
+            || self.post_outgoing_loss_liveness_limitation
+                != RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION
+            || self.provisioning_policy != RECEIVER_PROVISIONING_POLICY
             || self.raw_headroom_bytes_per_nonzero_incoming_component
                 != RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT
             || self.release_policy != RECEIVER_RELEASE_POLICY
+            || self.request_activation_policy != RECEIVER_REQUEST_ACTIVATION_POLICY
+            || self.request_prefix_delivery_precondition
+                != RECEIVER_REQUEST_PREFIX_DELIVERY_PRECONDITION
+            || self.resource_precondition != RECEIVER_RESOURCE_PRECONDITION
+            || self.reserve_lifecycle_policy != RECEIVER_RESERVE_LIFECYCLE_POLICY
+            || self.reserve_policy != RECEIVER_RESERVE_POLICY
         {
             return Err(Error::InvalidConfig(
                 "Walkie-Talkie receiver_continuation metadata does not match the supported \
@@ -596,10 +639,11 @@ pub struct WalkieTalkie {
     incoming_capacity_committed: u64,
     realization_failure: Option<RealizationFailure>,
     failed_incoming_shortfall_bytes: u64,
+    reserved_chaff_capacity: u64,
 }
 
 impl WalkieTalkie {
-    /// Load a version-four molded sequence from `config.molded`.
+    /// Load a version-five molded sequence from `config.molded`.
     ///
     /// # Errors
     ///
@@ -618,7 +662,7 @@ impl WalkieTalkie {
         )
     }
 
-    /// Load a version-four molded sequence from `path`.
+    /// Load a version-five molded sequence from `path`.
     ///
     /// # Errors
     ///
@@ -640,7 +684,7 @@ impl WalkieTalkie {
         )
     }
 
-    /// Parse a version-four molded sequence.
+    /// Parse a version-five molded sequence.
     ///
     /// # Errors
     ///
@@ -659,7 +703,7 @@ impl WalkieTalkie {
         )
     }
 
-    /// Parse a version-four molded sequence for an explicit parser allowance.
+    /// Parse a version-five molded sequence for an explicit parser allowance.
     ///
     /// # Errors
     ///
@@ -744,6 +788,7 @@ impl WalkieTalkie {
             incoming_capacity_committed: 0,
             realization_failure: None,
             failed_incoming_shortfall_bytes: 0,
+            reserved_chaff_capacity: 0,
         })
     }
 
@@ -1016,6 +1061,7 @@ impl WalkieTalkie {
     fn incoming_capacity_available(&self) -> u64 {
         self.incoming_capacity_reported
             .unwrap_or(0)
+            .saturating_sub(self.reserved_chaff_capacity)
             .saturating_sub(self.incoming_capacity_reserved)
             .saturating_sub(self.incoming_capacity_committed)
     }
@@ -1325,6 +1371,7 @@ impl Defense for WalkieTalkie {
                     *receiver_continuation_pending = false;
                     *initial_credits_awaiting = initial_credits_awaiting.saturating_add(1);
                     self.last_receiver_continuation = Some(ReceiverContinuationDisposition {
+                        cell_bytes: u64::from(self.packet_size),
                         parser_ceiling_bytes: self.receiver_parser_allowance_ceiling_bytes,
                     });
                     return Some(packet);
@@ -1342,6 +1389,71 @@ impl Defense for WalkieTalkie {
 
     fn last_incoming_event_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
         self.last_receiver_continuation
+    }
+
+    fn pending_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
+        matches!(
+            self.turn,
+            Turn::Incoming {
+                receiver_continuation_pending: true,
+                ..
+            }
+        )
+        .then_some(ReceiverContinuationDisposition {
+            cell_bytes: u64::from(self.packet_size),
+            parser_ceiling_bytes: self.receiver_parser_allowance_ceiling_bytes,
+        })
+    }
+
+    fn preprovision_chaff_to_stream_limit(&self) -> bool {
+        true
+    }
+
+    fn base_chaff_requires_peer_acknowledgment(&self) -> bool {
+        true
+    }
+
+    fn receiver_continuation_reserve_horizon(&self) -> usize {
+        let Turn::Incoming { index, .. } = self.turn else {
+            return 0;
+        };
+        let mut horizon = 0;
+        for (offset, pair) in self.molded[index..].iter().enumerate() {
+            if offset > 0 && pair.outgoing > 0 {
+                break;
+            }
+            horizon += usize::from(pair.incoming > 0);
+        }
+        horizon
+    }
+
+    fn max_receiver_continuation_reserve_horizon(&self) -> usize {
+        self.molded
+            .iter()
+            .enumerate()
+            .map(|(index, pair)| {
+                if pair.incoming == 0 {
+                    return 0;
+                }
+                let mut horizon = 0;
+                for (offset, candidate) in self.molded[index..].iter().enumerate() {
+                    if offset > 0 && candidate.outgoing > 0 {
+                        break;
+                    }
+                    horizon += usize::from(candidate.incoming > 0);
+                }
+                horizon
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn receiver_continuation_cell_bytes(&self) -> Option<u64> {
+        Some(u64::from(self.packet_size))
+    }
+
+    fn observe_capacity_adjustment(&mut self, adjustment: CapacityAdjustment) {
+        self.reserved_chaff_capacity = adjustment.reserved_chaff_bytes;
     }
 
     fn next_event_at(&self) -> Option<Duration> {
@@ -1576,6 +1688,14 @@ mod tests {
         let total_scheduled_bytes = bursts.iter().fold(0_u64, |total, pair| {
             total + (u64::from(pair.outgoing) + u64::from(pair.incoming)) * 1_200
         });
+        // Production parsing rejects an incoming-first artifact. A small set
+        // of defense-state unit tests intentionally start inside an incoming
+        // turn; give only those cfg(test) fixtures an explicit bypass marker.
+        let generated_by = if bursts.first().is_some_and(|pair| pair.outgoing == 0) {
+            "unit-test-incoming-first-fixture"
+        } else {
+            "test"
+        };
         let real = serde_json::to_string(&real).expect("serialize real test bursts");
         let decoy = serde_json::to_string(&decoy).expect("serialize decoy test bursts");
         let bursts = serde_json::to_string(&bursts).expect("serialize molded test bursts");
@@ -1584,21 +1704,30 @@ mod tests {
                 "adaptation": "qcsd-client-only",
                 "burst_definition": "global-application-batch-direction-transitions",
                 "cell_byte_domain": "http3-request-stream-offset.bytes",
-                "schema_version": 4,
-                "generated_by": "test",
+                "schema_version": 5,
+                "generated_by": "{generated_by}",
                 "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
                 "paper_equivalent": false,
                 "packet_size": 1200,
                 "receiver_continuation": {{
-                    "allocation_policy": "single-pristine-header-phase-controlled-chaff-stream-whole-cell",
+                    "allocation_policy": "single-peer-acknowledged-pristine-header-phase-controlled-chaff-stream-whole-cell",
                     "application_order": "after-symmetric-elementwise-mold",
+                    "base_allocation_policy": "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims",
                     "batch_end_release_policy": "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate",
+                    "causal_capacity_precondition": "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start",
                     "cells_per_nonzero_incoming_component": 1,
                     "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
                     "parser_allowance_ceiling_bytes": 1000,
                     "prefix_consumability_precondition": "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable",
+                    "post_outgoing_loss_liveness_limitation": "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee",
+                    "provisioning_policy": "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions",
                     "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
-                    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-fresh-stream;outstanding-at-or-below-parser-ceiling"
+                    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling",
+                    "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
+                    "request_prefix_delivery_precondition": "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1",
+                    "resource_precondition": "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component",
+                    "reserve_lifecycle_policy": "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation",
+                    "reserve_policy": "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
                 }},
                 "profiles": [{{
                     "real": "real page",
@@ -1738,13 +1867,13 @@ mod tests {
     #[test]
     fn loader_rejects_unknown_fields_wrong_versions_and_packet_size_mismatch() {
         let unknown = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
-            r#""schema_version": 4,"#,
-            r#""schema_version": 4, "unexpected": true,"#,
+            r#""schema_version": 5,"#,
+            r#""schema_version": 5, "unexpected": true,"#,
         );
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &unknown).is_err());
 
         let wrong_version = molded(r#"[{"outgoing": 1, "incoming": 1}]"#)
-            .replace(r#""schema_version": 4"#, r#""schema_version": 3"#);
+            .replace(r#""schema_version": 5"#, r#""schema_version": 4"#);
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_version).is_err());
 
         assert!(
@@ -1938,17 +2067,24 @@ mod tests {
             adaptation: "qcsd-client-only".into(),
             burst_definition: "global-application-batch-direction-transitions".into(),
             cell_byte_domain: "http3-request-stream-offset.bytes".into(),
-            schema_version: 4,
+            schema_version: 5,
             generated_by: "test".into(),
             matching_algorithm: "minimum-base-symmetric-mold-padding-cost-one-to-one".into(),
             paper_equivalent: false,
             packet_size: 1_200,
             receiver_continuation: super::ReceiverContinuation {
                 allocation_policy:
-                    "single-pristine-header-phase-controlled-chaff-stream-whole-cell".into(),
+                    "single-peer-acknowledged-pristine-header-phase-controlled-chaff-stream-whole-cell"
+                        .into(),
                 application_order: "after-symmetric-elementwise-mold".into(),
+                base_allocation_policy:
+                    "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims"
+                        .into(),
                 batch_end_release_policy:
                     "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate"
+                        .into(),
+                causal_capacity_precondition:
+                    "first-molded-component-outgoing>0;max_chaff_streams>=maximum-receiver-continuation-reserve-horizon+1;required-preprovisioned-chaff-request-stream-frames-through-fin-fit-within-residual-normal-priority-stream-data-budget-after-higher-priority-due-application-stream-frames-at-each-positive-outgoing-horizon-start"
                         .into(),
                 cells_per_nonzero_incoming_component: 1,
                 formula: "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0"
@@ -1957,9 +2093,29 @@ mod tests {
                 prefix_consumability_precondition:
                     "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable"
                         .into(),
+                post_outgoing_loss_liveness_limitation:
+                    "insufficient-peer-acknowledged-survivors-after-positive-outgoing-targets-resolve-hold-base-and-continuation-allocation;no-targetless-chaff-stream-retransmission-or-generic-loss-liveness-guarantee"
+                        .into(),
+                provisioning_policy:
+                    "fill-configured-chaff-stream-limit-before-due-molded-outgoing-actions".into(),
                 raw_headroom_bytes_per_nonzero_incoming_component: 1_200,
                 release_policy:
-                    "after-all-base-events-controller-requested-and-request-signals-observed;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-fresh-stream;outstanding-at-or-below-parser-ceiling"
+                    "after-all-base-events-controller-requested-and-request-signals-observed;reserve-deterministic-peer-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-and-retain-each-until-corresponding-continuation-release-or-session-end;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-reserved-peer-acknowledged-stream;outstanding-at-or-below-parser-ceiling"
+                        .into(),
+                request_activation_policy:
+                    "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells"
+                        .into(),
+                request_prefix_delivery_precondition:
+                    "before-each-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=current-receiver-continuation-reserve-horizon+1"
+                        .into(),
+                resource_precondition:
+                    "initial-chaff-selection-yields-known-valid-dependency-free-same-origin-resource-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component"
+                        .into(),
+                reserve_lifecycle_policy:
+                    "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-horizon-reserve-before-further-base-allocation"
+                        .into(),
+                reserve_policy:
+                    "reserve-deterministic-acknowledged-pristine-candidates-for-current-zero-outgoing-continuation-horizon-before-first-base-allocation-of-each-nonzero-incoming-component"
                         .into(),
             },
             profiles: vec![super::MoldedProfile {
@@ -2001,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_four_adapts_every_positive_incoming_component_exactly_once() {
+    fn schema_five_adapts_every_positive_incoming_component_exactly_once() {
         let input = molded_pair_from_sources(
             r#"[
                 {"outgoing": 2, "incoming": 0, "batch_end": false},
@@ -2015,7 +2171,7 @@ mod tests {
             ]"#,
         );
         let defense = WalkieTalkie::from_json(&config(1_200), 1_200, &input)
-            .expect("strict schema-four adapted mould");
+            .expect("strict schema-five adapted mould");
 
         assert_eq!(
             defense.molded,
@@ -2038,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_four_rejects_unadapted_or_overadapted_bursts() {
+    fn schema_five_rejects_unadapted_or_overadapted_bursts() {
         let input = molded_pair_from_sources(
             r#"[{"outgoing": 1, "incoming": 0, "batch_end": false},
                 {"outgoing": 0, "incoming": 2}]"#,
@@ -2069,6 +2225,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "all exact schema-five continuation fields are tested fail closed together"
+    )]
     fn receiver_continuation_metadata_and_runtime_allowance_are_fail_closed() {
         let input = molded_pair_from_sources(
             r#"[{"outgoing": 1, "incoming": 1}]"#,
@@ -2101,8 +2261,16 @@ mod tests {
             ),
             ("application_order", serde_json::json!("before-mold")),
             (
+                "base_allocation_policy",
+                serde_json::json!("unacknowledged-chaff-first"),
+            ),
+            (
                 "batch_end_release_policy",
                 serde_json::json!("before-application-batch-complete"),
+            ),
+            (
+                "causal_capacity_precondition",
+                serde_json::json!("max_chaff_streams>=horizon"),
             ),
             ("cells_per_nonzero_incoming_component", serde_json::json!(2)),
             ("formula", serde_json::json!("different")),
@@ -2112,10 +2280,29 @@ mod tests {
                 serde_json::json!("not-prepared"),
             ),
             (
+                "post_outgoing_loss_liveness_limitation",
+                serde_json::json!("loss-is-always-live"),
+            ),
+            ("provisioning_policy", serde_json::json!("lazy")),
+            (
                 "raw_headroom_bytes_per_nonzero_incoming_component",
                 serde_json::json!(1_201),
             ),
             ("release_policy", serde_json::json!("eager")),
+            ("request_activation_policy", serde_json::json!("any-byte")),
+            (
+                "request_prefix_delivery_precondition",
+                serde_json::json!("one-reserve-only"),
+            ),
+            (
+                "resource_precondition",
+                serde_json::json!("optional-manifest"),
+            ),
+            (
+                "reserve_lifecycle_policy",
+                serde_json::json!("leak-reserve"),
+            ),
+            ("reserve_policy", serde_json::json!("none")),
         ] {
             let mut malformed = valid.clone();
             malformed["receiver_continuation"][field] = mutation;
@@ -2128,13 +2315,22 @@ mod tests {
         for field in [
             "allocation_policy",
             "application_order",
+            "base_allocation_policy",
             "batch_end_release_policy",
+            "causal_capacity_precondition",
             "cells_per_nonzero_incoming_component",
             "formula",
             "parser_allowance_ceiling_bytes",
             "prefix_consumability_precondition",
+            "post_outgoing_loss_liveness_limitation",
+            "provisioning_policy",
             "raw_headroom_bytes_per_nonzero_incoming_component",
             "release_policy",
+            "request_activation_policy",
+            "request_prefix_delivery_precondition",
+            "resource_precondition",
+            "reserve_lifecycle_policy",
+            "reserve_policy",
         ] {
             let mut malformed = valid.clone();
             malformed["receiver_continuation"]
@@ -2160,6 +2356,15 @@ mod tests {
             .expect("receiver continuation object")
             .insert("unexpected".into(), serde_json::json!(true));
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &unknown.to_string()).is_err());
+
+        let mut incoming_first: serde_json::Value =
+            serde_json::from_str(&molded(r#"[{"outgoing": 0, "incoming": 1}]"#))
+                .expect("incoming-first unit fixture");
+        incoming_first["generated_by"] = serde_json::json!("external-generator");
+        assert!(
+            WalkieTalkie::from_json(&config(1_200), 1_200, &incoming_first.to_string()).is_err(),
+            "production artifacts must begin with an outgoing carrier component"
+        );
     }
 
     #[test]
@@ -2236,6 +2441,7 @@ mod tests {
         assert_eq!(
             defense.last_incoming_event_receiver_continuation(),
             Some(super::ReceiverContinuationDisposition {
+                cell_bytes: 1_200,
                 parser_ceiling_bytes: 1_000,
             })
         );
@@ -2288,6 +2494,7 @@ mod tests {
         assert_eq!(
             defense.last_incoming_event_receiver_continuation(),
             Some(super::ReceiverContinuationDisposition {
+                cell_bytes: 1_200,
                 parser_ceiling_bytes: 1_000,
             })
         );

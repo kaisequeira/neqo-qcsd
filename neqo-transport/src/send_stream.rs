@@ -2430,6 +2430,10 @@ impl RecoveryToken {
     pub(crate) const fn length(&self) -> usize {
         self.length
     }
+
+    pub(crate) const fn fin(&self) -> bool {
+        self.fin
+    }
 }
 
 #[cfg(test)]

@@ -81,12 +81,44 @@ impl ChaffManager {
         low_watermark: u64,
         endpoints: &[(QcsdEndpointId, String)],
     ) -> Vec<PlannedChaffRequest> {
+        self.plan_requests(
+            available,
+            open_streams,
+            max_streams,
+            low_watermark,
+            false,
+            endpoints,
+        )
+    }
+
+    /// Fill every available chaff-stream slot without consulting aggregate
+    /// response capacity. Walkie-Talkie uses this before its first scheduled
+    /// outgoing target so a request can acquire causal wire evidence before
+    /// receive credit needs the corresponding response stream.
+    pub fn preprovision_to_limit(
+        &mut self,
+        open_streams: usize,
+        max_streams: usize,
+        endpoints: &[(QcsdEndpointId, String)],
+    ) -> Vec<PlannedChaffRequest> {
+        self.plan_requests(0, open_streams, max_streams, 0, true, endpoints)
+    }
+
+    fn plan_requests(
+        &mut self,
+        available: u64,
+        open_streams: usize,
+        max_streams: usize,
+        low_watermark: u64,
+        fill_stream_limit: bool,
+        endpoints: &[(QcsdEndpointId, String)],
+    ) -> Vec<PlannedChaffRequest> {
         let mut anticipated = available.saturating_add(self.pending_capacity());
         let mut remaining_streams =
             max_streams.saturating_sub(open_streams.saturating_add(self.pending_count()));
         let mut planned = Vec::new();
 
-        while anticipated < low_watermark && remaining_streams > 0 {
+        while remaining_streams > 0 && (fill_stream_limit || anticipated < low_watermark) {
             let Some((resource, length)) = self.largest_eligible(endpoints) else {
                 break;
             };
@@ -252,6 +284,21 @@ mod tests {
         let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];
         assert_eq!(manager.replenish(0, 0, 2, 1_000, &endpoints).len(), 2);
         assert!(manager.replenish(0, 0, 2, 1_000, &endpoints).is_empty());
+    }
+
+    #[test]
+    fn walkie_talkie_preprovisioning_fills_the_stream_limit_without_a_watermark() {
+        let manifest = ResourceManifest {
+            resources: vec![resource(1, 400, "https://example.com")],
+        };
+        let mut manager = ChaffManager::new(manifest, false);
+        let endpoints = [(QcsdEndpointId(1), "https://example.com".into())];
+
+        let planned = manager.preprovision_to_limit(1, 5, &endpoints);
+
+        assert_eq!(planned.len(), 4);
+        assert_eq!(manager.pending_count(), 4);
+        assert!(manager.replenish(10_000, 1, 5, 0, &endpoints).is_empty());
     }
 
     #[test]

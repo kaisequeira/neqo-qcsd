@@ -523,6 +523,41 @@ impl Encoder {
         encoded_h
     }
 
+    /// Encode a header block that can be decoded without receiving any QPACK
+    /// encoder-stream instructions.
+    ///
+    /// Static-table references remain usable, while every other field is
+    /// encoded as a literal. This is intentionally narrower than the normal
+    /// adaptive encoder and is used by causally pre-provisioned chaff requests:
+    /// acknowledging their request-stream bytes must be sufficient evidence
+    /// that the peer can decode the request.
+    #[must_use]
+    pub fn encode_header_block_nonblocking(&self, h: &[Header]) -> HeaderEncoder {
+        // No dynamic references means the canonical base is zero. Keeping it
+        // independent of the live table also makes the request prefix stable
+        // as inserts accumulate on application traffic.
+        let mut encoded_h = HeaderEncoder::new(0, self.use_huffman, self.max_entries);
+        for header in h {
+            let name = header.name().as_bytes();
+            let value = header.value();
+            match HeaderTable::static_lookup(name, value) {
+                Some(LookupResult {
+                    index,
+                    static_table: true,
+                    value_matches: true,
+                }) => encoded_h.encode_indexed_static(index),
+                Some(LookupResult {
+                    index,
+                    static_table: true,
+                    value_matches: false,
+                }) => encoded_h.encode_literal_with_name_ref(true, index, value),
+                Some(_) | None => encoded_h.encode_literal_with_name_literal(name, value),
+            }
+        }
+        encoded_h.encode_header_block_prefix();
+        encoded_h
+    }
+
     /// Encoder stream has been created. Add the stream id.
     ///
     /// # Panics
@@ -588,7 +623,11 @@ mod tests {
     };
 
     use super::{Connection, Encoder, Error, Header, Res};
-    use crate::Settings;
+    use crate::{
+        Settings,
+        header_block::{HeaderDecoder, HeaderDecoderResult},
+        table::HeaderTable,
+    };
 
     struct TestEncoder {
         encoder: Encoder,
@@ -681,6 +720,36 @@ mod tests {
 
     fn connect(huffman: bool) -> TestEncoder {
         connect_generic(huffman, None)
+    }
+
+    #[test]
+    fn nonblocking_header_block_is_decodable_without_encoder_stream_state() {
+        let mut fixture = connect(true);
+        fixture.change_capacity(1_500).expect("dynamic capacity");
+        fixture
+            .encoder
+            .send_and_insert(&mut fixture.conn, b"x-qcsd-chaff", b"literal-value")
+            .expect("seed exact dynamic match");
+        let headers = [
+            Header::new(":method", "GET"),
+            Header::new(":authority", "example.com"),
+            Header::new("x-qcsd-chaff", "literal-value"),
+        ];
+        let stats_before = fixture.encoder.stats();
+        let encoded = fixture.encoder.encode_header_block_nonblocking(&headers);
+        let stats_after = fixture.encoder.stats();
+        assert_eq!(
+            stats_after.dynamic_table_inserts,
+            stats_before.dynamic_table_inserts
+        );
+        assert_eq!(stats_after.dynamic_table_references, 0);
+
+        let mut decoder = HeaderDecoder::new(encoded.as_ref());
+        let result = decoder
+            .decode_header_block(&HeaderTable::new(false), 1_500 >> 5, 0)
+            .expect("static/literal block decodes without encoder instructions");
+        assert_eq!(result, HeaderDecoderResult::Headers(headers.to_vec()));
+        assert_eq!(decoder.get_req_insert_cnt(), 0);
     }
 
     fn connect_flow_control(max_data: u64) -> TestEncoder {

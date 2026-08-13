@@ -223,6 +223,32 @@ impl Connection {
         }
     }
 
+    pub(super) fn qcsd_observe_stream_acknowledgment(
+        &mut self,
+        token: &crate::send_stream::RecoveryToken,
+    ) {
+        let Some(role) = self.qcsd_stream_roles.get(&token.stream_id()).copied() else {
+            return;
+        };
+        if !matches!(role, QcsdRequestRole::Chaff { .. }) {
+            return;
+        }
+        let Ok(bytes) = u64::try_from(token.length()) else {
+            return;
+        };
+        if bytes == 0 && !token.fin() {
+            return;
+        }
+        self.qcsd_observe(|endpoint| QcsdObservation::StreamDataAcknowledged {
+            endpoint,
+            stream: neqo_csdef::QcsdStreamId(token.stream_id().as_u64()),
+            role,
+            offset: token.offset(),
+            bytes,
+            fin: token.fin(),
+        });
+    }
+
     /// Bind transport target outcomes to a controller endpoint.
     pub fn qcsd_enable(&mut self, endpoint: QcsdEndpointId, shape_stream_sends: bool) {
         #![expect(
