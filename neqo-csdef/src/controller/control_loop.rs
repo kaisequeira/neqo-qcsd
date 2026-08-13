@@ -3,9 +3,9 @@
 // <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
 // option.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::{Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
+use crate::{Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId, ReceiverContinuationDisposition};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PendingIncoming {
@@ -52,6 +52,11 @@ pub(super) struct ControlLoop {
     pub outgoing: Vec<PendingOutgoing>,
     pub credit: Vec<PendingCredit>,
     pub claims: Vec<PendingClaim>,
+    /// Incoming continuation cells that must be released whole onto one
+    /// pristine controlled chaff stream. The marker survives queue retries so
+    /// the event can never fragment or fall back to an active/application
+    /// stream.
+    pub receiver_continuations: HashMap<QcsdSlotId, ReceiverContinuationDisposition>,
     /// Incoming slots already classified as terminal must not be resolved a
     /// second time if a delayed observation arrives for an old offset range.
     pub terminal_incoming: HashSet<QcsdSlotId>,

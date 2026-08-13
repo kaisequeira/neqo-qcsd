@@ -146,6 +146,57 @@ impl ReceiveState {
         }
     }
 
+    /// Whether this controlled chaff stream remains in an unparsed
+    /// response-header phase with exact capacity for one whole allocation.
+    ///
+    /// Claims must be absent. With no live base debt, the selected stream is
+    /// untouched at raw offset zero. With coalesced live base debt, the selected
+    /// stream may already have a small requested and advertised prefix, but has
+    /// consumed/parsing none of it. Appending the whole cell preserves the
+    /// prepared prefix-consumability invariant.
+    pub const fn has_receiver_continuation_capacity(
+        &self,
+        required: u64,
+        base_outstanding: u64,
+        parser_ceiling: u64,
+    ) -> bool {
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                reservation_capacity,
+                reservation_available,
+                consumed,
+                framing_bytes,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } => {
+                *consumed == 0
+                    && *requested_limit == *advertised_limit
+                    && *requested_limit <= parser_ceiling
+                    && if base_outstanding == 0 {
+                        *requested_limit == 0
+                    } else {
+                        *requested_limit > 0
+                    }
+                    && *reservation_available == *reservation_capacity
+                    && *framing_bytes == 0
+                    && *parser_lease_used == 0
+                    && last_parser_lease_boundary.is_none()
+                    && pending_parser_boundary.is_none()
+                    && *known_limit >= required
+                    && known_limit.saturating_sub(*requested_limit) >= required
+            }
+            Self::Created { .. }
+            | Self::ReceivingData { .. }
+            | Self::Automatic { .. }
+            | Self::Closed { .. } => false,
+        }
+    }
+
     /// Maximum scheduled work that may still be claimed as a non-advertised
     /// reservation for this stream.
     pub const fn claimable(&self) -> u64 {
@@ -711,6 +762,31 @@ mod tests {
         assert_eq!(state.available(), 84);
         state.advertised(516);
         assert_eq!(state.close(), (0, 0));
+    }
+
+    #[test]
+    fn pristine_exact_capacity_requires_zero_offset_headers_state() {
+        let mut state = ReceiveState::controlled(0, 1_000, 13_527);
+        assert!(state.has_receiver_continuation_capacity(1_200, 0, 1_000));
+        assert!(!state.has_receiver_continuation_capacity(13_528, 0, 1_000));
+
+        assert_eq!(state.release(3_093), Some((3_093, 3_093)));
+        state.advertised(3_093);
+        state.bytes_read(3_093);
+        assert_eq!(state.available(), 10_434);
+        assert!(!state.has_receiver_continuation_capacity(1_200, 0, 1_000));
+
+        let mut claimed = ReceiveState::controlled(0, 1_000, 13_527);
+        assert_eq!(claimed.available(), 13_527);
+        assert_eq!(claimed.claim(1), 1);
+        assert_eq!(claimed.claimable(), 999);
+        assert!(!claimed.has_receiver_continuation_capacity(1_200, 0, 1_000));
+
+        let mut blocked = ReceiveState::controlled(0, 1_000, 13_527);
+        assert_eq!(blocked.release(1), Some((1, 1)));
+        blocked.advertised(1);
+        assert!(blocked.has_receiver_continuation_capacity(1_200, 1, 1_000));
+        assert!(!blocked.has_receiver_continuation_capacity(1_200, 0, 1_000));
     }
 
     #[test]

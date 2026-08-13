@@ -30,9 +30,9 @@ pub use config::{
 pub use controller::QcsdController;
 pub use defense::{
     BurstPair, Capacity, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome,
-    Front, MIN_SHAPED_PAYLOAD, RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw,
-    TrafficMorphing, TrafficMorphingEgress, WalkieTalkie, WalkieTalkieBurstDiagnostics, WtfPad,
-    clamp_packet_size,
+    Front, MIN_SHAPED_PAYLOAD, ReceiverContinuationDisposition, RoundRobinScheduler, SignalKind,
+    StaticSchedule, Tamaraw, TrafficMorphing, TrafficMorphingEgress, WalkieTalkie,
+    WalkieTalkieBurstDiagnostics, WtfPad, clamp_packet_size,
 };
 pub use dependency_tracker::{DependencyTracker, ResourceRunState};
 pub use distribution::{Histogram, MorphingMatrix};

@@ -170,6 +170,41 @@ impl StreamRegistry {
         opportunities
     }
 
+    /// Deterministic exact-capacity opportunities for a held receiver
+    /// continuation. Only pristine controlled chaff streams are eligible;
+    /// provisional framing claims are never exposed to this path.
+    pub fn receiver_continuation_opportunities(
+        &self,
+        endpoint: QcsdEndpointId,
+        required: u64,
+        base_outstanding: u64,
+        parser_ceiling: u64,
+    ) -> Vec<AllocationOpportunity> {
+        let mut opportunities: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|((candidate, _), state)| {
+                *candidate == endpoint
+                    && matches!(state.role, QcsdRequestRole::Chaff { .. })
+                    && state.status.is_none()
+                    && state.receive.has_receiver_continuation_capacity(
+                        required,
+                        base_outstanding,
+                        parser_ceiling,
+                    )
+            })
+            .map(|((_, stream), state)| AllocationOpportunity {
+                endpoint,
+                stream: *stream,
+                role: state.role,
+                exact: state.receive.available(),
+                claimable: 0,
+            })
+            .collect();
+        opportunities.sort_unstable_by_key(|opportunity| opportunity.stream);
+        opportunities
+    }
+
     pub fn release_stream(
         &mut self,
         endpoint: QcsdEndpointId,
@@ -429,5 +464,78 @@ mod tests {
         let chaff_only = registry.allocation_opportunities(endpoint, DefenseMode::ChaffOnly);
         assert_eq!(chaff_only.len(), 1);
         assert!(matches!(chaff_only[0].role, QcsdRequestRole::Chaff { .. }));
+    }
+
+    #[test]
+    fn pristine_chaff_opportunity_skips_application_active_chaff_and_claims() {
+        let endpoint = QcsdEndpointId(1);
+        let mut registry = StreamRegistry::default();
+        registry.open(
+            endpoint,
+            QcsdStreamId(0),
+            QcsdRequestRole::Application,
+            true,
+            0,
+            1_000,
+            20_000,
+        );
+        registry.open(
+            endpoint,
+            QcsdStreamId(20),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            0,
+            1_000,
+            13_527,
+        );
+        let active = registry
+            .release_stream(endpoint, QcsdStreamId(20), 3_093)
+            .expect("activate first chaff stream");
+        let active_state = registry
+            .get_mut(endpoint, QcsdStreamId(20))
+            .expect("active chaff state");
+        active_state.receive.advertised(active.absolute_limit);
+        active_state.receive.bytes_read(3_093);
+
+        registry.open(
+            endpoint,
+            QcsdStreamId(24),
+            QcsdRequestRole::Chaff {
+                resource_id: 8,
+                request_id: None,
+            },
+            true,
+            0,
+            1_000,
+            13_390,
+        );
+        registry.open(
+            endpoint,
+            QcsdStreamId(28),
+            QcsdRequestRole::Chaff {
+                resource_id: 9,
+                request_id: None,
+            },
+            true,
+            0,
+            1_000,
+            13_390,
+        );
+        assert_eq!(registry.claim_stream(endpoint, QcsdStreamId(28), 1), 1);
+
+        let opportunities = registry.receiver_continuation_opportunities(endpoint, 1_200, 0, 1_000);
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities[0].stream, QcsdStreamId(24));
+        assert_eq!(opportunities[0].exact, 13_390);
+        assert_eq!(opportunities[0].claimable, 0);
+
+        let continuation = registry
+            .release_stream(endpoint, opportunities[0].stream, 1_200)
+            .expect("whole continuation release");
+        assert_eq!(continuation.absolute_limit, 1_200);
+        assert_eq!(continuation.increase, 1_200);
     }
 }

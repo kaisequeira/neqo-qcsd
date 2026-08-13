@@ -123,6 +123,15 @@ pub struct DefenseSignal {
     pub kind: SignalKind,
 }
 
+/// Allocation contract attached to one causal Walkie-Talkie receive
+/// continuation event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiverContinuationDisposition {
+    /// Maximum advertised raw prefix that may still count as pristine for the
+    /// prepared receiver-liveness contract.
+    pub parser_ceiling_bytes: u64,
+}
+
 /// Per-mould Walkie-Talkie realization recorded in the terminal run artifact.
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct WalkieTalkieBurstDiagnostics {
@@ -302,6 +311,17 @@ pub trait Defense: Debug {
     fn observe_application_bytes(&mut self, _at: Duration, _direction: Direction, _bytes: u64) {}
     /// Return the next event at or before `elapsed`.
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet>;
+    /// Whether the most recently returned incoming event must be assigned
+    /// whole to one pristine controlled chaff stream.
+    ///
+    /// The controller queries this immediately after [`Self::next_event`].
+    /// Ordinary receive events may be fragmented across streams and may use
+    /// bounded claims. A receiver-continuation event uses neither behavior:
+    /// the controller holds it until one pristine chaff stream has exact
+    /// capacity for the complete cell.
+    fn last_incoming_event_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
+        None
+    }
     /// Time of the next event relative to defense start.
     fn next_event_at(&self) -> Option<Duration>;
     /// Whether no events remain.

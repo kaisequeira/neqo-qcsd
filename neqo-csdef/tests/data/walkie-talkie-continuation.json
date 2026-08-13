@@ -2,17 +2,21 @@
   "adaptation": "qcsd-client-only",
   "burst_definition": "global-application-batch-direction-transitions",
   "cell_byte_domain": "http3-request-stream-offset.bytes",
-  "schema_version": 3,
+  "schema_version": 4,
   "generated_by": "neqo-csdef receiver-continuation regression fixture",
   "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
   "paper_equivalent": false,
   "packet_size": 1200,
   "receiver_continuation": {
+    "allocation_policy": "single-pristine-header-phase-controlled-chaff-stream-whole-cell",
     "application_order": "after-symmetric-elementwise-mold",
+    "batch_end_release_policy": "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate",
     "cells_per_nonzero_incoming_component": 1,
     "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
     "parser_allowance_ceiling_bytes": 1000,
-    "raw_headroom_bytes_per_nonzero_incoming_component": 1200
+    "prefix_consumability_precondition": "prepared-selected-pristine-first-prior-requested-plus-raw-headroom-bytes-are-consumable",
+    "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
+    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;recompute-live-unconsumed-base-each-retry;extend-single-coalesced-positive-outstanding-header-blocked-stream-else-fresh-stream;outstanding-at-or-below-parser-ceiling"
   },
   "profiles": [
     {
