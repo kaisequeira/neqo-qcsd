@@ -3159,6 +3159,9 @@ mod tests {
                 "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
                 "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
                 "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
+                "sender_framing_cells_per_nonzero_outgoing_component": 1,
+                "sender_framing_formula": "symmetric_outgoing=adapted_outgoing-1-if-adapted_outgoing>0-else-0",
+                "sender_framing_policy": "one-full-cell-per-positive-symmetric-outgoing-component-reserved-for-quic-http3-stream-framing-and-mandatory-control-overhead",
                 "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                 "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
                 "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
@@ -3195,7 +3198,7 @@ mod tests {
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
-                "matching_cost_packets": 4,
+                "matching_cost_packets": 8,
                 "training_inputs": {
                     "real": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
                     "decoy": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
@@ -3216,10 +3219,10 @@ mod tests {
                 },
                 "batch_ends": {"real": [1], "decoy": [1]},
                 "molded_batch_ends": [1],
-                "total_scheduled_bytes": 7200,
+                "total_scheduled_bytes": 9600,
                 "bursts": [
-                    {"outgoing": 1, "incoming": 2},
-                    {"outgoing": 1, "incoming": 2}
+                    {"outgoing": 2, "incoming": 2},
+                    {"outgoing": 2, "incoming": 2}
                 ]
             }]
         }"#;
@@ -3337,22 +3340,7 @@ mod tests {
         )));
         controller.observe(QcsdObservation::ApplicationBatchStarted, Duration::ZERO);
         controller.poll(Duration::ZERO);
-        let first_actions: Vec<_> = controller.drain_actions().collect();
-        let (outgoing_slot, outgoing_packet) = first_actions
-            .iter()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { slot, packet, .. } => Some((*slot, *packet)),
-                _ => None,
-            })
-            .expect("first outgoing component provides the chaff-request carrier");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot: outgoing_slot,
-                observed_size: outgoing_packet.length(),
-            },
-            Duration::ZERO,
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::ZERO, 2);
         controller.poll(Duration::from_micros(1));
         let credits: Vec<_> = controller
             .drain_actions()
@@ -3434,25 +3422,7 @@ mod tests {
             0
         );
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
-        let (second_outgoing, second_outgoing_slot) = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { packet, slot, .. }
-                    if packet.direction() == Direction::Outgoing =>
-                {
-                    Some((packet, slot))
-                }
-                _ => None,
-            })
-            .expect("positive outgoing component between the two continuations");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot: second_outgoing_slot,
-                observed_size: second_outgoing.length(),
-            },
-            Duration::from_micros(4),
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::from_micros(4), 2);
         controller.poll(Duration::from_micros(4));
         let (second_base_limit, second_base_slot) = controller
             .drain_actions()
@@ -3638,21 +3608,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let (outgoing_packet, outgoing_slot) = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
-                _ => None,
-            })
-            .expect("first outgoing cell");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot: outgoing_slot,
-                observed_size: outgoing_packet.length(),
-            },
-            Duration::from_micros(1),
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::from_micros(1), 2);
         controller.poll(Duration::from_micros(1));
 
         let credits: Vec<_> = controller
@@ -3947,21 +3903,7 @@ mod tests {
         controller.observe(QcsdObservation::ApplicationBatchStarted, Duration::ZERO);
         controller.push_application_bytes(Duration::ZERO, Direction::Outgoing, 1);
         controller.poll(Duration::ZERO);
-        let (outgoing, slot) = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
-                _ => None,
-            })
-            .expect("first shaped outgoing cell");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot,
-                observed_size: outgoing.length(),
-            },
-            Duration::from_micros(1),
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::from_micros(1), 2);
         controller.poll(Duration::from_micros(1));
         assert_eq!(
             controller.control.receiver_continuation_reserves,
@@ -4092,9 +4034,9 @@ mod tests {
         });
         profile["batch_ends"] = serde_json::json!({"real": [0], "decoy": [0]});
         profile["molded_batch_ends"] = serde_json::json!([0]);
-        profile["matching_cost_packets"] = serde_json::json!(2);
-        profile["total_scheduled_bytes"] = serde_json::json!(3_600);
-        profile["bursts"] = serde_json::json!([{"outgoing": 1, "incoming": 2}]);
+        profile["matching_cost_packets"] = serde_json::json!(4);
+        profile["total_scheduled_bytes"] = serde_json::json!(4_800);
+        profile["bursts"] = serde_json::json!([{"outgoing": 2, "incoming": 2}]);
 
         let config = WalkieTalkieConfig {
             molded: "one-shot-rollback.json".into(),
@@ -4195,21 +4137,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let (outgoing, outgoing_slot) = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
-                _ => None,
-            })
-            .expect("outgoing carrier");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot: outgoing_slot,
-                observed_size: outgoing.length(),
-            },
-            Duration::from_micros(1),
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::from_micros(1), 2);
         controller.poll(Duration::from_micros(1));
         let (base_limit, base_slot) = controller
             .drain_actions()
@@ -4314,9 +4242,9 @@ mod tests {
         });
         profile["batch_ends"] = serde_json::json!({"real": [0], "decoy": [0]});
         profile["molded_batch_ends"] = serde_json::json!([0]);
-        profile["matching_cost_packets"] = serde_json::json!(2);
-        profile["total_scheduled_bytes"] = serde_json::json!(57_600);
-        profile["bursts"] = serde_json::json!([{"outgoing": 1, "incoming": 47}]);
+        profile["matching_cost_packets"] = serde_json::json!(4);
+        profile["total_scheduled_bytes"] = serde_json::json!(58_800);
+        profile["bursts"] = serde_json::json!([{"outgoing": 2, "incoming": 47}]);
         let config = WalkieTalkieConfig {
             molded: "literal-cloudflare-controller-geometry.json".into(),
             workload_id: "cloudflare-real".into(),
@@ -4464,21 +4392,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let (outgoing, outgoing_slot) = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
-                _ => None,
-            })
-            .expect("moulded outgoing cell");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint,
-                slot: outgoing_slot,
-                observed_size: outgoing.length(),
-            },
-            Duration::from_micros(1),
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::from_micros(1), 2);
         controller.poll(Duration::from_micros(1));
 
         // In the failed Cloudflare trace, final slot 62 owned disjoint base
@@ -4746,8 +4660,8 @@ mod tests {
         );
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
-        assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 1);
-        assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 1);
+        assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 2);
+        assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 2);
         assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 47);
         assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 47);
         assert_eq!(
@@ -4838,6 +4752,9 @@ mod tests {
                 "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
                 "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
                 "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
+                "sender_framing_cells_per_nonzero_outgoing_component": 1,
+                "sender_framing_formula": "symmetric_outgoing=adapted_outgoing-1-if-adapted_outgoing>0-else-0",
+                "sender_framing_policy": "one-full-cell-per-positive-symmetric-outgoing-component-reserved-for-quic-http3-stream-framing-and-mandatory-control-overhead",
                 "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                 "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
                 "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
@@ -4874,7 +4791,7 @@ mod tests {
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
-                "matching_cost_packets": 2,
+                "matching_cost_packets": 4,
                 "training_inputs": {
                     "real": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
                     "decoy": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
@@ -4889,8 +4806,8 @@ mod tests {
                 },
                 "batch_ends": {"real": [0], "decoy": [0]},
                 "molded_batch_ends": [0],
-                "total_scheduled_bytes": 3600,
-                "bursts": [{"outgoing": 1, "incoming": 2}]
+                "total_scheduled_bytes": 4800,
+                "bursts": [{"outgoing": 2, "incoming": 2}]
             }]
         }"#;
         let config = WalkieTalkieConfig {
@@ -5005,21 +4922,7 @@ mod tests {
         controller.observe(QcsdObservation::ApplicationBatchStarted, Duration::ZERO);
         controller.push_application_bytes(Duration::ZERO, Direction::Outgoing, 1);
         controller.poll(Duration::ZERO);
-        let outgoing_slot = controller
-            .drain_actions()
-            .find_map(|action| match action {
-                QcsdAction::SendPacket { slot, .. } => Some(slot),
-                _ => None,
-            })
-            .expect("molded outgoing cell");
-        controller.observe(
-            QcsdObservation::SlotSatisfied {
-                endpoint: QcsdEndpointId(1),
-                slot: outgoing_slot,
-                observed_size: 1_200,
-            },
-            Duration::ZERO,
-        );
+        satisfy_outgoing_actions(&mut controller, Duration::ZERO, 2);
         controller.poll(Duration::from_micros(1));
         assert_eq!(
             controller.control.receiver_continuation_reserves,
@@ -5292,7 +5195,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(first_outgoing.len(), 2);
+        assert_eq!(first_outgoing.len(), 3);
         for (packet, slot) in first_outgoing {
             controller.observe(
                 QcsdObservation::SlotSatisfied {
@@ -5444,6 +5347,36 @@ mod tests {
             },
             Duration::ZERO,
         );
+    }
+
+    fn satisfy_outgoing_actions(
+        controller: &mut QcsdController,
+        at: Duration,
+        expected_count: usize,
+    ) {
+        let outgoing: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::SendPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    ..
+                } => Some((endpoint, packet, slot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outgoing.len(), expected_count);
+        for (endpoint, packet, slot) in outgoing {
+            controller.observe(
+                QcsdObservation::SlotSatisfied {
+                    endpoint,
+                    slot,
+                    observed_size: packet.length(),
+                },
+                at,
+            );
+        }
     }
 
     fn acknowledge_chaff_request(

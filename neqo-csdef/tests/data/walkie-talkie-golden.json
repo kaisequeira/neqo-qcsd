@@ -20,6 +20,9 @@
     "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
     "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
     "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
+    "sender_framing_cells_per_nonzero_outgoing_component": 1,
+    "sender_framing_formula": "symmetric_outgoing=adapted_outgoing-1-if-adapted_outgoing>0-else-0",
+    "sender_framing_policy": "one-full-cell-per-positive-symmetric-outgoing-component-reserved-for-quic-http3-stream-framing-and-mandatory-control-overhead",
     "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
     "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
     "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
@@ -57,7 +60,7 @@
     {
       "real": "real page",
       "decoy": "decoy page",
-      "matching_cost_packets": 4,
+      "matching_cost_packets": 8,
       "training_inputs": {
         "real": [
           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -105,14 +108,14 @@
         "decoy": [0, 1]
       },
       "molded_batch_ends": [0, 1],
-      "total_scheduled_bytes": 9600,
+      "total_scheduled_bytes": 12000,
       "bursts": [
         {
-          "outgoing": 2,
+          "outgoing": 3,
           "incoming": 3
         },
         {
-          "outgoing": 1,
+          "outgoing": 2,
           "incoming": 2
         }
       ]

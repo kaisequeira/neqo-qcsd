@@ -24,6 +24,10 @@ const RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT: u32 = 1;
 const RECEIVER_FORMULA: &str = "symmetric_incoming=adapted_incoming-1-if-adapted_incoming>0-else-0";
 const RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES: u64 = 1_000;
 const RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT: u64 = 1_200;
+const SENDER_FRAMING_CELLS_PER_NONZERO_OUTGOING_COMPONENT: u32 = 1;
+const SENDER_FRAMING_FORMULA: &str =
+    "symmetric_outgoing=adapted_outgoing-1-if-adapted_outgoing>0-else-0";
+const SENDER_FRAMING_POLICY: &str = "one-full-cell-per-positive-symmetric-outgoing-component-reserved-for-quic-http3-stream-framing-and-mandatory-control-overhead";
 const RECEIVER_ALLOCATION_POLICY: &str =
     "single-peer-acknowledged-pristine-header-phase-controlled-chaff-stream-whole-cell";
 const RECEIVER_BASE_ALLOCATION_POLICY: &str = "application-streams-before-peer-acknowledged-nonreserved-controlled-chaff-streams;exact-capacity-before-bounded-framing-claims";
@@ -182,6 +186,9 @@ struct ReceiverContinuation {
     post_outgoing_loss_liveness_limitation: String,
     provisioning_policy: String,
     raw_headroom_bytes_per_nonzero_incoming_component: u64,
+    sender_framing_cells_per_nonzero_outgoing_component: u32,
+    sender_framing_formula: String,
+    sender_framing_policy: String,
     release_policy: String,
     request_activation_policy: String,
     request_prefix_delivery_precondition: String,
@@ -288,7 +295,7 @@ impl MoldedFile {
         let mut identities = HashSet::new();
         let mut selected = None;
         for (index, profile) in self.profiles.iter().enumerate() {
-            profile.validate(self.packet_size, index)?;
+            profile.validate(self.packet_size, index, MoldContinuationContract::Current)?;
             for identity in [&profile.real, &profile.decoy] {
                 if !identities.insert(identity.as_str()) {
                     return Err(Error::InvalidConfig(format!(
@@ -360,6 +367,10 @@ impl ReceiverContinuation {
             || self.provisioning_policy != RECEIVER_PROVISIONING_POLICY
             || self.raw_headroom_bytes_per_nonzero_incoming_component
                 != RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT
+            || self.sender_framing_cells_per_nonzero_outgoing_component
+                != SENDER_FRAMING_CELLS_PER_NONZERO_OUTGOING_COMPONENT
+            || self.sender_framing_formula != SENDER_FRAMING_FORMULA
+            || self.sender_framing_policy != SENDER_FRAMING_POLICY
             || self.release_policy != RECEIVER_RELEASE_POLICY
             || self.request_activation_policy != RECEIVER_REQUEST_ACTIVATION_POLICY
             || self.request_prefix_delivery_precondition
@@ -374,7 +385,7 @@ impl ReceiverContinuation {
         {
             return Err(Error::InvalidConfig(
                 "Walkie-Talkie receiver_continuation metadata does not match the supported \
-                 receiver-liveness adaptation"
+                 sender-framing and receiver-liveness adaptation"
                     .into(),
             ));
         }
@@ -460,7 +471,11 @@ impl HistoricalMoldedFileSchemaFive {
         let mut workload_ids = Vec::with_capacity(self.profiles.len().saturating_mul(2));
         let mut identities = HashSet::new();
         for (index, profile) in self.profiles.iter().enumerate() {
-            profile.validate(self.packet_size, index)?;
+            profile.validate(
+                self.packet_size,
+                index,
+                MoldContinuationContract::HistoricalSchemaFive,
+            )?;
             for identity in [&profile.real, &profile.decoy] {
                 if !identities.insert(identity.as_str()) {
                     return Err(Error::InvalidConfig(format!(
@@ -479,7 +494,12 @@ impl HistoricalMoldedFileSchemaFive {
 }
 
 impl MoldedProfile {
-    fn validate(&self, packet_size: u16, profile_index: usize) -> Result<()> {
+    fn validate(
+        &self,
+        packet_size: u16,
+        profile_index: usize,
+        continuation_contract: MoldContinuationContract,
+    ) -> Result<()> {
         if self.real.trim().is_empty() || self.decoy.trim().is_empty() {
             return Err(Error::InvalidConfig(format!(
                 "Walkie-Talkie profile {profile_index} workload identities must not be empty"
@@ -543,14 +563,21 @@ impl MoldedProfile {
             profile_index,
             "molded",
         )?;
-        validate_derived_mold(self, packet_size, profile_index)
+        validate_derived_mold(self, packet_size, profile_index, continuation_contract)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MoldContinuationContract {
+    HistoricalSchemaFive,
+    Current,
 }
 
 fn validate_derived_mold(
     profile: &MoldedProfile,
     packet_size: u16,
     profile_index: usize,
+    continuation_contract: MoldContinuationContract,
 ) -> Result<()> {
     let (symmetric_mold, expected_batch_ends) = mold(
         &profile.source_envelopes.real,
@@ -558,11 +585,16 @@ fn validate_derived_mold(
         &profile.source_envelopes.decoy,
         &profile.batch_ends.decoy,
     );
-    let expected_mold = adapt_receiver_continuation(&symmetric_mold)?;
+    let expected_mold = match continuation_contract {
+        MoldContinuationContract::HistoricalSchemaFive => {
+            adapt_historical_schema_five_receiver_continuation(&symmetric_mold)?
+        }
+        MoldContinuationContract::Current => adapt_continuations(&symmetric_mold)?,
+    };
     if profile.bursts != expected_mold || profile.molded_batch_ends != expected_batch_ends {
         return Err(Error::InvalidConfig(format!(
             "Walkie-Talkie profile {profile_index} bursts and common batch boundaries \
-             are not the declared receiver continuation of the batch-aware element-wise \
+             are not the declared continuation adaptation of the batch-aware element-wise \
              maximum of its source envelopes"
         )));
     }
@@ -602,7 +634,37 @@ fn checked_scheduled_bytes(molded_packets: u64, packet_size: u16) -> Result<u64>
         })
 }
 
-fn adapt_receiver_continuation(symmetric_mold: &[BurstPair]) -> Result<Vec<BurstPair>> {
+fn adapt_continuations(symmetric_mold: &[BurstPair]) -> Result<Vec<BurstPair>> {
+    symmetric_mold
+        .iter()
+        .map(|pair| {
+            let outgoing = if pair.outgoing == 0 {
+                0
+            } else {
+                pair.outgoing.checked_add(1).ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "Walkie-Talkie sender framing continuation exceeds the u32 cell domain"
+                            .into(),
+                    )
+                })?
+            };
+            let incoming = if pair.incoming == 0 {
+                0
+            } else {
+                pair.incoming.checked_add(1).ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "Walkie-Talkie receiver continuation exceeds the u32 cell domain".into(),
+                    )
+                })?
+            };
+            Ok(BurstPair { outgoing, incoming })
+        })
+        .collect()
+}
+
+fn adapt_historical_schema_five_receiver_continuation(
+    symmetric_mold: &[BurstPair],
+) -> Result<Vec<BurstPair>> {
     symmetric_mold
         .iter()
         .map(|pair| {
@@ -611,7 +673,8 @@ fn adapt_receiver_continuation(symmetric_mold: &[BurstPair]) -> Result<Vec<Burst
             } else {
                 pair.incoming.checked_add(1).ok_or_else(|| {
                     Error::InvalidConfig(
-                        "Walkie-Talkie receiver continuation exceeds the u32 cell domain".into(),
+                        "historical Walkie-Talkie schema-five receiver continuation exceeds the u32 cell domain"
+                            .into(),
                     )
                 })?
             };
@@ -1887,8 +1950,8 @@ mod tests {
     ) -> String {
         let (symmetric_mold, molded_batch_ends) =
             super::mold(real, real_batch_ends, decoy, decoy_batch_ends);
-        let bursts = super::adapt_receiver_continuation(&symmetric_mold)
-            .expect("adapted receiver continuation");
+        let bursts = super::adapt_continuations(&symmetric_mold)
+            .expect("adapted sender-framing and receiver continuations");
         let matching_cost_packets = super::total_packets(&bursts)
             .expect("molded test packet count")
             .checked_mul(2)
@@ -1937,6 +2000,9 @@ mod tests {
                     "post_outgoing_loss_liveness_limitation": "loss-of-required-initial-peer-acknowledged-survivor-after-initial-request-chaff-batch-holds-base-and-continuation-allocation;no-new-chaff-request-replenishment-or-generic-post-loss-liveness-guarantee",
                     "provisioning_policy": "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch",
                     "raw_headroom_bytes_per_nonzero_incoming_component": 1200,
+                    "sender_framing_cells_per_nonzero_outgoing_component": 1,
+                    "sender_framing_formula": "symmetric_outgoing=adapted_outgoing-1-if-adapted_outgoing>0-else-0",
+                    "sender_framing_policy": "one-full-cell-per-positive-symmetric-outgoing-component-reserved-for-quic-http3-stream-framing-and-mandatory-control-overhead",
                     "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                     "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
                     "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
@@ -2037,6 +2103,19 @@ mod tests {
         incoming_wire(defense, at_us);
     }
 
+    fn realize_sender_framing_continuation(defense: &mut WalkieTalkie, at_us: u64) {
+        let packet = defense
+            .next_event(Duration::from_micros(at_us))
+            .expect("sender-framing continuation cell");
+        assert_eq!(packet.direction(), Direction::Outgoing);
+        resolve(
+            defense,
+            at_us,
+            packet,
+            EventOutcome::Satisfied { observed: 1_200 },
+        );
+    }
+
     fn incoming_payload(defense: &mut WalkieTalkie, at_us: u64, bytes: u64, cover: bool) {
         let pending_length = match defense.turn {
             super::Turn::Incoming {
@@ -2127,14 +2206,14 @@ mod tests {
         );
 
         let wrong_total = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
-            r#""total_scheduled_bytes": 3600"#,
-            r#""total_scheduled_bytes": 3599"#,
+            r#""total_scheduled_bytes": 4800"#,
+            r#""total_scheduled_bytes": 4799"#,
         );
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_total).is_err());
 
         let wrong_cost = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
-            r#""matching_cost_packets": 2"#,
-            r#""matching_cost_packets": 1"#,
+            r#""matching_cost_packets": 4"#,
+            r#""matching_cost_packets": 3"#,
         );
         assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_cost).is_err());
 
@@ -2189,6 +2268,9 @@ mod tests {
             "qualified_chaff_response_policy",
             "staged_prefix_pack_precondition",
             "qualification_binding_policy",
+            "sender_framing_cells_per_nonzero_outgoing_component",
+            "sender_framing_formula",
+            "sender_framing_policy",
         ] {
             receiver.remove(field);
         }
@@ -2254,6 +2336,9 @@ mod tests {
             "reserve_policy".into(),
             serde_json::json!(super::HISTORICAL_SCHEMA_FIVE_RESERVE_POLICY),
         );
+        historical["profiles"][0]["matching_cost_packets"] = serde_json::json!(2);
+        historical["profiles"][0]["total_scheduled_bytes"] = serde_json::json!(3_600);
+        historical["profiles"][0]["bursts"][0]["outgoing"] = serde_json::json!(1);
         let historical = historical.to_string();
 
         let diagnostic = WalkieTalkie::historical_schema_five_diagnostic(&historical)
@@ -2446,7 +2531,21 @@ mod tests {
         clippy::too_many_lines,
         reason = "the overflow fixture constructs the full strict schema-six envelope"
     )]
-    fn receiver_continuation_and_scheduled_byte_overflow_are_rejected() {
+    fn sender_and_receiver_continuation_and_scheduled_byte_overflow_are_rejected() {
+        assert!(
+            super::adapt_continuations(&[super::BurstPair {
+                outgoing: u32::MAX,
+                incoming: 0,
+            }])
+            .is_err()
+        );
+        assert!(
+            super::adapt_continuations(&[super::BurstPair {
+                outgoing: 0,
+                incoming: u32::MAX,
+            }])
+            .is_err()
+        );
         let bursts = vec![
             super::BurstPair {
                 outgoing: u32::MAX,
@@ -2486,6 +2585,10 @@ mod tests {
                     super::RECEIVER_POST_OUTGOING_LOSS_LIVENESS_LIMITATION.into(),
                 provisioning_policy: super::RECEIVER_PROVISIONING_POLICY.into(),
                 raw_headroom_bytes_per_nonzero_incoming_component: 1_200,
+                sender_framing_cells_per_nonzero_outgoing_component:
+                    super::SENDER_FRAMING_CELLS_PER_NONZERO_OUTGOING_COMPONENT,
+                sender_framing_formula: super::SENDER_FRAMING_FORMULA.into(),
+                sender_framing_policy: super::SENDER_FRAMING_POLICY.into(),
                 release_policy: super::RECEIVER_RELEASE_POLICY.into(),
                 request_activation_policy:
                     "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells"
@@ -2566,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_six_adapts_every_positive_incoming_component_exactly_once() {
+    fn schema_six_adapts_every_positive_outgoing_and_incoming_component_exactly_once() {
         let input = molded_pair_from_sources(
             r#"[
                 {"outgoing": 2, "incoming": 0, "batch_end": false},
@@ -2586,11 +2689,11 @@ mod tests {
             defense.molded,
             [
                 super::BurstPair {
-                    outgoing: 2,
+                    outgoing: 3,
                     incoming: 0,
                 },
                 super::BurstPair {
-                    outgoing: 3,
+                    outgoing: 4,
                     incoming: 4,
                 },
                 super::BurstPair {
@@ -2614,14 +2717,18 @@ mod tests {
         for bursts in [
             serde_json::json!([
                 {"outgoing": 2, "incoming": 0},
-                {"outgoing": 0, "incoming": 2}
-            ]),
-            serde_json::json!([
-                {"outgoing": 2, "incoming": 1},
                 {"outgoing": 0, "incoming": 3}
             ]),
             serde_json::json!([
-                {"outgoing": 2, "incoming": 0},
+                {"outgoing": 4, "incoming": 0},
+                {"outgoing": 0, "incoming": 3}
+            ]),
+            serde_json::json!([
+                {"outgoing": 3, "incoming": 0},
+                {"outgoing": 0, "incoming": 2}
+            ]),
+            serde_json::json!([
+                {"outgoing": 3, "incoming": 0},
                 {"outgoing": 0, "incoming": 4}
             ]),
         ] {
@@ -2697,6 +2804,12 @@ mod tests {
                 "raw_headroom_bytes_per_nonzero_incoming_component",
                 serde_json::json!(1_201),
             ),
+            (
+                "sender_framing_cells_per_nonzero_outgoing_component",
+                serde_json::json!(2),
+            ),
+            ("sender_framing_formula", serde_json::json!("different")),
+            ("sender_framing_policy", serde_json::json!("none")),
             ("release_policy", serde_json::json!("eager")),
             ("request_activation_policy", serde_json::json!("any-byte")),
             (
@@ -2750,6 +2863,9 @@ mod tests {
             "post_outgoing_loss_liveness_limitation",
             "provisioning_policy",
             "raw_headroom_bytes_per_nonzero_incoming_component",
+            "sender_framing_cells_per_nonzero_outgoing_component",
+            "sender_framing_formula",
+            "sender_framing_policy",
             "release_policy",
             "request_activation_policy",
             "request_prefix_delivery_precondition",
@@ -2904,6 +3020,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 1_200 },
         );
+        realize_sender_framing_continuation(&mut defense, 2);
         assert_eq!(
             defense.receiver_continuation_reserve_horizon(),
             3,
@@ -2983,6 +3100,7 @@ mod tests {
         let second = defense.next_event(Duration::ZERO).expect("outgoing two");
         assert_eq!(first.direction(), Direction::Outgoing);
         assert_eq!(second.direction(), Direction::Outgoing);
+        realize_sender_framing_continuation(&mut defense, 0);
         assert_eq!(defense.next_event(Duration::ZERO), None);
 
         resolve(
@@ -3108,6 +3226,7 @@ mod tests {
         let retry = defense.next_event(Duration::from_micros(1)).expect("retry");
         assert_eq!(retry.direction(), Direction::Outgoing);
         assert_eq!(defense.diagnostics().retried_outgoing_events, 1);
+        realize_sender_framing_continuation(&mut defense, 1);
         assert_eq!(defense.next_event(Duration::from_micros(1)), None);
 
         resolve(
@@ -3200,6 +3319,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         assert_eq!(
             defense
                 .next_event(Duration::from_micros(1))
@@ -3321,6 +3441,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         let credits: Vec<_> = std::iter::repeat_with(|| {
             defense
                 .next_event(Duration::from_micros(1))
@@ -3391,6 +3512,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         let credit = defense
             .next_event(Duration::from_micros(1))
             .expect("first incoming credit");
@@ -3565,6 +3687,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         let initial = defense
             .next_event(Duration::from_micros(1))
             .expect("initial incoming credit");
@@ -3623,6 +3746,7 @@ mod tests {
             first_outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 0);
         assert_eq!(
             defense.next_event(Duration::ZERO),
             Packet::new(Duration::ZERO, Direction::Incoming, 1_200).ok()
@@ -3640,6 +3764,7 @@ mod tests {
             second_outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 0);
         assert_eq!(
             defense.next_event(Duration::ZERO),
             Packet::new(Duration::ZERO, Direction::Incoming, 1_200).ok()
@@ -3681,6 +3806,7 @@ mod tests {
             first,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         assert_eq!(
             defense
                 .next_event(Duration::from_micros(1))
@@ -3693,7 +3819,7 @@ mod tests {
         realize_receiver_continuation(&mut defense, 3);
 
         assert!(!defense.can_start_application_batch());
-        for at_us in [3, 4] {
+        for at_us in [3, 4, 5] {
             let suffix = defense
                 .next_event(Duration::from_micros(at_us))
                 .expect("decoy-only outgoing suffix");
@@ -3707,12 +3833,12 @@ mod tests {
         }
         assert_eq!(
             defense
-                .next_event(Duration::from_micros(4))
+                .next_event(Duration::from_micros(5))
                 .map(Packet::direction),
             Some(Direction::Incoming)
         );
-        incoming_wire(&mut defense, 5);
-        realize_receiver_continuation(&mut defense, 5);
+        incoming_wire(&mut defense, 6);
+        realize_receiver_continuation(&mut defense, 6);
         assert!(matches!(defense.turn, super::Turn::Done));
         assert!(!defense.can_start_application_batch());
 
@@ -3762,6 +3888,7 @@ mod tests {
             application_outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         assert_eq!(
             defense
                 .next_event(Duration::from_micros(1))
@@ -3784,6 +3911,7 @@ mod tests {
             suffix_outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 4);
         assert_eq!(
             defense
                 .next_event(Duration::from_micros(4))
@@ -3838,7 +3966,7 @@ mod tests {
 
         application_batch_started(&mut defense, 0);
         application_bytes(&mut defense, 0, Direction::Outgoing, 2_400);
-        for at_us in 1..=3 {
+        for at_us in 1..=4 {
             let outgoing = defense
                 .next_event(Duration::from_micros(at_us))
                 .expect("molded outgoing cell");
@@ -3863,9 +3991,9 @@ mod tests {
         realize_receiver_continuation(&mut defense, 7);
 
         let diagnostics = defense.diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 4);
         assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 4);
-        assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 4);
         assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 4);
         assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 0);
         assert_eq!(diagnostics.walkie_talkie_natural_outgoing_bytes, 2_400);
@@ -3900,6 +4028,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 2);
         assert_eq!(
             defense
                 .next_event(Duration::from_micros(2))
@@ -4141,6 +4270,7 @@ mod tests {
             outgoing,
             EventOutcome::Satisfied { observed: 100 },
         );
+        realize_sender_framing_continuation(&mut defense, 1);
         application_batch_completed(&mut defense, 1);
 
         assert!(defense.is_complete());
@@ -4190,13 +4320,20 @@ mod tests {
                     outcome: EventOutcome::Satisfied { observed: 1_200 },
                 },
             ),
+            (
+                Duration::from_micros(25),
+                SignalKind::Resolved {
+                    packet: outgoing(0),
+                    outcome: EventOutcome::Satisfied { observed: 1_200 },
+                },
+            ),
         ];
         for at_us in [30, 40, 45] {
             script.extend([
                 (
                     Duration::from_micros(at_us),
                     SignalKind::ReceiveCreditRequested {
-                        packet: incoming(20),
+                        packet: incoming(25),
                     },
                 ),
                 (
@@ -4217,13 +4354,15 @@ mod tests {
             Duration::from_micros(40),
             SignalKind::ApplicationBatchCompleted,
         ));
-        script.extend([(
-            Duration::from_micros(50),
-            SignalKind::Resolved {
-                packet: outgoing(40),
-                outcome: EventOutcome::Satisfied { observed: 1_200 },
-            },
-        )]);
+        for at_us in [50, 55] {
+            script.push((
+                Duration::from_micros(at_us),
+                SignalKind::Resolved {
+                    packet: outgoing(40),
+                    outcome: EventOutcome::Satisfied { observed: 1_200 },
+                },
+            ));
+        }
         script.push((
             Duration::from_micros(45),
             SignalKind::ApplicationBatchStarted,
@@ -4233,7 +4372,7 @@ mod tests {
                 (
                     Duration::from_micros(at_us),
                     SignalKind::ReceiveCreditRequested {
-                        packet: incoming(50),
+                        packet: incoming(55),
                     },
                 ),
                 (
@@ -4264,11 +4403,13 @@ mod tests {
             [
                 (0, Direction::Outgoing, 1_200),
                 (0, Direction::Outgoing, 1_200),
-                (20, Direction::Incoming, 1_200),
-                (20, Direction::Incoming, 1_200),
+                (0, Direction::Outgoing, 1_200),
+                (25, Direction::Incoming, 1_200),
+                (25, Direction::Incoming, 1_200),
                 (40, Direction::Incoming, 1_200),
                 (45, Direction::Outgoing, 1_200),
-                (50, Direction::Incoming, 1_200),
+                (45, Direction::Outgoing, 1_200),
+                (55, Direction::Incoming, 1_200),
                 (60, Direction::Incoming, 1_200),
             ]
         );
@@ -4278,9 +4419,9 @@ mod tests {
             0
         );
         let diagnostics = defense.diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 5);
         assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 5);
-        assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 5);
         assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 5);
         assert_eq!(diagnostics.walkie_talkie_outgoing_shortfall_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_cells, 0);
