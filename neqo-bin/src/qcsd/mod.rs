@@ -1168,6 +1168,56 @@ struct QualifierStream {
     outcome: &'static str,
 }
 
+fn drain_qualifier_stream_data(
+    streams: &mut HashMap<StreamId, QualifierStream>,
+    completed: &mut Vec<QualifierStream>,
+    stream_id: StreamId,
+    max_response_bytes: u64,
+    mut read_data: impl FnMut(&mut [u8]) -> Result<(usize, bool), Error>,
+) -> Result<(), Error> {
+    // Processing a batch of received datagrams can queue more than one
+    // `DataReadable` for a stream.  The first event may consume its FIN and
+    // retire the HTTP/3 receive stream, making every remaining event stale.
+    if !streams.contains_key(&stream_id) {
+        return if completed.iter().any(|record| record.stream_id == stream_id) {
+            Ok(())
+        } else {
+            Err(Error::RunAborted(
+                "data arrived for an unknown qualifier stream".into(),
+            ))
+        };
+    }
+
+    let mut buffer = vec![0_u8; 32 * 1024];
+    loop {
+        let (read, fin) = read_data(&mut buffer)?;
+        let record = streams
+            .get_mut(&stream_id)
+            .expect("active qualifier stream remains present until FIN");
+        record.body_bytes = record
+            .body_bytes
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        record.complete |= fin;
+        if record.body_bytes > max_response_bytes {
+            record.outcome = "response_limit";
+            return Err(Error::RunAborted(format!(
+                "qualification response exceeds {max_response_bytes} bytes"
+            )));
+        }
+        record.body.extend_from_slice(&buffer[..read]);
+        if fin {
+            let mut record = streams.remove(&stream_id).expect("present");
+            record.outcome = "complete";
+            completed.push(record);
+            break;
+        }
+        if read == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::future_not_send,
     clippy::too_many_lines,
@@ -1348,35 +1398,13 @@ async fn qualify_chaff_response(
                         }
                     }
                     Http3ClientEvent::DataReadable { stream_id } => {
-                        let mut buffer = vec![0_u8; 32 * 1024];
-                        loop {
-                            let (read, fin) = client.read_data(loop_now, stream_id, &mut buffer)?;
-                            let record = streams.get_mut(&stream_id).ok_or_else(|| {
-                                Error::RunAborted(
-                                    "data arrived for an unknown qualifier stream".into(),
-                                )
-                            })?;
-                            record.body_bytes = record
-                                .body_bytes
-                                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-                            record.complete |= fin;
-                            if record.body_bytes > max_response_bytes {
-                                record.outcome = "response_limit";
-                                return Err(Error::RunAborted(format!(
-                                    "qualification response exceeds {max_response_bytes} bytes"
-                                )));
-                            }
-                            record.body.extend_from_slice(&buffer[..read]);
-                            if fin {
-                                let mut record = streams.remove(&stream_id).expect("present");
-                                record.outcome = "complete";
-                                completed.push(record);
-                                break;
-                            }
-                            if read == 0 {
-                                break;
-                            }
-                        }
+                        drain_qualifier_stream_data(
+                            &mut streams,
+                            &mut completed,
+                            stream_id,
+                            max_response_bytes,
+                            |buffer| Ok(client.read_data(loop_now, stream_id, buffer)?),
+                        )?;
                     }
                     Http3ClientEvent::Reset { stream_id, .. } => {
                         if let Some(mut record) = streams.remove(&stream_id) {
@@ -4611,6 +4639,7 @@ fn now() -> Instant {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         path::PathBuf,
@@ -4631,12 +4660,13 @@ mod tests {
 
     use super::{
         ApplicationBatchLifecycle, Args, DefenseArg, Error, ExpectedChaffIdentity, Preset,
-        ProfileArg, QcsdRequestRole, RequestPolicyArg, ResourceRunState, RunCompletion, RunSpec,
-        Socket, StaticModeArg, StreamRecord, StreamType, TrafficMorphingActivation,
-        action_failure_reason, activate_traffic_morphing, apply_action_batch, create_endpoints,
-        datagram_observation, deadline_error, defense_parameter_provenance,
-        ensure_defense_realizable, expected_application_response_length, finish_application_record,
-        finish_chaff_record, forward_qcsd_observation, has_in_flight_application_stream, now,
+        ProfileArg, QcsdRequestRole, QualifierStream, RequestPolicyArg, ResourceRunState,
+        RunCompletion, RunSpec, Socket, StaticModeArg, StreamRecord, StreamType,
+        TrafficMorphingActivation, action_failure_reason, activate_traffic_morphing,
+        apply_action_batch, create_endpoints, datagram_observation, deadline_error,
+        defense_parameter_provenance, drain_qualifier_stream_data, ensure_defense_realizable,
+        expected_application_response_length, finish_application_record, finish_chaff_record,
+        forward_qcsd_observation, has_in_flight_application_stream, now,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
         record_terminal_action, register_action_batch, resolve_run_config,
         resolve_run_config_with_workload, sanitize_chaff_action_headers, sha256,
@@ -6468,6 +6498,63 @@ mod tests {
             )]),
             None
         );
+    }
+
+    #[test]
+    fn response_qualification_ignores_queued_data_readable_after_fin_retirement() {
+        let stream_id = neqo_transport::StreamId::new(12);
+        let mut streams = HashMap::from([(
+            stream_id,
+            QualifierStream {
+                request_index: 3,
+                stream_id,
+                request_stream_bytes: 169,
+                status: Some(200),
+                content_encoding: Some("br".into()),
+                body: Vec::new(),
+                body_bytes: 0,
+                complete: false,
+                outcome: "in_flight",
+            },
+        )]);
+        let mut completed = Vec::new();
+        let mut read_calls = 0;
+        let events = [
+            neqo_http3::Http3ClientEvent::DataReadable { stream_id },
+            neqo_http3::Http3ClientEvent::DataReadable { stream_id },
+        ];
+
+        for event in events {
+            let neqo_http3::Http3ClientEvent::DataReadable { stream_id } = event else {
+                unreachable!("fixture contains only data-readable events")
+            };
+            drain_qualifier_stream_data(&mut streams, &mut completed, stream_id, 1_024, |buffer| {
+                read_calls += 1;
+                assert_eq!(read_calls, 1, "stale event must not read a retired stream");
+                buffer[..4].copy_from_slice(b"body");
+                Ok((4, true))
+            })
+            .expect("duplicate data-readable event is harmless");
+        }
+
+        assert_eq!(read_calls, 1);
+        assert!(streams.is_empty());
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].body, b"body");
+        assert!(completed[0].complete);
+        assert_eq!(completed[0].outcome, "complete");
+
+        let unknown = neqo_transport::StreamId::new(16);
+        let error =
+            drain_qualifier_stream_data(&mut streams, &mut completed, unknown, 1_024, |_| {
+                panic!("unknown stream must fail before an HTTP/3 read")
+            })
+            .expect_err("a genuinely unknown stream remains fail-closed");
+        assert!(matches!(
+            error,
+            Error::RunAborted(message)
+                if message == "data arrived for an unknown qualifier stream"
+        ));
     }
 
     #[test]
