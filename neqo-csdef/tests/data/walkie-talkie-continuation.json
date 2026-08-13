@@ -3,7 +3,7 @@
   "burst_definition": "global-application-batch-direction-transitions",
   "cell_byte_domain": "http3-request-stream-offset.bytes",
   "schema_version": 3,
-  "generated_by": "neqo-csdef golden fixture",
+  "generated_by": "neqo-csdef receiver-continuation regression fixture",
   "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
   "paper_equivalent": false,
   "packet_size": 1200,
@@ -16,9 +16,9 @@
   },
   "profiles": [
     {
-      "real": "real page",
-      "decoy": "decoy page",
-      "matching_cost_packets": 4,
+      "real": "bootstrap-like-real",
+      "decoy": "bootstrap-like-decoy",
+      "matching_cost_packets": 2,
       "training_inputs": {
         "real": [
           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -42,22 +42,22 @@
       "source_envelopes": {
         "real": [
           {
-            "outgoing": 2,
-            "incoming": 2
+            "outgoing": 1,
+            "incoming": 15
           },
           {
             "outgoing": 1,
-            "incoming": 1
+            "incoming": 0
           }
         ],
         "decoy": [
           {
-            "outgoing": 2,
-            "incoming": 2
+            "outgoing": 1,
+            "incoming": 15
           },
           {
             "outgoing": 1,
-            "incoming": 1
+            "incoming": 0
           }
         ]
       },
@@ -66,15 +66,15 @@
         "decoy": [0, 1]
       },
       "molded_batch_ends": [0, 1],
-      "total_scheduled_bytes": 9600,
+      "total_scheduled_bytes": 21600,
       "bursts": [
         {
-          "outgoing": 2,
-          "incoming": 3
+          "outgoing": 1,
+          "incoming": 16
         },
         {
           "outgoing": 1,
-          "incoming": 2
+          "incoming": 0
         }
       ]
     }

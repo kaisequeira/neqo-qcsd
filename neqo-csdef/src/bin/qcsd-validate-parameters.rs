@@ -50,7 +50,7 @@ fn validate_walkie_talkie(path: &Path, workloads: &[String]) -> Result<(), Box<d
             workload_id: workload_id.clone(),
             packet_size: UDP_PAYLOAD_CEILING,
         };
-        WalkieTalkie::from_file(&config, UDP_PAYLOAD_CEILING, path)?;
+        WalkieTalkie::from_file(&config, UDP_PAYLOAD_CEILING, 1_000, path)?;
     }
     Ok(())
 }

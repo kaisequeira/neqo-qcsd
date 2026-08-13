@@ -187,6 +187,7 @@ impl QcsdController {
         config.validate()?;
         let enable_chaff = !matches!(config.defense, DefenseConfig::None);
         let max_udp_payload_size = config.max_udp_payload_size;
+        let max_stream_data_excess = config.max_stream_data_excess;
         let defense: Box<dyn Defense> = match &config.defense {
             DefenseConfig::None => Box::new(StaticSchedule::new(crate::Trace::default(), true)),
             DefenseConfig::Static {
@@ -201,9 +202,11 @@ impl QcsdController {
             DefenseConfig::WtfPad(config) => {
                 Box::new(WtfPad::new(config, seed, max_udp_payload_size)?)
             }
-            DefenseConfig::WalkieTalkie(config) => {
-                Box::new(WalkieTalkie::new(config, max_udp_payload_size)?)
-            }
+            DefenseConfig::WalkieTalkie(config) => Box::new(WalkieTalkie::new(
+                config,
+                max_udp_payload_size,
+                max_stream_data_excess,
+            )?),
         };
         Self::build(config, resources, defense, enable_chaff)
     }
@@ -2024,7 +2027,7 @@ impl QcsdController {
 mod tests {
     use std::{
         cell::RefCell,
-        collections::{BTreeSet, VecDeque},
+        collections::{BTreeSet, HashMap, VecDeque},
         rc::Rc,
         time::Duration,
     };
@@ -2526,7 +2529,7 @@ mod tests {
         let config = WalkieTalkieConfig {
             molded: "walkie-talkie-golden.json".into(),
             workload_id: "real page".into(),
-            packet_size: 100,
+            packet_size: 1_200,
         };
         let defense = WalkieTalkie::from_json(
             &config,
@@ -2699,15 +2702,22 @@ mod tests {
             "adaptation": "qcsd-client-only",
             "burst_definition": "global-application-batch-direction-transitions",
             "cell_byte_domain": "http3-request-stream-offset.bytes",
-            "schema_version": 2,
+            "schema_version": 3,
             "generated_by": "controller ordering test",
-            "matching_algorithm": "minimum-cost-one-to-one",
+            "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
             "paper_equivalent": false,
-            "packet_size": 100,
+            "packet_size": 1200,
+            "receiver_continuation": {
+                "application_order": "after-symmetric-elementwise-mold",
+                "cells_per_nonzero_incoming_component": 1,
+                "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+                "parser_allowance_ceiling_bytes": 1000,
+                "raw_headroom_bytes_per_nonzero_incoming_component": 1200
+            },
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
-                "matching_cost_packets": 0,
+                "matching_cost_packets": 4,
                 "training_inputs": {
                     "real": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
                     "decoy": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
@@ -2728,17 +2738,17 @@ mod tests {
                 },
                 "batch_ends": {"real": [1], "decoy": [1]},
                 "molded_batch_ends": [1],
-                "total_scheduled_bytes": 300,
+                "total_scheduled_bytes": 6000,
                 "bursts": [
-                    {"outgoing": 0, "incoming": 1},
-                    {"outgoing": 1, "incoming": 1}
+                    {"outgoing": 0, "incoming": 2},
+                    {"outgoing": 1, "incoming": 2}
                 ]
             }]
         }"#;
         let config = WalkieTalkieConfig {
             molded: "inline-ordering-test.json".into(),
             workload_id: "real page".into(),
-            packet_size: 100,
+            packet_size: 1_200,
         };
         let defense = WalkieTalkie::from_json(&config, 1_200, molded).expect("valid mould");
         let mut controller = QcsdController::with_defense(
@@ -2762,7 +2772,7 @@ mod tests {
                 endpoint,
                 stream,
                 role: QcsdRequestRole::Application,
-                expected_response_length: Some(200),
+                expected_response_length: Some(2_400),
             },
             Duration::ZERO,
         );
@@ -2775,9 +2785,9 @@ mod tests {
         )));
         controller.observe(QcsdObservation::ApplicationBatchStarted, Duration::ZERO);
         controller.poll(Duration::ZERO);
-        let (absolute_limit, slot) = controller
+        let credits: Vec<_> = controller
             .drain_actions()
-            .find_map(|action| match action {
+            .filter_map(|action| match action {
                 QcsdAction::IncreaseReceiveLimit {
                     absolute_limit,
                     slot,
@@ -2785,35 +2795,310 @@ mod tests {
                 } => Some((absolute_limit, slot)),
                 _ => None,
             })
-            .expect("first incoming mould credit");
-        assert_eq!(absolute_limit, 100);
+            .collect();
+        assert_eq!(credits.len(), 2);
+        assert_eq!(
+            credits.iter().map(|credit| credit.0).collect::<Vec<_>>(),
+            [1_200, 2_400]
+        );
 
-        controller.observe(
-            QcsdObservation::ReceiveLimitAdvertised {
-                endpoint,
-                stream,
-                absolute_limit,
-                slot: Some(slot),
-            },
-            Duration::from_micros(1),
-        );
-        controller.observe(
-            QcsdObservation::BytesRead {
-                endpoint,
-                stream,
-                bytes: 100,
-            },
-            Duration::from_micros(1),
-        );
+        for (absolute_limit, slot) in credits {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(1),
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: 1_200,
+                },
+                Duration::from_micros(1),
+            );
+        }
         controller.poll(Duration::from_micros(1));
 
         let diagnostics = controller.defense_diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 100);
+        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 2_400);
         assert_eq!(
             diagnostics.walkie_talkie_application_stream_crossing_bytes,
             0
         );
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
+        assert!(controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SendPacket { packet, .. }
+                if packet.direction() == Direction::Outgoing
+        )));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the production-shaped continuation, FIN transfer, and next-batch gate remain explicit"
+    )]
+    fn receiver_continuation_realizes_bootstrap_shaped_application_and_chaff_credit() {
+        const EXPECTED_BODY: u64 = 17_109;
+        const APPLICATION_RAW: u64 = 17_667;
+        const CHAFF_RAW: u64 = 1_533;
+        const TARGET_INCOMING: u64 = 16 * 1_200;
+
+        let config = WalkieTalkieConfig {
+            molded: "walkie-talkie-continuation.json".into(),
+            workload_id: "bootstrap-like-real".into(),
+            packet_size: 1_200,
+        };
+        let defense = WalkieTalkie::from_json_with_max_stream_data_excess(
+            &config,
+            1_200,
+            1_000,
+            include_str!("../../tests/data/walkie-talkie-continuation.json"),
+        )
+        .expect("production-shaped receiver continuation fixture");
+        let manifest = ResourceManifest {
+            resources: vec![Resource {
+                id: 7,
+                url: "https://example.com/chaff".into(),
+                kind: "Image".into(),
+                content_length: Some(EXPECTED_BODY),
+                data_length: EXPECTED_BODY,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            }],
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 1,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                low_watermark: 0,
+                max_udp_payload_size: 1_200,
+                tail_wait_us: 0,
+                defense: DefenseConfig::WalkieTalkie(config),
+                ..QcsdConfig::default()
+            },
+            Some(manifest),
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let application = QcsdStreamId(0);
+        let chaff = QcsdStreamId(4);
+        ready(&mut controller, 1, "https://example.com");
+        for (stream, role, expected_response_length) in [
+            (
+                application,
+                QcsdRequestRole::Application,
+                Some(EXPECTED_BODY),
+            ),
+            (
+                chaff,
+                QcsdRequestRole::Chaff {
+                    resource_id: 7,
+                    request_id: None,
+                },
+                None,
+            ),
+        ] {
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role,
+                    expected_response_length,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.drain_actions().for_each(drop);
+
+        controller.observe(QcsdObservation::ApplicationBatchStarted, Duration::ZERO);
+        controller.observe(
+            QcsdObservation::StreamDataTransmitted {
+                endpoint,
+                stream: application,
+                role: QcsdRequestRole::Application,
+                offset: 0,
+                bytes: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let (outgoing_packet, outgoing_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::SendPacket { packet, slot, .. } => Some((packet, slot)),
+                _ => None,
+            })
+            .expect("first outgoing cell");
+        controller.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot: outgoing_slot,
+                observed_size: outgoing_packet.length(),
+            },
+            Duration::from_micros(1),
+        );
+        controller.poll(Duration::from_micros(1));
+
+        let credits: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(credits.len(), 16);
+        assert_eq!(credits[14].0, application);
+        assert_eq!(credits[14].1, 17_109);
+        assert_eq!(credits[15].0, chaff);
+        assert_eq!(credits[15].1, 1_091);
+        assert_eq!(controller.control.claims.len(), 2);
+        assert_eq!(controller.control.claims[0].remaining, 891);
+        assert_eq!(controller.control.claims[1].remaining, 109);
+
+        for (stream, absolute_limit, slot) in &credits {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream: *stream,
+                    absolute_limit: *absolute_limit,
+                    slot: Some(*slot),
+                },
+                Duration::from_micros(2),
+            );
+        }
+        controller.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint,
+                stream: application,
+                frame_bytes: APPLICATION_RAW - EXPECTED_BODY,
+                status: Some(200),
+                content_length: Some(EXPECTED_BODY),
+            },
+            Duration::from_micros(2),
+        );
+        let (framing_limit, framing_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if stream == application => Some((absolute_limit, slot)),
+                _ => None,
+            })
+            .expect("discovered framing converts application claim to exact credit");
+        assert_eq!(framing_limit, APPLICATION_RAW);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: application,
+                absolute_limit: framing_limit,
+                slot: Some(framing_slot),
+            },
+            Duration::from_micros(2),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: application,
+                bytes: APPLICATION_RAW,
+            },
+            Duration::from_micros(2),
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream: application,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(2),
+        );
+        controller.poll(Duration::from_micros(2));
+
+        let reassigned: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reassigned.len(), 2);
+        assert!(reassigned.iter().all(|credit| credit.0 == chaff));
+        assert_eq!(reassigned[0].1, 1_424);
+        assert_eq!(reassigned[1].1, CHAFF_RAW);
+        for (stream, absolute_limit, slot) in &reassigned {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream: *stream,
+                    absolute_limit: *absolute_limit,
+                    slot: Some(*slot),
+                },
+                Duration::from_micros(3),
+            );
+        }
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: chaff,
+                bytes: CHAFF_RAW,
+            },
+            Duration::from_micros(3),
+        );
+        controller.observe(
+            QcsdObservation::ApplicationBatchCompleted,
+            Duration::from_micros(3),
+        );
+        controller.poll(Duration::from_micros(3));
+
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            diagnostics.scheduled_incoming_requested_bytes,
+            TARGET_INCOMING
+        );
+        assert_eq!(
+            diagnostics.scheduled_incoming_consumed_bytes,
+            TARGET_INCOMING
+        );
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 16);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 16);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 0);
+        assert_eq!(
+            diagnostics.walkie_talkie_natural_incoming_bytes,
+            APPLICATION_RAW
+        );
+        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, CHAFF_RAW);
+        assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
+        assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
+        assert!(controller.can_start_application_batch());
+
+        controller.observe(
+            QcsdObservation::ApplicationBatchStarted,
+            Duration::from_micros(4),
+        );
+        controller.poll(Duration::from_micros(4));
         assert!(controller.drain_actions().any(|action| matches!(
             action,
             QcsdAction::SendPacket { packet, .. }
@@ -2831,15 +3116,22 @@ mod tests {
             "adaptation": "qcsd-client-only",
             "burst_definition": "global-application-batch-direction-transitions",
             "cell_byte_domain": "http3-request-stream-offset.bytes",
-            "schema_version": 2,
+            "schema_version": 3,
             "generated_by": "controller multi-origin test",
-            "matching_algorithm": "minimum-cost-one-to-one",
+            "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
             "paper_equivalent": false,
-            "packet_size": 100,
+            "packet_size": 1200,
+            "receiver_continuation": {
+                "application_order": "after-symmetric-elementwise-mold",
+                "cells_per_nonzero_incoming_component": 1,
+                "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+                "parser_allowance_ceiling_bytes": 1000,
+                "raw_headroom_bytes_per_nonzero_incoming_component": 1200
+            },
             "profiles": [{
                 "real": "real page",
                 "decoy": "decoy page",
-                "matching_cost_packets": 0,
+                "matching_cost_packets": 2,
                 "training_inputs": {
                     "real": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
                     "decoy": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
@@ -2854,14 +3146,14 @@ mod tests {
                 },
                 "batch_ends": {"real": [0], "decoy": [0]},
                 "molded_batch_ends": [0],
-                "total_scheduled_bytes": 100,
-                "bursts": [{"outgoing": 0, "incoming": 1}]
+                "total_scheduled_bytes": 2400,
+                "bursts": [{"outgoing": 0, "incoming": 2}]
             }]
         }"#;
         let config = WalkieTalkieConfig {
             molded: "inline-multi-origin-test.json".into(),
             workload_id: "real page".into(),
-            packet_size: 100,
+            packet_size: 1_200,
         };
         let defense = WalkieTalkie::from_json(&config, 1_200, molded).expect("valid mould");
         let manifest = ResourceManifest {
@@ -2870,8 +3162,8 @@ mod tests {
                     id: 7,
                     url: "https://1.example/chaff".into(),
                     kind: "Image".into(),
-                    content_length: Some(60),
-                    data_length: 60,
+                    content_length: Some(600),
+                    data_length: 600,
                     chaff_priority: false,
                     known_valid: true,
                     depends_on: Vec::new(),
@@ -2881,8 +3173,8 @@ mod tests {
                     id: 8,
                     url: "https://2.example/chaff".into(),
                     kind: "Image".into(),
-                    content_length: Some(40),
-                    data_length: 40,
+                    content_length: Some(1_800),
+                    data_length: 1_800,
                     chaff_priority: false,
                     known_valid: true,
                     depends_on: Vec::new(),
@@ -2939,16 +3231,33 @@ mod tests {
             })
             .collect();
         let [
-            (_, _, first_limit, first_slot),
-            (_, _, second_limit, second_slot),
+            (first_endpoint, first_stream, first_limit, first_slot),
+            (second_endpoint, second_stream, second_limit, second_slot),
+            (continuation_endpoint, continuation_stream, continuation_limit, continuation_slot),
         ] = credits.as_slice()
         else {
-            panic!("one logical credit must fan out exactly twice");
+            panic!("one logical credit must fan out twice before its continuation");
         };
-        assert_eq!(*first_limit, 60);
-        assert_eq!(*second_limit, 40);
+        assert_eq!(
+            (*first_endpoint, *first_stream, *first_limit),
+            (QcsdEndpointId(1), QcsdStreamId(0), 600)
+        );
+        assert_eq!(
+            (*second_endpoint, *second_stream, *second_limit),
+            (QcsdEndpointId(2), QcsdStreamId(4), 600)
+        );
         assert_eq!(first_slot, second_slot);
+        assert_eq!(
+            (
+                *continuation_endpoint,
+                *continuation_stream,
+                *continuation_limit
+            ),
+            (QcsdEndpointId(2), QcsdStreamId(4), 1_800)
+        );
+        assert_ne!(continuation_slot, first_slot);
 
+        let mut previous_limits = HashMap::new();
         for (endpoint, stream, absolute_limit, slot) in &credits {
             controller.observe(
                 QcsdObservation::ReceiveLimitAdvertised {
@@ -2959,11 +3268,14 @@ mod tests {
                 },
                 Duration::from_micros(1),
             );
+            let previous = previous_limits
+                .insert((*endpoint, *stream), *absolute_limit)
+                .unwrap_or(0);
             controller.observe(
                 QcsdObservation::BytesRead {
                     endpoint: *endpoint,
                     stream: *stream,
-                    bytes: *absolute_limit,
+                    bytes: absolute_limit.saturating_sub(previous),
                 },
                 Duration::from_micros(1),
             );
@@ -2983,12 +3295,12 @@ mod tests {
         controller.poll(Duration::from_micros(1));
 
         let diagnostics = controller.defense_diagnostics();
-        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
-        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 2_400);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 2_400);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 1);
-        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 100);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 2);
+        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 2_400);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 0);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
@@ -3004,7 +3316,7 @@ mod tests {
         let config = WalkieTalkieConfig {
             molded: "walkie-talkie-golden.json".into(),
             workload_id: "real page".into(),
-            packet_size: 100,
+            packet_size: 1_200,
         };
         let defense = WalkieTalkie::from_json(
             &config,
@@ -3013,17 +3325,30 @@ mod tests {
         )
         .expect("two-batch Walkie-Talkie fixture");
         let manifest = ResourceManifest {
-            resources: vec![Resource {
-                id: 7,
-                url: "https://example.com/chaff".into(),
-                kind: "Image".into(),
-                content_length: Some(1_000),
-                data_length: 1_000,
-                chaff_priority: true,
-                known_valid: true,
-                depends_on: Vec::new(),
-                headers: Vec::new(),
-            }],
+            resources: vec![
+                Resource {
+                    id: 7,
+                    url: "https://example.com/chaff".into(),
+                    kind: "Image".into(),
+                    content_length: Some(7_200),
+                    data_length: 7_200,
+                    chaff_priority: true,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                },
+                Resource {
+                    id: 8,
+                    url: "https://spare.example/chaff".into(),
+                    kind: "Image".into(),
+                    content_length: Some(1),
+                    data_length: 1,
+                    chaff_priority: false,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                },
+            ],
         };
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
@@ -3124,14 +3449,23 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(first_credits.len(), 2);
-        assert!(first_credits.iter().all(|credit| credit.2.length() == 100));
+        assert_eq!(first_credits.len(), 4);
+        assert!(
+            first_credits
+                .iter()
+                .all(|credit| credit.2.length() == 1_200)
+        );
         assert_eq!(
             first_credits
                 .iter()
                 .map(|(stream, absolute_limit, _, _)| (*stream, *absolute_limit))
                 .collect::<Vec<_>>(),
-            [(QcsdStreamId(0), 100), (QcsdStreamId(0), 200),]
+            [
+                (QcsdStreamId(0), 300),
+                (QcsdStreamId(4), 884),
+                (QcsdStreamId(4), 2_084),
+                (QcsdStreamId(4), 3_284),
+            ]
         );
         for (stream, absolute_limit, _, slot) in first_credits {
             controller.observe(
@@ -3148,7 +3482,7 @@ mod tests {
             QcsdObservation::BytesRead {
                 endpoint,
                 stream: QcsdStreamId(0),
-                bytes: 150,
+                bytes: 250,
             },
             Duration::from_micros(2),
         );
@@ -3166,12 +3500,25 @@ mod tests {
         );
         controller.poll(Duration::from_micros(2));
         let terminal_actions: Vec<_> = controller.drain_actions().collect();
-        assert!(
-            terminal_actions
-                .iter()
-                .all(|action| !matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
-        );
         assert!(terminal_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit {
+                stream: QcsdStreamId(4),
+                absolute_limit: 3_300,
+                ..
+            }
+        )));
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream: QcsdStreamId(4),
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(3),
+        );
+        controller.poll(Duration::from_micros(3));
+        let retired_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(retired_actions.iter().any(|action| matches!(
             action,
             QcsdAction::SlotMissed {
                 reason: MissedSlotReason::ReceiveCreditRetired,
@@ -3185,14 +3532,14 @@ mod tests {
         );
         assert_eq!(controller.next_deadline(), None);
         let diagnostics = controller.defense_diagnostics();
-        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 200);
-        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 150);
-        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 50);
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 3_600);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 250);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 3_350);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
-        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 150);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 2);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 5_750);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 1);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 150);
+        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 250);
         assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 0);
         assert_eq!(
             diagnostics.walkie_talkie_application_stream_crossing_bytes,

@@ -14,11 +14,17 @@ use super::{
 };
 use crate::{Direction, Error, MissedSlotReason, Packet, Result, WalkieTalkieConfig};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const ADAPTATION: &str = "qcsd-client-only";
 const BURST_DEFINITION: &str = "global-application-batch-direction-transitions";
 const CELL_BYTE_DOMAIN: &str = "http3-request-stream-offset.bytes";
-const MATCHING_ALGORITHM: &str = "minimum-cost-one-to-one";
+const MATCHING_ALGORITHM: &str = "minimum-base-symmetric-mold-padding-cost-one-to-one";
+const RECEIVER_APPLICATION_ORDER: &str = "after-symmetric-elementwise-mold";
+const RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT: u32 = 1;
+const RECEIVER_FORMULA: &str =
+    "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0";
+const RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES: u64 = 1_000;
+const RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT: u64 = 1_200;
 
 /// Packet counts in one molded half-duplex burst pair.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,7 +47,18 @@ struct MoldedFile {
     matching_algorithm: String,
     paper_equivalent: bool,
     packet_size: u16,
+    receiver_continuation: ReceiverContinuation,
     profiles: Vec<MoldedProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiverContinuation {
+    application_order: String,
+    cells_per_nonzero_incoming_component: u32,
+    formula: String,
+    parser_allowance_ceiling_bytes: u64,
+    raw_headroom_bytes_per_nonzero_incoming_component: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +116,7 @@ impl MoldedFile {
     fn select_profile(
         &self,
         configured_packet_size: u16,
+        max_stream_data_excess: u64,
         workload_id: &str,
     ) -> Result<&MoldedProfile> {
         if self.schema_version != SCHEMA_VERSION {
@@ -115,7 +133,8 @@ impl MoldedFile {
         {
             return Err(Error::InvalidConfig(
                 "Walkie-Talkie parameters must declare the QCSD client-only global-batch \
-                 application-STREAM-cell adaptation and minimum-cost one-to-one matching"
+                 application-STREAM-cell adaptation and minimum base-symmetric-mould padding-cost \
+                 one-to-one matching"
                     .into(),
             ));
         }
@@ -130,6 +149,8 @@ impl MoldedFile {
                 self.packet_size
             )));
         }
+        self.receiver_continuation
+            .validate(self.packet_size, max_stream_data_excess)?;
 
         let mut identities = HashSet::new();
         let mut selected = None;
@@ -153,6 +174,47 @@ impl MoldedFile {
                 "Walkie-Talkie bundle contains no profile for workload {workload_id:?}"
             ))
         })
+    }
+}
+
+impl ReceiverContinuation {
+    fn validate(&self, packet_size: u16, max_stream_data_excess: u64) -> Result<()> {
+        if self.application_order != RECEIVER_APPLICATION_ORDER
+            || self.cells_per_nonzero_incoming_component
+                != RECEIVER_CELLS_PER_NONZERO_INCOMING_COMPONENT
+            || self.formula != RECEIVER_FORMULA
+            || self.parser_allowance_ceiling_bytes != RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES
+            || self.raw_headroom_bytes_per_nonzero_incoming_component
+                != RECEIVER_RAW_HEADROOM_BYTES_PER_NONZERO_INCOMING_COMPONENT
+        {
+            return Err(Error::InvalidConfig(
+                "Walkie-Talkie receiver_continuation metadata does not match the supported \
+                 receiver-liveness adaptation"
+                    .into(),
+            ));
+        }
+        if self.raw_headroom_bytes_per_nonzero_incoming_component
+            <= self.parser_allowance_ceiling_bytes
+        {
+            return Err(Error::InvalidConfig(
+                "Walkie-Talkie receiver continuation requires one full packet of raw headroom \
+                 strictly larger than its parser allowance ceiling"
+                    .into(),
+            ));
+        }
+        if self.raw_headroom_bytes_per_nonzero_incoming_component != u64::from(packet_size) {
+            return Err(Error::InvalidConfig(
+                "Walkie-Talkie receiver continuation headroom must equal one packet".into(),
+            ));
+        }
+        if max_stream_data_excess > self.parser_allowance_ceiling_bytes {
+            return Err(Error::InvalidConfig(format!(
+                "Walkie-Talkie max_stream_data_excess {max_stream_data_excess} exceeds the \
+                 artifact parser allowance ceiling {}",
+                self.parser_allowance_ceiling_bytes
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -230,16 +292,18 @@ fn validate_derived_mold(
     packet_size: u16,
     profile_index: usize,
 ) -> Result<()> {
-    let (expected_mold, expected_batch_ends) = mold(
+    let (symmetric_mold, expected_batch_ends) = mold(
         &profile.source_envelopes.real,
         &profile.batch_ends.real,
         &profile.source_envelopes.decoy,
         &profile.batch_ends.decoy,
     );
+    let expected_mold = adapt_receiver_continuation(&symmetric_mold)?;
     if profile.bursts != expected_mold || profile.molded_batch_ends != expected_batch_ends {
         return Err(Error::InvalidConfig(format!(
             "Walkie-Talkie profile {profile_index} bursts and common batch boundaries \
-             are not the batch-aware element-wise maximum of its source envelopes"
+             are not the declared receiver continuation of the batch-aware element-wise \
+             maximum of its source envelopes"
         )));
     }
     let molded_packets = total_packets(&profile.bursts)?;
@@ -259,11 +323,7 @@ fn validate_derived_mold(
             profile.matching_cost_packets
         )));
     }
-    let expected_bytes = molded_packets
-        .checked_mul(u64::from(packet_size))
-        .ok_or_else(|| {
-            Error::InvalidConfig("Walkie-Talkie total scheduled bytes exceeds u64".into())
-        })?;
+    let expected_bytes = checked_scheduled_bytes(molded_packets, packet_size)?;
     if profile.total_scheduled_bytes != expected_bytes {
         return Err(Error::InvalidConfig(format!(
             "Walkie-Talkie profile {profile_index} total_scheduled_bytes is {}; \
@@ -272,6 +332,35 @@ fn validate_derived_mold(
         )));
     }
     Ok(())
+}
+
+fn checked_scheduled_bytes(molded_packets: u64, packet_size: u16) -> Result<u64> {
+    molded_packets
+        .checked_mul(u64::from(packet_size))
+        .ok_or_else(|| {
+            Error::InvalidConfig("Walkie-Talkie total scheduled bytes exceeds u64".into())
+        })
+}
+
+fn adapt_receiver_continuation(symmetric_mold: &[BurstPair]) -> Result<Vec<BurstPair>> {
+    symmetric_mold
+        .iter()
+        .map(|pair| {
+            let incoming = if pair.incoming == 0 {
+                0
+            } else {
+                pair.incoming.checked_add(1).ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "Walkie-Talkie receiver continuation exceeds the u32 cell domain".into(),
+                    )
+                })?
+            };
+            Ok(BurstPair {
+                outgoing: pair.outgoing,
+                incoming,
+            })
+        })
+        .collect()
 }
 
 fn validate_training_inputs(
@@ -492,17 +581,26 @@ pub struct WalkieTalkie {
 }
 
 impl WalkieTalkie {
-    /// Load a version-two molded sequence from `config.molded`.
+    /// Load a version-three molded sequence from `config.molded`.
     ///
     /// # Errors
     ///
     /// Returns an error when the configuration, file, or strict JSON envelope
     /// is invalid, including when its packet size differs from the config.
-    pub fn new(config: &WalkieTalkieConfig, max_udp_payload_size: u16) -> Result<Self> {
-        Self::from_file(config, max_udp_payload_size, &config.molded)
+    pub fn new(
+        config: &WalkieTalkieConfig,
+        max_udp_payload_size: u16,
+        max_stream_data_excess: u64,
+    ) -> Result<Self> {
+        Self::from_file(
+            config,
+            max_udp_payload_size,
+            max_stream_data_excess,
+            &config.molded,
+        )
     }
 
-    /// Load a version-two molded sequence from `path`.
+    /// Load a version-three molded sequence from `path`.
     ///
     /// # Errors
     ///
@@ -511,14 +609,20 @@ impl WalkieTalkie {
     pub fn from_file<P: AsRef<Path>>(
         config: &WalkieTalkieConfig,
         max_udp_payload_size: u16,
+        max_stream_data_excess: u64,
         path: P,
     ) -> Result<Self> {
         config.validate(max_udp_payload_size)?;
         let input = fs::read_to_string(path)?;
-        Self::from_json(config, max_udp_payload_size, &input)
+        Self::from_json_with_max_stream_data_excess(
+            config,
+            max_udp_payload_size,
+            max_stream_data_excess,
+            &input,
+        )
     }
 
-    /// Parse a version-two molded sequence.
+    /// Parse a version-three molded sequence.
     ///
     /// # Errors
     ///
@@ -529,9 +633,34 @@ impl WalkieTalkie {
         max_udp_payload_size: u16,
         input: &str,
     ) -> Result<Self> {
+        Self::from_json_with_max_stream_data_excess(
+            config,
+            max_udp_payload_size,
+            RECEIVER_PARSER_ALLOWANCE_CEILING_BYTES,
+            input,
+        )
+    }
+
+    /// Parse a version-three molded sequence for an explicit parser allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same strict-envelope errors as [`Self::from_json`], and an
+    /// error when `max_stream_data_excess` exceeds the artifact's declared
+    /// parser allowance ceiling.
+    pub fn from_json_with_max_stream_data_excess(
+        config: &WalkieTalkieConfig,
+        max_udp_payload_size: u16,
+        max_stream_data_excess: u64,
+        input: &str,
+    ) -> Result<Self> {
         config.validate(max_udp_payload_size)?;
         let file: MoldedFile = serde_json::from_str(input)?;
-        let selected = file.select_profile(config.packet_size, &config.workload_id)?;
+        let selected = file.select_profile(
+            config.packet_size,
+            max_stream_data_excess,
+            &config.workload_id,
+        )?;
         let (selected_source_envelope, selected_batch_ends) = if selected.real == config.workload_id
         {
             (&selected.source_envelopes.real, &selected.batch_ends.real)
@@ -1310,7 +1439,7 @@ mod tests {
     }
 
     fn molded(bursts: &str) -> String {
-        molded_pair(bursts, bursts)
+        molded_pair_from_runtime(bursts)
     }
 
     fn parse_test_bursts(bursts: &str) -> (Vec<super::BurstPair>, Vec<usize>) {
@@ -1333,22 +1462,43 @@ mod tests {
     }
 
     fn molded_pair(real: &str, decoy: &str) -> String {
+        molded_pair_from_sources(real, decoy)
+    }
+
+    fn molded_pair_from_runtime(bursts: &str) -> String {
+        let (runtime, batch_ends) = parse_test_bursts(bursts);
+        let source = runtime;
+        molded_file(&source, &batch_ends, &source, &batch_ends)
+    }
+
+    fn molded_pair_from_sources(real: &str, decoy: &str) -> String {
         let (real, real_batch_ends) = parse_test_bursts(real);
         let (decoy, decoy_batch_ends) = parse_test_bursts(decoy);
-        let (bursts, molded_batch_ends) =
-            super::mold(&real, &real_batch_ends, &decoy, &decoy_batch_ends);
+        molded_file(&real, &real_batch_ends, &decoy, &decoy_batch_ends)
+    }
+
+    fn molded_file(
+        real: &[super::BurstPair],
+        real_batch_ends: &[usize],
+        decoy: &[super::BurstPair],
+        decoy_batch_ends: &[usize],
+    ) -> String {
+        let (symmetric_mold, molded_batch_ends) =
+            super::mold(real, real_batch_ends, decoy, decoy_batch_ends);
+        let bursts = super::adapt_receiver_continuation(&symmetric_mold)
+            .expect("adapted receiver continuation");
         let matching_cost_packets = super::total_packets(&bursts)
             .expect("molded test packet count")
             .checked_mul(2)
             .and_then(|value| {
                 value.checked_sub(
-                    super::total_packets(&real).expect("real test packet count")
-                        + super::total_packets(&decoy).expect("decoy test packet count"),
+                    super::total_packets(real).expect("real test packet count")
+                        + super::total_packets(decoy).expect("decoy test packet count"),
                 )
             })
             .expect("test matching cost");
         let total_scheduled_bytes = bursts.iter().fold(0_u64, |total, pair| {
-            total + (u64::from(pair.outgoing) + u64::from(pair.incoming)) * 100
+            total + (u64::from(pair.outgoing) + u64::from(pair.incoming)) * 1_200
         });
         let real = serde_json::to_string(&real).expect("serialize real test bursts");
         let decoy = serde_json::to_string(&decoy).expect("serialize decoy test bursts");
@@ -1358,11 +1508,18 @@ mod tests {
                 "adaptation": "qcsd-client-only",
                 "burst_definition": "global-application-batch-direction-transitions",
                 "cell_byte_domain": "http3-request-stream-offset.bytes",
-                "schema_version": 2,
+                "schema_version": 3,
                 "generated_by": "test",
-                "matching_algorithm": "minimum-cost-one-to-one",
+                "matching_algorithm": "minimum-base-symmetric-mold-padding-cost-one-to-one",
                 "paper_equivalent": false,
-                "packet_size": 100,
+                "packet_size": 1200,
+                "receiver_continuation": {{
+                    "application_order": "after-symmetric-elementwise-mold",
+                    "cells_per_nonzero_incoming_component": 1,
+                    "formula": "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0",
+                    "parser_allowance_ceiling_bytes": 1000,
+                    "raw_headroom_bytes_per_nonzero_incoming_component": 1200
+                }},
                 "profiles": [{{
                     "real": "real page",
                     "decoy": "decoy page",
@@ -1419,7 +1576,15 @@ mod tests {
     }
 
     fn incoming_wire(defense: &mut WalkieTalkie, at_us: u64) {
-        incoming_payload(defense, at_us, 100, false);
+        incoming_payload(defense, at_us, 1_200, false);
+    }
+
+    fn realize_receiver_continuation(defense: &mut WalkieTalkie, at_us: u64) {
+        let packet = defense
+            .next_event(Duration::from_micros(at_us))
+            .expect("receiver-continuation credit");
+        assert_eq!(packet.direction(), Direction::Incoming);
+        incoming_wire(defense, at_us);
     }
 
     fn incoming_payload(defense: &mut WalkieTalkie, at_us: u64, bytes: u64, cover: bool) {
@@ -1493,14 +1658,14 @@ mod tests {
     #[test]
     fn loader_rejects_unknown_fields_wrong_versions_and_packet_size_mismatch() {
         let unknown = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
-            r#""schema_version": 2,"#,
-            r#""schema_version": 2, "unexpected": true,"#,
+            r#""schema_version": 3,"#,
+            r#""schema_version": 3, "unexpected": true,"#,
         );
-        assert!(WalkieTalkie::from_json(&config(100), 1_200, &unknown).is_err());
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &unknown).is_err());
 
         let wrong_version = molded(r#"[{"outgoing": 1, "incoming": 1}]"#)
-            .replace(r#""schema_version": 2"#, r#""schema_version": 1"#);
-        assert!(WalkieTalkie::from_json(&config(100), 1_200, &wrong_version).is_err());
+            .replace(r#""schema_version": 3"#, r#""schema_version": 2"#);
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_version).is_err());
 
         assert!(
             WalkieTalkie::from_json(
@@ -1512,16 +1677,28 @@ mod tests {
         );
 
         let wrong_total = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
-            r#""total_scheduled_bytes": 200"#,
-            r#""total_scheduled_bytes": 199"#,
+            r#""total_scheduled_bytes": 3600"#,
+            r#""total_scheduled_bytes": 3599"#,
         );
-        assert!(WalkieTalkie::from_json(&config(100), 1_200, &wrong_total).is_err());
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_total).is_err());
+
+        let wrong_cost = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
+            r#""matching_cost_packets": 2"#,
+            r#""matching_cost_packets": 1"#,
+        );
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_cost).is_err());
+
+        let wrong_algorithm = molded(r#"[{"outgoing": 1, "incoming": 1}]"#).replace(
+            "minimum-base-symmetric-mold-padding-cost-one-to-one",
+            "minimum-cost-one-to-one",
+        );
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &wrong_algorithm).is_err());
 
         let same_label = molded(r#"[{"outgoing": 1, "incoming": 1}]"#)
             .replace(r#""decoy": "decoy page""#, r#""decoy": "real page""#);
-        assert!(WalkieTalkie::from_json(&config(100), 1_200, &same_label).is_err());
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &same_label).is_err());
 
-        let mut missing = config(100);
+        let mut missing = config(1_200);
         missing.workload_id = "missing workload".into();
         assert!(
             WalkieTalkie::from_json(
@@ -1532,7 +1709,7 @@ mod tests {
             .is_err()
         );
 
-        let mut unbound = config(100);
+        let mut unbound = config(1_200);
         unbound.workload_id.clear();
         assert!(
             WalkieTalkie::from_json(
@@ -1618,7 +1795,7 @@ mod tests {
             .expect("profile object")
             .remove("molded_batch_ends");
         assert!(
-            WalkieTalkie::from_json(&config(100), 1_200, &missing.to_string()).is_err(),
+            WalkieTalkie::from_json(&config(1_200), 1_200, &missing.to_string()).is_err(),
             "legacy profiles without explicit common boundaries must be rejected"
         );
 
@@ -1639,7 +1816,7 @@ mod tests {
         profile.insert("matching_cost_packets".into(), serde_json::json!(18));
         profile.insert("total_scheduled_bytes".into(), serde_json::json!(3_000));
         assert!(
-            WalkieTalkie::from_json(&config(100), 1_200, &flattened.to_string()).is_err(),
+            WalkieTalkie::from_json(&config(1_200), 1_200, &flattened.to_string()).is_err(),
             "strict validation must recompute the batch-aware mould"
         );
     }
@@ -1657,8 +1834,8 @@ mod tests {
                 {"outgoing": 1, "incoming": 2}
             ]"#,
         );
-        let real = WalkieTalkie::from_json(&config(100), 1_200, &input).expect("real binding");
-        let mut decoy_config = config(100);
+        let real = WalkieTalkie::from_json(&config(1_200), 1_200, &input).expect("real binding");
+        let mut decoy_config = config(1_200);
         decoy_config.workload_id = "decoy page".into();
         let decoy = WalkieTalkie::from_json(&decoy_config, 1_200, &input).expect("decoy binding");
         assert_eq!(real.molded, decoy.molded);
@@ -1669,23 +1846,31 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_byte_overflow_is_rejected() {
+    fn receiver_continuation_and_scheduled_byte_overflow_are_rejected() {
         let bursts = vec![
             super::BurstPair {
                 outgoing: u32::MAX,
                 incoming: u32::MAX,
             };
-            32_769
+            1
         ];
         let file = super::MoldedFile {
             adaptation: "qcsd-client-only".into(),
             burst_definition: "global-application-batch-direction-transitions".into(),
             cell_byte_domain: "http3-request-stream-offset.bytes".into(),
-            schema_version: 2,
+            schema_version: 3,
             generated_by: "test".into(),
-            matching_algorithm: "minimum-cost-one-to-one".into(),
+            matching_algorithm: "minimum-base-symmetric-mold-padding-cost-one-to-one".into(),
             paper_equivalent: false,
-            packet_size: u16::MAX,
+            packet_size: 1_200,
+            receiver_continuation: super::ReceiverContinuation {
+                application_order: "after-symmetric-elementwise-mold".into(),
+                cells_per_nonzero_incoming_component: 1,
+                formula: "adapted_incoming=symmetric_incoming+1-if-symmetric_incoming>0-else-0"
+                    .into(),
+                parser_allowance_ceiling_bytes: 1_000,
+                raw_headroom_bytes_per_nonzero_incoming_component: 1_200,
+            },
             profiles: vec![super::MoldedProfile {
                 real: "real".into(),
                 decoy: "decoy".into(),
@@ -1720,13 +1905,159 @@ mod tests {
             }],
         };
 
-        assert!(file.select_profile(u16::MAX, "real").is_err());
+        assert!(file.select_profile(1_200, 1_000, "real").is_err());
+        assert!(super::checked_scheduled_bytes(u64::MAX, 1_200).is_err());
+    }
+
+    #[test]
+    fn schema_three_adapts_every_positive_incoming_component_exactly_once() {
+        let input = molded_pair_from_sources(
+            r#"[
+                {"outgoing": 2, "incoming": 0, "batch_end": false},
+                {"outgoing": 1, "incoming": 3, "batch_end": false},
+                {"outgoing": 0, "incoming": 4}
+            ]"#,
+            r#"[
+                {"outgoing": 1, "incoming": 0, "batch_end": false},
+                {"outgoing": 3, "incoming": 2, "batch_end": false},
+                {"outgoing": 0, "incoming": 5}
+            ]"#,
+        );
+        let defense = WalkieTalkie::from_json(&config(1_200), 1_200, &input)
+            .expect("strict schema-three adapted mould");
+
+        assert_eq!(
+            defense.molded,
+            [
+                super::BurstPair {
+                    outgoing: 2,
+                    incoming: 0,
+                },
+                super::BurstPair {
+                    outgoing: 3,
+                    incoming: 4,
+                },
+                super::BurstPair {
+                    outgoing: 0,
+                    incoming: 6,
+                },
+            ]
+        );
+        assert_eq!(defense.batch_ends, HashSet::from([2]));
+    }
+
+    #[test]
+    fn schema_three_rejects_unadapted_or_overadapted_bursts() {
+        let input = molded_pair_from_sources(
+            r#"[{"outgoing": 1, "incoming": 0, "batch_end": false},
+                {"outgoing": 0, "incoming": 2}]"#,
+            r#"[{"outgoing": 2, "incoming": 0, "batch_end": false},
+                {"outgoing": 0, "incoming": 1}]"#,
+        );
+        let valid: serde_json::Value = serde_json::from_str(&input).expect("valid JSON");
+        for bursts in [
+            serde_json::json!([
+                {"outgoing": 2, "incoming": 0},
+                {"outgoing": 0, "incoming": 2}
+            ]),
+            serde_json::json!([
+                {"outgoing": 2, "incoming": 1},
+                {"outgoing": 0, "incoming": 3}
+            ]),
+            serde_json::json!([
+                {"outgoing": 2, "incoming": 0},
+                {"outgoing": 0, "incoming": 4}
+            ]),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["profiles"][0]["bursts"] = bursts;
+            assert!(
+                WalkieTalkie::from_json(&config(1_200), 1_200, &malformed.to_string()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn receiver_continuation_metadata_and_runtime_allowance_are_fail_closed() {
+        let input = molded_pair_from_sources(
+            r#"[{"outgoing": 1, "incoming": 1}]"#,
+            r#"[{"outgoing": 1, "incoming": 1}]"#,
+        );
+        for allowance in [0, 999, 1_000] {
+            WalkieTalkie::from_json_with_max_stream_data_excess(
+                &config(1_200),
+                1_200,
+                allowance,
+                &input,
+            )
+            .expect("runtime allowance safely dominated by the artifact ceiling");
+        }
+        assert!(
+            WalkieTalkie::from_json_with_max_stream_data_excess(
+                &config(1_200),
+                1_200,
+                1_001,
+                &input,
+            )
+            .is_err()
+        );
+
+        let valid: serde_json::Value = serde_json::from_str(&input).expect("valid JSON");
+        for (field, mutation) in [
+            ("application_order", serde_json::json!("before-mold")),
+            ("cells_per_nonzero_incoming_component", serde_json::json!(2)),
+            ("formula", serde_json::json!("different")),
+            ("parser_allowance_ceiling_bytes", serde_json::json!(999)),
+            (
+                "raw_headroom_bytes_per_nonzero_incoming_component",
+                serde_json::json!(1_201),
+            ),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["receiver_continuation"][field] = mutation;
+            assert!(
+                WalkieTalkie::from_json(&config(1_200), 1_200, &malformed.to_string()).is_err(),
+                "mutated {field} must be rejected"
+            );
+        }
+
+        for field in [
+            "application_order",
+            "cells_per_nonzero_incoming_component",
+            "formula",
+            "parser_allowance_ceiling_bytes",
+            "raw_headroom_bytes_per_nonzero_incoming_component",
+        ] {
+            let mut malformed = valid.clone();
+            malformed["receiver_continuation"]
+                .as_object_mut()
+                .expect("receiver continuation object")
+                .remove(field);
+            assert!(
+                WalkieTalkie::from_json(&config(1_200), 1_200, &malformed.to_string()).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
+
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .expect("top-level object")
+            .remove("receiver_continuation");
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &missing.to_string()).is_err());
+
+        let mut unknown = valid;
+        unknown["receiver_continuation"]
+            .as_object_mut()
+            .expect("receiver continuation object")
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(WalkieTalkie::from_json(&config(1_200), 1_200, &unknown.to_string()).is_err());
     }
 
     #[test]
     fn incoming_turn_never_emits_an_outgoing_defense_event() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -1762,16 +2093,22 @@ mod tests {
         let incoming_two = defense
             .next_event(Duration::from_micros(2))
             .expect("incoming credit two");
+        let incoming_three = defense
+            .next_event(Duration::from_micros(2))
+            .expect("receiver-continuation credit");
         assert_eq!(incoming_one.direction(), Direction::Incoming);
         assert_eq!(incoming_two.direction(), Direction::Incoming);
+        assert_eq!(incoming_three.direction(), Direction::Incoming);
         assert_eq!(defense.next_event(Duration::from_micros(2)), None);
 
         incoming_wire(&mut defense, 3);
         assert_eq!(defense.next_event(Duration::from_micros(3)), None);
         incoming_wire(&mut defense, 4);
+        assert_eq!(defense.next_event(Duration::from_micros(4)), None);
+        incoming_wire(&mut defense, 5);
         assert_eq!(
             defense
-                .next_event(Duration::from_micros(4))
+                .next_event(Duration::from_micros(5))
                 .map(Packet::direction),
             Some(Direction::Outgoing)
         );
@@ -1781,7 +2118,7 @@ mod tests {
     #[test]
     fn outgoing_wire_during_an_incoming_turn_is_a_control_only_crossing() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 1}]"#),
         )
@@ -1807,7 +2144,7 @@ mod tests {
     #[test]
     fn application_stream_bytes_during_incoming_turn_are_integrity_failures() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 1}]"#),
         )
@@ -1846,7 +2183,7 @@ mod tests {
     #[test]
     fn missed_outgoing_events_are_retried_before_the_turn_advances() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 1}]"#),
         )
@@ -1881,7 +2218,7 @@ mod tests {
     #[test]
     fn incoming_shortage_never_advances_on_elapsed_time() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -1906,18 +2243,24 @@ mod tests {
             kind: SignalKind::ApplicationComplete,
         });
 
-        assert_eq!(defense.next_event(Duration::from_micros(109)), None);
+        assert_eq!(
+            defense
+                .next_event(Duration::from_micros(109))
+                .map(Packet::direction),
+            Some(Direction::Incoming)
+        );
         assert_eq!(defense.next_event(Duration::from_micros(999)), None);
         assert_eq!(defense.next_event(Duration::from_secs(60)), None);
         assert!(!defense.is_complete());
         assert_eq!(
             defense.diagnostics().walkie_talkie_incoming_shortfall_bytes,
-            200
+            4_800
         );
         incoming_wire(&mut defense, 60_000_001);
+        incoming_wire(&mut defense, 60_000_002);
         assert_eq!(
             defense
-                .next_event(Duration::from_micros(60_000_001))
+                .next_event(Duration::from_micros(60_000_003))
                 .map(Packet::direction),
             Some(Direction::Outgoing)
         );
@@ -1926,7 +2269,7 @@ mod tests {
     #[test]
     fn incoming_turn_waits_for_both_payload_budget_and_application_batch() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -1956,13 +2299,19 @@ mod tests {
             Some(Direction::Incoming)
         );
         incoming_wire(&mut defense, 2);
+        realize_receiver_continuation(&mut defense, 2);
         application_bytes(&mut defense, 2, Direction::Incoming, 100);
 
         defense.observe(DefenseSignal {
             at: Duration::from_secs(60),
             kind: SignalKind::ApplicationComplete,
         });
-        assert_eq!(defense.next_event(Duration::from_secs(60)), None);
+        assert_eq!(
+            defense
+                .next_event(Duration::from_secs(60))
+                .map(Packet::direction),
+            None
+        );
         assert!(!defense.can_start_application_batch());
 
         application_batch_completed(&mut defense, 60_000_001);
@@ -1989,7 +2338,7 @@ mod tests {
     #[test]
     fn incoming_events_wait_without_a_busy_deadline_when_capacity_is_absent() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
         )
@@ -2006,21 +2355,21 @@ mod tests {
     #[test]
     fn repeated_and_partially_growing_capacity_never_double_allocates() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
         )
         .expect("incoming-only molded sequence");
 
-        provide_capacity(&mut defense, 0, 150);
+        provide_capacity(&mut defense, 0, 1_250);
         let first = defense.next_event(Duration::ZERO).expect("first cell");
-        assert_eq!(first.length(), 100);
-        assert_eq!(defense.incoming_capacity_reserved, 100);
+        assert_eq!(first.length(), 1_200);
+        assert_eq!(defense.incoming_capacity_reserved, 1_200);
         assert_eq!(defense.next_event(Duration::ZERO), None);
 
-        provide_capacity(&mut defense, 1, 150);
+        provide_capacity(&mut defense, 1, 1_250);
         assert_eq!(defense.next_event(Duration::from_micros(1)), None);
-        provide_capacity(&mut defense, 2, 175);
+        provide_capacity(&mut defense, 2, 1_275);
         assert_eq!(defense.next_event(Duration::from_micros(2)), None);
 
         defense.observe(DefenseSignal {
@@ -2028,8 +2377,8 @@ mod tests {
             kind: SignalKind::ReceiveCreditRequested { packet: first },
         });
         assert_eq!(defense.incoming_capacity_reserved, 0);
-        assert_eq!(defense.incoming_capacity_committed, 100);
-        provide_capacity(&mut defense, 3, 175);
+        assert_eq!(defense.incoming_capacity_committed, 1_200);
+        provide_capacity(&mut defense, 3, 1_275);
         assert_eq!(defense.next_event(Duration::from_micros(3)), None);
 
         // Changed values are authoritative remaining-capacity snapshots after
@@ -2038,19 +2387,19 @@ mod tests {
         assert_eq!(defense.next_event(Duration::from_micros(4)), None);
         provide_capacity(&mut defense, 5, 75);
         assert_eq!(defense.next_event(Duration::from_micros(5)), None);
-        provide_capacity(&mut defense, 6, 100);
+        provide_capacity(&mut defense, 6, 1_200);
         let second = defense
             .next_event(Duration::from_micros(6))
             .expect("second cell after full capacity becomes available");
-        assert_eq!(second.length(), 100);
+        assert_eq!(second.length(), 1_200);
         assert_eq!(defense.next_event(Duration::from_micros(6)), None);
-        assert_eq!(defense.incoming_capacity_reserved, 100);
+        assert_eq!(defense.incoming_capacity_reserved, 1_200);
     }
 
     #[test]
     fn retired_credit_is_a_terminal_bounded_realization_failure() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 2}]"#),
         )
@@ -2069,7 +2418,7 @@ mod tests {
                 .next_event(Duration::from_micros(1))
                 .expect("initial incoming credit")
         })
-        .take(2)
+        .take(3)
         .collect();
         for credit in credits {
             resolve(
@@ -2100,11 +2449,11 @@ mod tests {
         });
         assert!(defense.is_complete());
         let diagnostics = defense.diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 2);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 2);
-        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 50);
+        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 1);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 3_450);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 0);
+        assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 2);
         assert_eq!(diagnostics.walkie_talkie_expected_application_batches, 1);
         assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
@@ -2114,7 +2463,7 @@ mod tests {
     #[test]
     fn retired_credit_aborts_before_a_later_application_batch_can_start() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -2173,7 +2522,7 @@ mod tests {
     #[test]
     fn batch_completion_never_regrants_credit_that_is_still_in_flight() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
         )
@@ -2186,7 +2535,7 @@ mod tests {
                 .next_event(Duration::ZERO)
                 .expect("initial incoming credit")
         })
-        .take(2)
+        .take(3)
         .collect();
         for credit in credits {
             resolve(
@@ -2200,7 +2549,7 @@ mod tests {
         application_bytes(&mut defense, 2, Direction::Incoming, 50);
         application_batch_completed(&mut defense, 3);
 
-        // The 150-byte residual is already backed by advertised credit. Batch
+        // The 3,550-byte residual is already backed by advertised credit. Batch
         // completion alone cannot prove that this allowance was lost.
         assert_eq!(defense.next_event(Duration::from_micros(3)), None);
         retire_credit(&mut defense, 4, 50);
@@ -2218,43 +2567,53 @@ mod tests {
         let diagnostics = defense.diagnostics();
         assert!(defense.is_complete());
         assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 1);
-        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 150);
+        assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_bytes, 3_550);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 1);
+        assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 2);
     }
 
     #[test]
     fn initial_allowance_does_not_retire_scheduled_credit_early() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 1}]"#),
         )
         .expect("single incoming cell");
-        provide_capacity(&mut defense, 0, 100);
+        provide_capacity(&mut defense, 0, 1_200);
         let credit = defense.next_event(Duration::ZERO).expect("incoming credit");
         resolve(
             &mut defense,
             1,
             credit,
-            EventOutcome::Satisfied { observed: 100 },
+            EventOutcome::Satisfied { observed: 1_200 },
         );
         defense.observe(DefenseSignal {
             at: Duration::from_micros(2),
             kind: SignalKind::PayloadBytes {
                 direction: Direction::Incoming,
-                bytes: 100,
+                bytes: 1_200,
                 cover: true,
             },
         });
         // Raw offsets 0..16 came from the initial transport allowance. Only
-        // 84 bytes intersect the scheduled [16, 116) range.
+        // 1,184 bytes intersect the scheduled [16, 1,216) range.
         defense.observe(DefenseSignal {
             at: Duration::from_micros(2),
-            kind: SignalKind::ReceiveCreditConsumed { bytes: 84 },
+            kind: SignalKind::ReceiveCreditConsumed { bytes: 1_184 },
         });
+        let continuation = defense
+            .next_event(Duration::from_micros(2))
+            .expect("receiver-continuation credit");
+        resolve(
+            &mut defense,
+            2,
+            continuation,
+            EventOutcome::Satisfied { observed: 1_200 },
+        );
+        incoming_payload(&mut defense, 3, 1_200, false);
         defense.observe(DefenseSignal {
-            at: Duration::from_micros(3),
+            at: Duration::from_micros(4),
             kind: SignalKind::ApplicationComplete,
         });
 
@@ -2272,7 +2631,7 @@ mod tests {
     #[test]
     fn impossible_incoming_slot_fails_once_without_a_retry_loop() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 1}]"#),
         )
@@ -2310,7 +2669,7 @@ mod tests {
         assert_eq!(defense.next_event(Duration::from_micros(24_002)), None);
         assert_eq!(
             defense.diagnostics().walkie_talkie_incoming_shortfall_bytes,
-            100
+            2_400
         );
         application_batch_completed(&mut defense, 24_003);
         defense.observe(DefenseSignal {
@@ -2323,7 +2682,7 @@ mod tests {
     #[test]
     fn direction_transitions_inside_one_batch_do_not_open_a_new_batch() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -2346,9 +2705,10 @@ mod tests {
         );
         assert_eq!(
             defense.next_event(Duration::ZERO),
-            Packet::new(Duration::ZERO, Direction::Incoming, 100).ok()
+            Packet::new(Duration::ZERO, Direction::Incoming, 1_200).ok()
         );
         incoming_wire(&mut defense, 0);
+        realize_receiver_continuation(&mut defense, 0);
 
         assert!(!defense.can_start_application_batch());
         let second_outgoing = defense
@@ -2362,9 +2722,10 @@ mod tests {
         );
         assert_eq!(
             defense.next_event(Duration::ZERO),
-            Packet::new(Duration::ZERO, Direction::Incoming, 100).ok()
+            Packet::new(Duration::ZERO, Direction::Incoming, 1_200).ok()
         );
         incoming_wire(&mut defense, 0);
+        realize_receiver_continuation(&mut defense, 0);
         assert!(!matches!(defense.turn, super::Turn::Done));
 
         application_batch_completed(&mut defense, 0);
@@ -2374,7 +2735,7 @@ mod tests {
     #[test]
     fn longer_decoy_suffix_is_chaff_only_and_batch_overflow_is_diagnostic() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded_pair(
                 r#"[{"outgoing": 1, "incoming": 1}]"#,
@@ -2406,6 +2767,7 @@ mod tests {
             Some(Direction::Incoming)
         );
         incoming_wire(&mut defense, 2);
+        realize_receiver_continuation(&mut defense, 2);
         application_bytes(&mut defense, 2, Direction::Incoming, 100);
         application_batch_completed(&mut defense, 3);
 
@@ -2429,6 +2791,7 @@ mod tests {
             Some(Direction::Incoming)
         );
         incoming_wire(&mut defense, 5);
+        realize_receiver_continuation(&mut defense, 5);
         assert!(matches!(defense.turn, super::Turn::Done));
         assert!(!defense.can_start_application_batch());
 
@@ -2449,7 +2812,7 @@ mod tests {
     #[test]
     fn shorter_selected_batch_finishes_its_common_chaff_suffix_before_the_next_batch() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded_pair(
                 r#"[
@@ -2485,6 +2848,7 @@ mod tests {
             Some(Direction::Incoming)
         );
         incoming_wire(&mut defense, 2);
+        realize_receiver_continuation(&mut defense, 2);
         application_bytes(&mut defense, 2, Direction::Incoming, 100);
         application_batch_completed(&mut defense, 3);
 
@@ -2506,6 +2870,7 @@ mod tests {
             Some(Direction::Incoming)
         );
         incoming_wire(&mut defense, 5);
+        realize_receiver_continuation(&mut defense, 5);
 
         assert!(defense.can_start_application_batch());
         assert_eq!(defense.next_event(Duration::from_micros(5)), None);
@@ -2520,7 +2885,7 @@ mod tests {
     #[test]
     fn natural_ingress_outside_an_incoming_turn_is_a_lifecycle_failure() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 1}]"#),
         )
@@ -2541,7 +2906,7 @@ mod tests {
     #[test]
     fn evaluation_over_source_envelope_is_diagnostic_even_when_pair_mould_is_exact() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded_pair(
                 r#"[{"outgoing": 1, "incoming": 1}]"#,
@@ -2551,7 +2916,7 @@ mod tests {
         .expect("asymmetric molded sequence");
 
         application_batch_started(&mut defense, 0);
-        application_bytes(&mut defense, 0, Direction::Outgoing, 200);
+        application_bytes(&mut defense, 0, Direction::Outgoing, 2_400);
         for at_us in 1..=3 {
             let outgoing = defense
                 .next_event(Duration::from_micros(at_us))
@@ -2564,24 +2929,24 @@ mod tests {
                 EventOutcome::Satisfied { observed: 100 },
             );
         }
-        application_bytes(&mut defense, 4, Direction::Incoming, 200);
-        for at_us in 4..=6 {
+        application_bytes(&mut defense, 4, Direction::Incoming, 2_400);
+        for at_us in 4..=7 {
             let incoming = defense
                 .next_event(Duration::from_micros(at_us))
                 .expect("molded incoming cell");
             assert_eq!(incoming.direction(), Direction::Incoming);
             incoming_wire(&mut defense, at_us);
         }
-        application_batch_completed(&mut defense, 7);
+        application_batch_completed(&mut defense, 8);
 
         let diagnostics = defense.diagnostics();
         assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 3);
-        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 4);
         assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 3);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 4);
         assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 0);
-        assert_eq!(diagnostics.walkie_talkie_natural_outgoing_bytes, 200);
-        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 200);
+        assert_eq!(diagnostics.walkie_talkie_natural_outgoing_bytes, 2_400);
+        assert_eq!(diagnostics.walkie_talkie_natural_incoming_bytes, 2_400);
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 2);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
     }
@@ -2589,7 +2954,7 @@ mod tests {
     #[test]
     fn completed_batch_still_waits_for_incoming_payload_budget() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -2619,15 +2984,22 @@ mod tests {
             Some(Direction::Incoming)
         );
 
-        assert_eq!(defense.next_event(Duration::from_secs(60)), None);
-        assert!(!defense.can_start_application_batch());
-        incoming_wire(&mut defense, 60_000_001);
-        assert!(defense.can_start_application_batch());
-        assert_eq!(defense.next_event(Duration::from_micros(60_000_001)), None);
-        application_batch_started(&mut defense, 60_000_002);
         assert_eq!(
             defense
-                .next_event(Duration::from_micros(60_000_002))
+                .next_event(Duration::from_secs(60))
+                .map(Packet::direction),
+            Some(Direction::Incoming)
+        );
+        assert!(!defense.can_start_application_batch());
+        incoming_wire(&mut defense, 60_000_001);
+        assert!(!defense.can_start_application_batch());
+        incoming_wire(&mut defense, 60_000_002);
+        assert!(defense.can_start_application_batch());
+        assert_eq!(defense.next_event(Duration::from_micros(60_000_002)), None);
+        application_batch_started(&mut defense, 60_000_003);
+        assert_eq!(
+            defense
+                .next_event(Duration::from_micros(60_000_003))
                 .map(Packet::direction),
             Some(Direction::Outgoing)
         );
@@ -2636,7 +3008,7 @@ mod tests {
     #[test]
     fn malformed_application_batch_lifecycle_is_diagnostic() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 1}]"#),
         )
@@ -2662,7 +3034,7 @@ mod tests {
     #[test]
     fn incoming_payload_satisfies_the_turn() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -2679,6 +3051,7 @@ mod tests {
         );
 
         incoming_wire(&mut defense, 1_000);
+        realize_receiver_continuation(&mut defense, 1_000);
 
         assert_eq!(
             defense
@@ -2691,7 +3064,7 @@ mod tests {
     #[test]
     fn diagnostics_preserve_each_burst_instead_of_cancelling_counts() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -2703,11 +3076,11 @@ mod tests {
         .expect("molded sequence");
         provide_capacity(&mut defense, 0, u64::MAX);
         assert!(defense.next_event(Duration::ZERO).is_some());
-        incoming_payload(&mut defense, 1, 200, false);
+        incoming_payload(&mut defense, 1, 2_400, false);
         assert!(defense.next_event(Duration::from_micros(1)).is_some());
 
         let diagnostics = defense.diagnostics();
-        assert_eq!(diagnostics.walkie_talkie_target_observed_cell_l1, 0);
+        assert_eq!(diagnostics.walkie_talkie_target_observed_cell_l1, 2);
         assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 2);
         assert_eq!(
             diagnostics.walkie_talkie_burst_realization,
@@ -2715,14 +3088,14 @@ mod tests {
                 WalkieTalkieBurstDiagnostics {
                     index: 0,
                     target_outgoing_cells: 0,
-                    target_incoming_cells: 1,
+                    target_incoming_cells: 2,
                     observed_outgoing_cells: 0,
                     observed_incoming_cells: 2,
                 },
                 WalkieTalkieBurstDiagnostics {
                     index: 1,
                     target_outgoing_cells: 0,
-                    target_incoming_cells: 1,
+                    target_incoming_cells: 2,
                     observed_outgoing_cells: 0,
                     observed_incoming_cells: 0,
                 },
@@ -2735,7 +3108,7 @@ mod tests {
     #[should_panic(expected = "the controller must deliver Walkie-Talkie timestamps monotonically")]
     fn non_monotonic_timestamps_violate_the_controller_contract() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 0}]"#),
         )
@@ -2747,7 +3120,7 @@ mod tests {
     #[test]
     fn incoming_only_suffix_keeps_chaff_stream_data_gated_until_done() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 0, "incoming": 2}]"#),
         )
@@ -2764,6 +3137,10 @@ mod tests {
             defense.next_event(Duration::ZERO).map(Packet::direction),
             Some(Direction::Incoming)
         );
+        assert_eq!(
+            defense.next_event(Duration::ZERO).map(Packet::direction),
+            Some(Direction::Incoming)
+        );
         incoming_wire(&mut defense, 10);
         assert_eq!(defense.next_event(Duration::from_micros(109)), None);
         assert_eq!(defense.next_event(Duration::from_micros(999)), None);
@@ -2771,16 +3148,17 @@ mod tests {
         assert_eq!(defense.next_event(Duration::from_millis(1)), None);
         assert_eq!(
             defense.diagnostics().walkie_talkie_incoming_shortfall_bytes,
-            100
+            2_400
         );
         incoming_wire(&mut defense, 1_001);
+        incoming_wire(&mut defense, 1_002);
         assert!(defense.can_release_chaff_send_shaping());
     }
 
     #[test]
     fn incoming_turn_requires_observed_payload_for_liveness() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(
                 r#"[
@@ -2796,11 +3174,17 @@ mod tests {
             Some(Direction::Incoming)
         );
 
-        assert_eq!(defense.next_event(Duration::from_secs(60)), None);
-        incoming_wire(&mut defense, 60_000_001);
         assert_eq!(
             defense
-                .next_event(Duration::from_micros(60_000_001))
+                .next_event(Duration::from_secs(60))
+                .map(Packet::direction),
+            Some(Direction::Incoming)
+        );
+        incoming_wire(&mut defense, 60_000_001);
+        incoming_wire(&mut defense, 60_000_002);
+        assert_eq!(
+            defense
+                .next_event(Duration::from_micros(60_000_003))
                 .map(Packet::direction),
             Some(Direction::Outgoing)
         );
@@ -2809,7 +3193,7 @@ mod tests {
     #[test]
     fn completion_requires_both_application_and_molded_sequence() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             &molded(r#"[{"outgoing": 1, "incoming": 0}]"#),
         )
@@ -2839,20 +3223,20 @@ mod tests {
     )]
     fn full_molded_sequence_has_a_golden_schedule() {
         let mut defense = WalkieTalkie::from_json(
-            &config(100),
+            &config(1_200),
             1_200,
             include_str!("../../tests/data/walkie-talkie-golden.json"),
         )
         .expect("molded sequence");
         let outgoing = |at_us| {
-            Packet::new(Duration::from_micros(at_us), Direction::Outgoing, 100)
+            Packet::new(Duration::from_micros(at_us), Direction::Outgoing, 1_200)
                 .expect("golden outgoing packet")
         };
         let incoming = |at_us| {
-            Packet::new(Duration::from_micros(at_us), Direction::Incoming, 100)
+            Packet::new(Duration::from_micros(at_us), Direction::Incoming, 1_200)
                 .expect("golden incoming packet")
         };
-        let script = [
+        let mut script = vec![
             (
                 Duration::ZERO,
                 SignalKind::Capacity(Capacity {
@@ -2864,92 +3248,84 @@ mod tests {
                 Duration::from_micros(10),
                 SignalKind::Resolved {
                     packet: outgoing(0),
-                    outcome: EventOutcome::Satisfied { observed: 100 },
+                    outcome: EventOutcome::Satisfied { observed: 1_200 },
                 },
             ),
             (
                 Duration::from_micros(20),
                 SignalKind::Resolved {
                     packet: outgoing(0),
-                    outcome: EventOutcome::Satisfied { observed: 100 },
+                    outcome: EventOutcome::Satisfied { observed: 1_200 },
                 },
             ),
-            (
-                Duration::from_micros(30),
-                SignalKind::ReceiveCreditRequested {
-                    packet: incoming(20),
-                },
-            ),
-            (
-                Duration::from_micros(30),
-                SignalKind::PayloadBytes {
-                    direction: Direction::Incoming,
-                    bytes: 100,
-                    cover: false,
-                },
-            ),
-            (
-                Duration::from_micros(30),
-                SignalKind::ReceiveCreditConsumed { bytes: 100 },
-            ),
-            (
-                Duration::from_micros(40),
-                SignalKind::ReceiveCreditRequested {
-                    packet: incoming(20),
-                },
-            ),
-            (
-                Duration::from_micros(40),
-                SignalKind::PayloadBytes {
-                    direction: Direction::Incoming,
-                    bytes: 100,
-                    cover: false,
-                },
-            ),
-            (
-                Duration::from_micros(40),
-                SignalKind::ReceiveCreditConsumed { bytes: 100 },
-            ),
-            (
-                Duration::from_micros(50),
-                SignalKind::Resolved {
-                    packet: outgoing(40),
-                    outcome: EventOutcome::Satisfied { observed: 100 },
-                },
-            ),
-            (
-                Duration::from_micros(60),
-                SignalKind::ReceiveCreditRequested {
-                    packet: incoming(50),
-                },
-            ),
-            (
-                Duration::from_micros(60),
-                SignalKind::PayloadBytes {
-                    direction: Direction::Incoming,
-                    bytes: 100,
-                    cover: true,
-                },
-            ),
-            (
-                Duration::from_micros(60),
-                SignalKind::ReceiveCreditConsumed { bytes: 100 },
-            ),
-            (Duration::from_micros(60), SignalKind::ApplicationComplete),
         ];
-        let actual: Vec<_> = drive(&mut defense, &script, Duration::from_micros(60))
+        for at_us in [30, 40, 45] {
+            script.extend([
+                (
+                    Duration::from_micros(at_us),
+                    SignalKind::ReceiveCreditRequested {
+                        packet: incoming(20),
+                    },
+                ),
+                (
+                    Duration::from_micros(at_us),
+                    SignalKind::PayloadBytes {
+                        direction: Direction::Incoming,
+                        bytes: 1_200,
+                        cover: false,
+                    },
+                ),
+                (
+                    Duration::from_micros(at_us),
+                    SignalKind::ReceiveCreditConsumed { bytes: 1_200 },
+                ),
+            ]);
+        }
+        script.extend([(
+            Duration::from_micros(50),
+            SignalKind::Resolved {
+                packet: outgoing(40),
+                outcome: EventOutcome::Satisfied { observed: 1_200 },
+            },
+        )]);
+        for at_us in [60, 70] {
+            script.extend([
+                (
+                    Duration::from_micros(at_us),
+                    SignalKind::ReceiveCreditRequested {
+                        packet: incoming(50),
+                    },
+                ),
+                (
+                    Duration::from_micros(at_us),
+                    SignalKind::PayloadBytes {
+                        direction: Direction::Incoming,
+                        bytes: 1_200,
+                        cover: true,
+                    },
+                ),
+                (
+                    Duration::from_micros(at_us),
+                    SignalKind::ReceiveCreditConsumed { bytes: 1_200 },
+                ),
+            ]);
+        }
+        script.push((Duration::from_micros(70), SignalKind::ApplicationComplete));
+        let actual: Vec<_> = drive(&mut defense, &script, Duration::from_micros(70))
             .into_iter()
             .map(|packet| (packet.timestamp_us(), packet.direction(), packet.length()))
             .collect();
         assert_eq!(
             actual,
             [
-                (0, Direction::Outgoing, 100),
-                (0, Direction::Outgoing, 100),
-                (20, Direction::Incoming, 100),
-                (20, Direction::Incoming, 100),
-                (40, Direction::Outgoing, 100),
-                (50, Direction::Incoming, 100),
+                (0, Direction::Outgoing, 1_200),
+                (0, Direction::Outgoing, 1_200),
+                (20, Direction::Incoming, 1_200),
+                (20, Direction::Incoming, 1_200),
+                (20, Direction::Incoming, 1_200),
+                (45, Direction::Outgoing, 1_200),
+                (50, Direction::Incoming, 1_200),
+                (50, Direction::Incoming, 1_200),
             ]
         );
         assert!(defense.is_complete());
@@ -2959,14 +3335,14 @@ mod tests {
         );
         let diagnostics = defense.diagnostics();
         assert_eq!(diagnostics.walkie_talkie_target_outgoing_cells, 3);
-        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_target_incoming_cells, 5);
         assert_eq!(diagnostics.walkie_talkie_observed_outgoing_cells, 3);
-        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 3);
+        assert_eq!(diagnostics.walkie_talkie_observed_incoming_cells, 5);
         assert_eq!(diagnostics.walkie_talkie_outgoing_shortfall_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_incoming_shortfall_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_outgoing_overflow_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_incoming_overflow_cells, 0);
-        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 100);
+        assert_eq!(diagnostics.walkie_talkie_incoming_chaff_bytes, 2_400);
         assert_eq!(diagnostics.walkie_talkie_target_observed_cell_l1, 0);
         assert_eq!(diagnostics.walkie_talkie_target_observed_burst_l1, 0);
         assert_eq!(diagnostics.walkie_talkie_control_only_crossings, 0);
