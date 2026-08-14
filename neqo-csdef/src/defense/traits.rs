@@ -372,6 +372,14 @@ pub trait Defense: Debug {
     fn next_event_at(&self) -> Option<Duration>;
     /// Whether no events remain.
     fn is_complete(&self) -> bool;
+    /// Whether this defense can prove that it will never emit another
+    /// incoming event.
+    ///
+    /// Dynamic defenses conservatively inherit whole-schedule completion.
+    /// Fixed schedules may report this earlier while outgoing events remain.
+    fn is_incoming_complete(&self) -> bool {
+        self.is_complete()
+    }
     /// Whether no outgoing events remain.
     fn is_outgoing_complete(&self) -> bool;
     /// Whether normal-priority chaff STREAM data may leave without a slot.

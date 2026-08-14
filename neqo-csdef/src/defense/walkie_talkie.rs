@@ -39,7 +39,7 @@ const RECEIVER_RESOURCE_PRECONDITION: &str = "schema-two-qualified-manifest-sele
 const RECEIVER_PROVISIONING_POLICY: &str = "fill-effective-configured-max-chaff-streams-once-before-first-due-molded-outgoing-actions;never-replenish-after-initial-request-chaff-batch";
 const RECEIVER_RESERVE_POLICY: &str = "reserve-deterministic-acknowledged-pristine-candidates-for-all-remaining-nonzero-incoming-components-before-first-base-allocation-and-retain-distinct-reserves-across-later-positive-outgoing-components";
 const RECEIVER_RESERVE_LIFECYCLE_POLICY: &str = "remove-exactly-first-reserve-once-at-corresponding-continuation-controller-allocation-even-when-positive-live-debt-releases-on-nonreserved-stream;refresh-only-from-initial-peer-acknowledged-preprovisioned-cohort-for-defense-pending-continuation-or-tagged-continuation-still-queued-for-allocation;retryable-unadvertised-continuation-allocation-rollback-or-requeue-reconstitutes-corresponding-all-future-horizon-reserve-before-further-base-allocation";
-const RECEIVER_RELEASE_POLICY: &str = "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once";
+const RECEIVER_RELEASE_POLICY: &str = "after-issued-base-events-controller-requested-and-request-signals-observed;batch-gate-open;release-when-all-base-events-issued-or-real-reported-nonreserved-capacity-is-below-one-cell;recompute-live-unconsumed-base-each-retry;retain-single-coalescible-unadvertised-positive-outstanding-at-or-below-parser-ceiling-until-max-stream-data-advertised;prefer-single-coalesced-advertised-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once";
 const RECEIVER_BATCH_END_RELEASE_POLICY: &str =
     "at-molded-batch-end-after-application-batch-complete-otherwise-no-batch-gate";
 const RECEIVER_PREFIX_CONSUMABILITY_PRECONDITION: &str =
@@ -1364,6 +1364,21 @@ impl WalkieTalkie {
             .saturating_sub(self.incoming_capacity_committed)
     }
 
+    fn receiver_continuation_due(
+        &self,
+        index: usize,
+        credits_to_emit: u32,
+        receiver_continuation_pending: bool,
+        initial_credits_awaiting: u32,
+    ) -> bool {
+        receiver_continuation_pending
+            && initial_credits_awaiting == 0
+            && self.batch_gate_open(index)
+            && (credits_to_emit == 0
+                || self.incoming_capacity_reported.is_some()
+                    && self.incoming_capacity_available() < u64::from(self.packet_size))
+    }
+
     fn on_capacity(&mut self, capacity: Capacity) {
         let reported = capacity.available(DefenseMode::ChaffAndShape);
         if self.incoming_capacity_reported != Some(reported) {
@@ -1509,10 +1524,12 @@ impl WalkieTalkie {
                 ..
             } => (credits_to_emit > 0
                 && self.incoming_capacity_available() >= u64::from(self.packet_size)
-                || receiver_continuation_pending
-                    && credits_to_emit == 0
-                    && initial_credits_awaiting == 0
-                    && self.batch_gate_open(index)
+                || self.receiver_continuation_due(
+                    index,
+                    credits_to_emit,
+                    receiver_continuation_pending,
+                    initial_credits_awaiting,
+                )
                 || observed_remaining_bytes == 0
                     && !receiver_continuation_pending
                     && initial_credits_awaiting == 0
@@ -1613,8 +1630,19 @@ impl Defense for WalkieTalkie {
 
         loop {
             let incoming_capacity_available = self.incoming_capacity_available();
-            let batch_gate_open = match self.turn {
-                Turn::Incoming { index, .. } => self.batch_gate_open(index),
+            let receiver_continuation_due = match self.turn {
+                Turn::Incoming {
+                    index,
+                    credits_to_emit,
+                    receiver_continuation_pending,
+                    initial_credits_awaiting,
+                    ..
+                } => self.receiver_continuation_due(
+                    index,
+                    credits_to_emit,
+                    receiver_continuation_pending,
+                    initial_credits_awaiting,
+                ),
                 Turn::Outgoing { .. } | Turn::Done => false,
             };
             match &mut self.turn {
@@ -1634,6 +1662,23 @@ impl Defense for WalkieTalkie {
                     }
                 }
                 Turn::Incoming {
+                    receiver_continuation_pending,
+                    initial_credits_awaiting,
+                    ..
+                } if receiver_continuation_due => {
+                    self.incoming_capacity_reserved = self
+                        .incoming_capacity_reserved
+                        .saturating_add(u64::from(self.packet_size));
+                    let packet = Packet::new(at, Direction::Incoming, self.packet_size).ok()?;
+                    *receiver_continuation_pending = false;
+                    *initial_credits_awaiting = initial_credits_awaiting.saturating_add(1);
+                    self.last_receiver_continuation = Some(ReceiverContinuationDisposition {
+                        cell_bytes: u64::from(self.packet_size),
+                        parser_ceiling_bytes: self.receiver_parser_allowance_ceiling_bytes,
+                    });
+                    return Some(packet);
+                }
+                Turn::Incoming {
                     credits_to_emit,
                     initial_credits_awaiting,
                     ..
@@ -1647,27 +1692,6 @@ impl Defense for WalkieTalkie {
                     let packet = Packet::new(at, Direction::Incoming, self.packet_size).ok()?;
                     *credits_to_emit = credits_to_emit.saturating_sub(1);
                     *initial_credits_awaiting = initial_credits_awaiting.saturating_add(1);
-                    return Some(packet);
-                }
-                Turn::Incoming {
-                    credits_to_emit: 0,
-                    receiver_continuation_pending,
-                    initial_credits_awaiting,
-                    ..
-                } if *receiver_continuation_pending
-                    && *initial_credits_awaiting == 0
-                    && batch_gate_open =>
-                {
-                    self.incoming_capacity_reserved = self
-                        .incoming_capacity_reserved
-                        .saturating_add(u64::from(self.packet_size));
-                    let packet = Packet::new(at, Direction::Incoming, self.packet_size).ok()?;
-                    *receiver_continuation_pending = false;
-                    *initial_credits_awaiting = initial_credits_awaiting.saturating_add(1);
-                    self.last_receiver_continuation = Some(ReceiverContinuationDisposition {
-                        cell_bytes: u64::from(self.packet_size),
-                        parser_ceiling_bytes: self.receiver_parser_allowance_ceiling_bytes,
-                    });
                     return Some(packet);
                 }
                 Turn::Incoming { .. } => {
@@ -2003,7 +2027,7 @@ mod tests {
                     "sender_framing_cells_per_nonzero_outgoing_component": 1,
                     "sender_framing_formula": "symmetric_outgoing=adapted_outgoing-1-if-adapted_outgoing>0-else-0",
                     "sender_framing_policy": "one-full-cell-per-positive-symmetric-outgoing-component-reserved-for-quic-http3-stream-framing-and-mandatory-control-overhead",
-                    "release_policy": "after-all-base-events-controller-requested-and-request-signals-observed;batch-gate-open;recompute-live-unconsumed-base-each-retry;prefer-single-coalesced-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
+                    "release_policy": "after-issued-base-events-controller-requested-and-request-signals-observed;batch-gate-open;release-when-all-base-events-issued-or-real-reported-nonreserved-capacity-is-below-one-cell;recompute-live-unconsumed-base-each-retry;retain-single-coalescible-unadvertised-positive-outstanding-at-or-below-parser-ceiling-until-max-stream-data-advertised;prefer-single-coalesced-advertised-positive-outstanding-at-or-below-parser-ceiling-on-peer-acknowledged-nonreserved-header-blocked-stream;otherwise-release-whole-cell-to-oldest-retained-peer-acknowledged-pristine-reserve-regardless-of-live-base-debt;remove-oldest-reserve-once",
                     "request_activation_policy": "zero-required-insert-count-nonblocking-qpack-chaff-header-block;positive-final-size-with-contiguous-unique-request-stream-offsets-[0,final-size)-and-fin-peer-acknowledged-under-molded-outgoing-cells",
                     "request_prefix_delivery_precondition": "before-first-incoming-component-first-base-allocation-peer-acknowledged-nonblocking-chaff-request-survivors>=total-receiver-continuation-reserve-horizon+1;initial-survivor-gate-remains-latched-across-complete-schedule",
                     "resource_precondition": "schema-two-qualified-manifest-selects-known-valid-same-origin-source-resource;derived-selected-resource-projection-dependency-free-with-effective-length>=raw-headroom-bytes-per-nonzero-incoming-component;required-chaff-streams-defines-effective-configured-max-chaff-streams",
@@ -3078,6 +3102,123 @@ mod tests {
                 cell_bytes: 1_200,
                 parser_ceiling_bytes: 1_000,
             })
+        );
+    }
+
+    #[test]
+    fn subcell_reported_capacity_releases_continuation_before_remaining_base() {
+        const CELL: u64 = 1_200;
+        let mut defense = WalkieTalkie::from_json(
+            &config(1_200),
+            1_200,
+            &molded(r#"[{"outgoing": 0, "incoming": 46}]"#),
+        )
+        .expect("47-cell adapted incoming component");
+        application_batch_started(&mut defense, 0);
+        application_bytes(&mut defense, 0, Direction::Outgoing, 1);
+        provide_capacity(&mut defense, 0, 45 * CELL + 1);
+
+        let base: Vec<_> = std::iter::repeat_with(|| {
+            let packet = defense.next_event(Duration::ZERO).expect("base cell");
+            assert_eq!(defense.last_incoming_event_receiver_continuation(), None);
+            packet
+        })
+        .take(45)
+        .collect();
+        assert_eq!(defense.incoming_capacity_available(), 1);
+        assert_eq!(defense.next_event(Duration::ZERO), None);
+        assert_eq!(
+            defense.next_event_at(),
+            None,
+            "the batch gate remains closed"
+        );
+
+        for packet in base {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(1),
+                kind: SignalKind::ReceiveCreditRequested { packet },
+            });
+        }
+        application_bytes(&mut defense, 1, Direction::Incoming, 1);
+        application_batch_completed(&mut defense, 2);
+        assert_eq!(defense.next_event_at(), Some(Duration::from_micros(2)));
+        let continuation = defense
+            .next_event(Duration::from_micros(2))
+            .expect("early receiver continuation");
+        assert_eq!(continuation.direction(), Direction::Incoming);
+        assert!(
+            defense
+                .last_incoming_event_receiver_continuation()
+                .is_some()
+        );
+        assert!(matches!(
+            defense.turn,
+            super::Turn::Incoming {
+                credits_to_emit: 1,
+                receiver_continuation_pending: false,
+                ..
+            }
+        ));
+        assert_eq!(defense.next_event(Duration::from_micros(2)), None);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2),
+            kind: SignalKind::ReceiveCreditRequested {
+                packet: continuation,
+            },
+        });
+        // The controller's reserve discharge exposes at least one fresh cell
+        // in its next authoritative capacity snapshot.
+        provide_capacity(&mut defense, 3, CELL);
+        let final_base = defense
+            .next_event(Duration::from_micros(3))
+            .expect("remaining base cell after reserve discharge");
+        assert_eq!(final_base.direction(), Direction::Incoming);
+        assert_eq!(defense.last_incoming_event_receiver_continuation(), None);
+    }
+
+    #[test]
+    fn one_cell_reported_capacity_keeps_final_base_before_continuation() {
+        const CELL: u64 = 1_200;
+        let mut defense = WalkieTalkie::from_json(
+            &config(1_200),
+            1_200,
+            &molded(r#"[{"outgoing": 0, "incoming": 46}]"#),
+        )
+        .expect("47-cell adapted incoming component");
+        application_batch_started(&mut defense, 0);
+        application_bytes(&mut defense, 0, Direction::Outgoing, 1);
+        provide_capacity(&mut defense, 0, 46 * CELL);
+
+        let base: Vec<_> =
+            std::iter::repeat_with(|| defense.next_event(Duration::ZERO).expect("base cell"))
+                .take(45)
+                .collect();
+        for packet in base {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(1),
+                kind: SignalKind::ReceiveCreditRequested { packet },
+            });
+        }
+        application_bytes(&mut defense, 1, Direction::Incoming, 1);
+        application_batch_completed(&mut defense, 2);
+
+        let final_base = defense
+            .next_event(Duration::from_micros(2))
+            .expect("one full reported cell keeps base priority");
+        assert_eq!(defense.last_incoming_event_receiver_continuation(), None);
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2),
+            kind: SignalKind::ReceiveCreditRequested { packet: final_base },
+        });
+        let continuation = defense
+            .next_event(Duration::from_micros(2))
+            .expect("continuation follows the requested final base");
+        assert_eq!(continuation.direction(), Direction::Incoming);
+        assert!(
+            defense
+                .last_incoming_event_receiver_continuation()
+                .is_some()
         );
     }
 

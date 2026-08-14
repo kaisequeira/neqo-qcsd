@@ -330,6 +330,38 @@ impl StreamRegistry {
         self.receiver_continuation_opportunities(endpoint, required, 0, parser_ceiling)
     }
 
+    /// Deterministic peer-acknowledged pristine chaff streams that can carry
+    /// one complete final chaff-only incoming slot without fragmentation.
+    pub fn pristine_terminal_chaff_opportunities(
+        &self,
+        endpoint: QcsdEndpointId,
+        required: u64,
+        initial_limit: u64,
+    ) -> Vec<AllocationOpportunity> {
+        let mut opportunities: Vec<_> = self
+            .streams
+            .iter()
+            .filter(|((candidate, _), state)| {
+                *candidate == endpoint
+                    && matches!(state.role, QcsdRequestRole::Chaff { .. })
+                    && state.chaff_request_activated()
+                    && state.status.is_none()
+                    && state
+                        .receive
+                        .has_pristine_terminal_chaff_capacity(required, initial_limit)
+            })
+            .map(|((_, stream), state)| AllocationOpportunity {
+                endpoint,
+                stream: *stream,
+                role: state.role,
+                exact: state.receive.available(),
+                claimable: 0,
+            })
+            .collect();
+        opportunities.sort_unstable_by_key(|opportunity| opportunity.stream);
+        opportunities
+    }
+
     pub fn is_receiver_continuation_reserve(
         &self,
         endpoint: QcsdEndpointId,
@@ -344,6 +376,31 @@ impl StreamRegistry {
                 && state
                     .receive
                     .has_receiver_continuation_capacity(required, 0, parser_ceiling)
+        })
+    }
+
+    /// Whether an exact ordinary base tail on this stream is waiting only for
+    /// its local `MAX_STREAM_DATA` advertisement before a continuation can be
+    /// coalesced onto it.
+    pub fn is_pending_receiver_continuation_tail(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        required: u64,
+        base_outstanding: u64,
+        unadvertised_base: u64,
+        parser_ceiling: u64,
+    ) -> bool {
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            matches!(state.role, QcsdRequestRole::Chaff { .. })
+                && state.chaff_request_activated()
+                && state.status.is_none()
+                && state.receive.has_pending_receiver_continuation_capacity(
+                    required,
+                    base_outstanding,
+                    unadvertised_base,
+                    parser_ceiling,
+                )
         })
     }
 
@@ -940,6 +997,105 @@ mod tests {
                 .get_mut(endpoint, QcsdStreamId(44))
                 .expect("empty FIN stream")
                 .chaff_request_activated()
+        );
+    }
+
+    #[test]
+    fn pending_receiver_tail_requires_exact_acked_unadvertised_base_delta() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 7,
+            request_id: None,
+        };
+        let mut registry = StreamRegistry::default();
+        registry.open(endpoint, stream, role, true, 0, 1_000, 2_400);
+        assert_eq!(
+            registry.record_chaff_request_acknowledgment(endpoint, stream, role, 0, 100, true),
+            100
+        );
+        let base = registry
+            .release_stream(endpoint, stream, 324)
+            .expect("small exact base tail");
+        assert!(
+            registry
+                .is_pending_receiver_continuation_tail(endpoint, stream, 1_200, 324, 324, 1_000,)
+        );
+        assert!(
+            !registry
+                .is_pending_receiver_continuation_tail(endpoint, stream, 1_200, 324, 323, 1_000,)
+        );
+
+        registry
+            .get_mut(endpoint, stream)
+            .expect("registered chaff")
+            .receive
+            .advertised(base.absolute_limit);
+        assert!(
+            !registry
+                .is_pending_receiver_continuation_tail(endpoint, stream, 1_200, 324, 324, 1_000,)
+        );
+        let ready = registry.receiver_continuation_opportunities(endpoint, 1_200, 324, 1_000);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].stream, stream);
+    }
+
+    #[test]
+    fn terminal_chaff_opportunity_requires_ack_pristine_state_and_whole_capacity() {
+        let endpoint = QcsdEndpointId(1);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 7,
+            request_id: None,
+        };
+        let mut registry = StreamRegistry::default();
+        for (stream, expected) in [(4, 38_376), (8, 38_376), (12, 1_215)] {
+            registry.open(
+                endpoint,
+                QcsdStreamId(stream),
+                role,
+                true,
+                16,
+                1_000,
+                expected,
+            );
+        }
+        for stream in [4, 12] {
+            assert_eq!(
+                registry.record_chaff_request_acknowledgment(
+                    endpoint,
+                    QcsdStreamId(stream),
+                    role,
+                    0,
+                    110,
+                    true,
+                ),
+                110
+            );
+        }
+
+        let eligible = registry.pristine_terminal_chaff_opportunities(endpoint, 1_200, 16);
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|opportunity| opportunity.stream)
+                .collect::<Vec<_>>(),
+            [QcsdStreamId(4)],
+            "stream 8 is unacknowledged and stream 12 lacks a whole slot"
+        );
+
+        let release = registry
+            .release_stream(endpoint, QcsdStreamId(4), 1)
+            .expect("touch pristine state");
+        registry
+            .get_mut(endpoint, QcsdStreamId(4))
+            .expect("registered stream")
+            .receive
+            .advertised(release.absolute_limit);
+        assert!(
+            registry
+                .pristine_terminal_chaff_opportunities(endpoint, 1_200, 16)
+                .is_empty(),
+            "previously advertised credit is not an untouched initial prefix"
         );
     }
 

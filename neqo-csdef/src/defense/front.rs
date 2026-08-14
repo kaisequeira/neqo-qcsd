@@ -81,6 +81,10 @@ impl Defense for Front {
         self.schedule.is_complete()
     }
 
+    fn is_incoming_complete(&self) -> bool {
+        self.schedule.is_incoming_complete()
+    }
+
     fn is_outgoing_complete(&self) -> bool {
         self.schedule.is_outgoing_complete()
     }
@@ -92,11 +96,36 @@ impl Defense for Front {
 
 #[cfg(test)]
 mod tests {
-    use super::rayleigh_seconds;
+    use std::time::Duration;
+
+    use super::{Front, rayleigh_seconds};
+    use crate::{Defense as _, FrontConfig};
 
     #[test]
     fn rayleigh_inverse_matches_the_published_transform() {
         let unit = 1.0 - (-0.5_f64).exp();
         assert!((rayleigh_seconds(unit, 2.5) - 2.5).abs() < f64::EPSILON * 4.0);
+    }
+
+    #[test]
+    fn fixed_front_reports_a_finished_incoming_schedule_with_outgoing_work_left() {
+        let config = FrontConfig {
+            n_client_packets: 4,
+            n_server_packets: 5,
+            packet_size: 1_234,
+            peak_minimum_seconds: 0.1,
+            peak_maximum_seconds: 0.2,
+        };
+        let mut front = Front::new(&config, 42);
+
+        while front
+            .next_event_at()
+            .is_some_and(|at| at <= Duration::from_micros(233_524))
+        {
+            _ = front.next_event(Duration::from_micros(233_524));
+        }
+        assert!(front.is_incoming_complete());
+        assert!(!front.is_complete());
+        assert!(!front.is_outgoing_complete());
     }
 }

@@ -146,6 +146,48 @@ impl ReceiveState {
         }
     }
 
+    /// Whether this stream is still at its configured initial response prefix
+    /// and has exact capacity for one complete terminal chaff-only slot.
+    ///
+    /// The initial prefix may be nonzero, but no scheduled credit, framing
+    /// claim, parser lease, or response byte may have touched the stream.
+    pub const fn has_pristine_terminal_chaff_capacity(
+        &self,
+        required: u64,
+        initial_limit: u64,
+    ) -> bool {
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                reservation_capacity,
+                reservation_available,
+                consumed,
+                framing_bytes,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } => {
+                required > 0
+                    && *requested_limit == initial_limit
+                    && *advertised_limit == initial_limit
+                    && *consumed == 0
+                    && *reservation_available == *reservation_capacity
+                    && *framing_bytes == 0
+                    && *parser_lease_used == 0
+                    && last_parser_lease_boundary.is_none()
+                    && pending_parser_boundary.is_none()
+                    && known_limit.saturating_sub(*requested_limit) >= required
+            }
+            Self::Created { .. }
+            | Self::ReceivingData { .. }
+            | Self::Automatic { .. }
+            | Self::Closed { .. } => false,
+        }
+    }
+
     /// Whether this controlled chaff stream remains in an unparsed
     /// response-header phase with exact capacity for one whole allocation.
     ///
@@ -182,6 +224,53 @@ impl ReceiveState {
                     } else {
                         *requested_limit > 0
                     }
+                    && *reservation_available == *reservation_capacity
+                    && *framing_bytes == 0
+                    && *parser_lease_used == 0
+                    && last_parser_lease_boundary.is_none()
+                    && pending_parser_boundary.is_none()
+                    && *known_limit >= required
+                    && known_limit.saturating_sub(*requested_limit) >= required
+            }
+            Self::Created { .. }
+            | Self::ReceivingData { .. }
+            | Self::Automatic { .. }
+            | Self::Closed { .. } => false,
+        }
+    }
+
+    /// Whether one small live base prefix would become an eligible receiver
+    /// continuation target solely by advertising its already-requested exact
+    /// credit. The pending delta must be wholly owned by ordinary base slots;
+    /// parser-only growth and split live debt remain ineligible.
+    pub const fn has_pending_receiver_continuation_capacity(
+        &self,
+        required: u64,
+        base_outstanding: u64,
+        unadvertised_base: u64,
+        parser_ceiling: u64,
+    ) -> bool {
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                reservation_capacity,
+                reservation_available,
+                consumed,
+                framing_bytes,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } => {
+                *consumed == 0
+                    && base_outstanding > 0
+                    && *requested_limit == base_outstanding
+                    && *requested_limit > *advertised_limit
+                    && *requested_limit <= parser_ceiling
+                    && unadvertised_base > 0
+                    && requested_limit.saturating_sub(*advertised_limit) == unadvertised_base
                     && *reservation_available == *reservation_capacity
                     && *framing_bytes == 0
                     && *parser_lease_used == 0
@@ -787,6 +876,57 @@ mod tests {
         blocked.advertised(1);
         assert!(blocked.has_receiver_continuation_capacity(1_200, 1, 1_000));
         assert!(!blocked.has_receiver_continuation_capacity(1_200, 0, 1_000));
+    }
+
+    #[test]
+    fn terminal_chaff_capacity_requires_an_untouched_initial_prefix() {
+        let mut pristine = ReceiveState::controlled(16, 1_000, 38_376);
+        assert!(pristine.has_pristine_terminal_chaff_capacity(1_200, 16));
+        assert!(!pristine.has_pristine_terminal_chaff_capacity(38_361, 16));
+        assert!(!pristine.has_pristine_terminal_chaff_capacity(1_200, 0));
+        assert!(!pristine.has_pristine_terminal_chaff_capacity(0, 16));
+
+        assert_eq!(pristine.claim(1), 1);
+        assert!(!pristine.has_pristine_terminal_chaff_capacity(1_200, 16));
+
+        let mut previously_released = ReceiveState::controlled(16, 1_000, 38_376);
+        let release = previously_released.release(1).expect("exact capacity");
+        previously_released.advertised(release.0);
+        assert!(!previously_released.has_pristine_terminal_chaff_capacity(1_200, 16));
+
+        let insufficient = ReceiveState::controlled(16, 1_000, 1_215);
+        assert!(!insufficient.has_pristine_terminal_chaff_capacity(1_200, 16));
+
+        let mut parsed = ReceiveState::controlled(16, 1_000, 38_376);
+        parsed.bytes_read(1);
+        assert!(!parsed.has_pristine_terminal_chaff_capacity(1_200, 16));
+
+        let mut framed = ReceiveState::controlled(16, 1_000, 38_376);
+        framed.response_headers(10, Some(38_376));
+        assert!(!framed.has_pristine_terminal_chaff_capacity(1_200, 16));
+
+        let mut parser_pending = ReceiveState::controlled(16, 1_000, 38_376);
+        parser_pending.header_progress(1, true);
+        assert!(!parser_pending.has_pristine_terminal_chaff_capacity(1_200, 16));
+    }
+
+    #[test]
+    fn pending_base_tail_becomes_coalescible_only_after_exact_advertisement() {
+        let mut state = ReceiveState::controlled(0, 1_000, 2_400);
+        assert_eq!(state.release(324), Some((324, 324)));
+        assert!(state.has_pending_receiver_continuation_capacity(1_200, 324, 324, 1_000));
+        assert!(!state.has_pending_receiver_continuation_capacity(1_200, 323, 324, 1_000));
+        assert!(!state.has_pending_receiver_continuation_capacity(1_200, 324, 323, 1_000));
+        assert!(!state.has_receiver_continuation_capacity(1_200, 324, 1_000));
+
+        state.advertised(324);
+        assert!(!state.has_pending_receiver_continuation_capacity(1_200, 324, 324, 1_000));
+        assert!(state.has_receiver_continuation_capacity(1_200, 324, 1_000));
+
+        let mut claimed = ReceiveState::controlled(0, 1_000, 2_400);
+        assert_eq!(claimed.release(324), Some((324, 324)));
+        assert_eq!(claimed.claim(1), 1);
+        assert!(!claimed.has_pending_receiver_continuation_capacity(1_200, 324, 324, 1_000));
     }
 
     #[test]

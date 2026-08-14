@@ -64,6 +64,13 @@ impl Defense for StaticSchedule {
         self.trace.is_empty()
     }
 
+    fn is_incoming_complete(&self) -> bool {
+        !self
+            .trace
+            .iter()
+            .any(|packet| packet.direction() == Direction::Incoming)
+    }
+
     fn is_outgoing_complete(&self) -> bool {
         !self
             .trace
@@ -73,5 +80,28 @@ impl Defense for StaticSchedule {
 
     fn mode(&self) -> DefenseMode {
         self.mode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::StaticSchedule;
+    use crate::{Defense as _, Direction, Packet, Trace};
+
+    #[test]
+    fn incoming_schedule_can_finish_before_the_whole_schedule() {
+        let incoming =
+            Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("incoming packet");
+        let outgoing = Packet::new(Duration::from_millis(1), Direction::Outgoing, 1_200)
+            .expect("outgoing packet");
+        let mut schedule = StaticSchedule::new(Trace::new([incoming, outgoing]), true);
+
+        assert!(!schedule.is_incoming_complete());
+        assert_eq!(schedule.next_event(Duration::ZERO), Some(incoming));
+        assert!(schedule.is_incoming_complete());
+        assert!(!schedule.is_complete());
+        assert!(!schedule.is_outgoing_complete());
     }
 }
