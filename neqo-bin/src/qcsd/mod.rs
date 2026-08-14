@@ -26,12 +26,14 @@ use futures::{
 use http::Uri;
 use neqo_common::{Header, event::Provider as _};
 use neqo_csdef::{
-    ChaffManifest, DefenseConfig, DefenseDiagnostics, DefenseKind, DependencyTracker, Direction,
-    ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig,
-    QcsdController, QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdProfile,
-    QcsdRequestRole, QcsdSlotId, QcsdStreamTransmission, Resource, ResourceManifest,
-    ResourceRunState, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
-    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
+    ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics, DefenseKind,
+    DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
+    QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
+    QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, QcsdStreamTransmission,
+    Resource, ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest,
+    ResponseOnlyChaffQualification, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress,
+    WalkieTalkie, WalkieTalkieQualificationBinding, derive, normalize_content_encoding,
+    sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -269,7 +271,7 @@ enum Command {
         /// Workload identity selecting a Traffic Morphing or Walkie-Talkie profile.
         #[arg(long)]
         workload_id: Option<String>,
-        /// Explicit current schema-two qualified chaff manifest required by every defended run.
+        /// Explicit current qualified chaff manifest required by every defended run.
         #[arg(long = "chaff-manifest", visible_alias = "manifest")]
         chaff_manifest: Option<PathBuf>,
         /// Application request dispatch policy used by the campaign collector.
@@ -374,15 +376,16 @@ impl Args {
                 } else {
                     (None, None)
                 };
-                if !matches!(config.defense, DefenseConfig::None)
-                    && let Some(chaff) = &chaff_manifest
-                {
-                    bind_qualified_chaff_stream_limits(&mut config, chaff)?;
+                if let Some(chaff) = &chaff_manifest {
+                    validate_chaff_manifest_defense(&config.defense, chaff)?;
+                    if !matches!(config.defense, DefenseConfig::None) {
+                        bind_qualified_chaff_stream_limits(&mut config, chaff)?;
+                    }
                 }
                 let defense_parameters = defense_parameter_provenance(&config)?;
                 if !matches!(config.defense, DefenseConfig::None) && chaff_manifest.is_none() {
                     return Err(Error::Argument(
-                        "every defended run requires an explicit current schema-two qualified --chaff-manifest"
+                        "every defended run requires an explicit current qualified --chaff-manifest"
                             .into(),
                     ));
                 }
@@ -689,18 +692,161 @@ fn defense_parameter_provenance(
     }))
 }
 
+enum RuntimeChaffManifest {
+    SchemaTwo(ChaffManifest),
+    ResponseOnly(ResponseOnlyChaffManifest),
+}
+
+struct RuntimeChaffQualification<'a> {
+    request_stream_bytes: u64,
+    expected_response: &'a ExpectedChaffResponse,
+}
+
+impl RuntimeChaffQualification<'_> {
+    const fn request_stream_bytes(&self) -> u64 {
+        self.request_stream_bytes
+    }
+
+    const fn expected_response(&self) -> &ExpectedChaffResponse {
+        self.expected_response
+    }
+}
+
+impl From<ChaffManifest> for RuntimeChaffManifest {
+    fn from(value: ChaffManifest) -> Self {
+        Self::SchemaTwo(value)
+    }
+}
+
+impl From<ResponseOnlyChaffManifest> for RuntimeChaffManifest {
+    fn from(value: ResponseOnlyChaffManifest) -> Self {
+        Self::ResponseOnly(value)
+    }
+}
+
+impl RuntimeChaffManifest {
+    fn from_json(input: &str) -> neqo_csdef::Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(input)?;
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(3)
+        {
+            ResponseOnlyChaffManifest::from_json(input).map(Self::ResponseOnly)
+        } else {
+            ChaffManifest::from_json(input).map(Self::SchemaTwo)
+        }
+    }
+
+    const fn schema_two(&self) -> Option<&ChaffManifest> {
+        match self {
+            Self::SchemaTwo(manifest) => Some(manifest),
+            Self::ResponseOnly(_) => None,
+        }
+    }
+
+    const fn is_response_only(&self) -> bool {
+        matches!(self, Self::ResponseOnly(_))
+    }
+
+    fn application_workload_sha256(&self) -> &str {
+        match self {
+            Self::SchemaTwo(manifest) => &manifest.application_workload_sha256,
+            Self::ResponseOnly(manifest) => &manifest.application_workload_sha256,
+        }
+    }
+
+    const fn application_resource_id(&self) -> u32 {
+        match self {
+            Self::SchemaTwo(manifest) => manifest.application_resource_id,
+            Self::ResponseOnly(manifest) => manifest.application_resource_id,
+        }
+    }
+
+    const fn selected_chaff_resource_id(&self) -> u32 {
+        match self {
+            Self::SchemaTwo(manifest) => manifest.selected_chaff_resource_id,
+            Self::ResponseOnly(manifest) => manifest.selected_chaff_resource_id,
+        }
+    }
+
+    const fn qualified_parallel_chaff_streams(&self) -> usize {
+        match self {
+            Self::SchemaTwo(manifest) => manifest.qualified_parallel_chaff_streams,
+            Self::ResponseOnly(manifest) => manifest.qualified_parallel_chaff_streams,
+        }
+    }
+
+    fn resource_manifest(&self) -> ResourceManifest {
+        match self {
+            Self::SchemaTwo(manifest) => manifest.resource_manifest(),
+            Self::ResponseOnly(manifest) => manifest.resource_manifest(),
+        }
+    }
+
+    fn selected_resource(&self) -> Resource {
+        self.resource_manifest()
+            .resources
+            .into_iter()
+            .next()
+            .expect("validated chaff manifests contain exactly one resource")
+    }
+
+    fn qualification(&self, resource_id: u32) -> Option<RuntimeChaffQualification<'_>> {
+        match self {
+            Self::SchemaTwo(manifest) => {
+                manifest
+                    .qualification(resource_id)
+                    .map(
+                        |qualification: &ChaffQualification| RuntimeChaffQualification {
+                            request_stream_bytes: qualification.request_stream_bytes,
+                            expected_response: &qualification.expected_response,
+                        },
+                    )
+            }
+            Self::ResponseOnly(manifest) => manifest.qualification(resource_id).map(
+                |qualification: &ResponseOnlyChaffQualification| RuntimeChaffQualification {
+                    request_stream_bytes: qualification.request_stream_bytes,
+                    expected_response: &qualification.expected_response,
+                },
+            ),
+        }
+    }
+}
+
+fn validate_chaff_manifest_defense(
+    defense: &DefenseConfig,
+    chaff: &RuntimeChaffManifest,
+) -> Result<(), Error> {
+    if chaff.is_response_only()
+        && !matches!(defense, DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_))
+    {
+        return Err(Error::Argument(
+            "schema-three response-only chaff manifests are accepted only for FRONT and Tamaraw"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn bind_qualified_chaff_stream_limits(
     config: &mut QcsdConfig,
-    chaff: &ChaffManifest,
+    chaff: &RuntimeChaffManifest,
 ) -> Result<(), Error> {
     if matches!(config.defense, DefenseConfig::WalkieTalkie(_)) {
-        config.max_chaff_streams = chaff.walkie_talkie_required_chaff_streams;
+        let schema_two = chaff.schema_two().ok_or_else(|| {
+            Error::Argument(
+                "Walkie-Talkie requires a schema-two prefix-qualified chaff manifest".into(),
+            )
+        })?;
+        config.max_chaff_streams = schema_two.walkie_talkie_required_chaff_streams;
         config.validate()?;
     }
-    if config.max_chaff_streams > chaff.qualified_parallel_chaff_streams {
+    if config.max_chaff_streams > chaff.qualified_parallel_chaff_streams() {
         return Err(Error::Argument(format!(
             "configured max_chaff_streams {} exceeds response-qualified parallel cohort {}",
-            config.max_chaff_streams, chaff.qualified_parallel_chaff_streams
+            config.max_chaff_streams,
+            chaff.qualified_parallel_chaff_streams()
         )));
     }
     Ok(())
@@ -717,7 +863,7 @@ struct RunSpec {
     )>,
     config: QcsdConfig,
     defense_parameters: Option<DefenseParameterProvenance>,
-    chaff_manifest: Option<ChaffManifest>,
+    chaff_manifest: Option<RuntimeChaffManifest>,
     chaff_manifest_hash: Option<String>,
     request_policy: RequestPolicyArg,
     seed: u64,
@@ -2774,9 +2920,9 @@ fn load_application_workload_source(
     Ok((manifest, sha256(&bytes)?, by_id))
 }
 
-fn load_chaff_manifest(path: &Path) -> Result<(ChaffManifest, String), Error> {
+fn load_chaff_manifest(path: &Path) -> Result<(RuntimeChaffManifest, String), Error> {
     let bytes = fs::read(path)?;
-    let manifest = ChaffManifest::from_json(std::str::from_utf8(&bytes).map_err(|_| {
+    let manifest = RuntimeChaffManifest::from_json(std::str::from_utf8(&bytes).map_err(|_| {
         Error::Argument(format!(
             "qualified chaff manifest is not UTF-8: {}",
             path.display()
@@ -3158,6 +3304,9 @@ fn sha256(bytes: &[u8]) -> Result<String, Error> {
 async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     spec.workload.validate()?;
     validate_workload_urls(&spec.workload)?;
+    if let Some(chaff) = &spec.chaff_manifest {
+        validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
+    }
     validate_qualified_chaff_binding(&spec)?;
     validate_walkie_talkie_chaff_precondition(&spec)?;
     if spec.output_dir.exists() && fs::read_dir(&spec.output_dir)?.next().is_some() {
@@ -3226,7 +3375,15 @@ fn validate_walkie_talkie_chaff_precondition(spec: &RunSpec) -> Result<(), Error
     let chaff_manifest_hash = spec.chaff_manifest_hash.as_deref().ok_or_else(|| {
         Error::Argument("Walkie-Talkie requires a raw qualified chaff manifest hash".into())
     })?;
-    let chaff = spec.chaff_manifest.as_ref().expect("defended run gate");
+    let chaff = spec
+        .chaff_manifest
+        .as_ref()
+        .and_then(RuntimeChaffManifest::schema_two)
+        .ok_or_else(|| {
+            Error::Argument(
+                "Walkie-Talkie requires a schema-two prefix-qualified chaff manifest".into(),
+            )
+        })?;
     if !walkie_talkie_qualification_binding_matches(
         &binding,
         &config.workload_id,
@@ -3296,15 +3453,17 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
             "qualified chaff requires an exact application workload source binding".into(),
         ));
     };
-    if chaff.application_workload_sha256 != *source_hash {
+    if chaff.application_workload_sha256() != source_hash {
         return Err(Error::Argument(
             "qualified chaff application_workload_sha256 does not match the exact frozen application workload source"
                 .into(),
         ));
     }
-    let qualified = &chaff.resources[0];
+    let qualified = chaff.selected_resource();
+    let selected_chaff_resource_id = chaff.selected_chaff_resource_id();
+    let application_resource_id = chaff.application_resource_id();
     let prepared_selected = expected_responses
-        .get(&chaff.selected_chaff_resource_id)
+        .get(&selected_chaff_resource_id)
         .ok_or_else(|| {
             Error::Argument(
                 "qualified chaff selected resource lacks a frozen prepared response identity"
@@ -3315,7 +3474,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         .workload
         .resources
         .iter()
-        .find(|resource| resource.id == chaff.application_resource_id)
+        .find(|resource| resource.id == application_resource_id)
         .ok_or_else(|| {
             Error::Argument(
                 "qualified chaff application_resource_id is absent from the workload".into(),
@@ -3324,7 +3483,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let source_application_root = source
         .resources
         .iter()
-        .find(|resource| resource.id == chaff.application_resource_id)
+        .find(|resource| resource.id == application_resource_id)
         .ok_or_else(|| {
             Error::Argument(
                 "qualified chaff application_resource_id is absent from the frozen source".into(),
@@ -3350,11 +3509,11 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
                 .into(),
         ));
     }
-    validate_qualification_application_root(application_root, chaff.application_resource_id)?;
+    validate_qualification_application_root(application_root, application_resource_id)?;
     let (deterministic_selected, deterministic_response) =
         deterministic_selected_chaff_resource(source, expected_responses, source_application_root)?;
-    if deterministic_selected.id != chaff.selected_chaff_resource_id
-        || deterministic_response.resource_id != chaff.selected_chaff_resource_id
+    if deterministic_selected.id != selected_chaff_resource_id
+        || deterministic_response.resource_id != selected_chaff_resource_id
     {
         return Err(Error::Argument(
             "qualified chaff manifest does not select the deterministic frozen same-origin resource"
@@ -3365,7 +3524,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         .workload
         .resources
         .iter()
-        .find(|resource| resource.id == chaff.selected_chaff_resource_id)
+        .find(|resource| resource.id == selected_chaff_resource_id)
         .ok_or_else(|| {
             Error::Argument(
                 "qualified chaff selected_chaff_resource_id is absent from the workload".into(),
@@ -3374,7 +3533,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let source_selected = source
         .resources
         .iter()
-        .find(|resource| resource.id == chaff.selected_chaff_resource_id)
+        .find(|resource| resource.id == selected_chaff_resource_id)
         .ok_or_else(|| {
             Error::Argument(
                 "qualified chaff selected_chaff_resource_id is absent from the frozen source"
@@ -3414,8 +3573,13 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
                 .into(),
         ));
     }
-    let expected = qualified.chaff_qualification.expected_response.body_bytes;
-    let identity = &qualified.chaff_qualification.expected_response;
+    let qualification = chaff
+        .qualification(selected_chaff_resource_id)
+        .ok_or_else(|| {
+            Error::Argument("qualified chaff selected resource lacks qualification data".into())
+        })?;
+    let identity = qualification.expected_response();
+    let expected = identity.body_bytes;
     if identity.status != prepared_selected.status
         || (identity.body_bytes != prepared_selected.bytes)
         || identity.body_sha256 != prepared_selected.body_sha256
@@ -3529,7 +3693,7 @@ async fn execute_run_inner(
         spec.seed,
         spec.chaff_manifest
             .as_ref()
-            .map(ChaffManifest::resource_manifest),
+            .map(RuntimeChaffManifest::resource_manifest),
     )?;
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let mut defense_start = None;
@@ -4879,7 +5043,7 @@ fn register_action_batch(
 fn apply_action_batch(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
-    chaff_manifest: Option<&ChaffManifest>,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
@@ -4906,7 +5070,7 @@ fn apply_action_batch(
 fn apply_queued_actions(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
-    chaff_manifest: Option<&ChaffManifest>,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
@@ -4938,7 +5102,7 @@ fn apply_queued_actions(
 fn apply_action(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
-    chaff_manifest: Option<&ChaffManifest>,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
     traces: &mut TraceFiles,
     now: Instant,
     defense_elapsed: Duration,
@@ -5046,10 +5210,18 @@ fn apply_action(
                     .and_then(|manifest| manifest.qualification(resource_id))
                     .ok_or_else(|| {
                         Error::RunAborted(
-                            "chaff request lacks a current schema-two qualification binding".into(),
+                            "chaff request lacks a current qualification binding".into(),
                         )
                     })?;
-                if request_stream_bytes != qualification.request_stream_bytes {
+                let expected_request_stream_bytes = qualification.request_stream_bytes();
+                let expected_response = qualification.expected_response();
+                let expected_chaff_response = ExpectedChaffIdentity {
+                    status: expected_response.status,
+                    content_encoding: expected_response.content_encoding.clone(),
+                    body_bytes: expected_response.body_bytes,
+                    body_sha256: expected_response.body_sha256.clone(),
+                };
+                if request_stream_bytes != expected_request_stream_bytes {
                     endpoint.streams.insert(
                         stream_id,
                         StreamRecord {
@@ -5061,7 +5233,7 @@ fn apply_action(
                             },
                             request_headers,
                             request_stream_bytes,
-                            expected_request_stream_bytes: Some(qualification.request_stream_bytes),
+                            expected_request_stream_bytes: Some(expected_request_stream_bytes),
                             response_headers: Vec::new(),
                             status: None,
                             content_length: None,
@@ -5069,20 +5241,11 @@ fn apply_action(
                             bytes: 0,
                             complete: false,
                             outcome: "request_size_mismatch",
-                            expected_chaff_response: Some(ExpectedChaffIdentity {
-                                status: qualification.expected_response.status,
-                                content_encoding: qualification
-                                    .expected_response
-                                    .content_encoding
-                                    .clone(),
-                                body_bytes: qualification.expected_response.body_bytes,
-                                body_sha256: qualification.expected_response.body_sha256.clone(),
-                            }),
+                            expected_chaff_response: Some(expected_chaff_response),
                         },
                     );
                     return Err(Error::RunAborted(format!(
-                        "chaff request stream encoded {request_stream_bytes} bytes, expected qualified size {}",
-                        qualification.request_stream_bytes
+                        "chaff request stream encoded {request_stream_bytes} bytes, expected qualified size {expected_request_stream_bytes}"
                     )));
                 }
                 endpoint.streams.insert(
@@ -5096,7 +5259,7 @@ fn apply_action(
                         },
                         request_headers,
                         request_stream_bytes,
-                        expected_request_stream_bytes: Some(qualification.request_stream_bytes),
+                        expected_request_stream_bytes: Some(expected_request_stream_bytes),
                         response_headers: Vec::new(),
                         status: None,
                         content_length: None,
@@ -5104,17 +5267,7 @@ fn apply_action(
                         bytes: 0,
                         complete: false,
                         outcome: "in_flight",
-                        expected_chaff_response: chaff_manifest
-                            .and_then(|manifest| manifest.qualification(resource_id))
-                            .map(|qualification| ExpectedChaffIdentity {
-                                status: qualification.expected_response.status,
-                                content_encoding: qualification
-                                    .expected_response
-                                    .content_encoding
-                                    .clone(),
-                                body_bytes: qualification.expected_response.body_bytes,
-                                body_sha256: qualification.expected_response.body_sha256.clone(),
-                            }),
+                        expected_chaff_response: Some(expected_chaff_response),
                     },
                 );
                 // Apply manual receive control before the newly created chaff
@@ -5501,20 +5654,22 @@ mod tests {
         QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass,
         QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId,
         QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource,
-        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig,
-        WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig,
-        sanitize_chaff_headers,
+        ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffQualification,
+        ResponseOnlyQualifiedChaffResource, SignalKind, StaticSchedule, TamarawConfig, Trace,
+        TrafficMorphingConfig, WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad,
+        WtfPadConfig, sanitize_chaff_headers,
     };
 
     use super::{
         ApplicationBatchLifecycle, Args, DefenseArg, Error, ExpectedChaffIdentity, PrefixBurst,
         PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt, Preset, ProfileArg,
         QcsdRequestRole, QualificationAcknowledgement, QualifierStream, RequestPolicyArg,
-        ResourceRunState, RunCompletion, RunSpec, Socket, StaticModeArg, StreamActivationStage,
-        StreamRecord, StreamType, TrafficMorphingActivation, action_failure_reason,
-        activate_traffic_morphing, apply_action_batch, bind_qualified_chaff_stream_limits,
-        bounded_qualification_wait, create_endpoints, datagram_observation, deadline_error,
-        defense_parameter_provenance, drain_qualifier_stream_data, ensure_defense_realizable,
+        ResourceRunState, RunCompletion, RunSpec, RuntimeChaffManifest, Socket, StaticModeArg,
+        StreamActivationStage, StreamRecord, StreamType, TrafficMorphingActivation,
+        action_failure_reason, activate_traffic_morphing, apply_action_batch,
+        bind_qualified_chaff_stream_limits, bounded_qualification_wait, create_endpoints,
+        datagram_observation, deadline_error, defense_parameter_provenance,
+        drain_qualifier_stream_data, ensure_defense_realizable,
         expected_application_response_length, finish_application_record, finish_chaff_record,
         forward_qcsd_observation, has_in_flight_application_stream, now, prefix_receipts_pass,
         prefix_targetless_stream_bytes, qcsd_connection_parameters, qualification_content_encoding,
@@ -5522,9 +5677,9 @@ mod tests {
         resolve_run_config_with_workload, sanitize_chaff_action_headers, sha256,
         shapes_stream_sends, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
-        traffic_morphing_endpoint_seed, validate_prefix_capacity_plan,
-        validate_walkie_talkie_chaff_precondition, wait_for_activity,
-        walkie_talkie_qualification_binding_matches, write_run_json,
+        traffic_morphing_endpoint_seed, validate_chaff_manifest_defense,
+        validate_prefix_capacity_plan, validate_walkie_talkie_chaff_precondition,
+        wait_for_activity, walkie_talkie_qualification_binding_matches, write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -5634,6 +5789,47 @@ mod tests {
         }
     }
 
+    fn response_only_chaff_manifest() -> ResponseOnlyChaffManifest {
+        ResponseOnlyChaffManifest {
+            schema_version: 3,
+            artifact_type: "qcsd-qualified-chaff-manifest".into(),
+            qualification_scope: "response-only".into(),
+            application_workload_sha256: "e".repeat(64),
+            application_resource_id: 0,
+            selected_chaff_resource_id: 6,
+            qualified_parallel_chaff_streams: 5,
+            resources: vec![ResponseOnlyQualifiedChaffResource {
+                id: 6,
+                url: "https://example.com/font.woff2".into(),
+                kind: "Font".into(),
+                content_length: Some(1_200),
+                data_length: 1_200,
+                chaff_priority: false,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: vec![
+                    ("accept".into(), "text/html".into()),
+                    ("accept-encoding".into(), "gzip, br".into()),
+                    ("accept-language".into(), "en-AU".into()),
+                ],
+                chaff_qualification: ResponseOnlyChaffQualification {
+                    schema_version: 3,
+                    qualification_scope: "response-only".into(),
+                    method: "GET".into(),
+                    request_stream_bytes: 42,
+                    qualified_parallel_chaff_streams: 5,
+                    expected_response: ExpectedChaffResponse {
+                        status: 200,
+                        content_encoding: "br".into(),
+                        body_bytes: 1_200,
+                        body_sha256: "a".repeat(64),
+                    },
+                    response_qualification_sha256: "b".repeat(64),
+                },
+            }],
+        }
+    }
+
     fn request(resource_id: u32, origin: &str, depends_on: Vec<u32>) -> Resource {
         Resource {
             id: resource_id,
@@ -5707,6 +5903,99 @@ mod tests {
     }
 
     #[test]
+    fn runtime_chaff_manifest_dispatches_strict_schema_two_and_three_inputs() {
+        let response_only = response_only_chaff_manifest();
+        let response_only_json = serde_json::to_string(&response_only).expect("serialize schema 3");
+        let runtime =
+            RuntimeChaffManifest::from_json(&response_only_json).expect("load schema three");
+        assert!(runtime.is_response_only());
+        assert_eq!(runtime.application_resource_id(), 0);
+        assert_eq!(runtime.selected_chaff_resource_id(), 6);
+        assert_eq!(runtime.qualified_parallel_chaff_streams(), 5);
+        let qualification = runtime.qualification(6).expect("qualification");
+        assert_eq!(qualification.request_stream_bytes(), 42);
+        assert_eq!(qualification.expected_response().body_bytes, 1_200);
+
+        let resource = Resource {
+            id: 6,
+            url: "https://example.com/font.woff2".into(),
+            kind: "Font".into(),
+            content_length: Some(1_200),
+            data_length: 1_200,
+            chaff_priority: false,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: vec![
+                ("accept".into(), "text/html".into()),
+                ("accept-encoding".into(), "gzip, br".into()),
+                ("accept-language".into(), "en-AU".into()),
+            ],
+        };
+        let mut schema_two = qualified_chaff_manifest(vec![resource]);
+        schema_two.resources[0]
+            .chaff_qualification
+            .expected_response
+            .body_bytes = 1_200;
+        let schema_two_json = serde_json::to_string(&schema_two).expect("serialize schema 2");
+        let runtime =
+            RuntimeChaffManifest::from_json(&schema_two_json).expect("load schema two unchanged");
+        assert!(runtime.schema_two().is_some());
+
+        let mut forbidden = serde_json::to_value(response_only).expect("schema three value");
+        forbidden["walkie_talkie_required_chaff_streams"] = serde_json::json!(5);
+        assert!(RuntimeChaffManifest::from_json(&forbidden.to_string()).is_err());
+    }
+
+    #[test]
+    fn response_only_runtime_contract_is_exclusive_to_front_and_tamaraw() {
+        let manifest: RuntimeChaffManifest = response_only_chaff_manifest().into();
+        for defense in [
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+        ] {
+            validate_chaff_manifest_defense(&defense, &manifest)
+                .expect("response-only defense is supported");
+        }
+        let mut front = QcsdConfig {
+            defense: DefenseConfig::Front(FrontConfig::default()),
+            ..QcsdConfig::default()
+        };
+        bind_qualified_chaff_stream_limits(&mut front, &manifest)
+            .expect("FRONT consumes the five-stream response qualification");
+        front.max_chaff_streams = 6;
+        assert!(bind_qualified_chaff_stream_limits(&mut front, &manifest).is_err());
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Static {
+                schedule: "schedule.csv".into(),
+                padding_only: true,
+            },
+            DefenseConfig::TrafficMorphing(TrafficMorphingConfig::default()),
+            DefenseConfig::WtfPad(WtfPadConfig::default()),
+            DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
+        ] {
+            assert!(validate_chaff_manifest_defense(&defense, &manifest).is_err());
+        }
+
+        let schema_two: RuntimeChaffManifest = qualified_chaff_manifest(Vec::new()).into();
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Static {
+                schedule: "schedule.csv".into(),
+                padding_only: true,
+            },
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::TrafficMorphing(TrafficMorphingConfig::default()),
+            DefenseConfig::WtfPad(WtfPadConfig::default()),
+            DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
+        ] {
+            validate_chaff_manifest_defense(&defense, &schema_two)
+                .expect("schema-two compatibility remains unchanged");
+        }
+    }
+
+    #[test]
     fn qualified_manifest_rewrites_walkie_talkie_limit_before_provenance_use() {
         let resource = Resource {
             id: 6,
@@ -5734,7 +6023,7 @@ mod tests {
             ..QcsdConfig::default()
         };
 
-        bind_qualified_chaff_stream_limits(&mut config, &manifest)
+        bind_qualified_chaff_stream_limits(&mut config, &manifest.clone().into())
             .expect("hash-bound exact stream count");
         assert_eq!(config.max_chaff_streams, 20);
 
@@ -5747,7 +6036,7 @@ mod tests {
             .chaff_qualification
             .walkie_talkie_required_chaff_streams = 3;
         config.max_chaff_streams = 20;
-        bind_qualified_chaff_stream_limits(&mut config, &manifest)
+        bind_qualified_chaff_stream_limits(&mut config, &manifest.into())
             .expect("WT replaces a common ceiling before checking qualified concurrency");
         assert_eq!(config.max_chaff_streams, 3);
     }
@@ -5831,7 +6120,7 @@ mod tests {
                 ..QcsdConfig::default()
             },
             defense_parameters: None,
-            chaff_manifest: Some(qualified_chaff_manifest(resources)),
+            chaff_manifest: Some(qualified_chaff_manifest(resources).into()),
             chaff_manifest_hash: Some("f".repeat(64)),
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,

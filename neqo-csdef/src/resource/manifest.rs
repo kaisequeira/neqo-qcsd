@@ -139,6 +139,79 @@ pub struct ChaffManifest {
     pub resources: Vec<QualifiedChaffResource>,
 }
 
+/// Evidence bindings for a response-only compact HTTP/3 chaff request.
+///
+/// Unlike [`ChaffQualification`], this schema has no Walkie-Talkie prefix-pack
+/// fields. It proves only the compact request encoding, concurrent response
+/// stability, and immutable response identity needed by FRONT and Tamaraw.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOnlyChaffQualification {
+    /// Qualification schema version. Current response-only artifacts use three.
+    pub schema_version: u32,
+    /// Exact qualification discriminator. Current artifacts use `response-only`.
+    pub qualification_scope: String,
+    /// Qualified request method. Current response-only artifacts support only `GET`.
+    pub method: String,
+    /// Exact production nonblocking HTTP/3 request-stream bytes, including HEADERS framing.
+    pub request_stream_bytes: u64,
+    /// Concurrent request count covered by response qualification.
+    pub qualified_parallel_chaff_streams: usize,
+    /// Stable response identity established by the concurrent response qualification.
+    pub expected_response: ExpectedChaffResponse,
+    /// SHA-256 binding the repeated response-identity qualification receipt.
+    pub response_qualification_sha256: String,
+}
+
+/// One selected resource projected into the schema-three response-only contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOnlyQualifiedChaffResource {
+    /// Stable manifest-local identifier.
+    pub id: u32,
+    /// Absolute HTTPS URL.
+    pub url: String,
+    /// Browser-style resource type retained from the application workload.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Qualified complete response-body length.
+    pub content_length: Option<u64>,
+    /// Qualified complete response-body length.
+    pub data_length: u64,
+    /// Selection priority retained from the application workload.
+    pub chaff_priority: bool,
+    /// Whether the compact request was qualified successfully.
+    pub known_valid: bool,
+    /// Qualified selected-resource projections are dependency-free.
+    pub depends_on: Vec<u32>,
+    /// Exact compact request headers qualified for this representation.
+    pub headers: Vec<(String, String)>,
+    /// Immutable response-only request/response and evidence bindings.
+    pub chaff_qualification: ResponseOnlyChaffQualification,
+}
+
+/// Strict schema-three response-only manifest for FRONT and Tamaraw chaff.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOnlyChaffManifest {
+    /// Qualified-chaff manifest schema version. Response-only artifacts use three.
+    pub schema_version: u32,
+    /// Exact artifact discriminator preventing application-manifest confusion.
+    pub artifact_type: String,
+    /// Exact qualification discriminator. Current artifacts use `response-only`.
+    pub qualification_scope: String,
+    /// Raw SHA-256 of the exact frozen application workload file.
+    pub application_workload_sha256: String,
+    /// Application navigation root bound to resource zero.
+    pub application_resource_id: u32,
+    /// Frozen application-source resource selected for compact chaff replay.
+    pub selected_chaff_resource_id: u32,
+    /// Exact concurrent response-qualified cohort. Current artifacts use five.
+    pub qualified_parallel_chaff_streams: usize,
+    /// Exactly one independently qualified, dependency-free chaff projection.
+    pub resources: Vec<ResponseOnlyQualifiedChaffResource>,
+}
+
 fn default_resource_type() -> String {
     "Unknown".into()
 }
@@ -551,6 +624,162 @@ impl ChaffManifest {
     }
 }
 
+impl ResponseOnlyQualifiedChaffResource {
+    fn as_resource(&self) -> Resource {
+        Resource {
+            id: self.id,
+            url: self.url.clone(),
+            kind: self.kind.clone(),
+            content_length: self.content_length,
+            data_length: self.data_length,
+            chaff_priority: self.chaff_priority,
+            known_valid: self.known_valid,
+            depends_on: self.depends_on.clone(),
+            headers: self.headers.clone(),
+        }
+    }
+
+    fn validate(&self, qualified_parallel_chaff_streams: usize) -> Result<()> {
+        let resource = self.as_resource();
+        ResourceManifest {
+            resources: vec![resource.clone()],
+        }
+        .validate()?;
+        let qualification = &self.chaff_qualification;
+        if qualification.schema_version != 3
+            || qualification.qualification_scope != "response-only"
+            || qualification.method != "GET"
+            || qualification.qualified_parallel_chaff_streams != qualified_parallel_chaff_streams
+            || qualification.request_stream_bytes == 0
+        {
+            return Err(Error::InvalidConfig(
+                "response-only chaff qualification schema, scope, method, request size, or parallel stream count is invalid"
+                    .into(),
+            ));
+        }
+        let response = &qualification.expected_response;
+        if !(200..300).contains(&response.status)
+            || response.body_bytes < 1_200
+            || normalize_content_encoding(Some(&response.content_encoding)).as_deref()
+                != Some(response.content_encoding.as_str())
+            || !is_lower_hex_sha256(&response.body_sha256)
+            || !is_lower_hex_sha256(&qualification.response_qualification_sha256)
+        {
+            return Err(Error::InvalidConfig(
+                "response-only chaff expected response or qualification receipt is invalid".into(),
+            ));
+        }
+        if !self.known_valid
+            || !self.depends_on.is_empty()
+            || self.content_length != Some(response.body_bytes)
+            || self.data_length != response.body_bytes
+            || resource.effective_length() != response.body_bytes
+        {
+            return Err(Error::InvalidConfig(
+                "response-only chaff resource must be known-valid, dependency-free, and bind both length fields exactly to expected_response.body_bytes"
+                    .into(),
+            ));
+        }
+        let normalized_names: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        if normalized_names != ["accept", "accept-encoding", "accept-language"]
+            || self
+                .headers
+                .iter()
+                .any(|(name, _)| name != &name.to_ascii_lowercase())
+        {
+            return Err(Error::InvalidConfig(
+                "response-only chaff headers must be the exact lowercase accept, accept-encoding, accept-language projection in that order"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ResponseOnlyChaffManifest {
+    /// Load and strictly validate a schema-three response-only chaff manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, parsed, or validated.
+    pub fn from_json_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let input = fs::read_to_string(path)?;
+        Self::from_json(&input)
+    }
+
+    /// Parse and strictly validate a schema-three response-only chaff manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema or any response qualification binding is invalid.
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self = serde_json::from_str(input)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate the schema-three response-only selected-resource contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong discriminator, resource count, or qualification.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 3
+            || self.artifact_type != "qcsd-qualified-chaff-manifest"
+            || self.qualification_scope != "response-only"
+        {
+            return Err(Error::InvalidConfig(
+                "response-only qualified chaff manifest requires schema_version 3, artifact_type qcsd-qualified-chaff-manifest, and qualification_scope response-only"
+                    .into(),
+            ));
+        }
+        if !is_lower_hex_sha256(&self.application_workload_sha256) {
+            return Err(Error::InvalidConfig(
+                "response-only chaff application_workload_sha256 must be a lowercase SHA-256"
+                    .into(),
+            ));
+        }
+        if self.application_resource_id != 0 || self.qualified_parallel_chaff_streams != 5 {
+            return Err(Error::InvalidConfig(
+                "response-only chaff manifest requires application resource zero and exactly five response-qualified parallel streams"
+                    .into(),
+            ));
+        }
+        if self.resources.len() != 1 || self.resources[0].id != self.selected_chaff_resource_id {
+            return Err(Error::InvalidConfig(
+                "response-only chaff manifest requires exactly one resource matching selected_chaff_resource_id"
+                    .into(),
+            ));
+        }
+        self.resources[0].validate(self.qualified_parallel_chaff_streams)
+    }
+
+    /// Generic resource view consumed by the transport-independent controller.
+    #[must_use]
+    pub fn resource_manifest(&self) -> ResourceManifest {
+        ResourceManifest {
+            resources: self
+                .resources
+                .iter()
+                .map(ResponseOnlyQualifiedChaffResource::as_resource)
+                .collect(),
+        }
+    }
+
+    /// Qualification associated with a manifest-local resource identifier.
+    #[must_use]
+    pub fn qualification(&self, resource_id: u32) -> Option<&ResponseOnlyChaffQualification> {
+        self.resources
+            .iter()
+            .find(|resource| resource.id == resource_id)
+            .map(|resource| &resource.chaff_qualification)
+    }
+}
+
 /// Resource/dependency input for application and chaff requests.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -816,7 +1045,8 @@ impl ResourceManifest {
 mod tests {
     use super::{
         ChaffManifest, ChaffQualification, ExpectedChaffResponse, QualifiedChaffResource,
-        ResourceManifest, sanitize_chaff_headers,
+        ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffQualification,
+        ResponseOnlyQualifiedChaffResource, sanitize_chaff_headers,
     };
 
     const LEGACY: &str = r#"{
@@ -866,6 +1096,47 @@ mod tests {
                     response_qualification_sha256: "c".repeat(64),
                     prefix_pack_qualification_sha256: "d".repeat(64),
                     prefix_spec_sha256: "e".repeat(64),
+                },
+            }],
+        }
+    }
+
+    fn response_only_manifest() -> ResponseOnlyChaffManifest {
+        ResponseOnlyChaffManifest {
+            schema_version: 3,
+            artifact_type: "qcsd-qualified-chaff-manifest".into(),
+            qualification_scope: "response-only".into(),
+            application_workload_sha256: "a".repeat(64),
+            application_resource_id: 0,
+            selected_chaff_resource_id: 6,
+            qualified_parallel_chaff_streams: 5,
+            resources: vec![ResponseOnlyQualifiedChaffResource {
+                id: 6,
+                url: "https://example.com/font.woff2".into(),
+                kind: "Font".into(),
+                content_length: Some(2_048),
+                data_length: 2_048,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: vec![
+                    ("accept".into(), "text/html".into()),
+                    ("accept-encoding".into(), "gzip, br".into()),
+                    ("accept-language".into(), "en-AU".into()),
+                ],
+                chaff_qualification: ResponseOnlyChaffQualification {
+                    schema_version: 3,
+                    qualification_scope: "response-only".into(),
+                    method: "GET".into(),
+                    request_stream_bytes: 42,
+                    qualified_parallel_chaff_streams: 5,
+                    expected_response: ExpectedChaffResponse {
+                        status: 200,
+                        content_encoding: "br".into(),
+                        body_bytes: 2_048,
+                        body_sha256: "b".repeat(64),
+                    },
+                    response_qualification_sha256: "c".repeat(64),
                 },
             }],
         }
@@ -930,6 +1201,75 @@ mod tests {
             .expect("object")
             .remove("selected_chaff_resource_id");
         assert!(ChaffManifest::from_json(&missing_selected.to_string()).is_err());
+    }
+
+    #[test]
+    fn response_only_chaff_is_a_strict_schema_three_contract() {
+        let manifest = response_only_manifest();
+        manifest.validate().expect("response-only manifest");
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        assert_eq!(
+            ResponseOnlyChaffManifest::from_json(&json).expect("round trip"),
+            manifest
+        );
+        assert!(ChaffManifest::from_json(&json).is_err());
+        assert!(ResourceManifest::from_json(&json).is_err());
+
+        let mut extra = serde_json::to_value(&manifest).expect("value");
+        extra["walkie_talkie_required_chaff_streams"] = serde_json::json!(5);
+        assert!(ResponseOnlyChaffManifest::from_json(&extra.to_string()).is_err());
+
+        let mut nested_extra = serde_json::to_value(&manifest).expect("value");
+        nested_extra["resources"][0]["chaff_qualification"]["prefix_pack_qualification_sha256"] =
+            serde_json::json!("d".repeat(64));
+        assert!(ResponseOnlyChaffManifest::from_json(&nested_extra.to_string()).is_err());
+
+        for required in ["type", "chaff_priority", "depends_on"] {
+            let mut missing = serde_json::to_value(&manifest).expect("value");
+            missing["resources"][0]
+                .as_object_mut()
+                .expect("resource object")
+                .remove(required);
+            assert!(
+                ResponseOnlyChaffManifest::from_json(&missing.to_string()).is_err(),
+                "missing schema-three resource field {required} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn response_only_chaff_rejects_scope_concurrency_and_identity_mutations() {
+        let mut manifest = response_only_manifest();
+        manifest.qualification_scope = "prefix-qualified".into();
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = response_only_manifest();
+        manifest.qualified_parallel_chaff_streams = 6;
+        manifest.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 6;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = response_only_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .qualification_scope = "response".into();
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = response_only_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .expected_response
+            .body_bytes = 1_199;
+        manifest.resources[0].content_length = Some(1_199);
+        manifest.resources[0].data_length = 1_199;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest = response_only_manifest();
+        manifest.resources[0]
+            .chaff_qualification
+            .response_qualification_sha256 = "C".repeat(64);
+        assert!(manifest.validate().is_err());
     }
 
     #[test]
