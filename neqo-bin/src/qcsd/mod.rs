@@ -31,9 +31,9 @@ use neqo_csdef::{
     QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
     QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, QcsdStreamTransmission,
     Resource, ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest,
-    ResponseOnlyChaffQualification, StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress,
-    WalkieTalkie, WalkieTalkieQualificationBinding, derive, normalize_content_encoding,
-    sanitize_chaff_headers,
+    ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
+    StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
+    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -54,6 +54,10 @@ use trace_files::{PacketTraceRow, ScheduleTraceRow, TraceFiles};
 
 const NEQO_BASE_COMMIT: &str = "8a04d065c2d35c8e8fd804f91c7081ab6bb60b89";
 const PUBLISHED_QCSD_COMMIT: &str = "39e293fb384dd341156eedd1e4b833d24904b1f6";
+const SUSTAINED_QUALIFICATION_REQUESTS: usize = 40;
+const SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS: usize = 5;
+const SUSTAINED_QUALIFICATION_WAVES: usize =
+    SUSTAINED_QUALIFICATION_REQUESTS / SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -138,12 +142,50 @@ enum RequestPolicyArg {
     HalfDuplex,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ChaffRequestHeaderModeArg {
+    #[value(name = "identity-chaff-v1")]
+    IdentityChaffV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseQualificationMode {
+    Legacy,
+    SustainedIdentity,
+}
+
 impl From<StaticModeArg> for StaticMode {
     fn from(value: StaticModeArg) -> Self {
         match value {
             StaticModeArg::ChaffOnly => Self::ChaffOnly,
             StaticModeArg::ChaffAndShape => Self::ChaffAndShape,
         }
+    }
+}
+
+fn response_qualification_mode(
+    parallel_requests: usize,
+    total_requests: Option<usize>,
+    request_header_mode: Option<ChaffRequestHeaderModeArg>,
+) -> Result<ResponseQualificationMode, Error> {
+    match (total_requests, request_header_mode) {
+        (None, None) if (5..=20).contains(&parallel_requests) => {
+            Ok(ResponseQualificationMode::Legacy)
+        }
+        (
+            Some(SUSTAINED_QUALIFICATION_REQUESTS),
+            Some(ChaffRequestHeaderModeArg::IdentityChaffV1),
+        ) if parallel_requests == SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS =>
+        {
+            Ok(ResponseQualificationMode::SustainedIdentity)
+        }
+        (None, None) => Err(Error::Argument(
+            "legacy response qualification requires 5..=20 parallel_requests".into(),
+        )),
+        _ => Err(Error::Argument(
+            "sustained response qualification requires the exact paired flags --total-requests 40 --parallel-requests 5 --request-header-mode identity-chaff-v1"
+                .into(),
+        )),
     }
 }
 
@@ -189,6 +231,12 @@ enum Command {
         output_dir: PathBuf,
         #[arg(long)]
         parallel_requests: usize,
+        /// Total requests on the one sustained connection; schema three requires exactly 40.
+        #[arg(long)]
+        total_requests: Option<usize>,
+        /// Isolated chaff request-header derivation; paired with --total-requests.
+        #[arg(long, value_enum)]
+        request_header_mode: Option<ChaffRequestHeaderModeArg>,
         #[arg(long, default_value_t = 1_048_576)]
         max_response_bytes: u64,
         #[arg(long, default_value_t = 1_200)]
@@ -301,6 +349,15 @@ impl Args {
         reason = "the binary deliberately uses Tokio's current-thread runtime"
     )]
     pub async fn execute(self) -> Result<(), Error> {
+        if let Command::QualifyChaffResponse {
+            parallel_requests,
+            total_requests,
+            request_header_mode,
+            ..
+        } = &self.command
+        {
+            response_qualification_mode(*parallel_requests, *total_requests, *request_header_mode)?;
+        }
         neqo_common::log::init(None);
         nss::init()?;
         match self.command {
@@ -432,6 +489,8 @@ impl Args {
                 selected_chaff_resource_id,
                 output_dir,
                 parallel_requests,
+                total_requests,
+                request_header_mode,
                 max_response_bytes,
                 packet_size,
                 timeout_seconds,
@@ -442,6 +501,8 @@ impl Args {
                     selected_chaff_resource_id,
                     &output_dir,
                     parallel_requests,
+                    total_requests,
+                    request_header_mode,
                     max_response_bytes,
                     packet_size,
                     timeout_seconds,
@@ -694,7 +755,8 @@ fn defense_parameter_provenance(
 
 enum RuntimeChaffManifest {
     SchemaTwo(ChaffManifest),
-    ResponseOnly(ResponseOnlyChaffManifest),
+    ResponseOnlyV3(ResponseOnlyChaffManifest),
+    ResponseOnlyV4(ResponseOnlyChaffManifestV4),
 }
 
 struct RuntimeChaffQualification<'a> {
@@ -720,67 +782,84 @@ impl From<ChaffManifest> for RuntimeChaffManifest {
 
 impl From<ResponseOnlyChaffManifest> for RuntimeChaffManifest {
     fn from(value: ResponseOnlyChaffManifest) -> Self {
-        Self::ResponseOnly(value)
+        Self::ResponseOnlyV3(value)
+    }
+}
+
+impl From<ResponseOnlyChaffManifestV4> for RuntimeChaffManifest {
+    fn from(value: ResponseOnlyChaffManifestV4) -> Self {
+        Self::ResponseOnlyV4(value)
     }
 }
 
 impl RuntimeChaffManifest {
     fn from_json(input: &str) -> neqo_csdef::Result<Self> {
         let value: serde_json::Value = serde_json::from_str(input)?;
-        if value
+        match value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            == Some(3)
         {
-            ResponseOnlyChaffManifest::from_json(input).map(Self::ResponseOnly)
-        } else {
-            ChaffManifest::from_json(input).map(Self::SchemaTwo)
+            Some(2) => ChaffManifest::from_json(input).map(Self::SchemaTwo),
+            Some(3) => ResponseOnlyChaffManifest::from_json(input).map(Self::ResponseOnlyV3),
+            Some(4) => ResponseOnlyChaffManifestV4::from_json(input).map(Self::ResponseOnlyV4),
+            _ => Err(neqo_csdef::Error::InvalidConfig(
+                "qualified chaff manifest schema_version must be exactly 2, 3, or 4".into(),
+            )),
         }
     }
 
     const fn schema_two(&self) -> Option<&ChaffManifest> {
         match self {
             Self::SchemaTwo(manifest) => Some(manifest),
-            Self::ResponseOnly(_) => None,
+            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) => None,
         }
     }
 
     const fn is_response_only(&self) -> bool {
-        matches!(self, Self::ResponseOnly(_))
+        matches!(self, Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_))
+    }
+
+    const fn is_identity_chaff_v4(&self) -> bool {
+        matches!(self, Self::ResponseOnlyV4(_))
     }
 
     fn application_workload_sha256(&self) -> &str {
         match self {
             Self::SchemaTwo(manifest) => &manifest.application_workload_sha256,
-            Self::ResponseOnly(manifest) => &manifest.application_workload_sha256,
+            Self::ResponseOnlyV3(manifest) => &manifest.application_workload_sha256,
+            Self::ResponseOnlyV4(manifest) => &manifest.application_workload_sha256,
         }
     }
 
     const fn application_resource_id(&self) -> u32 {
         match self {
             Self::SchemaTwo(manifest) => manifest.application_resource_id,
-            Self::ResponseOnly(manifest) => manifest.application_resource_id,
+            Self::ResponseOnlyV3(manifest) => manifest.application_resource_id,
+            Self::ResponseOnlyV4(manifest) => manifest.application_resource_id,
         }
     }
 
     const fn selected_chaff_resource_id(&self) -> u32 {
         match self {
             Self::SchemaTwo(manifest) => manifest.selected_chaff_resource_id,
-            Self::ResponseOnly(manifest) => manifest.selected_chaff_resource_id,
+            Self::ResponseOnlyV3(manifest) => manifest.selected_chaff_resource_id,
+            Self::ResponseOnlyV4(manifest) => manifest.selected_chaff_resource_id,
         }
     }
 
     const fn qualified_parallel_chaff_streams(&self) -> usize {
         match self {
             Self::SchemaTwo(manifest) => manifest.qualified_parallel_chaff_streams,
-            Self::ResponseOnly(manifest) => manifest.qualified_parallel_chaff_streams,
+            Self::ResponseOnlyV3(manifest) => manifest.qualified_parallel_chaff_streams,
+            Self::ResponseOnlyV4(manifest) => manifest.qualified_parallel_chaff_streams,
         }
     }
 
     fn resource_manifest(&self) -> ResourceManifest {
         match self {
             Self::SchemaTwo(manifest) => manifest.resource_manifest(),
-            Self::ResponseOnly(manifest) => manifest.resource_manifest(),
+            Self::ResponseOnlyV3(manifest) => manifest.resource_manifest(),
+            Self::ResponseOnlyV4(manifest) => manifest.resource_manifest(),
         }
     }
 
@@ -804,8 +883,14 @@ impl RuntimeChaffManifest {
                         },
                     )
             }
-            Self::ResponseOnly(manifest) => manifest.qualification(resource_id).map(
+            Self::ResponseOnlyV3(manifest) => manifest.qualification(resource_id).map(
                 |qualification: &ResponseOnlyChaffQualification| RuntimeChaffQualification {
+                    request_stream_bytes: qualification.request_stream_bytes,
+                    expected_response: &qualification.expected_response,
+                },
+            ),
+            Self::ResponseOnlyV4(manifest) => manifest.qualification(resource_id).map(
+                |qualification: &ResponseOnlyChaffQualificationV4| RuntimeChaffQualification {
                     request_stream_bytes: qualification.request_stream_bytes,
                     expected_response: &qualification.expected_response,
                 },
@@ -822,7 +907,7 @@ fn validate_chaff_manifest_defense(
         && !matches!(defense, DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_))
     {
         return Err(Error::Argument(
-            "schema-three response-only chaff manifests are accepted only for FRONT and Tamaraw"
+            "response-only schema-three/four chaff manifests are accepted only for FRONT and Tamaraw"
                 .into(),
         ));
     }
@@ -931,6 +1016,20 @@ struct ResponseQualificationRequest {
     outcome: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct SustainedResponseQualificationRequest {
+    request_index: usize,
+    wave_index: usize,
+    stream_id: u64,
+    request_stream_bytes: u64,
+    status: Option<u16>,
+    content_encoding: Option<String>,
+    body_bytes: u64,
+    body_sha256: Option<String>,
+    complete: bool,
+    outcome: &'static str,
+}
+
 fn qualification_content_encoding(headers: &[Header]) -> Option<String> {
     let fields: Vec<_> = headers
         .iter()
@@ -942,6 +1041,33 @@ fn qualification_content_encoding(headers: &[Header]) -> Option<String> {
         [Ok(value)] => normalize_content_encoding(Some(value)),
         [Err(_)] | [_, _, ..] => None,
     }
+}
+
+fn sustained_qualification_content_encoding(headers: &[Header]) -> Result<String, Error> {
+    let mut fields = Vec::new();
+    for header in headers
+        .iter()
+        .filter(|header| header.name().eq_ignore_ascii_case("content-encoding"))
+    {
+        let value = header.value_utf8().map_err(|_| {
+            Error::RunAborted(
+                "sustained response qualification received a non-UTF-8 content-encoding field"
+                    .into(),
+            )
+        })?;
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err(Error::RunAborted(
+                "sustained response qualification received an empty content-encoding field".into(),
+            ));
+        }
+        fields.push(normalized);
+    }
+    Ok(if fields.is_empty() {
+        "identity".into()
+    } else {
+        fields.join(", ")
+    })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1354,6 +1480,48 @@ fn projected_ael(resource: &Resource) -> Result<Vec<(String, String)>, Error> {
     Ok(projected)
 }
 
+fn projected_identity_chaff_headers(resource: &Resource) -> Result<Vec<(String, String)>, Error> {
+    if !resource.known_valid {
+        return Err(Error::Argument(
+            "identity chaff response qualification requires a known-valid resource".into(),
+        ));
+    }
+    let mut accept = None;
+    let mut accept_encoding = None;
+    let mut accept_language = None;
+    for (name, value) in &resource.headers {
+        let normalized = name.to_ascii_lowercase();
+        let slot = match normalized.as_str() {
+            "accept" => Some(&mut accept),
+            "accept-encoding" => Some(&mut accept_encoding),
+            "accept-language" => Some(&mut accept_language),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            if name != &normalized || slot.is_some() {
+                return Err(Error::Argument(
+                    "identity chaff application headers must contain each exact lowercase accept, accept-encoding, and accept-language field once"
+                        .into(),
+                ));
+            }
+            *slot = Some(value.clone());
+        }
+    }
+    let (Some(accept), Some(_application_accept_encoding), Some(accept_language)) =
+        (accept, accept_encoding, accept_language)
+    else {
+        return Err(Error::Argument(
+            "identity chaff application headers must contain each exact lowercase accept, accept-encoding, and accept-language field once"
+                .into(),
+        ));
+    };
+    Ok(vec![
+        ("accept".into(), accept),
+        ("accept-encoding".into(), "identity".into()),
+        ("accept-language".into(), accept_language),
+    ])
+}
+
 fn validate_qualification_application_root(
     resource: &Resource,
     application_resource_id: u32,
@@ -1408,6 +1576,38 @@ fn deterministic_selected_chaff_resource<'a>(
                 .into(),
         )
     })
+}
+
+fn selected_identity_chaff_resource<'a>(
+    workload: &'a ResourceManifest,
+    expected: &'a BTreeMap<u32, PreparedExpectedResponse>,
+    application: &Resource,
+    selected_chaff_resource_id: u32,
+) -> Result<(&'a Resource, &'a PreparedExpectedResponse), Error> {
+    let resource = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == selected_chaff_resource_id)
+        .ok_or_else(|| {
+            Error::Argument("selected_chaff_resource_id is absent from workload".into())
+        })?;
+    let response = expected.get(&selected_chaff_resource_id).ok_or_else(|| {
+        Error::Argument(
+            "selected identity-chaff resource lacks a frozen prepared response identity".into(),
+        )
+    })?;
+    if !resource.known_valid
+        || resource.origin().is_none()
+        || resource.origin() != application.origin()
+        || response.bytes < 1_200
+    {
+        return Err(Error::Argument(
+            "selected identity-chaff resource must be known-valid, same-origin, and have a prepared body of at least 1200 bytes"
+                .into(),
+        ));
+    }
+    projected_identity_chaff_headers(resource)?;
+    Ok((resource, response))
 }
 
 #[derive(Debug)]
@@ -1473,6 +1673,93 @@ fn drain_qualifier_stream_data(
     Ok(())
 }
 
+fn open_qualifier_wave(
+    client: &mut Http3Client,
+    now: Instant,
+    url: &Uri,
+    headers: &[Header],
+    streams: &mut HashMap<StreamId, QualifierStream>,
+    next_request_index: &mut usize,
+    wave_size: usize,
+) -> Result<(), Error> {
+    for _ in 0..wave_size {
+        let request_index = *next_request_index;
+        let stream_id = client.qcsd_fetch_nonblocking(now, url, headers)?;
+        let request_stream_bytes = client.qcsd_request_stream_bytes(stream_id)?;
+        if request_stream_bytes == 0 {
+            return Err(Error::RunAborted(
+                "production nonblocking encoder produced an empty request".into(),
+            ));
+        }
+        client.stream_close_send(stream_id, now)?;
+        streams.insert(
+            stream_id,
+            QualifierStream {
+                request_index,
+                stream_id,
+                request_stream_bytes,
+                status: None,
+                content_encoding: None,
+                body: Vec::new(),
+                body_bytes: 0,
+                complete: false,
+                outcome: "in_flight",
+            },
+        );
+        *next_request_index = next_request_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn sustained_requests_are_classifiable(requests: &[ResponseQualificationRequest]) -> bool {
+    requests.len() == SUSTAINED_QUALIFICATION_REQUESTS
+        && requests.iter().enumerate().all(|(index, request)| {
+            request.request_index == index
+                && request.complete
+                && request.outcome == "complete"
+                && request
+                    .status
+                    .is_some_and(|status| (100..=599).contains(&status))
+                && request.content_encoding.is_some()
+                && request.body_sha256.is_some()
+        })
+        && requests
+            .iter()
+            .map(|request| request.stream_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == SUSTAINED_QUALIFICATION_REQUESTS
+}
+
+fn sustained_representation_failure(
+    requests: &[ResponseQualificationRequest],
+) -> Option<&'static str> {
+    if requests.iter().any(|request| request.body_bytes < 1_200) {
+        return Some("capacity");
+    }
+    let identities: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            (
+                request.status,
+                request.content_encoding.as_deref(),
+                request.body_bytes,
+                request.body_sha256.as_deref(),
+            )
+        })
+        .collect();
+    (identities
+        .windows(2)
+        .any(|pair| pair.first() != pair.last())
+        || requests.iter().any(|request| {
+            !request
+                .status
+                .is_some_and(|status| (200..300).contains(&status))
+                || request.content_encoding.as_deref() != Some("identity")
+        }))
+    .then_some("identity")
+}
+
 #[expect(
     clippy::future_not_send,
     clippy::too_many_arguments,
@@ -1485,13 +1772,16 @@ async fn qualify_chaff_response(
     selected_chaff_resource_id: u32,
     output_dir: &Path,
     parallel_requests: usize,
+    total_requests: Option<usize>,
+    request_header_mode: Option<ChaffRequestHeaderModeArg>,
     max_response_bytes: u64,
     packet_size: u16,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    if !(5..=20).contains(&parallel_requests) || packet_size != 1_200 || max_response_bytes == 0 {
+    let mode = response_qualification_mode(parallel_requests, total_requests, request_header_mode)?;
+    if packet_size != 1_200 || max_response_bytes == 0 {
         return Err(Error::Argument(
-            "response qualification requires 5..=20 parallel_requests, packet_size=1200, and positive max_response_bytes"
+            "response qualification requires packet_size=1200 and positive max_response_bytes"
                 .into(),
         ));
     }
@@ -1505,27 +1795,29 @@ async fn qualify_chaff_response(
             Error::Argument("application_resource_id 0 is absent from workload".into())
         })?;
     validate_qualification_application_root(application, application_resource_id)?;
-    let (deterministic, prepared_selected) =
-        deterministic_selected_chaff_resource(&workload, &expected_responses, application)?;
-    if deterministic.id != selected_chaff_resource_id {
-        return Err(Error::Argument(format!(
-            "selected_chaff_resource_id {selected_chaff_resource_id} is not deterministic source {}",
-            deterministic.id
-        )));
-    }
-    let resource = workload
-        .resources
-        .iter()
-        .find(|resource| resource.id == selected_chaff_resource_id)
-        .ok_or_else(|| {
-            Error::Argument("selected_chaff_resource_id is absent from workload".into())
-        })?;
-    if resource.origin().is_none() || resource.origin() != application.origin() {
-        return Err(Error::Argument(
-            "selected chaff resource must share the navigation root's exact HTTPS origin".into(),
-        ));
-    }
-    let request_headers = projected_ael(resource)?;
+    let (resource, prepared_selected) = match mode {
+        ResponseQualificationMode::Legacy => {
+            let (deterministic, prepared) =
+                deterministic_selected_chaff_resource(&workload, &expected_responses, application)?;
+            if deterministic.id != selected_chaff_resource_id {
+                return Err(Error::Argument(format!(
+                    "selected_chaff_resource_id {selected_chaff_resource_id} is not deterministic source {}",
+                    deterministic.id
+                )));
+            }
+            (deterministic, prepared)
+        }
+        ResponseQualificationMode::SustainedIdentity => selected_identity_chaff_resource(
+            &workload,
+            &expected_responses,
+            application,
+            selected_chaff_resource_id,
+        )?,
+    };
+    let request_headers = match mode {
+        ResponseQualificationMode::Legacy => projected_ael(resource)?,
+        ResponseQualificationMode::SustainedIdentity => projected_identity_chaff_headers(resource)?,
+    };
     let url: Uri = resource
         .url
         .parse()
@@ -1600,7 +1892,14 @@ async fn qualify_chaff_response(
     let mut packet_observations = Vec::<QualificationPacketObservation>::new();
     let mut next_packet_sequence = 0_u64;
     let deadline = started + Duration::from_secs(timeout_seconds);
+    let request_target = match mode {
+        ResponseQualificationMode::Legacy => parallel_requests,
+        ResponseQualificationMode::SustainedIdentity => SUSTAINED_QUALIFICATION_REQUESTS,
+    };
     let mut opened = false;
+    let mut next_request_index = 0_usize;
+    let mut request_waves = 0_usize;
+    let mut max_concurrent_requests = 0_usize;
     let mut requests_opened_before_first_network_output = 0_usize;
     let mut qualification_network_output_seen = false;
     let loop_result: Result<(), Error> = async {
@@ -1629,33 +1928,17 @@ async fn qualify_chaff_response(
                     }
                     Http3ClientEvent::StateChange(Http3State::Connected) if !opened => {
                         opened = true;
-                        for request_index in 0..parallel_requests {
-                            let stream_id =
-                                client.qcsd_fetch_nonblocking(loop_now, &url, &headers)?;
-                            let request_stream_bytes =
-                                client.qcsd_request_stream_bytes(stream_id)?;
-                            if request_stream_bytes == 0 {
-                                return Err(Error::RunAborted(
-                                    "production nonblocking encoder produced an empty request"
-                                        .into(),
-                                ));
-                            }
-                            client.stream_close_send(stream_id, loop_now)?;
-                            streams.insert(
-                                stream_id,
-                                QualifierStream {
-                                    request_index,
-                                    stream_id,
-                                    request_stream_bytes,
-                                    status: None,
-                                    content_encoding: None,
-                                    body: Vec::new(),
-                                    body_bytes: 0,
-                                    complete: false,
-                                    outcome: "in_flight",
-                                },
-                            );
-                        }
+                        open_qualifier_wave(
+                            &mut client,
+                            loop_now,
+                            &url,
+                            &headers,
+                            &mut streams,
+                            &mut next_request_index,
+                            parallel_requests,
+                        )?;
+                        request_waves = request_waves.saturating_add(1);
+                        max_concurrent_requests = max_concurrent_requests.max(streams.len());
                         requests_opened_before_first_network_output = streams.len();
                     }
                     Http3ClientEvent::HeaderReady {
@@ -1667,7 +1950,14 @@ async fn qualify_chaff_response(
                         if let Some(record) = streams.get_mut(&stream_id) {
                             record.status = header_u64(&headers, ":status")
                                 .and_then(|value| value.try_into().ok());
-                            record.content_encoding = qualification_content_encoding(&headers);
+                            record.content_encoding = match mode {
+                                ResponseQualificationMode::Legacy => {
+                                    qualification_content_encoding(&headers)
+                                }
+                                ResponseQualificationMode::SustainedIdentity => {
+                                    Some(sustained_qualification_content_encoding(&headers)?)
+                                }
+                            };
                             if fin {
                                 record.complete = true;
                             }
@@ -1700,8 +1990,23 @@ async fn qualify_chaff_response(
                     _ => {}
                 }
             }
-            if completed.len() == parallel_requests {
+            if completed.len() == request_target {
                 return Ok(());
+            }
+            if opened && streams.is_empty() && next_request_index < request_target {
+                let remaining = request_target.saturating_sub(next_request_index);
+                let wave_size = remaining.min(parallel_requests);
+                open_qualifier_wave(
+                    &mut client,
+                    loop_now,
+                    &url,
+                    &headers,
+                    &mut streams,
+                    &mut next_request_index,
+                    wave_size,
+                )?;
+                request_waves = request_waves.saturating_add(1);
+                max_concurrent_requests = max_concurrent_requests.max(streams.len());
             }
             let output = client.process_multiple_output(loop_now, NonZeroUsize::MIN);
             let delay = match output {
@@ -1779,7 +2084,7 @@ async fn qualify_chaff_response(
             )
         })
         .collect();
-    let passed = loop_result.is_ok()
+    let legacy_passed = loop_result.is_ok()
         && requests.len() == parallel_requests
         && requests.iter().all(|request| {
             request.complete
@@ -1804,7 +2109,6 @@ async fn qualify_chaff_response(
         && outgoing.oversized_packet_count == 0
         && requests_opened_before_first_network_output == parallel_requests
         && qualification_network_output_seen;
-    let error = loop_result.as_ref().err().map(ToString::to_string);
     let request_stream_bytes = requests
         .first()
         .map(|request| request.request_stream_bytes)
@@ -1813,59 +2117,162 @@ async fn qualify_chaff_response(
                 .iter()
                 .all(|request| request.request_stream_bytes == *size)
         });
+    let sustained_classifiable = loop_result.is_ok()
+        && sustained_requests_are_classifiable(&requests)
+        && request_stream_bytes.is_some()
+        && next_request_index == SUSTAINED_QUALIFICATION_REQUESTS
+        && request_waves == SUSTAINED_QUALIFICATION_WAVES
+        && max_concurrent_requests == SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS
+        && requests_opened_before_first_network_output == SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS
+        && incoming.oversized_packet_count == 0
+        && outgoing.oversized_packet_count == 0
+        && qualification_network_output_seen;
+    let sustained_failure_class = sustained_classifiable
+        .then(|| sustained_representation_failure(&requests))
+        .flatten();
+    let sustained_passed = sustained_classifiable && sustained_failure_class.is_none();
+    let loop_error = loop_result.as_ref().err().map(ToString::to_string);
+    let sustained_error =
+        if sustained_passed {
+            None
+        } else if let Some(failure_class) = sustained_failure_class {
+            Some(format!(
+                "sustained chaff response qualification classified a {failure_class} failure"
+            ))
+        } else {
+            Some(loop_error.clone().unwrap_or_else(|| {
+                "sustained chaff response qualification invariants failed".into()
+            }))
+        };
+    let sustained_requests: Vec<_> = requests
+        .iter()
+        .map(|request| SustainedResponseQualificationRequest {
+            request_index: request.request_index,
+            wave_index: request.request_index / SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS,
+            stream_id: request.stream_id,
+            request_stream_bytes: request.request_stream_bytes,
+            status: request.status,
+            content_encoding: request.content_encoding.clone(),
+            body_bytes: request.body_bytes,
+            body_sha256: request.body_sha256.clone(),
+            complete: request.complete,
+            outcome: request.outcome,
+        })
+        .collect();
     let packet_log = serde_json::to_vec(&packet_observations)?;
     atomic_write(&output_dir.join("packets.json"), &packet_log)?;
     let packet_log_sha256 = sha256(&packet_log)?;
-    let receipt = json!({
-        "schema_version": 2,
-        "artifact_type": "qcsd-chaff-response-qualification",
-        "invocation_id": format!("{}-{local_addr}", started_unix_ns),
-        "neqo_version": env!("CARGO_PKG_VERSION"),
-        "application_workload_sha256": workload_hash,
-        "application_resource_id": application_resource_id,
-        "selected_chaff_resource_id": selected_chaff_resource_id,
-        "qualified_parallel_chaff_streams": parallel_requests,
-        "method": "GET",
-        "url": url.to_string(),
-        "request_headers": request_headers,
-        "parallel_requests": parallel_requests,
-        "connection_count": 1,
-        "requests_opened_before_first_network_output": requests_opened_before_first_network_output,
-        "request_stream_bytes": request_stream_bytes,
-        "max_response_bytes": max_response_bytes,
-        "udp_payload_ceiling": packet_size,
-        "started_unix_ns": started_unix_ns,
-        "ended_unix_ns": unix_nanos(),
-        "completion_status": if passed { "complete" } else { "error" },
-        "error": error,
-        "source": {
-            "neqo_base_commit": NEQO_BASE_COMMIT,
-            "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
-            "migration_commit": option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"),
-        },
-        "requests": requests,
-        "packet_observations": packet_observations,
-        "packet_log_sha256": packet_log_sha256,
-        "packets": {
-            "incoming": incoming,
-            "outgoing": outgoing,
-            "total": {
-                "packet_count": incoming.packet_count.saturating_add(outgoing.packet_count),
-                "observed_udp_payload_max": incoming.observed_udp_payload_max.max(outgoing.observed_udp_payload_max),
-                "oversized_packet_count": incoming.oversized_packet_count.saturating_add(outgoing.oversized_packet_count),
+    let ended_unix_ns = unix_nanos();
+    let receipt = match mode {
+        ResponseQualificationMode::Legacy => json!({
+            "schema_version": 2,
+            "artifact_type": "qcsd-chaff-response-qualification",
+            "invocation_id": format!("{}-{local_addr}", started_unix_ns),
+            "neqo_version": env!("CARGO_PKG_VERSION"),
+            "application_workload_sha256": workload_hash,
+            "application_resource_id": application_resource_id,
+            "selected_chaff_resource_id": selected_chaff_resource_id,
+            "qualified_parallel_chaff_streams": parallel_requests,
+            "method": "GET",
+            "url": url.to_string(),
+            "request_headers": &request_headers,
+            "parallel_requests": parallel_requests,
+            "connection_count": 1,
+            "requests_opened_before_first_network_output": requests_opened_before_first_network_output,
+            "request_stream_bytes": request_stream_bytes,
+            "max_response_bytes": max_response_bytes,
+            "udp_payload_ceiling": packet_size,
+            "started_unix_ns": started_unix_ns,
+            "ended_unix_ns": ended_unix_ns,
+            "completion_status": if legacy_passed { "complete" } else { "error" },
+            "error": loop_error,
+            "source": {
+                "neqo_base_commit": NEQO_BASE_COMMIT,
+                "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
+                "migration_commit": option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"),
             },
-        },
-        "passed": passed,
-    });
+            "requests": &requests,
+            "packet_observations": &packet_observations,
+            "packet_log_sha256": packet_log_sha256,
+            "packets": {
+                "incoming": &incoming,
+                "outgoing": &outgoing,
+                "total": {
+                    "packet_count": incoming.packet_count.saturating_add(outgoing.packet_count),
+                    "observed_udp_payload_max": incoming.observed_udp_payload_max.max(outgoing.observed_udp_payload_max),
+                    "oversized_packet_count": incoming.oversized_packet_count.saturating_add(outgoing.oversized_packet_count),
+                },
+            },
+            "passed": legacy_passed,
+        }),
+        ResponseQualificationMode::SustainedIdentity => json!({
+            "schema_version": 3,
+            "artifact_type": "qcsd-chaff-response-qualification",
+            "invocation_id": format!("{}-{local_addr}", started_unix_ns),
+            "neqo_version": env!("CARGO_PKG_VERSION"),
+            "application_workload_sha256": workload_hash,
+            "application_resource_id": application_resource_id,
+            "selected_chaff_resource_id": selected_chaff_resource_id,
+            "qualified_parallel_chaff_streams": parallel_requests,
+            "method": "GET",
+            "url": url.to_string(),
+            "request_headers": &request_headers,
+            "request_header_mode": "identity-chaff-v1",
+            "parallel_requests": parallel_requests,
+            "total_requests": SUSTAINED_QUALIFICATION_REQUESTS,
+            "request_waves": request_waves,
+            "max_concurrent_requests": max_concurrent_requests,
+            "connection_count": 1,
+            "requests_opened_before_first_network_output": requests_opened_before_first_network_output,
+            "request_stream_bytes": request_stream_bytes,
+            "max_response_bytes": max_response_bytes,
+            "udp_payload_ceiling": packet_size,
+            "started_unix_ns": started_unix_ns,
+            "ended_unix_ns": ended_unix_ns,
+            "completion_status": if sustained_classifiable { "complete" } else { "error" },
+            "error": sustained_error,
+            "failure_class": sustained_failure_class,
+            "source": {
+                "neqo_base_commit": NEQO_BASE_COMMIT,
+                "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
+                "migration_commit": option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"),
+            },
+            "requests": &sustained_requests,
+            "packet_observations": &packet_observations,
+            "packet_log_sha256": packet_log_sha256,
+            "packets": {
+                "incoming": &incoming,
+                "outgoing": &outgoing,
+                "total": {
+                    "packet_count": incoming.packet_count.saturating_add(outgoing.packet_count),
+                    "observed_udp_payload_max": incoming.observed_udp_payload_max.max(outgoing.observed_udp_payload_max),
+                    "oversized_packet_count": incoming.oversized_packet_count.saturating_add(outgoing.oversized_packet_count),
+                },
+            },
+            "passed": sustained_passed,
+        }),
+    };
     atomic_write(
         &output_dir.join("qualification.json"),
         serde_json::to_string_pretty(&receipt)?.as_bytes(),
     )?;
+    let passed = match mode {
+        ResponseQualificationMode::Legacy => legacy_passed,
+        ResponseQualificationMode::SustainedIdentity => sustained_passed,
+    };
     if passed {
         Ok(())
     } else {
         Err(loop_result.err().unwrap_or_else(|| {
-            Error::RunAborted("chaff response qualification invariants failed".into())
+            let message = sustained_failure_class.map_or_else(
+                || "chaff response qualification invariants failed".into(),
+                |failure_class| {
+                    format!(
+                    "sustained chaff response qualification classified a {failure_class} failure"
+                )
+                },
+            );
+            Error::RunAborted(message)
         }))
     }
 }
@@ -3510,15 +3917,28 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         ));
     }
     validate_qualification_application_root(application_root, application_resource_id)?;
-    let (deterministic_selected, deterministic_response) =
-        deterministic_selected_chaff_resource(source, expected_responses, source_application_root)?;
-    if deterministic_selected.id != selected_chaff_resource_id
-        || deterministic_response.resource_id != selected_chaff_resource_id
-    {
-        return Err(Error::Argument(
-            "qualified chaff manifest does not select the deterministic frozen same-origin resource"
-                .into(),
-        ));
+    if chaff.is_identity_chaff_v4() {
+        selected_identity_chaff_resource(
+            source,
+            expected_responses,
+            source_application_root,
+            selected_chaff_resource_id,
+        )?;
+    } else {
+        let (deterministic_selected, deterministic_response) =
+            deterministic_selected_chaff_resource(
+                source,
+                expected_responses,
+                source_application_root,
+            )?;
+        if deterministic_selected.id != selected_chaff_resource_id
+            || deterministic_response.resource_id != selected_chaff_resource_id
+        {
+            return Err(Error::Argument(
+                "qualified chaff manifest does not select the deterministic frozen same-origin resource"
+                    .into(),
+            ));
+        }
     }
     let selected = spec
         .workload
@@ -3540,20 +3960,30 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
                     .into(),
             )
         })?;
+    let selected_headers = if chaff.is_identity_chaff_v4() {
+        projected_identity_chaff_headers(selected)?
+    } else {
+        projected_ael(selected)?
+    };
+    let source_selected_headers = if chaff.is_identity_chaff_v4() {
+        projected_identity_chaff_headers(source_selected)?
+    } else {
+        projected_ael(source_selected)?
+    };
     if (
         &selected.url,
         &selected.kind,
         selected.chaff_priority,
         selected.known_valid,
         &selected.depends_on,
-        projected_ael(selected)?,
+        &selected_headers,
     ) != (
         &source_selected.url,
         &source_selected.kind,
         source_selected.chaff_priority,
         source_selected.known_valid,
         &source_selected.depends_on,
-        projected_ael(source_selected)?,
+        &source_selected_headers,
     ) {
         return Err(Error::Argument(
             "runtime workload and frozen application source disagree on the selected chaff request"
@@ -3566,7 +3996,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         || selected.kind != qualified.kind
         || selected.chaff_priority != qualified.chaff_priority
         || !selected.known_valid
-        || projected_ael(selected)? != qualified.headers
+        || selected_headers != qualified.headers
     {
         return Err(Error::Argument(
             "qualified chaff selected-resource metadata, origin, or exact AEL projection is invalid"
@@ -3580,9 +4010,10 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         })?;
     let identity = qualification.expected_response();
     let expected = identity.body_bytes;
-    if identity.status != prepared_selected.status
-        || (identity.body_bytes != prepared_selected.bytes)
-        || identity.body_sha256 != prepared_selected.body_sha256
+    if !chaff.is_identity_chaff_v4()
+        && (identity.status != prepared_selected.status
+            || identity.body_bytes != prepared_selected.bytes
+            || identity.body_sha256 != prepared_selected.body_sha256)
     {
         return Err(Error::Argument(
             "qualified chaff response identity does not match frozen prepared status, body length, and body SHA-256"
@@ -5639,7 +6070,7 @@ fn now() -> Instant {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeSet, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         fs,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         path::PathBuf,
@@ -5650,36 +6081,44 @@ mod tests {
     use clap::Parser as _;
     use neqo_csdef::{
         ChaffManifest, ChaffQualification, Defense, DefenseConfig, DefenseMode, DefenseSignal,
-        DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig, MissedSlotReason, Packet,
-        QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass,
-        QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId,
-        QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource,
-        ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffQualification,
-        ResponseOnlyQualifiedChaffResource, SignalKind, StaticSchedule, TamarawConfig, Trace,
+        DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig,
+        IdentityChaffRequestHeaderPrimitive, MissedSlotReason, Packet, QcsdAction,
+        QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId,
+        QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId, QcsdStreamFinish,
+        QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource, ResourceManifest,
+        ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
+        ResponseOnlyChaffQualificationV4, ResponseOnlyQualifiedChaffResource,
+        ResponseOnlyQualifiedChaffResourceV4, SignalKind, StaticSchedule, TamarawConfig, Trace,
         TrafficMorphingConfig, WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad,
         WtfPadConfig, sanitize_chaff_headers,
     };
 
     use super::{
-        ApplicationBatchLifecycle, Args, DefenseArg, Error, ExpectedChaffIdentity, PrefixBurst,
-        PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt, Preset, ProfileArg,
-        QcsdRequestRole, QualificationAcknowledgement, QualifierStream, RequestPolicyArg,
-        ResourceRunState, RunCompletion, RunSpec, RuntimeChaffManifest, Socket, StaticModeArg,
-        StreamActivationStage, StreamRecord, StreamType, TrafficMorphingActivation,
+        ApplicationBatchLifecycle, Args, ChaffRequestHeaderModeArg, DefenseArg, Error,
+        ExpectedChaffIdentity, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
+        PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg, QcsdRequestRole,
+        QualificationAcknowledgement, QualifierStream, RequestPolicyArg, ResourceRunState,
+        ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
+        RuntimeChaffManifest, Socket, StaticModeArg, StreamActivationStage, StreamRecord,
+        StreamType, SustainedResponseQualificationRequest, TrafficMorphingActivation,
         action_failure_reason, activate_traffic_morphing, apply_action_batch,
         bind_qualified_chaff_stream_limits, bounded_qualification_wait, create_endpoints,
         datagram_observation, deadline_error, defense_parameter_provenance,
         drain_qualifier_stream_data, ensure_defense_realizable,
         expected_application_response_length, finish_application_record, finish_chaff_record,
         forward_qcsd_observation, has_in_flight_application_stream, now, prefix_receipts_pass,
-        prefix_targetless_stream_bytes, qcsd_connection_parameters, qualification_content_encoding,
-        ready_request_batch, record_terminal_action, register_action_batch, resolve_run_config,
-        resolve_run_config_with_workload, sanitize_chaff_action_headers, sha256,
-        shapes_stream_sends, terminalize_pending_slots,
+        prefix_targetless_stream_bytes, projected_ael, projected_identity_chaff_headers,
+        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
+        record_terminal_action, register_action_batch, resolve_run_config,
+        resolve_run_config_with_workload, response_qualification_mode,
+        sanitize_chaff_action_headers, sha256, shapes_stream_sends,
+        sustained_qualification_content_encoding, sustained_representation_failure,
+        sustained_requests_are_classifiable, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_chaff_manifest_defense,
-        validate_prefix_capacity_plan, validate_walkie_talkie_chaff_precondition,
-        wait_for_activity, walkie_talkie_qualification_binding_matches, write_run_json,
+        validate_prefix_capacity_plan, validate_qualified_chaff_binding,
+        validate_walkie_talkie_chaff_precondition, wait_for_activity,
+        walkie_talkie_qualification_binding_matches, write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -5830,6 +6269,58 @@ mod tests {
         }
     }
 
+    fn response_only_chaff_manifest_v4(
+        selected_resource_id: u32,
+        url: &str,
+        body_bytes: u64,
+        body_sha256: &str,
+    ) -> ResponseOnlyChaffManifestV4 {
+        ResponseOnlyChaffManifestV4 {
+            schema_version: 4,
+            artifact_type: "qcsd-qualified-chaff-manifest".into(),
+            qualification_scope: "response-only".into(),
+            application_workload_sha256: "e".repeat(64),
+            application_resource_id: 0,
+            selected_chaff_resource_id: selected_resource_id,
+            qualified_parallel_chaff_streams: 5,
+            resources: vec![ResponseOnlyQualifiedChaffResourceV4 {
+                id: selected_resource_id,
+                url: url.into(),
+                kind: "Stylesheet".into(),
+                content_length: Some(body_bytes),
+                data_length: body_bytes,
+                chaff_priority: false,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: vec![
+                    ("accept".into(), "text/html".into()),
+                    ("accept-encoding".into(), "identity".into()),
+                    ("accept-language".into(), "en-AU".into()),
+                ],
+                chaff_qualification: ResponseOnlyChaffQualificationV4 {
+                    schema_version: 4,
+                    qualification_scope: "response-only".into(),
+                    method: "GET".into(),
+                    request_header_primitive: IdentityChaffRequestHeaderPrimitive {
+                        mode: "identity-chaff-v1".into(),
+                        copied_from_application: vec!["accept".into(), "accept-language".into()],
+                        forced: vec![("accept-encoding".into(), "identity".into())],
+                    },
+                    request_stream_bytes: 42,
+                    qualified_parallel_chaff_streams: 5,
+                    qualified_completion_count: 120,
+                    expected_response: ExpectedChaffResponse {
+                        status: 200,
+                        content_encoding: "identity".into(),
+                        body_bytes,
+                        body_sha256: body_sha256.into(),
+                    },
+                    response_qualification_sha256: "b".repeat(64),
+                },
+            }],
+        }
+    }
+
     fn request(resource_id: u32, origin: &str, depends_on: Vec<u32>) -> Resource {
         Resource {
             id: resource_id,
@@ -5903,7 +6394,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_chaff_manifest_dispatches_strict_schema_two_and_three_inputs() {
+    fn runtime_chaff_manifest_dispatches_only_strict_schema_two_three_and_four_inputs() {
         let response_only = response_only_chaff_manifest();
         let response_only_json = serde_json::to_string(&response_only).expect("serialize schema 3");
         let runtime =
@@ -5915,6 +6406,26 @@ mod tests {
         let qualification = runtime.qualification(6).expect("qualification");
         assert_eq!(qualification.request_stream_bytes(), 42);
         assert_eq!(qualification.expected_response().body_bytes, 1_200);
+
+        let schema_four = response_only_chaff_manifest_v4(
+            7,
+            "https://example.com/site.css",
+            1_463,
+            &"f".repeat(64),
+        );
+        let schema_four_json = serde_json::to_string(&schema_four).expect("serialize schema four");
+        let runtime = RuntimeChaffManifest::from_json(&schema_four_json).expect("load schema four");
+        assert!(runtime.is_response_only());
+        assert!(runtime.is_identity_chaff_v4());
+        assert_eq!(runtime.selected_chaff_resource_id(), 7);
+        assert_eq!(
+            runtime
+                .qualification(7)
+                .expect("schema-four qualification")
+                .expected_response()
+                .content_encoding,
+            "identity"
+        );
 
         let resource = Resource {
             id: 6,
@@ -5944,37 +6455,54 @@ mod tests {
         let mut forbidden = serde_json::to_value(response_only).expect("schema three value");
         forbidden["walkie_talkie_required_chaff_streams"] = serde_json::json!(5);
         assert!(RuntimeChaffManifest::from_json(&forbidden.to_string()).is_err());
+
+        for schema_version in [0, 1, 5, 99] {
+            let mut unknown = serde_json::to_value(&schema_four).expect("schema four value");
+            unknown["schema_version"] = serde_json::json!(schema_version);
+            assert!(RuntimeChaffManifest::from_json(&unknown.to_string()).is_err());
+        }
     }
 
     #[test]
     fn response_only_runtime_contract_is_exclusive_to_front_and_tamaraw() {
-        let manifest: RuntimeChaffManifest = response_only_chaff_manifest().into();
-        for defense in [
-            DefenseConfig::Front(FrontConfig::default()),
-            DefenseConfig::Tamaraw(TamarawConfig::default()),
-        ] {
-            validate_chaff_manifest_defense(&defense, &manifest)
-                .expect("response-only defense is supported");
-        }
-        let mut front = QcsdConfig {
-            defense: DefenseConfig::Front(FrontConfig::default()),
-            ..QcsdConfig::default()
-        };
-        bind_qualified_chaff_stream_limits(&mut front, &manifest)
-            .expect("FRONT consumes the five-stream response qualification");
-        front.max_chaff_streams = 6;
-        assert!(bind_qualified_chaff_stream_limits(&mut front, &manifest).is_err());
-        for defense in [
-            DefenseConfig::None,
-            DefenseConfig::Static {
-                schedule: "schedule.csv".into(),
-                padding_only: true,
-            },
-            DefenseConfig::TrafficMorphing(TrafficMorphingConfig::default()),
-            DefenseConfig::WtfPad(WtfPadConfig::default()),
-            DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
-        ] {
-            assert!(validate_chaff_manifest_defense(&defense, &manifest).is_err());
+        let manifests: Vec<RuntimeChaffManifest> = vec![
+            response_only_chaff_manifest().into(),
+            response_only_chaff_manifest_v4(
+                7,
+                "https://example.com/site.css",
+                1_463,
+                &"f".repeat(64),
+            )
+            .into(),
+        ];
+        for manifest in &manifests {
+            for defense in [
+                DefenseConfig::Front(FrontConfig::default()),
+                DefenseConfig::Tamaraw(TamarawConfig::default()),
+            ] {
+                validate_chaff_manifest_defense(&defense, manifest)
+                    .expect("response-only defense is supported");
+            }
+            let mut front = QcsdConfig {
+                defense: DefenseConfig::Front(FrontConfig::default()),
+                ..QcsdConfig::default()
+            };
+            bind_qualified_chaff_stream_limits(&mut front, manifest)
+                .expect("FRONT consumes the five-stream response qualification");
+            front.max_chaff_streams = 6;
+            assert!(bind_qualified_chaff_stream_limits(&mut front, manifest).is_err());
+            for defense in [
+                DefenseConfig::None,
+                DefenseConfig::Static {
+                    schedule: "schedule.csv".into(),
+                    padding_only: true,
+                },
+                DefenseConfig::TrafficMorphing(TrafficMorphingConfig::default()),
+                DefenseConfig::WtfPad(WtfPadConfig::default()),
+                DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
+            ] {
+                assert!(validate_chaff_manifest_defense(&defense, manifest).is_err());
+            }
         }
 
         let schema_two: RuntimeChaffManifest = qualified_chaff_manifest(Vec::new()).into();
@@ -5993,6 +6521,108 @@ mod tests {
             validate_chaff_manifest_defense(&defense, &schema_two)
                 .expect("schema-two compatibility remains unchanged");
         }
+    }
+
+    #[test]
+    fn schema_four_runtime_binding_accepts_a_qualified_fallback_candidate_only() {
+        let application_headers = vec![
+            ("accept".into(), "text/html".into()),
+            ("accept-encoding".into(), "gzip, br".into()),
+            ("accept-language".into(), "en-AU".into()),
+        ];
+        let source = ResourceManifest {
+            resources: vec![
+                Resource {
+                    id: 0,
+                    url: "https://example.com/".into(),
+                    kind: "Document".into(),
+                    content_length: Some(6_165),
+                    data_length: 6_165,
+                    chaff_priority: false,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: application_headers.clone(),
+                },
+                Resource {
+                    id: 1,
+                    url: "https://example.com/site.css".into(),
+                    kind: "Stylesheet".into(),
+                    content_length: Some(1_463),
+                    data_length: 1_463,
+                    chaff_priority: false,
+                    known_valid: true,
+                    depends_on: vec![0],
+                    headers: application_headers,
+                },
+            ],
+        };
+        let expected = BTreeMap::from([
+            (
+                0,
+                PreparedExpectedResponse {
+                    resource_id: 0,
+                    status: 200,
+                    bytes: 6_165,
+                    body_sha256: "a".repeat(64),
+                },
+            ),
+            (
+                1,
+                PreparedExpectedResponse {
+                    resource_id: 1,
+                    status: 200,
+                    bytes: 1_463,
+                    body_sha256: "b".repeat(64),
+                },
+            ),
+        ]);
+        let schema_four = response_only_chaff_manifest_v4(
+            1,
+            "https://example.com/site.css",
+            1_500,
+            &"c".repeat(64),
+        );
+        let spec = RunSpec {
+            method: "GET",
+            workload: source.clone(),
+            workload_hash: "runtime".into(),
+            application_workload_source: Some((source.clone(), "e".repeat(64), expected)),
+            config: QcsdConfig {
+                defense: DefenseConfig::Front(FrontConfig::default()),
+                ..QcsdConfig::default()
+            },
+            defense_parameters: None,
+            chaff_manifest: Some(schema_four.into()),
+            chaff_manifest_hash: Some("f".repeat(64)),
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 0,
+            output_dir: trace_output_dir("schema-four-fallback"),
+            max_response_bytes: 2_000,
+            timeout_seconds: 1,
+        };
+        validate_qualified_chaff_binding(&spec)
+            .expect("schema four accepts the second eligible sustained candidate");
+
+        let mut schema_three = response_only_chaff_manifest();
+        schema_three.selected_chaff_resource_id = 1;
+        schema_three.resources[0].id = 1;
+        schema_three.resources[0].url = "https://example.com/site.css".into();
+        schema_three.resources[0].kind = "Stylesheet".into();
+        schema_three.resources[0].content_length = Some(1_463);
+        schema_three.resources[0].data_length = 1_463;
+        schema_three.resources[0].headers =
+            projected_ael(&source.resources[1]).expect("legacy compact projection");
+        schema_three.resources[0]
+            .chaff_qualification
+            .expected_response
+            .body_bytes = 1_463;
+        schema_three.resources[0]
+            .chaff_qualification
+            .expected_response
+            .body_sha256 = "b".repeat(64);
+        let mut legacy_spec = spec;
+        legacy_spec.chaff_manifest = Some(schema_three.into());
+        assert!(validate_qualified_chaff_binding(&legacy_spec).is_err());
     }
 
     #[test]
@@ -6019,7 +6649,11 @@ mod tests {
             .walkie_talkie_required_chaff_streams = 20;
         let mut config = QcsdConfig {
             max_chaff_streams: 5,
-            defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
+            defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
+                molded: "molded.json".into(),
+                workload_id: "workload".into(),
+                ..WalkieTalkieConfig::default()
+            }),
             ..QcsdConfig::default()
         };
 
@@ -6092,6 +6726,20 @@ mod tests {
 
     #[test]
     fn walkie_talkie_chaff_preflight_filters_origins_before_priority_selection() {
+        let molded_path = trace_output_dir("walkie-preflight-molded").join("molded.json");
+        let mut molded: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../neqo-csdef/tests/data/walkie-talkie-golden.json"
+        ))
+        .expect("strict Walkie-Talkie fixture");
+        let binding = &mut molded["qualification_bindings"][0];
+        binding["qualified_chaff_manifest_sha256"] = serde_json::json!("f".repeat(64));
+        binding["prefix_pack_spec_sha256"] = serde_json::json!("d".repeat(64));
+        binding["selected_chaff_resource_id"] = serde_json::json!(7);
+        fs::write(
+            &molded_path,
+            serde_json::to_vec(&molded).expect("serialize Walkie-Talkie fixture"),
+        )
+        .expect("write Walkie-Talkie fixture");
         let workload = ResourceManifest {
             resources: vec![request(1, "https://match.example", Vec::new())],
         };
@@ -6114,8 +6762,9 @@ mod tests {
             config: QcsdConfig {
                 use_empty_resources,
                 defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
+                    molded: molded_path.to_string_lossy().into_owned(),
+                    workload_id: "real page".into(),
                     packet_size: 1_200,
-                    ..WalkieTalkieConfig::default()
                 }),
                 ..QcsdConfig::default()
             },
@@ -6685,6 +7334,7 @@ mod tests {
             Packet::new(Duration::from_micros(1), Direction::Incoming, 31).expect("framing slot");
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
+                control_interval_us: 1,
                 initial_max_stream_data: 16,
                 max_stream_data_excess: 1_000,
                 ..QcsdConfig::default()
@@ -7738,6 +8388,195 @@ mod tests {
             )]),
             None
         );
+    }
+
+    #[test]
+    fn sustained_response_qualification_preserves_nonidentity_content_encoding_evidence() {
+        assert_eq!(
+            sustained_qualification_content_encoding(&[]).expect("absent encoding"),
+            "identity"
+        );
+        assert_eq!(
+            sustained_qualification_content_encoding(&[neqo_common::Header::new(
+                "content-encoding",
+                " Identity ",
+            )])
+            .expect("normalized identity"),
+            "identity"
+        );
+        assert_eq!(
+            sustained_qualification_content_encoding(&[
+                neqo_common::Header::new("content-encoding", "GZIP"),
+                neqo_common::Header::new("content-encoding", "Br"),
+            ])
+            .expect("duplicate valid fields"),
+            "gzip, br"
+        );
+        assert_eq!(
+            sustained_qualification_content_encoding(&[neqo_common::Header::new(
+                "content-encoding",
+                "GZIP, BR",
+            )])
+            .expect("coding stack evidence"),
+            "gzip, br"
+        );
+        for invalid in [
+            neqo_common::Header::new("content-encoding", [0xff]),
+            neqo_common::Header::new("content-encoding", "  "),
+        ] {
+            assert!(sustained_qualification_content_encoding(&[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn identity_chaff_projection_is_order_independent_but_exact_and_lowercase() {
+        let mut resource = Resource {
+            id: 7,
+            url: "https://example.com/site.css".into(),
+            kind: "Stylesheet".into(),
+            content_length: Some(1_463),
+            data_length: 1_463,
+            chaff_priority: false,
+            known_valid: true,
+            depends_on: vec![0],
+            headers: vec![
+                ("accept-language".into(), "en-AU".into()),
+                ("user-agent".into(), "browser".into()),
+                ("accept".into(), "text/html".into()),
+                ("accept-encoding".into(), "gzip, br".into()),
+            ],
+        };
+        assert_eq!(
+            projected_identity_chaff_headers(&resource).expect("identity projection"),
+            [
+                ("accept".into(), "text/html".into()),
+                ("accept-encoding".into(), "identity".into()),
+                ("accept-language".into(), "en-AU".into()),
+            ]
+        );
+
+        resource.headers.push(("Accept".into(), "duplicate".into()));
+        assert!(projected_identity_chaff_headers(&resource).is_err());
+        resource.headers.pop();
+        resource.headers[2].0 = "Accept".into();
+        assert!(projected_identity_chaff_headers(&resource).is_err());
+    }
+
+    fn sustained_request(request_index: usize) -> ResponseQualificationRequest {
+        ResponseQualificationRequest {
+            request_index,
+            stream_id: u64::try_from(request_index).expect("request index") * 4,
+            request_stream_bytes: 169,
+            status: Some(200),
+            content_encoding: Some("identity".into()),
+            body_bytes: 1_463,
+            body_sha256: Some("a".repeat(64)),
+            complete: true,
+            outcome: "complete",
+        }
+    }
+
+    #[test]
+    fn sustained_response_classification_checks_all_forty_and_prioritizes_capacity() {
+        let mut requests: Vec<_> = (0..40).map(sustained_request).collect();
+        assert!(sustained_requests_are_classifiable(&requests));
+        assert_eq!(sustained_representation_failure(&requests), None);
+
+        requests[35].body_sha256 = Some("b".repeat(64));
+        assert_eq!(
+            sustained_representation_failure(&requests),
+            Some("identity")
+        );
+        requests[35].body_bytes = 1_199;
+        assert_eq!(
+            sustained_representation_failure(&requests),
+            Some("capacity")
+        );
+
+        requests[35].body_bytes = 1_463;
+        requests[35].body_sha256 = Some("a".repeat(64));
+        requests[35].content_encoding = Some("gzip, br".into());
+        assert_eq!(
+            sustained_representation_failure(&requests),
+            Some("identity")
+        );
+        requests[35].content_encoding = Some("identity".into());
+        requests[35].status = Some(404);
+        assert_eq!(
+            sustained_representation_failure(&requests),
+            Some("identity")
+        );
+
+        requests[35].status = None;
+        assert!(!sustained_requests_are_classifiable(&requests));
+    }
+
+    #[test]
+    fn sustained_request_adds_wave_index_without_changing_legacy_request_shape() {
+        let legacy = sustained_request(35);
+        let legacy_value = serde_json::to_value(&legacy).expect("legacy request value");
+        assert!(legacy_value.get("wave_index").is_none());
+
+        let sustained = SustainedResponseQualificationRequest {
+            request_index: legacy.request_index,
+            wave_index: legacy.request_index / 5,
+            stream_id: legacy.stream_id,
+            request_stream_bytes: legacy.request_stream_bytes,
+            status: legacy.status,
+            content_encoding: legacy.content_encoding,
+            body_bytes: legacy.body_bytes,
+            body_sha256: legacy.body_sha256,
+            complete: legacy.complete,
+            outcome: legacy.outcome,
+        };
+        let sustained_value = serde_json::to_value(&sustained).expect("sustained request value");
+        assert_eq!(sustained_value["wave_index"], 7);
+        assert_eq!(
+            sustained_value.as_object().expect("request object").len(),
+            legacy_value
+                .as_object()
+                .expect("legacy request object")
+                .len()
+                + 1
+        );
+    }
+
+    #[test]
+    fn sustained_response_cli_mode_requires_the_exact_paired_40_by_5_contract() {
+        assert_eq!(
+            response_qualification_mode(5, None, None).expect("legacy mode"),
+            ResponseQualificationMode::Legacy
+        );
+        assert_eq!(
+            response_qualification_mode(
+                5,
+                Some(40),
+                Some(ChaffRequestHeaderModeArg::IdentityChaffV1),
+            )
+            .expect("sustained mode"),
+            ResponseQualificationMode::SustainedIdentity
+        );
+        for (parallel, total, header_mode) in [
+            (5, Some(40), None),
+            (5, None, Some(ChaffRequestHeaderModeArg::IdentityChaffV1)),
+            (
+                4,
+                Some(40),
+                Some(ChaffRequestHeaderModeArg::IdentityChaffV1),
+            ),
+            (
+                6,
+                Some(40),
+                Some(ChaffRequestHeaderModeArg::IdentityChaffV1),
+            ),
+            (
+                5,
+                Some(39),
+                Some(ChaffRequestHeaderModeArg::IdentityChaffV1),
+            ),
+        ] {
+            assert!(response_qualification_mode(parallel, total, header_mode).is_err());
+        }
     }
 
     #[test]

@@ -6,7 +6,9 @@
 mod manifest;
 
 pub use manifest::{
-    ChaffManifest, ChaffQualification, ExpectedChaffResponse, QualifiedChaffResource, Resource,
-    ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffQualification,
-    ResponseOnlyQualifiedChaffResource, normalize_content_encoding, sanitize_chaff_headers,
+    ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
+    QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
+    ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
+    ResponseOnlyQualifiedChaffResource, ResponseOnlyQualifiedChaffResourceV4,
+    normalize_content_encoding, sanitize_chaff_headers,
 };

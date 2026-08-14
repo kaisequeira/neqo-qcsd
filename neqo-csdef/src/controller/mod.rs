@@ -489,6 +489,7 @@ impl QcsdController {
                 content_length,
                 ..
             } => {
+                self.streams.clear_pre_header_blocked(endpoint, stream);
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
                     if status.is_some() {
                         state.status = status;
@@ -504,6 +505,7 @@ impl QcsdController {
                 data_bytes,
                 ..
             } => {
+                self.streams.clear_pre_header_blocked(endpoint, stream);
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
                     state.receive.data_frame(frame_header_bytes, data_bytes);
                 }
@@ -519,6 +521,7 @@ impl QcsdController {
                 stream,
                 frame_bytes,
             } => {
+                self.streams.clear_pre_header_blocked(endpoint, stream);
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
                     state.receive.framing(frame_bytes);
                 }
@@ -529,6 +532,9 @@ impl QcsdController {
                 stream,
                 bytes,
             } => {
+                if bytes > 0 {
+                    self.streams.clear_pre_header_blocked(endpoint, stream);
+                }
                 if let Some((cover, consumed_start, consumed_end)) =
                     self.streams.get_mut(endpoint, stream).map(|state| {
                         let consumed_start = state.receive.consumed();
@@ -568,11 +574,22 @@ impl QcsdController {
                     );
                 }
             }
+            QcsdObservation::StreamDataBlocked {
+                endpoint,
+                stream,
+                blocked_at,
+            } => {
+                if self
+                    .streams
+                    .record_pre_header_blocked(endpoint, stream, blocked_at)
+                {
+                    self.try_pre_header_bootstrap(endpoint, stream);
+                }
+            }
             // Application and qualified-chaff resources occupy distinct
             // namespaces. Only a real chaff request stream completion can
             // mutate chaff resource state.
-            QcsdObservation::StreamDataBlocked { .. }
-            | QcsdObservation::ResourceCompleted { .. } => {}
+            QcsdObservation::ResourceCompleted { .. } => {}
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
                 stream,
@@ -853,7 +870,32 @@ impl QcsdController {
         // scheduled capacity.  That release had to be encoded before a
         // slotless tail could be appended safely; retry the retained boundary
         // now that requested and advertised limits can agree.
+        self.try_pre_header_bootstrap(endpoint, stream);
         self.try_parser_lease(endpoint, stream, true);
+    }
+
+    fn try_pre_header_bootstrap(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
+        let Some(lease) = self.streams.pre_header_bootstrap_lease(endpoint, stream) else {
+            return;
+        };
+        debug_assert!(!lease.scheduled);
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                start: lease.absolute_limit.saturating_sub(lease.increase),
+                end: lease.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: false,
+            });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: None,
+        });
     }
 
     fn try_parser_lease(
@@ -6453,6 +6495,404 @@ mod tests {
             0
         );
         assert!(controller.actions.is_empty());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "both stream roles and the complete atomic-HEADERS accounting path form one oracle"
+    )]
+    fn pre_header_bootstrap_handles_atomic_headers_for_application_and_chaff() {
+        const FLOOR: u64 = 250;
+        const INITIAL: u64 = 16;
+        const SCHEDULED: u16 = 234;
+        for (stream, role) in [
+            (QcsdStreamId(0), QcsdRequestRole::Application),
+            (
+                QcsdStreamId(4),
+                QcsdRequestRole::Chaff {
+                    resource_id: 7,
+                    request_id: None,
+                },
+            ),
+        ] {
+            let packet =
+                Packet::new(Duration::ZERO, Direction::Incoming, SCHEDULED).expect("packet");
+            let manifest = ResourceManifest {
+                resources: vec![Resource {
+                    id: 7,
+                    url: "https://example.com/chaff".into(),
+                    kind: "Image".into(),
+                    content_length: Some(FLOOR),
+                    data_length: FLOOR,
+                    chaff_priority: true,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                }],
+            };
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: INITIAL,
+                    max_stream_data_excess: 1_000,
+                    low_watermark: 1,
+                    ..QcsdConfig::default()
+                },
+                Some(manifest),
+                Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+            )
+            .expect("controller");
+            let endpoint = QcsdEndpointId(1);
+            ready(&mut controller, 1, "https://example.com");
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role,
+                    expected_response_length: matches!(role, QcsdRequestRole::Application)
+                        .then_some(FLOOR),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+
+            // Serde's early proof is retained while the exact floor is still
+            // only known locally. It cannot grow credit on its own.
+            controller.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint,
+                    stream,
+                    blocked_at: INITIAL,
+                },
+                Duration::ZERO,
+            );
+            assert!(controller.next_action().is_none());
+
+            controller.poll(Duration::ZERO);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            let (floor_limit, slot) = actions
+                .iter()
+                .find_map(|action| match action {
+                    QcsdAction::IncreaseReceiveLimit {
+                        endpoint: observed_endpoint,
+                        stream: observed_stream,
+                        absolute_limit,
+                        slot,
+                        ..
+                    } if (*observed_endpoint, *observed_stream) == (endpoint, stream) => {
+                        Some((*absolute_limit, *slot))
+                    }
+                    _ => None,
+                })
+                .expect("prepared floor action");
+            assert_eq!(floor_limit, FLOOR);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. }))
+            );
+
+            // Encoding the exact floor activates the retained proof. The
+            // lease ends at absolute 1000, carries no owner, and does not
+            // resolve the scheduled range on grant.
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit: floor_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(1),
+            );
+            let QcsdAction::LeaseParserReceive {
+                absolute_limit: lease_limit,
+                increase,
+                owner,
+                ..
+            } = controller.next_action().expect("pre-header bootstrap")
+            else {
+                panic!("expected slotless parser lease");
+            };
+            assert_eq!((lease_limit, increase, owner), (1_000, 750, None));
+            assert_eq!(controller.pending_slots(), [(slot, packet)]);
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(
+                diagnostics.scheduled_incoming_requested_bytes,
+                u64::from(SCHEDULED)
+            );
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(
+                diagnostics.scheduled_incoming_unresolved_bytes,
+                u64::from(SCHEDULED)
+            );
+
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit: lease_limit,
+                    slot: None,
+                },
+                Duration::from_micros(2),
+            );
+            assert!(controller.next_action().is_none());
+            assert_eq!(controller.pending_slots(), [(slot, packet)]);
+
+            // Duplicate and stale blocked reports cannot issue a second
+            // bootstrap or turn generic SDB into speculative capacity.
+            for blocked_at in [FLOOR, lease_limit] {
+                controller.observe(
+                    QcsdObservation::StreamDataBlocked {
+                        endpoint,
+                        stream,
+                        blocked_at,
+                    },
+                    Duration::from_micros(3),
+                );
+            }
+            assert!(controller.next_action().is_none());
+
+            // One atomic HEADERS frame can now exceed the 250-byte body floor.
+            // Only the already scheduled [16,250) range resolves the slot;
+            // the parser tail remains raw, unowned overflow.
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: 400,
+                },
+                Duration::from_micros(4),
+            );
+            assert!(matches!(
+                controller.next_action(),
+                Some(QcsdAction::SlotSatisfied { slot: satisfied, .. }) if satisfied == slot
+            ));
+            controller.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint,
+                    stream,
+                    frame_bytes: 400,
+                    status: Some(200),
+                    content_length: Some(FLOOR),
+                },
+                Duration::from_micros(4),
+            );
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(
+                diagnostics.scheduled_incoming_requested_bytes,
+                u64::from(SCHEDULED)
+            );
+            assert_eq!(
+                diagnostics.scheduled_incoming_consumed_bytes,
+                u64::from(SCHEDULED)
+            );
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+            assert!(controller.pending_slots().is_empty());
+
+            controller.observe(
+                QcsdObservation::StreamFinished {
+                    endpoint,
+                    stream,
+                    finish: QcsdStreamFinish::Fin,
+                },
+                Duration::from_micros(5),
+            );
+            assert!(controller.parser_lease_ranges.is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_header_bootstrap_rolls_back_on_fin_and_reset_with_closed_ledger() {
+        for finish in [QcsdStreamFinish::Fin, QcsdStreamFinish::Reset] {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 234).expect("packet");
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: 16,
+                    max_stream_data_excess: 1_000,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+            )
+            .expect("controller");
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(0);
+            ready(&mut controller, 1, "https://example.com");
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(250),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint,
+                    stream,
+                    blocked_at: 16,
+                },
+                Duration::ZERO,
+            );
+            controller.poll(Duration::ZERO);
+            let (absolute_limit, slot) = controller
+                .drain_actions()
+                .find_map(|action| match action {
+                    QcsdAction::IncreaseReceiveLimit {
+                        absolute_limit,
+                        slot,
+                        ..
+                    } => Some((absolute_limit, slot)),
+                    _ => None,
+                })
+                .expect("floor action");
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(1),
+            );
+            assert!(matches!(
+                controller.actions.front(),
+                Some(QcsdAction::LeaseParserReceive {
+                    absolute_limit: 1_000,
+                    increase: 750,
+                    owner: None,
+                    ..
+                })
+            ));
+
+            // Closing before the lease reaches the adapter removes and rolls
+            // back its suffix. The already-advertised scheduled floor retires
+            // normally and closes the one ledger exactly once.
+            controller.observe(
+                QcsdObservation::StreamFinished {
+                    endpoint,
+                    stream,
+                    finish,
+                },
+                Duration::from_micros(2),
+            );
+            assert!(controller.parser_lease_ranges.is_empty());
+            let actions: Vec<_> = controller.drain_actions().collect();
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. }))
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(
+                        action,
+                        QcsdAction::SlotMissed {
+                            slot: observed,
+                            reason: MissedSlotReason::ReceiveCreditRetired,
+                            ..
+                        } if *observed == slot
+                    ))
+                    .count(),
+                1
+            );
+            assert!(controller.pending_slots().is_empty());
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 234);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 234);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn aborted_exhausting_pre_header_bootstrap_rejects_duplicate_blocked_proof() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 234).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 750,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(250),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint,
+                stream,
+                blocked_at: 16,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let (floor_limit, slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((absolute_limit, slot)),
+                _ => None,
+            })
+            .expect("prepared floor action");
+        assert_eq!(floor_limit, 250);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: floor_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        assert!(matches!(
+            controller.actions.front(),
+            Some(QcsdAction::LeaseParserReceive {
+                absolute_limit: 1_000,
+                increase: 750,
+                owner: None,
+                ..
+            })
+        ));
+
+        controller.abort_pending_slots(Duration::from_micros(2), MissedSlotReason::RunAborted);
+        controller.drain_actions().for_each(drop);
+        assert!(controller.parser_lease_ranges.is_empty());
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint,
+                stream,
+                blocked_at: floor_limit,
+            },
+            Duration::from_micros(3),
+        );
+        assert!(
+            !controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. })),
+            "sticky exhaustion prevents a second unowned bootstrap after abort rollback"
+        );
     }
 
     #[test]

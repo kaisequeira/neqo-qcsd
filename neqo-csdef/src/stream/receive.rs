@@ -3,6 +3,8 @@
 // <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
 // option.
 
+const PRE_HEADER_BOOTSTRAP_TARGET: u64 = 1_000;
+
 /// Published QCSD receive-side stream state machine (paper Figure 7).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReceiveState {
@@ -393,6 +395,99 @@ impl ReceiveState {
             }
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => {}
         }
+    }
+
+    /// Whether a transport stall is safe to retain while response headers are
+    /// wholly unparsed.
+    ///
+    /// The peer must report exactly the limit that is currently advertised,
+    /// and both the prepared payload floor and current prefix must remain
+    /// below the absolute framing target. Reports from automatic, post-header,
+    /// consumed, parser-active, or stale states are ignored.
+    pub(crate) const fn accepts_pre_header_blocked(&self, blocked_at: u64) -> bool {
+        let Self::ReceivingHeaders {
+            advertised_limit,
+            payload_floor,
+            consumed,
+            framing_bytes,
+            parser_lease_capacity,
+            parser_lease_used,
+            parser_lease_exhausted,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let remaining_budget = parser_lease_capacity.saturating_sub(*parser_lease_used);
+        if *payload_floor == 0
+            || *payload_floor >= PRE_HEADER_BOOTSTRAP_TARGET
+            || blocked_at != *advertised_limit
+            || blocked_at >= PRE_HEADER_BOOTSTRAP_TARGET
+            || *consumed != 0
+            || *framing_bytes != 0
+            || *parser_lease_used != 0
+            || *parser_lease_exhausted
+            || remaining_budget == 0
+            || last_parser_lease_boundary.is_some()
+            || pending_parser_boundary.is_some()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Use retained pristine blocked evidence to bridge one atomic response
+    /// HEADERS frame after the prepared payload floor is on the wire.
+    ///
+    /// The lease is physically slotless and consumes the same bounded
+    /// lifetime allowance as ordinary parser leases. Its absolute target is
+    /// 1000 bytes, bounded independently by the remaining parser-lease budget
+    /// (for example, floor 250 with 1000 bytes of budget produces 750 bytes).
+    pub(crate) fn pre_header_bootstrap_lease(&mut self, blocked_at: u64) -> Option<(u64, u64)> {
+        let Self::ReceivingHeaders {
+            advertised_limit,
+            requested_limit,
+            known_limit,
+            consumed,
+            payload_floor,
+            framing_bytes,
+            parser_lease_capacity,
+            parser_lease_used,
+            parser_lease_exhausted,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if *requested_limit != *advertised_limit
+            || *requested_limit != *known_limit
+            || *requested_limit < *payload_floor
+            || *requested_limit >= PRE_HEADER_BOOTSTRAP_TARGET
+            || blocked_at >= PRE_HEADER_BOOTSTRAP_TARGET
+            || *consumed != 0
+            || *framing_bytes != 0
+            || *parser_lease_used != 0
+            || *parser_lease_exhausted
+            || last_parser_lease_boundary.is_some()
+            || pending_parser_boundary.is_some()
+        {
+            return None;
+        }
+        let remaining_budget = parser_lease_capacity.saturating_sub(*parser_lease_used);
+        let increase = PRE_HEADER_BOOTSTRAP_TARGET
+            .saturating_sub(*requested_limit)
+            .min(remaining_budget);
+        if increase == 0 {
+            return None;
+        }
+        *requested_limit = requested_limit.saturating_add(increase);
+        *parser_lease_used = parser_lease_used.saturating_add(increase);
+        *parser_lease_exhausted |= *parser_lease_used == *parser_lease_capacity;
+        Some((*requested_limit, increase))
     }
 
     /// Lease one maximum HTTP/3 frame-header prefix at a pristine DATA
@@ -946,6 +1041,215 @@ mod tests {
         state.bytes_read(100);
         state.header_progress(2_000, false);
         assert_eq!(state.available(), 2_000);
+    }
+
+    #[test]
+    fn pristine_pre_header_blocked_bootstrap_targets_one_absolute_ceiling() {
+        for (floor, expected_increase) in [(250, 750), (96, 904)] {
+            let mut state = ReceiveState::controlled(16, 1_000, floor);
+            assert_eq!(state.release(floor - 16), Some((floor, floor - 16)));
+
+            // Serde's proof can arrive at the initial prefix while the exact
+            // floor is staged but not yet encoded.
+            assert!(state.accepts_pre_header_blocked(16));
+            assert_eq!(state.pre_header_bootstrap_lease(16), None);
+            state.advertised(floor);
+            assert_eq!(
+                state.pre_header_bootstrap_lease(16),
+                Some((1_000, expected_increase))
+            );
+            assert_eq!(
+                state.pre_header_bootstrap_lease(16),
+                None,
+                "one retained proof can issue only one lease"
+            );
+            assert!(matches!(
+                state,
+                ReceiveState::ReceivingHeaders {
+                    requested_limit: 1_000,
+                    parser_lease_used,
+                    ..
+                } if parser_lease_used == expected_increase
+            ));
+        }
+
+        // Hyper can first report the exact prepared floor itself. The same
+        // event is immediately actionable because requested and advertised
+        // limits already agree.
+        let mut at_floor = ReceiveState::controlled(16, 1_000, 250);
+        assert_eq!(at_floor.release(234), Some((250, 234)));
+        at_floor.advertised(250);
+        assert!(at_floor.accepts_pre_header_blocked(250));
+        assert_eq!(at_floor.pre_header_bootstrap_lease(250), Some((1_000, 750)));
+    }
+
+    #[test]
+    fn pre_header_bootstrap_target_is_distinct_from_its_remaining_delta_budget() {
+        let mut floor_below_initial = ReceiveState::controlled(16, 1_000, 10);
+        assert!(floor_below_initial.accepts_pre_header_blocked(16));
+        assert_eq!(
+            floor_below_initial.pre_header_bootstrap_lease(16),
+            Some((1_000, 984))
+        );
+
+        let mut partial_budget = ReceiveState::controlled(16, 500, 800);
+        assert_eq!(partial_budget.release(784), Some((800, 784)));
+        partial_budget.advertised(800);
+        assert!(partial_budget.accepts_pre_header_blocked(800));
+        assert_eq!(
+            partial_budget.pre_header_bootstrap_lease(800),
+            Some((1_000, 200))
+        );
+        assert!(matches!(
+            partial_budget,
+            ReceiveState::ReceivingHeaders {
+                requested_limit: 1_000,
+                parser_lease_capacity: 500,
+                parser_lease_used: 200,
+                parser_lease_exhausted: false,
+                ..
+            }
+        ));
+
+        let mut exhausted_budget = ReceiveState::controlled(16, 100, 800);
+        assert_eq!(exhausted_budget.release(784), Some((800, 784)));
+        exhausted_budget.advertised(800);
+        assert!(exhausted_budget.accepts_pre_header_blocked(800));
+        assert_eq!(
+            exhausted_budget.pre_header_bootstrap_lease(800),
+            Some((900, 100))
+        );
+        assert!(matches!(
+            exhausted_budget,
+            ReceiveState::ReceivingHeaders {
+                requested_limit: 900,
+                parser_lease_used: 100,
+                parser_lease_exhausted: true,
+                ..
+            }
+        ));
+
+        for floor in [1_000, 1_200] {
+            let mut at_or_above_target = ReceiveState::controlled(16, 500, floor);
+            assert_eq!(
+                at_or_above_target.release(floor - 16),
+                Some((floor, floor - 16))
+            );
+            at_or_above_target.advertised(floor);
+            assert!(!at_or_above_target.accepts_pre_header_blocked(floor));
+            assert_eq!(at_or_above_target.pre_header_bootstrap_lease(floor), None);
+        }
+    }
+
+    #[test]
+    fn canceled_exhausting_pre_header_bootstrap_cannot_be_reissued() {
+        let mut state = ReceiveState::controlled(16, 750, 250);
+        assert_eq!(state.release(234), Some((250, 234)));
+        state.advertised(250);
+        assert!(state.accepts_pre_header_blocked(250));
+        assert_eq!(state.pre_header_bootstrap_lease(250), Some((1_000, 750)));
+        assert!(state.cancel_parser_lease(1_000, 750, true));
+        assert!(matches!(
+            state,
+            ReceiveState::ReceivingHeaders {
+                requested_limit: 250,
+                parser_lease_used: 0,
+                parser_lease_exhausted: true,
+                ..
+            }
+        ));
+        assert!(!state.accepts_pre_header_blocked(250));
+        assert_eq!(state.pre_header_bootstrap_lease(250), None);
+    }
+
+    #[test]
+    fn pre_header_bootstrap_preserves_the_parser_lifetime_cap() {
+        let mut state = ReceiveState::controlled(16, 1_000, 250);
+        assert_eq!(state.release(234), Some((250, 234)));
+        state.advertised(250);
+        assert!(state.accepts_pre_header_blocked(250));
+        assert_eq!(state.pre_header_bootstrap_lease(250), Some((1_000, 750)));
+        state.advertised(1_000);
+        state.bytes_read(1_000);
+
+        let mut typed_tail = 0;
+        while typed_tail < 250 {
+            state.header_progress(1, true);
+            let (absolute, increase, scheduled) = state
+                .parser_lease(true, 0)
+                .expect("remaining lifetime lease");
+            assert!(!scheduled);
+            assert_eq!(increase, (250 - typed_tail).min(16));
+            typed_tail += increase;
+            assert_eq!(absolute, 1_000 + typed_tail);
+            state.advertised(absolute);
+            state.bytes_read(increase);
+        }
+        assert_eq!(typed_tail, 250);
+        state.header_progress(1, true);
+        assert_eq!(
+            state.parser_lease(true, 0),
+            None,
+            "bootstrap plus typed leases cannot exceed max_stream_data_excess"
+        );
+    }
+
+    #[test]
+    fn pre_header_blocked_evidence_rejects_stale_progressed_and_wrong_states() {
+        let mut partial = ReceiveState::controlled(16, 1_000, 250);
+        assert!(
+            !partial.accepts_pre_header_blocked(15),
+            "wrong current limit"
+        );
+        assert_eq!(partial.release(234), Some((250, 234)));
+        assert!(partial.accepts_pre_header_blocked(16));
+        partial.advertised(249);
+        assert!(!partial.accepts_pre_header_blocked(16), "stale limit");
+        assert_eq!(partial.pre_header_bootstrap_lease(16), None);
+
+        let mut parser_active = ReceiveState::controlled(16, 1_000, 250);
+        assert_eq!(parser_active.release(234), Some((250, 234)));
+        parser_active.advertised(250);
+        if let ReceiveState::ReceivingHeaders {
+            parser_lease_used, ..
+        } = &mut parser_active
+        {
+            *parser_lease_used = 1;
+        }
+        assert!(!parser_active.accepts_pre_header_blocked(250));
+        assert_eq!(parser_active.pre_header_bootstrap_lease(250), None);
+
+        let mut progressed = ReceiveState::controlled(16, 1_000, 250);
+        assert!(progressed.accepts_pre_header_blocked(16));
+        assert_eq!(progressed.release(234), Some((250, 234)));
+        progressed.header_progress(1, true);
+        progressed.advertised(250);
+        assert_eq!(progressed.pre_header_bootstrap_lease(16), None);
+
+        let mut consumed = ReceiveState::controlled(16, 1_000, 250);
+        consumed.bytes_read(1);
+        assert!(!consumed.accepts_pre_header_blocked(16));
+
+        let mut post_headers = ReceiveState::controlled(16, 1_000, 250);
+        post_headers.response_headers(20, Some(250));
+        assert!(!post_headers.accepts_pre_header_blocked(16));
+
+        let mut data = ReceiveState::controlled(16, 1_000, 250);
+        data.data_frame(2, 250);
+        assert!(!data.accepts_pre_header_blocked(16));
+
+        let mut automatic = ReceiveState::created(false, 16, 1_000, 250);
+        automatic.open();
+        assert!(!automatic.accepts_pre_header_blocked(16));
+
+        let mut closed = ReceiveState::controlled(16, 1_000, 250);
+        closed.close();
+        assert!(!closed.accepts_pre_header_blocked(16));
+
+        let mut at_ceiling = ReceiveState::controlled(16, 1_000, 1_000);
+        assert_eq!(at_ceiling.release(984), Some((1_000, 984)));
+        at_ceiling.advertised(1_000);
+        assert!(!at_ceiling.accepts_pre_header_blocked(1_000));
     }
 
     #[test]

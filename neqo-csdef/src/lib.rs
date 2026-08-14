@@ -45,9 +45,11 @@ pub use event::{
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{
-    ChaffManifest, ChaffQualification, ExpectedChaffResponse, QualifiedChaffResource, Resource,
-    ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffQualification,
-    ResponseOnlyQualifiedChaffResource, normalize_content_encoding, sanitize_chaff_headers,
+    ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
+    QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
+    ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
+    ResponseOnlyQualifiedChaffResource, ResponseOnlyQualifiedChaffResourceV4,
+    normalize_content_encoding, sanitize_chaff_headers,
 };
 pub use rng::{SplitMix64, derive};
 pub use trace::{Direction, Packet, Trace};

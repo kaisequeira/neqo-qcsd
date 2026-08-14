@@ -1276,8 +1276,9 @@ mod tests {
     use neqo_common::{Datagram, Decoder, Encoder, event::Provider as _, qtrace, to_u64};
     #[cfg(feature = "qcsd")]
     use neqo_csdef::{
-        QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdRequestRole,
-        QcsdStreamFinish, QcsdStreamId, Resource,
+        Direction, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController,
+        QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdStreamFinish, QcsdStreamId, Resource,
+        StaticSchedule, Trace,
     };
     use neqo_qpack as qpack;
     use neqo_transport::{
@@ -2660,6 +2661,171 @@ mod tests {
                     )
                 })
         );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the controller-to-wire advertisement lifecycle is one integration oracle"
+    )]
+    fn qcsd_pre_header_bootstrap_crosses_controller_adapter_and_transport_slotlessly() {
+        fixture_init();
+        let mut client = Http3Client::new(
+            DEFAULT_SERVER_NAME,
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            DEFAULT_ADDR,
+            DEFAULT_ADDR,
+            Http3Parameters::default()
+                .connection_parameters(
+                    ConnectionParameters::default()
+                        .versions(Version::default(), vec![Version::default()])
+                        .max_stream_data(StreamType::BiDi, false, 16),
+                )
+                .max_table_size_encoder(100)
+                .max_table_size_decoder(100)
+                .max_blocked_streams(100)
+                .max_concurrent_push_streams(5),
+            now(),
+        )
+        .expect("client with 16-byte request-stream receive prefix");
+        let mut server = TestServer::new();
+        connect_with(&mut client, &mut server);
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .expect("enable QCSD");
+
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 234).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+
+        let stream = make_request(&mut client, false, &[]);
+        client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(250))
+            .expect("register application floor");
+        for observation in drain_qcsd_observations(&mut client) {
+            controller.observe(observation, Duration::ZERO);
+        }
+        let configure = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::ConfigureManualReceive { .. }))
+            .expect("manual receive action");
+        client
+            .apply_qcsd_action(now(), configure)
+            .expect("apply initial manual limit");
+
+        // This is the proof produced by the transport before HTTP/3 can
+        // classify an atomic response HEADERS frame.
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint: QcsdEndpointId(7),
+                stream: QcsdStreamId(stream.as_u64()),
+                blocked_at: 16,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let floor_action = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+            .expect("prepared floor action");
+        let (floor_limit, floor_slot) = match &floor_action {
+            QcsdAction::IncreaseReceiveLimit {
+                absolute_limit,
+                slot,
+                packet,
+                ..
+            } => {
+                assert_eq!(packet.length(), 234);
+                (*absolute_limit, *slot)
+            }
+            _ => unreachable!("filtered receive-limit action"),
+        };
+        assert_eq!(floor_limit, 250);
+        client
+            .apply_qcsd_action(now(), floor_action)
+            .expect("apply exact floor");
+
+        let floor_advertised = (0..4)
+            .find_map(|_| {
+                let output = client.process_output(now());
+                if let Some(datagram) = output.dgram() {
+                    server.conn.process_input(datagram, now());
+                }
+                drain_qcsd_observations(&mut client)
+                    .into_iter()
+                    .find(|observation| {
+                        matches!(
+                            observation,
+                            QcsdObservation::ReceiveLimitAdvertised {
+                                absolute_limit: 250,
+                                slot: Some(slot),
+                                ..
+                            } if *slot == floor_slot
+                        )
+                    })
+            })
+            .expect("floor reaches the wire with its slot");
+        controller.observe(floor_advertised, Duration::from_micros(1));
+
+        let lease = controller.next_action().expect("bootstrap lease");
+        assert!(matches!(
+            lease,
+            QcsdAction::LeaseParserReceive {
+                endpoint: QcsdEndpointId(7),
+                stream: observed_stream,
+                absolute_limit: 1_000,
+                increase: 750,
+                owner: None,
+            } if observed_stream == QcsdStreamId(stream.as_u64())
+        ));
+        assert_eq!(controller.pending_slots(), [(floor_slot, packet)]);
+        client
+            .apply_qcsd_action(now(), lease)
+            .expect("apply slotless bootstrap");
+
+        let bootstrap_advertised = (0..4)
+            .find_map(|_| {
+                let output = client.process_output(now());
+                if let Some(datagram) = output.dgram() {
+                    server.conn.process_input(datagram, now());
+                }
+                drain_qcsd_observations(&mut client)
+                    .into_iter()
+                    .find(|observation| {
+                        matches!(
+                            observation,
+                            QcsdObservation::ReceiveLimitAdvertised {
+                                absolute_limit: 1_000,
+                                slot: None,
+                                ..
+                            }
+                        )
+                    })
+            })
+            .expect("bootstrap reaches the wire without a slot");
+        controller.observe(bootstrap_advertised, Duration::from_micros(2));
+        assert!(controller.next_action().is_none());
+        assert_eq!(controller.pending_slots(), [(floor_slot, packet)]);
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 234);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 234);
     }
 
     #[cfg(feature = "qcsd")]

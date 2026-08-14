@@ -17,6 +17,9 @@ pub struct StreamState {
     pub role: QcsdRequestRole,
     pub receive: ReceiveState,
     pub status: Option<u16>,
+    /// Exact transport proof retained only until HTTP/3 makes response-header
+    /// progress or the prepared floor can activate the one bootstrap lease.
+    pre_header_blocked_at: Option<u64>,
     request_acknowledged_ranges: Vec<(u64, u64)>,
     request_acknowledged_final_size: Option<u64>,
     request_acknowledgment_invalid: bool,
@@ -134,6 +137,7 @@ impl StreamRegistry {
                 role,
                 receive,
                 status: None,
+                pre_header_blocked_at: None,
                 request_acknowledged_ranges: Vec::new(),
                 request_acknowledged_final_size: None,
                 request_acknowledgment_invalid: false,
@@ -487,10 +491,59 @@ impl StreamRegistry {
         awaiting_data_frame: bool,
     ) {
         if let Some(state) = self.get_mut(endpoint, stream) {
+            state.pre_header_blocked_at = None;
             state
                 .receive
                 .header_progress(min_remaining, awaiting_data_frame);
         }
+    }
+
+    /// Invalidate transport-only pre-header proof after typed HTTP/3 progress.
+    pub(crate) fn clear_pre_header_blocked(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) {
+        if let Some(state) = self.get_mut(endpoint, stream) {
+            state.pre_header_blocked_at = None;
+        }
+    }
+
+    /// Record an exact, pristine pre-header `STREAM_DATA_BLOCKED` report.
+    pub(crate) fn record_pre_header_blocked(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        blocked_at: u64,
+    ) -> bool {
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return false;
+        };
+        if !state.receive.accepts_pre_header_blocked(blocked_at) {
+            return false;
+        }
+        state.pre_header_blocked_at = Some(blocked_at);
+        true
+    }
+
+    /// Lease the remaining prefix up to the stream's absolute framing ceiling
+    /// after its prepared floor and retained blocked proof agree.
+    pub(crate) fn pre_header_bootstrap_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        let blocked_at = state.pre_header_blocked_at?;
+        let (absolute_limit, increase) = state.receive.pre_header_bootstrap_lease(blocked_at)?;
+        state.pre_header_blocked_at = None;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled: false,
+        })
     }
 
     pub fn parser_lease(
@@ -553,6 +606,7 @@ impl StreamRegistry {
             reason = "clearing every independent stream boundary is order-insensitive"
         )]
         for state in self.streams.values_mut() {
+            state.pre_header_blocked_at = None;
             state.receive.clear_parser_boundary();
         }
     }
@@ -582,6 +636,39 @@ fn merge_ranges(ranges: &mut Vec<(u64, u64)>) {
 mod tests {
     use super::StreamRegistry;
     use crate::{DefenseMode, QcsdEndpointId, QcsdRequestRole, QcsdStreamId};
+
+    #[test]
+    fn typed_header_progress_invalidates_retained_pre_header_blocked_proof() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        let mut registry = StreamRegistry::default();
+        registry.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            1_000,
+            250,
+        );
+        assert!(registry.record_pre_header_blocked(endpoint, stream, 16));
+        assert_eq!(
+            registry
+                .release_stream(endpoint, stream, 234)
+                .map(|release| release.absolute_limit),
+            Some(250)
+        );
+
+        // Even progress that does not raise the already prepared body floor
+        // supersedes the transport-only proof.
+        registry.header_progress(endpoint, stream, 1, false);
+        registry
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .advertised(250);
+        assert_eq!(registry.pre_header_bootstrap_lease(endpoint, stream), None);
+    }
 
     #[test]
     fn chaff_only_never_releases_application_capacity() {
