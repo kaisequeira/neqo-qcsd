@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use neqo_common::Header;
 use neqo_csdef::{
     QcsdAction, QcsdChaffRequestId, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
-    QcsdRequestRole, QcsdStreamId, Resource, TimestampedQcsdObservation, TrafficMorphingEgress,
-    sanitize_chaff_headers,
+    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdStreamId, Resource, TimestampedQcsdObservation,
+    TrafficMorphingEgress, sanitize_chaff_headers,
 };
 use neqo_transport::StreamId;
 
@@ -281,6 +282,265 @@ impl Http3Client {
     #[must_use]
     pub fn qcsd_pending_packet_targets(&self) -> usize {
         self.conn.qcsd_pending_packet_targets()
+    }
+
+    /// Purely classify one receive-limit action without mutating HTTP/3 or
+    /// transport state.
+    ///
+    /// Returns `None` for non-receive actions or actions addressed to another
+    /// endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome for receive-credit revoke, ordering, or
+    /// action-ledger failures.
+    pub fn preview_qcsd_receive_action(
+        &self,
+        action: &QcsdAction,
+        virtual_high_water: Option<u64>,
+    ) -> Result<Option<QcsdReceiveLimitOutcome>, QcsdReceiveLimitError> {
+        let own_endpoint = self.qcsd_endpoint.ok_or(QcsdReceiveLimitError {
+            kind: QcsdReceiveLimitFatal::Ledger,
+            requested_limit: 0,
+            reference_limit: 0,
+        })?;
+        if let QcsdAction::ConfigureAutomaticReceive {
+            endpoint, stream, ..
+        } = action
+        {
+            if *endpoint != own_endpoint {
+                return Ok(None);
+            }
+            return Ok(Some(
+                self.conn
+                    .qcsd_stream_receive_lifecycle(StreamId::new(stream.0)),
+            ));
+        }
+        let (endpoint, stream, absolute_limit, identity, expected_previous, strict_advance) =
+            match action {
+                QcsdAction::ConfigureManualReceive {
+                    endpoint,
+                    stream,
+                    initial_limit,
+                } => (*endpoint, *stream, *initial_limit, None, None, false),
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    ..
+                } => (
+                    *endpoint,
+                    *stream,
+                    *absolute_limit,
+                    action.receive_identity(),
+                    None,
+                    true,
+                ),
+                QcsdAction::LeaseParserReceive {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    increase,
+                    ..
+                } => {
+                    let Some(expected_previous) = absolute_limit.checked_sub(*increase) else {
+                        return Err(QcsdReceiveLimitError {
+                            kind: QcsdReceiveLimitFatal::Ledger,
+                            requested_limit: *absolute_limit,
+                            reference_limit: *increase,
+                        });
+                    };
+                    (
+                        *endpoint,
+                        *stream,
+                        *absolute_limit,
+                        action.receive_identity(),
+                        Some(expected_previous),
+                        true,
+                    )
+                }
+                _ => return Ok(None),
+            };
+        if endpoint != own_endpoint {
+            return Ok(None);
+        }
+        self.conn
+            .qcsd_preview_stream_receive_limit_action(
+                StreamId::new(stream.0),
+                absolute_limit,
+                identity,
+                virtual_high_water,
+                expected_previous,
+                strict_advance,
+            )
+            .map(Some)
+    }
+
+    /// Apply one receive-limit action and return its typed lifecycle outcome.
+    ///
+    /// Returns `None` for non-receive actions or actions addressed to another
+    /// endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if live transport state no longer
+    /// matches the action ledger established during preflight.
+    pub fn apply_qcsd_receive_action(
+        &mut self,
+        action: &QcsdAction,
+    ) -> Result<Option<QcsdReceiveLimitOutcome>, QcsdReceiveLimitError> {
+        let own_endpoint = self.qcsd_endpoint.ok_or(QcsdReceiveLimitError {
+            kind: QcsdReceiveLimitFatal::Ledger,
+            requested_limit: 0,
+            reference_limit: 0,
+        })?;
+        if let QcsdAction::ConfigureAutomaticReceive {
+            endpoint,
+            stream,
+            window,
+        } = action
+        {
+            if *endpoint != own_endpoint {
+                return Ok(None);
+            }
+            return self
+                .conn
+                .qcsd_apply_stream_auto_receive_action(StreamId::new(stream.0), *window)
+                .map(Some);
+        }
+        let (endpoint, stream, absolute_limit, identity, expected_previous, strict_advance) =
+            match action {
+                QcsdAction::ConfigureManualReceive {
+                    endpoint,
+                    stream,
+                    initial_limit,
+                } => (*endpoint, *stream, *initial_limit, None, None, false),
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    ..
+                } => (
+                    *endpoint,
+                    *stream,
+                    *absolute_limit,
+                    action.receive_identity(),
+                    None,
+                    true,
+                ),
+                QcsdAction::LeaseParserReceive {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    increase,
+                    ..
+                } => {
+                    let Some(expected_previous) = absolute_limit.checked_sub(*increase) else {
+                        return Err(QcsdReceiveLimitError {
+                            kind: QcsdReceiveLimitFatal::Ledger,
+                            requested_limit: *absolute_limit,
+                            reference_limit: *increase,
+                        });
+                    };
+                    (
+                        *endpoint,
+                        *stream,
+                        *absolute_limit,
+                        action.receive_identity(),
+                        Some(expected_previous),
+                        true,
+                    )
+                }
+                _ => return Ok(None),
+            };
+        if endpoint != own_endpoint {
+            return Ok(None);
+        }
+        if matches!(action, QcsdAction::ConfigureManualReceive { .. }) {
+            let preview = self.conn.qcsd_preview_stream_receive_limit_action(
+                StreamId::new(stream.0),
+                absolute_limit,
+                identity,
+                None,
+                expected_previous,
+                strict_advance,
+            )?;
+            if preview != QcsdReceiveLimitOutcome::Applied {
+                return Ok(Some(preview));
+            }
+            self.conn
+                .stream_keep_alive(StreamId::new(stream.0), true)
+                .map_err(|_| QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: absolute_limit,
+                    reference_limit: 0,
+                })?;
+        }
+        self.conn
+            .qcsd_apply_stream_receive_limit_action(
+                StreamId::new(stream.0),
+                absolute_limit,
+                identity,
+                expected_previous,
+                strict_advance,
+            )
+            .map(Some)
+    }
+
+    /// Exact typed receive actions accepted but not yet encoded by transport.
+    #[must_use]
+    pub fn qcsd_pending_receive_action_identities(&self) -> Vec<QcsdReceiveActionIdentity> {
+        self.conn.qcsd_pending_receive_action_identities()
+    }
+
+    /// Purely validate rollback of exact accepted-but-unencoded actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome for an unknown, encoded, or non-LIFO identity.
+    pub fn preview_qcsd_receive_action_cancellation(
+        &self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<(), QcsdReceiveLimitError> {
+        self.conn
+            .qcsd_preview_receive_action_cancellation(identities)
+    }
+
+    /// Per-stream controller boundary restored by this adapter rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed fatal outcomes as cancellation preview.
+    pub fn qcsd_receive_action_cancellation_boundaries(
+        &self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<Vec<(QcsdEndpointId, QcsdStreamId, u64)>, QcsdReceiveLimitError> {
+        let endpoint = self.qcsd_endpoint.ok_or(QcsdReceiveLimitError {
+            kind: QcsdReceiveLimitFatal::Ledger,
+            requested_limit: 0,
+            reference_limit: 0,
+        })?;
+        self.conn
+            .qcsd_receive_action_cancellation_boundaries(identities)
+            .map(|boundaries| {
+                boundaries
+                    .into_iter()
+                    .map(|(stream, restored)| (endpoint, QcsdStreamId(stream.as_u64()), restored))
+                    .collect()
+            })
+    }
+
+    /// Commit a previously validated exact accepted-but-unencoded rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if transport changed since preview.
+    pub fn commit_qcsd_receive_action_cancellation(
+        &mut self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<(), QcsdReceiveLimitError> {
+        self.conn
+            .qcsd_commit_receive_action_cancellation(identities)
     }
 
     /// Apply one controller action addressed to this connection.

@@ -29,11 +29,13 @@ use neqo_csdef::{
     ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics, DefenseKind,
     DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
     QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
-    QcsdObservationClock, QcsdProfile, QcsdRequestRole, QcsdSlotId, QcsdStreamTransmission,
-    Resource, ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest,
-    ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
-    StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
-    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
+    QcsdObservationClock, QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
+    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSlotId,
+    QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
+    ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
+    ResponseOnlyChaffQualificationV4, StaticMode, TimestampedQcsdObservation,
+    TrafficMorphingEgress, WalkieTalkie, WalkieTalkieQualificationBinding, derive,
+    normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -81,6 +83,8 @@ pub enum Error {
     RunAborted(String),
     #[error("QCSD slot accounting invariant failed: {0}")]
     SlotInvariant(String),
+    #[error(transparent)]
+    ReceiveLimit(#[from] QcsdReceiveLimitError),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -5473,6 +5477,552 @@ fn register_action_batch(
     Ok(incoming_fanout_slots)
 }
 
+#[derive(Debug)]
+struct ReceiveBatchPreflight {
+    expected: Vec<Option<QcsdReceiveLimitOutcome>>,
+    rejected_streams: BTreeMap<(QcsdEndpointId, neqo_csdef::QcsdStreamId), QcsdReceiveLimitOutcome>,
+}
+
+const fn receive_action_target(
+    action: &QcsdAction,
+) -> Option<(QcsdEndpointId, neqo_csdef::QcsdStreamId, u64)> {
+    match action {
+        QcsdAction::ConfigureManualReceive {
+            endpoint,
+            stream,
+            initial_limit,
+        } => Some((*endpoint, *stream, *initial_limit)),
+        QcsdAction::ConfigureAutomaticReceive {
+            endpoint,
+            stream,
+            window,
+        } => Some((*endpoint, *stream, *window)),
+        QcsdAction::IncreaseReceiveLimit {
+            endpoint,
+            stream,
+            absolute_limit,
+            ..
+        }
+        | QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream,
+            absolute_limit,
+            ..
+        } => Some((*endpoint, *stream, *absolute_limit)),
+        _ => None,
+    }
+}
+
+const fn receive_action_requires_controller_ledger(action: &QcsdAction) -> bool {
+    matches!(
+        action,
+        QcsdAction::ConfigureManualReceive { .. }
+            | QcsdAction::IncreaseReceiveLimit { .. }
+            | QcsdAction::LeaseParserReceive { .. }
+    )
+}
+
+const fn receive_limit_outcome_name(outcome: QcsdReceiveLimitOutcome) -> &'static str {
+    match outcome {
+        QcsdReceiveLimitOutcome::Applied => "applied",
+        QcsdReceiveLimitOutcome::FinalKnown => "final_known",
+        QcsdReceiveLimitOutcome::Terminal => "terminal",
+        QcsdReceiveLimitOutcome::Gone => "gone",
+    }
+}
+
+const fn receive_limit_fatal_name(fatal: QcsdReceiveLimitFatal) -> &'static str {
+    match fatal {
+        QcsdReceiveLimitFatal::WouldRevoke => "would_revoke",
+        QcsdReceiveLimitFatal::Order => "order",
+        QcsdReceiveLimitFatal::Ledger => "ledger",
+    }
+}
+
+fn record_receive_limit_error(
+    traces: &mut TraceFiles,
+    now: Instant,
+    action: &QcsdAction,
+    phase: &str,
+    error: QcsdReceiveLimitError,
+) -> Result<(), Error> {
+    let outcome = format!(
+        "failed_receive_{phase}_{}",
+        receive_limit_fatal_name(error.kind)
+    );
+    traces.event(now, action_endpoint(action), "action", &outcome, action)?;
+    traces.event(now, action_endpoint(action), "action_error", phase, &error)?;
+    Ok(())
+}
+
+fn record_adapter_action_error(
+    traces: &mut TraceFiles,
+    now: Instant,
+    action: &QcsdAction,
+    error: &neqo_http3::Error,
+) -> Result<(), Error> {
+    traces.event(now, action_endpoint(action), "action", "failed", action)?;
+    traces.event(
+        now,
+        action_endpoint(action),
+        "action_error",
+        "adapter",
+        &json!({ "error": error.to_string() }),
+    )?;
+    Ok(())
+}
+
+fn preflight_receive_actions_with(
+    actions: &[QcsdAction],
+    mut preview: impl FnMut(
+        usize,
+        &QcsdAction,
+        Option<u64>,
+    ) -> Result<Option<QcsdReceiveLimitOutcome>, QcsdReceiveLimitError>,
+) -> Result<ReceiveBatchPreflight, (usize, QcsdReceiveLimitError)> {
+    let mut expected = vec![None; actions.len()];
+    let mut virtual_high_water = BTreeMap::new();
+    let mut rejected_streams = BTreeMap::new();
+    for (index, action) in actions.iter().enumerate() {
+        let Some((endpoint, stream, absolute_limit)) = receive_action_target(action) else {
+            continue;
+        };
+        let key = (endpoint, stream);
+        if let Some(outcome) = rejected_streams.get(&key).copied() {
+            expected[index] = Some(outcome);
+            continue;
+        }
+        let Some(outcome) = preview(index, action, virtual_high_water.get(&key).copied())
+            .map_err(|error| (index, error))?
+        else {
+            // A missing endpoint is handled by the established EndpointClosed
+            // dispatch path. It has no transport state to preflight.
+            continue;
+        };
+        expected[index] = Some(outcome);
+        match outcome {
+            QcsdReceiveLimitOutcome::Applied => {
+                virtual_high_water.insert(key, absolute_limit);
+            }
+            QcsdReceiveLimitOutcome::FinalKnown
+            | QcsdReceiveLimitOutcome::Terminal
+            | QcsdReceiveLimitOutcome::Gone => {
+                rejected_streams.insert(key, outcome);
+            }
+        }
+    }
+    Ok(ReceiveBatchPreflight {
+        expected,
+        rejected_streams,
+    })
+}
+
+fn preflight_receive_action_batch(
+    endpoints: &[Endpoint],
+    traces: &mut TraceFiles,
+    now: Instant,
+    actions: &[QcsdAction],
+) -> Result<ReceiveBatchPreflight, Error> {
+    match preflight_receive_actions_with(actions, |_, action, virtual_high_water| {
+        let (endpoint_id, _, absolute_limit) =
+            receive_action_target(action).ok_or(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Ledger,
+                requested_limit: 0,
+                reference_limit: 0,
+            })?;
+        let Some(endpoint) = endpoints
+            .iter()
+            .find(|candidate| candidate.id == endpoint_id)
+        else {
+            // Existing missing-endpoint dispatch produces the exact
+            // EndpointClosed slot outcome and controller rollback.
+            return Ok(None);
+        };
+        match endpoint
+            .client
+            .preview_qcsd_receive_action(action, virtual_high_water)
+        {
+            Ok(Some(outcome)) => Ok(Some(outcome)),
+            Ok(None) => Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Ledger,
+                requested_limit: absolute_limit,
+                reference_limit: 0,
+            }),
+            Err(error) => Err(error),
+        }
+    }) {
+        Ok(preflight) => Ok(preflight),
+        Err((index, error)) => {
+            record_receive_limit_error(traces, now, &actions[index], "preflight", error)?;
+            Err(error.into())
+        }
+    }
+}
+
+fn pending_receive_identity_is_reconciled(
+    identity: &QcsdReceiveActionIdentity,
+    restored_limits: &[(QcsdEndpointId, neqo_csdef::QcsdStreamId, u64)],
+    canceled: &[QcsdReceiveActionIdentity],
+    retained: &[QcsdReceiveActionIdentity],
+) -> bool {
+    let Some((_, _, cutoff)) = restored_limits
+        .iter()
+        .find(|candidate| candidate.0 == identity.endpoint() && candidate.1 == identity.stream())
+    else {
+        return true;
+    };
+    if identity.absolute_limit() > *cutoff {
+        canceled.contains(identity)
+    } else {
+        retained.contains(identity) && !canceled.contains(identity)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "global observation flush, three-ledger bijection, adapter preview, and atomic multi-stream commit form one audited transaction"
+)]
+fn cancel_rejected_receive_streams(
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    now: Instant,
+    defense_elapsed: Duration,
+    actions: &[QcsdAction],
+    rejected_streams: &BTreeMap<
+        (QcsdEndpointId, neqo_csdef::QcsdStreamId),
+        QcsdReceiveLimitOutcome,
+    >,
+) -> Result<BTreeMap<usize, QcsdReceiveLimitOutcome>, Error> {
+    if rejected_streams.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    // Preserve the transport-wide production order of FIN, BytesRead, and
+    // MAX_STREAM_DATA encoding observations before consulting controller
+    // ownership.  A queued advertisement must cease to be cancelable first.
+    handle_all_qcsd_observations(endpoints, controller, traces, defense_elapsed)?;
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+
+    let ledger_rejected_streams: BTreeSet<_> = rejected_streams
+        .keys()
+        .copied()
+        .filter(|&(endpoint, stream)| {
+            actions.iter().any(|action| {
+                receive_action_requires_controller_ledger(action)
+                    && receive_action_target(action).is_some_and(
+                        |(candidate, candidate_stream, _)| {
+                            candidate == endpoint && candidate_stream == stream
+                        },
+                    )
+            })
+        })
+        .collect();
+    if ledger_rejected_streams.is_empty() {
+        let mut canceled_indices = BTreeMap::new();
+        for (index, action) in actions.iter().enumerate() {
+            if let Some((endpoint, stream, _)) = receive_action_target(action)
+                && let Some(outcome) = rejected_streams.get(&(endpoint, stream)).copied()
+            {
+                canceled_indices.insert(index, outcome);
+            }
+        }
+        for (&(endpoint, stream), &outcome) in rejected_streams {
+            traces.event(
+                now,
+                Some(endpoint),
+                "receive_cancellation",
+                receive_limit_outcome_name(outcome),
+                &json!({
+                    "stream": stream.0,
+                    "drained_indices": canceled_indices
+                        .keys()
+                        .copied()
+                        .filter(|index| receive_action_target(&actions[*index])
+                            .is_some_and(|(candidate, candidate_stream, _)|
+                                candidate == endpoint && candidate_stream == stream))
+                        .collect::<Vec<_>>(),
+                    "canceled_slots": Vec::<u64>::new(),
+                    "canceled_actions": Vec::<String>::new(),
+                }),
+            )?;
+        }
+        handle_all_qcsd_observations(endpoints, controller, traces, defense_elapsed)?;
+        controller.flush_defense_observations();
+        ensure_defense_realizable(controller)?;
+        return Ok(canceled_indices);
+    }
+
+    let rejections: Vec<_> = rejected_streams
+        .keys()
+        .filter(|key| ledger_rejected_streams.contains(key))
+        .map(|&(endpoint, stream)| {
+            let roots = actions
+                .iter()
+                .filter_map(QcsdAction::receive_identity)
+                .filter(|identity| identity.endpoint() == endpoint && identity.stream() == stream)
+                .collect();
+            (endpoint, stream, roots)
+        })
+        .collect();
+    let plan = controller.plan_receive_streams_unavailable(&rejections)?;
+
+    let mut current = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        let Some(identity) = action.receive_identity() else {
+            continue;
+        };
+        if current
+            .iter()
+            .any(|(other, _): &(QcsdReceiveActionIdentity, usize)| *other == identity)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "duplicate drained receive identity {identity:?}"
+            )));
+        }
+        current.push((identity, index));
+    }
+    let mut pending = Vec::new();
+    for endpoint in endpoints.iter() {
+        for identity in endpoint.client.qcsd_pending_receive_action_identities() {
+            if identity.endpoint() != endpoint.id {
+                return Err(Error::SlotInvariant(format!(
+                    "adapter {} reported cross-endpoint pending identity {identity:?}",
+                    endpoint.id.0
+                )));
+            }
+            if pending.contains(&identity) || current.iter().any(|(other, _)| *other == identity) {
+                return Err(Error::SlotInvariant(format!(
+                    "pending receive identity is duplicate or not disjoint: {identity:?}"
+                )));
+            }
+            pending.push(identity);
+        }
+    }
+    let queued = controller.queued_receive_action_identities();
+    for (index, identity) in queued.iter().enumerate() {
+        if queued[..index].contains(identity)
+            || current.iter().any(|(candidate, _)| candidate == identity)
+            || pending.contains(identity)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "queued receive identity is duplicate or not disjoint: {identity:?}"
+            )));
+        }
+    }
+
+    for identity in plan.canceled_actions() {
+        let current_matches = current
+            .iter()
+            .filter(|(candidate, _)| candidate == identity)
+            .count();
+        let pending_matches = pending
+            .iter()
+            .filter(|candidate| *candidate == identity)
+            .count();
+        let queued_matches = queued
+            .iter()
+            .filter(|candidate| *candidate == identity)
+            .count();
+        if current_matches + pending_matches + queued_matches != 1 {
+            return Err(Error::SlotInvariant(format!(
+                "planned receive cancellation {identity:?} matched {current_matches} drained, {pending_matches} pending, and {queued_matches} queued actions"
+            )));
+        }
+    }
+    for identity in plan.retained_actions() {
+        let matches = current
+            .iter()
+            .filter(|(candidate, _)| candidate == identity)
+            .count()
+            + pending
+                .iter()
+                .filter(|candidate| *candidate == identity)
+                .count()
+            + queued
+                .iter()
+                .filter(|candidate| *candidate == identity)
+                .count();
+        if matches != 1 {
+            return Err(Error::SlotInvariant(format!(
+                "retained controller receive identity {identity:?} matched {matches} runner/adapter identities"
+            )));
+        }
+    }
+    for (identity, _) in &current {
+        if rejected_streams.contains_key(&(identity.endpoint(), identity.stream()))
+            && !plan.canceled_actions().contains(identity)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "receive cancellation omitted drained rejected identity {identity:?}"
+            )));
+        }
+    }
+    for identity in current
+        .iter()
+        .map(|(identity, _)| identity)
+        .chain(pending.iter())
+        .chain(queued.iter())
+    {
+        if !pending_receive_identity_is_reconciled(
+            identity,
+            plan.restored_limits(),
+            plan.canceled_actions(),
+            plan.retained_actions(),
+        ) {
+            return Err(Error::SlotInvariant(format!(
+                "controller plan misclassified runner/adapter identity around rollback cutoff: {identity:?}"
+            )));
+        }
+    }
+
+    let mut pending_by_endpoint: BTreeMap<QcsdEndpointId, Vec<QcsdReceiveActionIdentity>> =
+        BTreeMap::new();
+    for identity in plan.canceled_actions() {
+        if pending.contains(identity) {
+            pending_by_endpoint
+                .entry(identity.endpoint())
+                .or_default()
+                .push(*identity);
+        }
+    }
+    // Preview every adapter, including the last endpoint, before any commit.
+    let mut adapter_boundaries = Vec::new();
+    for (endpoint_id, identities) in &pending_by_endpoint {
+        let endpoint = endpoints
+            .iter()
+            .find(|candidate| candidate.id == *endpoint_id)
+            .ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "receive cancellation lost pending endpoint {}",
+                    endpoint_id.0
+                ))
+            })?;
+        endpoint
+            .client
+            .preview_qcsd_receive_action_cancellation(identities)?;
+        adapter_boundaries.extend(
+            endpoint
+                .client
+                .qcsd_receive_action_cancellation_boundaries(identities)?,
+        );
+    }
+    for (index, boundary) in adapter_boundaries.iter().enumerate() {
+        if adapter_boundaries[..index]
+            .iter()
+            .any(|candidate| candidate.0 == boundary.0 && candidate.1 == boundary.1)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "adapter receive rollback repeated boundary {}:{}",
+                boundary.0.0, boundary.1.0
+            )));
+        }
+        let matches: Vec<_> = plan
+            .restored_limits()
+            .iter()
+            .filter(|candidate| candidate.0 == boundary.0 && candidate.1 == boundary.1)
+            .collect();
+        if matches.len() != 1 || matches[0].2 != boundary.2 {
+            return Err(Error::SlotInvariant(format!(
+                "adapter/controller receive rollback boundary diverged on {}:{}: adapter {}, controller {:?}",
+                boundary.0.0,
+                boundary.1.0,
+                boundary.2,
+                matches
+                    .iter()
+                    .map(|candidate| candidate.2)
+                    .collect::<Vec<_>>()
+            )));
+        }
+    }
+
+    let mut canceled_indices = BTreeMap::new();
+    let fallback_outcome = *rejected_streams
+        .values()
+        .next()
+        .expect("nonempty rejected streams checked above");
+    for (identity, index) in &current {
+        if plan.canceled_actions().contains(identity) {
+            let outcome = rejected_streams
+                .get(&(identity.endpoint(), identity.stream()))
+                .copied()
+                .unwrap_or(fallback_outcome);
+            if canceled_indices.insert(*index, outcome).is_some() {
+                return Err(Error::SlotInvariant(format!(
+                    "drained receive action {index} was canceled more than once"
+                )));
+            }
+        }
+    }
+    for (index, action) in actions.iter().enumerate() {
+        let Some((endpoint, stream, _)) = receive_action_target(action) else {
+            continue;
+        };
+        if action.receive_identity().is_none()
+            && let Some(outcome) = rejected_streams.get(&(endpoint, stream)).copied()
+            && canceled_indices.insert(index, outcome).is_some()
+        {
+            return Err(Error::SlotInvariant(format!(
+                "drained receive configuration {index} was canceled more than once"
+            )));
+        }
+    }
+
+    for (endpoint_id, identities) in &pending_by_endpoint {
+        let endpoint = endpoints
+            .iter_mut()
+            .find(|candidate| candidate.id == *endpoint_id)
+            .expect("pending endpoint survived pure validation");
+        endpoint
+            .client
+            .commit_qcsd_receive_action_cancellation(identities)?;
+    }
+    let cancellation = controller.commit_receive_streams_unavailable(&plan, defense_elapsed)?;
+
+    for (&(endpoint, stream), &outcome) in rejected_streams {
+        let mut drained_indices: Vec<_> = canceled_indices
+            .keys()
+            .copied()
+            .filter(|index| {
+                receive_action_target(&actions[*index]).is_some_and(
+                    |(candidate, candidate_stream, _)| {
+                        candidate == endpoint && candidate_stream == stream
+                    },
+                )
+            })
+            .collect();
+        drained_indices.sort_unstable();
+        traces.event(
+            now,
+            Some(endpoint),
+            "receive_cancellation",
+            receive_limit_outcome_name(outcome),
+            &json!({
+                "stream": stream.0,
+                "drained_indices": drained_indices,
+                "canceled_slots": cancellation
+                    .canceled_slots()
+                    .iter()
+                    .map(|slot| slot.0)
+                    .collect::<Vec<_>>(),
+                "canceled_actions": cancellation
+                    .canceled_actions()
+                    .iter()
+                    .map(|identity| format!("{identity:?}"))
+                    .collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+
+    // Cancellation and terminal observations are a reducer barrier: no later,
+    // unrelated action may reach an adapter before global ordered delivery.
+    handle_all_qcsd_observations(endpoints, controller, traces, defense_elapsed)?;
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    Ok(canceled_indices)
+}
+
 fn apply_action_batch(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
@@ -5483,7 +6033,28 @@ fn apply_action_batch(
     actions: Vec<QcsdAction>,
 ) -> Result<(), Error> {
     let incoming_fanout_slots = register_action_batch(traces, now, &actions)?;
-    for action in actions {
+    let preflight = preflight_receive_action_batch(endpoints, traces, now, &actions)?;
+    let canceled_indices = cancel_rejected_receive_streams(
+        endpoints,
+        controller,
+        traces,
+        now,
+        defense_elapsed,
+        &actions,
+        &preflight.rejected_streams,
+    )?;
+    for (index, action) in actions.into_iter().enumerate() {
+        if let Some(outcome) = canceled_indices.get(&index).copied() {
+            let event_outcome = format!("canceled_receive_{}", receive_limit_outcome_name(outcome));
+            traces.event(
+                now,
+                action_endpoint(&action),
+                "action",
+                &event_outcome,
+                &action,
+            )?;
+            continue;
+        }
         let may_skip_terminal_sibling = scheduled_action(&action)
             .is_some_and(|(_, _, slot)| incoming_fanout_slots.contains(&slot));
         apply_action(
@@ -5495,6 +6066,7 @@ fn apply_action_batch(
             defense_elapsed,
             action,
             may_skip_terminal_sibling,
+            preflight.expected[index],
         )?;
     }
     Ok(())
@@ -5545,6 +6117,7 @@ fn apply_action(
     defense_elapsed: Duration,
     mut action: QcsdAction,
     may_skip_terminal_sibling: bool,
+    expected_receive: Option<QcsdReceiveLimitOutcome>,
 ) -> Result<(), Error> {
     sanitize_chaff_action_headers(&mut action);
     let endpoint_id = action_endpoint(&action);
@@ -5620,6 +6193,59 @@ fn apply_action(
         QcsdAction::SendPacket { packet, slot, .. } => Some((*packet, *slot)),
         _ => None,
     };
+    if let Some((_, _, absolute_limit)) = receive_action_target(&trace_action) {
+        let Some(expected) = expected_receive else {
+            return Err(Error::SlotInvariant(
+                "receive action reached a live endpoint without preflight".into(),
+            ));
+        };
+        if expected != QcsdReceiveLimitOutcome::Applied {
+            return Err(Error::SlotInvariant(format!(
+                "receive action reached dispatch with non-live {expected:?} preflight"
+            )));
+        }
+        match endpoint.client.apply_qcsd_receive_action(&trace_action) {
+            Ok(Some(QcsdReceiveLimitOutcome::Applied)) => {
+                traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
+                return Ok(());
+            }
+            Ok(Some(actual)) => {
+                traces.event(
+                    now,
+                    endpoint_id,
+                    "action",
+                    "failed_receive_apply_mismatch",
+                    &trace_action,
+                )?;
+                traces.event(
+                    now,
+                    endpoint_id,
+                    "action_error",
+                    "apply_mismatch",
+                    &json!({
+                        "expected": receive_limit_outcome_name(expected),
+                        "actual": receive_limit_outcome_name(actual),
+                    }),
+                )?;
+                return Err(Error::SlotInvariant(format!(
+                    "receive action previewed {expected:?} but applied as {actual:?}"
+                )));
+            }
+            Ok(None) => {
+                let error = QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: absolute_limit,
+                    reference_limit: 0,
+                };
+                record_receive_limit_error(traces, now, &trace_action, "apply", error)?;
+                return Err(error.into());
+            }
+            Err(error) => {
+                record_receive_limit_error(traces, now, &trace_action, "apply", error)?;
+                return Err(error.into());
+            }
+        }
+    }
     match endpoint.client.apply_qcsd_action(now, action) {
         Ok(chaff_stream) => {
             if let Some((packet, slot)) = scheduled_packet {
@@ -5739,7 +6365,7 @@ fn apply_action(
                     slot,
                 })?;
             }
-            traces.event(now, endpoint_id, "action", "failed", &error.to_string())?;
+            record_adapter_action_error(traces, now, &trace_action, &error)?;
             return Err(error.into());
         }
     }
@@ -6170,13 +6796,14 @@ mod tests {
         DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig,
         IdentityChaffRequestHeaderPrimitive, MissedSlotReason, Packet, QcsdAction,
         QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId,
-        QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdSlotId, QcsdStreamFinish,
-        QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource, ResourceManifest,
-        ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
-        ResponseOnlyChaffQualificationV4, ResponseOnlyQualifiedChaffResource,
-        ResponseOnlyQualifiedChaffResourceV4, SignalKind, StaticSchedule, TamarawConfig, Trace,
-        TrafficMorphingConfig, WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad,
-        WtfPadConfig, sanitize_chaff_headers,
+        QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
+        QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdSlotId,
+        QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource,
+        ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
+        ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
+        ResponseOnlyQualifiedChaffResource, ResponseOnlyQualifiedChaffResourceV4, SignalKind,
+        StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig, WalkieTalkieConfig,
+        WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig, sanitize_chaff_headers,
     };
 
     use super::{
@@ -6192,12 +6819,14 @@ mod tests {
         datagram_observation, deadline_error, defense_parameter_provenance,
         drain_qualifier_stream_data, ensure_defense_realizable,
         expected_application_response_length, finish_application_record, finish_chaff_record,
-        forward_qcsd_observation, has_in_flight_application_stream, now, prefix_receipts_pass,
-        prefix_targetless_stream_bytes, projected_ael, projected_identity_chaff_headers,
-        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
-        record_terminal_action, register_action_batch, remaining_wakeup_delay, resolve_run_config,
-        resolve_run_config_with_workload, response_qualification_mode,
-        sanitize_chaff_action_headers, sha256, shapes_stream_sends,
+        forward_qcsd_observation, has_in_flight_application_stream, now,
+        pending_receive_identity_is_reconciled, prefix_receipts_pass,
+        prefix_targetless_stream_bytes, preflight_receive_actions_with, projected_ael,
+        projected_identity_chaff_headers, qcsd_connection_parameters,
+        qualification_content_encoding, ready_request_batch, record_adapter_action_error,
+        record_receive_limit_error, record_terminal_action, register_action_batch,
+        remaining_wakeup_delay, resolve_run_config, resolve_run_config_with_workload,
+        response_qualification_mode, sanitize_chaff_action_headers, sha256, shapes_stream_sends,
         sustained_qualification_content_encoding, sustained_representation_failure,
         sustained_requests_are_classifiable, terminalize_pending_slots,
         trace_files::{ScheduleTraceRow, TraceFiles},
@@ -8087,6 +8716,288 @@ mod tests {
             ),
             MissedSlotReason::RunAborted
         );
+    }
+
+    #[test]
+    fn receive_batch_preflight_uses_virtual_high_water_and_rejects_one_stream_transitively() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let other_stream = QcsdStreamId(8);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let scheduled = |stream, absolute_limit, slot| QcsdAction::IncreaseReceiveLimit {
+            endpoint,
+            stream,
+            absolute_limit,
+            packet,
+            slot: QcsdSlotId(slot),
+        };
+        let actions = vec![
+            scheduled(stream, 26, 1),
+            QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit: 29,
+                increase: 3,
+                owner: None,
+            },
+            scheduled(stream, 39, 2),
+            scheduled(other_stream, 17, 3),
+        ];
+        let mut calls = Vec::new();
+        let preflight = preflight_receive_actions_with(&actions, |index, _, virtual_limit| {
+            calls.push((index, virtual_limit));
+            Ok(Some(match index {
+                0 | 3 => QcsdReceiveLimitOutcome::Applied,
+                1 => QcsdReceiveLimitOutcome::Terminal,
+                _ => panic!("rejected suffix must not be previewed independently"),
+            }))
+        })
+        .expect("lifecycle outcomes are cancellable");
+
+        assert_eq!(calls, vec![(0, None), (1, Some(26)), (3, None)]);
+        assert_eq!(
+            preflight.expected,
+            vec![
+                Some(QcsdReceiveLimitOutcome::Applied),
+                Some(QcsdReceiveLimitOutcome::Terminal),
+                Some(QcsdReceiveLimitOutcome::Terminal),
+                Some(QcsdReceiveLimitOutcome::Applied),
+            ]
+        );
+        assert_eq!(
+            preflight.rejected_streams,
+            BTreeMap::from([((endpoint, stream), QcsdReceiveLimitOutcome::Terminal)])
+        );
+
+        let fatal = QcsdReceiveLimitError {
+            kind: QcsdReceiveLimitFatal::Order,
+            requested_limit: 25,
+            reference_limit: 26,
+        };
+        let mut fatal_calls = Vec::new();
+        let result = preflight_receive_actions_with(&actions, |index, _, virtual_limit| {
+            fatal_calls.push((index, virtual_limit));
+            if index == 1 {
+                Err(fatal)
+            } else {
+                Ok(Some(QcsdReceiveLimitOutcome::Applied))
+            }
+        });
+        assert_eq!(result.unwrap_err(), (1, fatal));
+        assert_eq!(fatal_calls, vec![(0, None), (1, Some(26))]);
+    }
+
+    #[test]
+    fn configure_receive_actions_join_typed_batch_preflight() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let actions = vec![
+            QcsdAction::ConfigureManualReceive {
+                endpoint,
+                stream,
+                initial_limit: 16,
+            },
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit: 26,
+                packet,
+                slot: QcsdSlotId(1),
+            },
+        ];
+        let mut calls = Vec::new();
+        let preflight = preflight_receive_actions_with(&actions, |index, _, high_water| {
+            calls.push((index, high_water));
+            Ok(Some(QcsdReceiveLimitOutcome::FinalKnown))
+        })
+        .expect("typed configure rejection");
+        assert_eq!(calls, vec![(0, None)]);
+        assert_eq!(
+            preflight.expected,
+            vec![
+                Some(QcsdReceiveLimitOutcome::FinalKnown),
+                Some(QcsdReceiveLimitOutcome::FinalKnown),
+            ]
+        );
+
+        let automatic = vec![QcsdAction::ConfigureAutomaticReceive {
+            endpoint,
+            stream,
+            window: 1_024,
+        }];
+        let preflight = preflight_receive_actions_with(&automatic, |_, _, _| {
+            Ok(Some(QcsdReceiveLimitOutcome::Terminal))
+        })
+        .expect("typed automatic no-op");
+        assert_eq!(
+            preflight.rejected_streams,
+            BTreeMap::from([((endpoint, stream), QcsdReceiveLimitOutcome::Terminal)])
+        );
+
+        let mixed = vec![
+            QcsdAction::ConfigureAutomaticReceive {
+                endpoint,
+                stream,
+                window: 1_024,
+            },
+            QcsdAction::ConfigureManualReceive {
+                endpoint,
+                stream,
+                initial_limit: 16,
+            },
+        ];
+        let mut calls = Vec::new();
+        let preflight = preflight_receive_actions_with(&mixed, |index, _, _| {
+            calls.push(index);
+            Ok(Some(QcsdReceiveLimitOutcome::Terminal))
+        })
+        .expect("mixed receive configuration is rejected as one typed stream lifecycle");
+        assert_eq!(calls, vec![0]);
+        assert_eq!(
+            preflight.expected,
+            vec![
+                Some(QcsdReceiveLimitOutcome::Terminal),
+                Some(QcsdReceiveLimitOutcome::Terminal),
+            ]
+        );
+        assert_eq!(
+            preflight.rejected_streams,
+            BTreeMap::from([((endpoint, stream), QcsdReceiveLimitOutcome::Terminal)])
+        );
+    }
+
+    #[test]
+    fn omitted_pending_suffix_on_transitive_stream_fails_precommit() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(8);
+        let prefix = QcsdReceiveActionIdentity::Scheduled {
+            endpoint,
+            stream,
+            absolute_limit: 26,
+            slot: QcsdSlotId(1),
+        };
+        let suffix = QcsdReceiveActionIdentity::Scheduled {
+            endpoint,
+            stream,
+            absolute_limit: 36,
+            slot: QcsdSlotId(2),
+        };
+        let limits = [(endpoint, stream, 26)];
+        assert!(pending_receive_identity_is_reconciled(
+            &prefix,
+            &limits,
+            &[suffix],
+            &[prefix],
+        ));
+        assert!(
+            !pending_receive_identity_is_reconciled(&prefix, &limits, &[suffix], &[]),
+            "retained accepted prefix must biject controller retained ledger"
+        );
+        assert!(
+            !pending_receive_identity_is_reconciled(&suffix, &limits, &[], &[prefix]),
+            "pending suffix above cutoff cannot be omitted"
+        );
+    }
+
+    #[test]
+    fn omitted_current_suffix_on_transitive_stream_fails_precommit() {
+        let identity = QcsdReceiveActionIdentity::Scheduled {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(8),
+            absolute_limit: 36,
+            slot: QcsdSlotId(2),
+        };
+        assert!(!pending_receive_identity_is_reconciled(
+            &identity,
+            &[(QcsdEndpointId(1), QcsdStreamId(8), 26)],
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn omitted_queued_suffix_on_transitive_stream_fails_precommit() {
+        let identity = QcsdReceiveActionIdentity::ParserLease {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(8),
+            absolute_limit: 36,
+            increase: 10,
+            owner: None,
+        };
+        assert!(!pending_receive_identity_is_reconciled(
+            &identity,
+            &[(QcsdEndpointId(1), QcsdStreamId(8), 26)],
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn v009_receive_failure_trace_preserves_action_json_and_adds_structured_error() {
+        let output = trace_output_dir("v009-receive-action-error");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let action = QcsdAction::IncreaseReceiveLimit {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(136),
+            absolute_limit: 284_035,
+            packet: Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("packet"),
+            slot: QcsdSlotId(1_372),
+        };
+        let error = QcsdReceiveLimitError {
+            kind: QcsdReceiveLimitFatal::Ledger,
+            requested_limit: 284_035,
+            reference_limit: 283_710,
+        };
+        record_adapter_action_error(
+            &mut traces,
+            started,
+            &action,
+            &neqo_http3::Error::Transport(neqo_transport::Error::InvalidInput),
+        )
+        .expect("record adapter failure");
+        record_receive_limit_error(
+            &mut traces,
+            started + Duration::from_nanos(1),
+            &action,
+            "preflight",
+            error,
+        )
+        .expect("record typed failure");
+        drop(traces);
+
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        let adapter_action_row = events
+            .lines()
+            .find(|row| row.contains(",action,failed,"))
+            .expect("adapter action row");
+        assert!(adapter_action_row.contains("\"\"type\"\":\"\"increase_receive_limit\"\""));
+        assert!(adapter_action_row.contains("\"\"stream\"\":136"));
+        assert!(adapter_action_row.contains("\"\"absolute_limit\"\":284035"));
+        assert!(adapter_action_row.contains("\"\"slot\"\":1372"));
+        let adapter_error_row = events
+            .lines()
+            .find(|row| row.contains(",action_error,adapter,"))
+            .expect("adapter error row");
+        assert!(adapter_error_row.contains("\"\"error\"\""));
+        assert!(adapter_error_row.contains("Transport error: invalid input"));
+        let action_row = events
+            .lines()
+            .find(|row| row.contains(",action,failed_receive_preflight_ledger,"))
+            .expect("failed action row");
+        assert!(action_row.contains("\"\"type\"\":\"\"increase_receive_limit\"\""));
+        assert!(action_row.contains("\"\"stream\"\":136"));
+        assert!(action_row.contains("\"\"absolute_limit\"\":284035"));
+        assert!(action_row.contains("\"\"slot\"\":1372"));
+        let error_row = events
+            .lines()
+            .find(|row| row.contains(",action_error,preflight,"))
+            .expect("typed error row");
+        assert!(error_row.contains("\"\"kind\"\":\"\"ledger\"\""));
+        assert!(error_row.contains("\"\"requested_limit\"\":284035"));
+        assert!(error_row.contains("\"\"reference_limit\"\":283710"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[test]

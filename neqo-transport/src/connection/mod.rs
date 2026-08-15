@@ -30,8 +30,9 @@ use neqo_common::{
 #[cfg(feature = "qcsd")]
 use neqo_csdef::{
     MissedSlotReason, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
-    QcsdRequestRole, QcsdSlotId, TimestampedQcsdObservation, TrafficMorphingBypassReason,
-    TrafficMorphingEgress, TrafficMorphingOutcome,
+    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSlotId, TimestampedQcsdObservation,
+    TrafficMorphingBypassReason, TrafficMorphingEgress, TrafficMorphingOutcome,
 };
 use nss::{
     Agent, AntiReplay, AuthenticationStatus, Cipher, Client, Group, HandshakeState, PrivateKey,
@@ -93,7 +94,10 @@ use idle::IdleTimeout;
 pub use params::ConnectionParameters;
 use params::PreferredAddressConfig;
 #[cfg(feature = "qcsd")]
-use qcsd::{PacketTarget as QcsdPacketTarget, PendingReceiveCredit as QcsdPendingReceiveCredit};
+use qcsd::{
+    PacketTarget as QcsdPacketTarget, PendingReceiveAction as QcsdPendingReceiveAction,
+    PendingReceiveCredit as QcsdPendingReceiveCredit,
+};
 use state::StateSignaling;
 pub use state::{ClosingFrame, State};
 
@@ -374,6 +378,8 @@ pub struct Connection {
     /// Receive-credit actions awaiting an encoded `MAX_STREAM_DATA` frame.
     #[cfg(feature = "qcsd")]
     qcsd_pending_receive_credit: VecDeque<QcsdPendingReceiveCredit>,
+    #[cfg(feature = "qcsd")]
+    qcsd_pending_receive_actions: VecDeque<QcsdPendingReceiveAction>,
     /// Whether non-critical stream data is restricted to controller grants.
     #[cfg(feature = "qcsd")]
     qcsd_send_shaping: bool,
@@ -566,6 +572,8 @@ impl Connection {
             qcsd_stream_roles: HashMap::new(),
             #[cfg(feature = "qcsd")]
             qcsd_pending_receive_credit: VecDeque::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_pending_receive_actions: VecDeque::new(),
             #[cfg(feature = "qcsd")]
             qcsd_send_shaping: false,
             #[cfg(feature = "qcsd")]
@@ -4277,6 +4285,8 @@ impl Connection {
                     self.qcsd_active_target = None;
                     self.qcsd_slot_send_budget = 0;
                     self.qcsd_pending_receive_credit.clear();
+                    // Accepted typed identities remain as close tombstones
+                    // until runner/controller cancellation reconciles them.
                     while let Some(target) = self.qcsd_packet_targets.pop_front() {
                         self.qcsd_target_missed(&target, MissedSlotReason::EndpointClosed);
                     }
@@ -4576,8 +4586,171 @@ impl Connection {
         slot: Option<QcsdSlotId>,
     ) -> Res<()> {
         let stream = self.streams.get_recv_stream_mut(stream_id)?;
-        if stream.qcsd_set_manual_limit(absolute_limit) {
-            if let Some(slot) = slot {
+        match stream.qcsd_set_manual_limit(absolute_limit) {
+            Ok(QcsdReceiveLimitOutcome::Applied) => {
+                if let Some(slot) = slot {
+                    self.qcsd_pending_receive_credit
+                        .push_back(QcsdPendingReceiveCredit {
+                            slot,
+                            stream: stream_id,
+                            absolute_limit,
+                        });
+                }
+                Ok(())
+            }
+            Ok(
+                QcsdReceiveLimitOutcome::FinalKnown
+                | QcsdReceiveLimitOutcome::Terminal
+                | QcsdReceiveLimitOutcome::Gone,
+            )
+            | Err(_) => Err(Error::InvalidInput),
+        }
+    }
+
+    /// Purely classify a strictly advancing receive-limit action.
+    ///
+    /// `virtual_high_water` represents earlier actions in the same drained
+    /// runner batch. `expected_previous` is supplied for parser leases so the
+    /// lease range must join the preceding transport limit without a gap or
+    /// overlap.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if the action would revoke credit, does
+    /// not advance monotonically, or disagrees with the pending ledger.
+    #[cfg(feature = "qcsd")]
+    #[expect(
+        clippy::large_types_passed_by_value,
+        reason = "the optional Copy identity is consumed into the exact pending ledger on the matching apply API"
+    )]
+    pub fn qcsd_preview_stream_receive_limit_action(
+        &self,
+        stream_id: StreamId,
+        absolute_limit: u64,
+        identity: Option<QcsdReceiveActionIdentity>,
+        virtual_high_water: Option<u64>,
+        expected_previous: Option<u64>,
+        strict_advance: bool,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        if let Some(identity) = identity {
+            if identity.stream().0 != stream_id.as_u64()
+                || identity.absolute_limit() != absolute_limit
+                || self
+                    .qcsd_endpoint
+                    .is_some_and(|endpoint| endpoint != identity.endpoint())
+            {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: absolute_limit,
+                    reference_limit: identity.absolute_limit(),
+                });
+            }
+            let matches = self
+                .qcsd_pending_receive_actions
+                .iter()
+                .filter(|pending| pending.identity == identity)
+                .count();
+            if matches != 0 {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: absolute_limit,
+                    reference_limit: u64::try_from(matches).unwrap_or(u64::MAX),
+                });
+            }
+        }
+        let Some(stream) = self.streams.qcsd_get_recv_stream(stream_id) else {
+            return Ok(QcsdReceiveLimitOutcome::Gone);
+        };
+        if let Some(manual_limit) = stream.qcsd_receive_reference_limit()
+            && self
+                .qcsd_pending_receive_actions
+                .iter()
+                .filter(|pending| pending.identity.stream().0 == stream_id.as_u64())
+                .any(|pending| pending.identity.absolute_limit() > manual_limit)
+        {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Ledger,
+                requested_limit: absolute_limit,
+                reference_limit: manual_limit,
+            });
+        }
+        let outcome = stream.qcsd_preview_manual_limit_action(
+            absolute_limit,
+            virtual_high_water,
+            expected_previous,
+            strict_advance,
+        )?;
+        if outcome != QcsdReceiveLimitOutcome::Applied {
+            return Ok(outcome);
+        }
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    }
+
+    /// Apply one receive-limit action using the same typed checks as preview.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if transport state no longer matches the
+    /// action that the runner previewed.
+    #[cfg(feature = "qcsd")]
+    #[expect(
+        clippy::large_types_passed_by_value,
+        reason = "the optional Copy identity is consumed into the exact pending ledger when apply succeeds"
+    )]
+    pub fn qcsd_apply_stream_receive_limit_action(
+        &mut self,
+        stream_id: StreamId,
+        absolute_limit: u64,
+        identity: Option<QcsdReceiveActionIdentity>,
+        expected_previous: Option<u64>,
+        strict_advance: bool,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        let preview = self.qcsd_preview_stream_receive_limit_action(
+            stream_id,
+            absolute_limit,
+            identity,
+            None,
+            expected_previous,
+            strict_advance,
+        )?;
+        if preview != QcsdReceiveLimitOutcome::Applied {
+            return Ok(preview);
+        }
+        let Some(stream) = self.streams.qcsd_get_recv_stream(stream_id) else {
+            return Ok(QcsdReceiveLimitOutcome::Gone);
+        };
+        let expected_manual_limit = stream.qcsd_receive_reference_limit();
+        let previous_frame_pending = stream.qcsd_manual_frame_pending();
+        let stream =
+            self.streams
+                .get_recv_stream_mut(stream_id)
+                .map_err(|_| QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: absolute_limit,
+                    reference_limit: expected_manual_limit.unwrap_or_default(),
+                })?;
+        let outcome = stream.qcsd_apply_manual_limit_action(
+            absolute_limit,
+            expected_previous,
+            strict_advance,
+        )?;
+        if outcome == QcsdReceiveLimitOutcome::Applied
+            && let Some(identity) = identity
+        {
+            let Some(previous_limit) = expected_manual_limit else {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: absolute_limit,
+                    reference_limit: 0,
+                });
+            };
+            self.qcsd_pending_receive_actions
+                .push_back(QcsdPendingReceiveAction {
+                    identity,
+                    previous_limit,
+                    previous_frame_pending: previous_frame_pending.unwrap_or(false),
+                });
+            if let QcsdReceiveActionIdentity::Scheduled { slot, .. } = identity {
                 self.qcsd_pending_receive_credit
                     .push_back(QcsdPendingReceiveCredit {
                         slot,
@@ -4585,10 +4758,213 @@ impl Connection {
                         absolute_limit,
                     });
             }
-            Ok(())
-        } else {
-            Err(Error::InvalidInput)
         }
+        Ok(outcome)
+    }
+
+    /// Exact receive actions accepted by transport but not yet encoded.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_pending_receive_action_identities(&self) -> Vec<QcsdReceiveActionIdentity> {
+        self.qcsd_pending_receive_actions
+            .iter()
+            .map(|pending| pending.identity)
+            .collect()
+    }
+
+    /// Pure receive-side lifecycle classification for automatic configuration.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_stream_receive_lifecycle(&self, stream_id: StreamId) -> QcsdReceiveLimitOutcome {
+        self.streams
+            .qcsd_get_recv_stream(stream_id)
+            .map_or(QcsdReceiveLimitOutcome::Gone, |stream| {
+                stream.qcsd_receive_lifecycle()
+            })
+    }
+
+    /// Apply automatic receive configuration with typed lifecycle semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fatal ledger outcome if live state contradicts classification.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_apply_stream_auto_receive_action(
+        &mut self,
+        stream_id: StreamId,
+        window: u64,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        let lifecycle = self.qcsd_stream_receive_lifecycle(stream_id);
+        if lifecycle != QcsdReceiveLimitOutcome::Applied {
+            return Ok(lifecycle);
+        }
+        self.qcsd_set_stream_auto_receive(stream_id, window)
+            .map_err(|_| QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Ledger,
+                requested_limit: window,
+                reference_limit: 0,
+            })?;
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_receive_cancellation_ranges(
+        &self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<Vec<(StreamId, u64, u64, bool)>, QcsdReceiveLimitError> {
+        for (index, identity) in identities.iter().enumerate() {
+            if identities[..index].contains(identity) {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: identity.absolute_limit(),
+                    reference_limit: u64::try_from(index).unwrap_or(u64::MAX),
+                });
+            }
+            let matches = self
+                .qcsd_pending_receive_actions
+                .iter()
+                .filter(|pending| pending.identity == *identity)
+                .count();
+            if matches != 1 {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: identity.absolute_limit(),
+                    reference_limit: u64::try_from(matches).unwrap_or(u64::MAX),
+                });
+            }
+        }
+
+        let mut streams = Vec::new();
+        for identity in identities {
+            let stream = StreamId::new(identity.stream().0);
+            if !streams.contains(&stream) {
+                streams.push(stream);
+            }
+        }
+        let mut ranges = Vec::with_capacity(streams.len());
+        for stream in streams {
+            let pending: Vec<_> = self
+                .qcsd_pending_receive_actions
+                .iter()
+                .filter(|pending| pending.identity.stream().0 == stream.as_u64())
+                .copied()
+                .collect();
+            let Some(first_selected) = pending
+                .iter()
+                .position(|pending| identities.contains(&pending.identity))
+            else {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: stream.as_u64(),
+                    reference_limit: 0,
+                });
+            };
+            if pending[first_selected..]
+                .iter()
+                .any(|pending| !identities.contains(&pending.identity))
+            {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Order,
+                    requested_limit: pending[first_selected].identity.absolute_limit(),
+                    reference_limit: pending
+                        .last()
+                        .map_or(0, |pending| pending.identity.absolute_limit()),
+                });
+            }
+            for pair in pending.windows(2) {
+                if pair[1].previous_limit != pair[0].identity.absolute_limit() {
+                    return Err(QcsdReceiveLimitError {
+                        kind: QcsdReceiveLimitFatal::Ledger,
+                        requested_limit: pair[1].previous_limit,
+                        reference_limit: pair[0].identity.absolute_limit(),
+                    });
+                }
+            }
+            let first = pending[first_selected];
+            let last = *pending.last().expect("selected pending suffix is nonempty");
+            if let Some(recv_stream) = self.streams.qcsd_get_recv_stream(stream) {
+                recv_stream.qcsd_preview_cancel_manual_limit(
+                    last.identity.absolute_limit(),
+                    first.previous_limit,
+                )?;
+            }
+            ranges.push((
+                stream,
+                last.identity.absolute_limit(),
+                first.previous_limit,
+                first.previous_frame_pending,
+            ));
+        }
+        Ok(ranges)
+    }
+
+    /// Purely validate rollback of an exact unencoded receive-action suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome for an unknown, duplicate, encoded, or
+    /// non-LIFO identity, or if rollback would revoke live credit.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_preview_receive_action_cancellation(
+        &self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<(), QcsdReceiveLimitError> {
+        self.qcsd_receive_cancellation_ranges(identities).map(drop)
+    }
+
+    /// Per-stream absolute boundary restored by exact unencoded rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed fatal outcomes as cancellation preview.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_receive_action_cancellation_boundaries(
+        &self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<Vec<(StreamId, u64)>, QcsdReceiveLimitError> {
+        self.qcsd_receive_cancellation_ranges(identities)
+            .map(|ranges| {
+                ranges
+                    .into_iter()
+                    .map(|(stream, _, restored, _)| (stream, restored))
+                    .collect()
+            })
+    }
+
+    /// Commit a previously validated exact unencoded receive-action suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if transport no longer matches preview.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_commit_receive_action_cancellation(
+        &mut self,
+        identities: &[QcsdReceiveActionIdentity],
+    ) -> Result<(), QcsdReceiveLimitError> {
+        let ranges = self.qcsd_receive_cancellation_ranges(identities)?;
+        for (stream, _expected_current, restored_limit, restored_pending) in ranges {
+            if let Ok(recv_stream) = self.streams.get_recv_stream_mut(stream) {
+                recv_stream.qcsd_commit_cancel_manual_limit(restored_limit, restored_pending);
+            }
+        }
+        self.qcsd_pending_receive_actions
+            .retain(|pending| !identities.contains(&pending.identity));
+        self.qcsd_pending_receive_credit.retain(|credit| {
+            !identities.iter().any(|identity| {
+                matches!(
+                    identity,
+                    QcsdReceiveActionIdentity::Scheduled {
+                        stream,
+                        absolute_limit,
+                        slot,
+                        ..
+                    } if stream.0 == credit.stream.as_u64()
+                        && *absolute_limit == credit.absolute_limit
+                        && *slot == credit.slot
+                )
+            })
+        });
+        Ok(())
     }
 
     /// Restore normal receive-window management for a stream excluded from QCSD shaping.

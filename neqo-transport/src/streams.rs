@@ -675,6 +675,11 @@ impl Streams {
         self.recv.get_mut(stream_id)
     }
 
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_get_recv_stream(&self, stream_id: StreamId) -> Option<&RecvStream> {
+        self.recv.get(stream_id)
+    }
+
     /// # Errors
     /// When the stream does not exist.
     pub fn keep_alive(&mut self, stream_id: StreamId, keep: bool) -> Res<()> {

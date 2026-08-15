@@ -18,6 +18,8 @@ use std::{
 };
 
 use neqo_common::{Buffer, Role, qtrace, to_u64};
+#[cfg(feature = "qcsd")]
+use neqo_csdef::{QcsdReceiveLimitError, QcsdReceiveLimitOutcome};
 use smallvec::SmallVec;
 use strum::Display;
 
@@ -69,6 +71,12 @@ impl RecvStreams {
     )]
     pub fn get_mut(&mut self, id: StreamId) -> Res<&mut RecvStream> {
         self.streams.get_mut(&id).ok_or(Error::InvalidStreamId)
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn get(&self, id: StreamId) -> Option<&RecvStream> {
+        self.streams.get(&id)
     }
 
     #[allow(
@@ -1039,13 +1047,216 @@ impl RecvStream {
         }
     }
 
-    /// Switch this receive stream to a monotonically increasing absolute QCSD limit.
+    /// Purely classify a prospective strictly advancing QCSD action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome for revoke, ordering, or ledger failures.
     #[cfg(feature = "qcsd")]
-    pub const fn qcsd_set_manual_limit(&mut self, absolute_limit: u64) -> bool {
-        if let RecvStreamState::Recv { fc, .. } = &mut self.state {
-            fc.set_manual_limit(absolute_limit)
-        } else {
-            false
+    pub const fn qcsd_preview_manual_limit_action(
+        &self,
+        absolute_limit: u64,
+        virtual_high_water: Option<u64>,
+        expected_previous: Option<u64>,
+        strict_advance: bool,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        match &self.state {
+            RecvStreamState::Recv { fc, .. } => fc.preview_manual_limit(
+                absolute_limit,
+                virtual_high_water,
+                expected_previous,
+                strict_advance,
+            ),
+            RecvStreamState::SizeKnown { .. } | RecvStreamState::SizeKnownAt { .. } => {
+                Ok(QcsdReceiveLimitOutcome::FinalKnown)
+            }
+            RecvStreamState::DataRecvd { .. }
+            | RecvStreamState::DataRead { .. }
+            | RecvStreamState::AbortReading { .. }
+            | RecvStreamState::WaitForReset { .. }
+            | RecvStreamState::ResetRecvd { .. } => Ok(QcsdReceiveLimitOutcome::Terminal),
+        }
+    }
+
+    /// Classify whether receive-side configuration can still mutate this stream.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub const fn qcsd_receive_lifecycle(&self) -> QcsdReceiveLimitOutcome {
+        match self.state {
+            RecvStreamState::Recv { .. } => QcsdReceiveLimitOutcome::Applied,
+            RecvStreamState::SizeKnown { .. } | RecvStreamState::SizeKnownAt { .. } => {
+                QcsdReceiveLimitOutcome::FinalKnown
+            }
+            RecvStreamState::DataRecvd { .. }
+            | RecvStreamState::DataRead { .. }
+            | RecvStreamState::AbortReading { .. }
+            | RecvStreamState::WaitForReset { .. }
+            | RecvStreamState::ResetRecvd { .. } => QcsdReceiveLimitOutcome::Terminal,
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub const fn qcsd_manual_limit(&self) -> Option<u64> {
+        match &self.state {
+            RecvStreamState::Recv { fc, .. }
+            | RecvStreamState::SizeKnown { fc, .. }
+            | RecvStreamState::SizeKnownAt { fc, .. }
+            | RecvStreamState::DataRecvd { fc, .. }
+            | RecvStreamState::AbortReading { fc, .. }
+            | RecvStreamState::WaitForReset { fc, .. } => fc.manual_limit(),
+            RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => None,
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub const fn qcsd_manual_frame_pending(&self) -> Option<bool> {
+        match &self.state {
+            RecvStreamState::Recv { fc, .. }
+            | RecvStreamState::SizeKnown { fc, .. }
+            | RecvStreamState::SizeKnownAt { fc, .. }
+            | RecvStreamState::DataRecvd { fc, .. }
+            | RecvStreamState::AbortReading { fc, .. }
+            | RecvStreamState::WaitForReset { fc, .. } => Some(fc.manual_frame_pending()),
+            RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => None,
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub const fn qcsd_receive_reference_limit(&self) -> Option<u64> {
+        match &self.state {
+            RecvStreamState::Recv { fc, .. }
+            | RecvStreamState::SizeKnown { fc, .. }
+            | RecvStreamState::SizeKnownAt { fc, .. }
+            | RecvStreamState::DataRecvd { fc, .. }
+            | RecvStreamState::AbortReading { fc, .. }
+            | RecvStreamState::WaitForReset { fc, .. } => Some(fc.manual_reference_limit()),
+            RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => None,
+        }
+    }
+
+    /// Apply a strictly advancing QCSD action after typed validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome for revoke, ordering, or ledger failures.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_apply_manual_limit_action(
+        &mut self,
+        absolute_limit: u64,
+        expected_previous: Option<u64>,
+        strict_advance: bool,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        match &mut self.state {
+            RecvStreamState::Recv { fc, .. } if strict_advance => {
+                fc.apply_manual_limit_action(absolute_limit, expected_previous)
+            }
+            RecvStreamState::Recv { fc, .. } => fc.set_manual_limit(absolute_limit),
+            RecvStreamState::SizeKnown { .. } | RecvStreamState::SizeKnownAt { .. } => {
+                Ok(QcsdReceiveLimitOutcome::FinalKnown)
+            }
+            RecvStreamState::DataRecvd { .. }
+            | RecvStreamState::DataRead { .. }
+            | RecvStreamState::AbortReading { .. }
+            | RecvStreamState::WaitForReset { .. }
+            | RecvStreamState::ResetRecvd { .. } => Ok(QcsdReceiveLimitOutcome::Terminal),
+        }
+    }
+
+    /// Purely validate rollback of an unencoded manual receive-limit suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if rollback would revoke encoded or
+    /// consumed credit, or if the pending manual limit no longer matches.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_preview_cancel_manual_limit(
+        &self,
+        expected_current: u64,
+        restored_limit: u64,
+    ) -> Result<(), QcsdReceiveLimitError> {
+        match &self.state {
+            RecvStreamState::Recv { fc, .. }
+            | RecvStreamState::SizeKnown { fc, .. }
+            | RecvStreamState::SizeKnownAt { fc, .. }
+            | RecvStreamState::DataRecvd { fc, .. }
+            | RecvStreamState::AbortReading { fc, .. }
+            | RecvStreamState::WaitForReset { fc, .. } => {
+                fc.preview_cancel_manual_limit(expected_current, restored_limit)
+            }
+            RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => Ok(()),
+        }
+    }
+
+    /// Commit rollback of an unencoded manual receive-limit suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if live flow-control state no longer
+    /// matches the preceding rollback preview.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_cancel_manual_limit(
+        &mut self,
+        expected_current: u64,
+        restored_limit: u64,
+        restored_frame_pending: bool,
+    ) -> Result<(), QcsdReceiveLimitError> {
+        match &mut self.state {
+            RecvStreamState::Recv { fc, .. }
+            | RecvStreamState::SizeKnown { fc, .. }
+            | RecvStreamState::SizeKnownAt { fc, .. }
+            | RecvStreamState::DataRecvd { fc, .. }
+            | RecvStreamState::AbortReading { fc, .. }
+            | RecvStreamState::WaitForReset { fc, .. } => {
+                fc.cancel_manual_limit(expected_current, restored_limit, restored_frame_pending)
+            }
+            RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => Ok(()),
+        }
+    }
+
+    /// Commit a manual receive-limit rollback after a successful pure preview.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_commit_cancel_manual_limit(
+        &mut self,
+        restored_limit: u64,
+        restored_frame_pending: bool,
+    ) {
+        match &mut self.state {
+            RecvStreamState::Recv { fc, .. }
+            | RecvStreamState::SizeKnown { fc, .. }
+            | RecvStreamState::SizeKnownAt { fc, .. }
+            | RecvStreamState::DataRecvd { fc, .. }
+            | RecvStreamState::AbortReading { fc, .. }
+            | RecvStreamState::WaitForReset { fc, .. } => {
+                fc.commit_cancel_manual_limit(restored_limit, restored_frame_pending);
+            }
+            RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => {}
+        }
+    }
+
+    /// Switch this receive stream to a monotonically increasing absolute QCSD limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed fatal outcome if the initial manual limit would revoke
+    /// already advertised or consumed credit.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_set_manual_limit(
+        &mut self,
+        absolute_limit: u64,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        match &mut self.state {
+            RecvStreamState::Recv { fc, .. } => fc.set_manual_limit(absolute_limit),
+            RecvStreamState::SizeKnown { .. } | RecvStreamState::SizeKnownAt { .. } => {
+                Ok(QcsdReceiveLimitOutcome::FinalKnown)
+            }
+            RecvStreamState::DataRecvd { .. }
+            | RecvStreamState::DataRead { .. }
+            | RecvStreamState::AbortReading { .. }
+            | RecvStreamState::WaitForReset { .. }
+            | RecvStreamState::ResetRecvd { .. } => Ok(QcsdReceiveLimitOutcome::Terminal),
         }
     }
 
@@ -1860,6 +2071,53 @@ mod tests {
             Rc::new(RefCell::new(ReceiverFlowControl::new((), session_fc))),
             conn_events,
         )
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_receive_limit_preview_distinguishes_final_known_and_terminal() {
+        let live = create_stream(1_024 * to_u64(INITIAL_LOCAL_MAX_STREAM_DATA));
+        assert_eq!(
+            live.qcsd_preview_manual_limit_action(
+                to_u64(INITIAL_LOCAL_MAX_STREAM_DATA) + 1,
+                None,
+                None,
+                true,
+            ),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Applied)
+        );
+
+        let mut final_known = create_stream(1_024 * to_u64(INITIAL_LOCAL_MAX_STREAM_DATA));
+        final_known
+            .inbound_stream_frame(true, 10, &[])
+            .expect("FIN with a gap");
+        assert!(matches!(
+            final_known.state,
+            RecvStreamState::SizeKnown { .. }
+        ));
+        assert_eq!(
+            final_known.qcsd_preview_manual_limit_action(32, None, None, true),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::FinalKnown)
+        );
+
+        let mut terminal = create_stream(1_024 * to_u64(INITIAL_LOCAL_MAX_STREAM_DATA));
+        terminal
+            .inbound_stream_frame(true, 0, &[0; 10])
+            .expect("contiguous FIN");
+        assert!(matches!(terminal.state, RecvStreamState::DataRecvd { .. }));
+        assert_eq!(
+            terminal.qcsd_preview_manual_limit_action(32, None, None, true),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Terminal)
+        );
+        let mut read = [0; 10];
+        assert_eq!(
+            terminal.read(&mut read).expect("read terminal stream"),
+            (10, true)
+        );
+        assert_eq!(
+            terminal.qcsd_preview_manual_limit_action(32, None, None, true),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Terminal)
+        );
     }
 
     #[test]

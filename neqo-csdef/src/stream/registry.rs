@@ -17,6 +17,8 @@ pub struct StreamState {
     pub role: QcsdRequestRole,
     pub receive: ReceiveState,
     pub status: Option<u16>,
+    /// Whether the adapter can still accept new receive-limit actions.
+    receive_actions_available: bool,
     /// Exact transport proof retained only until HTTP/3 makes response-header
     /// progress or an exact prepared/scheduled prefix can activate the one
     /// bootstrap lease.
@@ -138,6 +140,7 @@ impl StreamRegistry {
                 role,
                 receive,
                 status: None,
+                receive_actions_available: true,
                 pre_header_blocked_at: None,
                 request_acknowledged_ranges: Vec::new(),
                 request_acknowledged_final_size: None,
@@ -159,6 +162,43 @@ impl StreamRegistry {
         self.streams
             .get(&(endpoint, stream))
             .map(|state| state.receive.consumed())
+    }
+
+    /// Prevent future receive allocation while retaining the stream's
+    /// advertised ownership and byte-consumption state until normal terminal
+    /// observations arrive.
+    pub fn mark_receive_unavailable(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        let Some(state) = self.streams.get_mut(&(endpoint, stream)) else {
+            return false;
+        };
+        state.receive_actions_available = false;
+        state.pre_header_blocked_at = None;
+        state.receive.clear_parser_boundary();
+        true
+    }
+
+    pub fn receive_actions_available(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.streams
+            .get(&(endpoint, stream))
+            .is_some_and(|state| state.receive_actions_available)
+    }
+
+    pub fn receive_limits(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<(u64, u64)> {
+        self.streams
+            .get(&(endpoint, stream))
+            .and_then(|state| state.receive.limits())
     }
 
     /// Record unique request-stream bytes only when the transport observation
@@ -200,7 +240,9 @@ impl StreamRegistry {
     pub fn capacity(&self, endpoint: QcsdEndpointId) -> Capacity {
         self.streams
             .iter()
-            .filter(|((candidate, _), _)| *candidate == endpoint)
+            .filter(|((candidate, _), state)| {
+                *candidate == endpoint && state.receive_actions_available
+            })
             .fold(Capacity::default(), |mut capacity, (_, state)| {
                 let available = state.receive.available();
                 match state.role {
@@ -219,6 +261,7 @@ impl StreamRegistry {
     pub fn aggregate_capacity(&self) -> Capacity {
         self.streams
             .values()
+            .filter(|state| state.receive_actions_available)
             .fold(Capacity::default(), |mut total, state| {
                 let available = state.receive.available();
                 match state.role {
@@ -247,6 +290,7 @@ impl StreamRegistry {
             .iter()
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
+                    && state.receive_actions_available
                     && (mode == DefenseMode::ChaffAndShape
                         || matches!(state.role, QcsdRequestRole::Chaff { .. }))
                     && (state.receive.available() > 0 || state.receive.claimable() > 0)
@@ -309,6 +353,7 @@ impl StreamRegistry {
             .iter()
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
+                    && state.receive_actions_available
                     && matches!(state.role, QcsdRequestRole::Chaff { .. })
                     && state.chaff_request_activated()
                     && state.status.is_none()
@@ -355,6 +400,7 @@ impl StreamRegistry {
             .iter()
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
+                    && state.receive_actions_available
                     && matches!(state.role, QcsdRequestRole::Chaff { .. })
                     && state.chaff_request_activated()
                     && state.status.is_none()
@@ -382,7 +428,8 @@ impl StreamRegistry {
         parser_ceiling: u64,
     ) -> bool {
         self.streams.get(&(endpoint, stream)).is_some_and(|state| {
-            matches!(state.role, QcsdRequestRole::Chaff { .. })
+            state.receive_actions_available
+                && matches!(state.role, QcsdRequestRole::Chaff { .. })
                 && state.chaff_request_activated()
                 && state.status.is_none()
                 && state
@@ -404,7 +451,8 @@ impl StreamRegistry {
         parser_ceiling: u64,
     ) -> bool {
         self.streams.get(&(endpoint, stream)).is_some_and(|state| {
-            matches!(state.role, QcsdRequestRole::Chaff { .. })
+            state.receive_actions_available
+                && matches!(state.role, QcsdRequestRole::Chaff { .. })
                 && state.chaff_request_activated()
                 && state.status.is_none()
                 && state.receive.has_pending_receiver_continuation_capacity(
@@ -421,6 +469,7 @@ impl StreamRegistry {
             total.saturating_add(
                 self.streams
                     .get(key)
+                    .filter(|state| state.receive_actions_available)
                     .map_or(0, |state| state.receive.available()),
             )
         })
@@ -433,6 +482,9 @@ impl StreamRegistry {
         amount: u64,
     ) -> Option<CreditRelease> {
         let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available {
+            return None;
+        }
         let (absolute_limit, increase) = state.receive.release(amount)?;
         Some(CreditRelease {
             endpoint,
@@ -448,8 +500,13 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         amount: u64,
     ) -> u64 {
-        self.get_mut(endpoint, stream)
-            .map_or(0, |state| state.receive.claim(amount))
+        self.get_mut(endpoint, stream).map_or(0, |state| {
+            if state.receive_actions_available {
+                state.receive.claim(amount)
+            } else {
+                0
+            }
+        })
     }
 
     pub fn restore_claim(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId, amount: u64) {
@@ -527,6 +584,9 @@ impl StreamRegistry {
         let Some(state) = self.get_mut(endpoint, stream) else {
             return false;
         };
+        if !state.receive_actions_available {
+            return false;
+        }
         if !state.receive.accepts_pre_header_blocked(blocked_at) {
             return false;
         }
@@ -544,6 +604,9 @@ impl StreamRegistry {
         live_scheduled_prefix: Option<(u64, u64)>,
     ) -> Option<ParserLease> {
         let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available {
+            return None;
+        }
         let blocked_at = state.pre_header_blocked_at?;
         let (absolute_limit, increase) = state
             .receive
@@ -567,6 +630,9 @@ impl StreamRegistry {
         terminal_advertised_tail: Option<u64>,
     ) -> Option<ParserLease> {
         let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available {
+            return None;
+        }
         let (absolute_limit, increase, scheduled) = state.receive.parser_lease(
             pristine_data_boundary,
             scheduled_backing,
@@ -600,16 +666,19 @@ impl StreamRegistry {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
     ) -> bool {
-        self.streams
-            .get(&(endpoint, stream))
-            .is_some_and(|state| state.receive.has_pending_parser_boundary())
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            state.receive_actions_available && state.receive.has_pending_parser_boundary()
+        })
     }
 
     pub fn pending_parser_boundaries(&self) -> Vec<(QcsdEndpointId, QcsdStreamId)> {
         let mut pending: Vec<_> = self
             .streams
             .iter()
-            .filter_map(|(key, state)| state.receive.has_pending_parser_boundary().then_some(*key))
+            .filter_map(|(key, state)| {
+                (state.receive_actions_available && state.receive.has_pending_parser_boundary())
+                    .then_some(*key)
+            })
             .collect();
         pending.sort_unstable();
         pending

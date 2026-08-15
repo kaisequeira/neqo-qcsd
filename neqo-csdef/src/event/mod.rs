@@ -9,7 +9,10 @@ mod action;
 mod ids;
 mod observation;
 
-pub use action::{QcsdAction, QcsdParserLeaseOwner};
+pub use action::{
+    QcsdAction, QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
+    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome,
+};
 pub use ids::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
 pub use observation::{
     MissedSlotReason, QcsdDatagramClass, QcsdObservation, QcsdObservationClock, QcsdStreamFinish,

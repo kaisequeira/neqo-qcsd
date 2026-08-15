@@ -27,7 +27,7 @@ pub use config::{
     DefenseConfig, FrontConfig, QcsdConfig, TamarawConfig, TrafficMorphingConfig,
     WalkieTalkieConfig, WtfPadConfig,
 };
-pub use controller::QcsdController;
+pub use controller::{QcsdController, QcsdReceiveCancellation, QcsdReceiveCancellationPlan};
 pub use defense::{
     BurstPair, Capacity, CapacityAdjustment, Defense, DefenseDiagnostics, DefenseMode,
     DefenseSignal, EventOutcome, Front, HistoricalWalkieTalkieSchemaFiveDiagnostic,
@@ -39,8 +39,9 @@ pub use dependency_tracker::{DependencyTracker, ResourceRunState};
 pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
     MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdDatagramClass, QcsdEndpointId,
-    QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdRequestRole, QcsdSlotId,
-    QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, TimestampedQcsdObservation,
+    QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
+    QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole,
+    QcsdSlotId, QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, TimestampedQcsdObservation,
     TrafficMorphingBypassReason, TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
@@ -77,6 +78,9 @@ pub enum Error {
     /// JSON input parsing failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// A controller/adapter accounting invariant was violated.
+    #[error("QCSD controller invariant failed: {0}")]
+    ControllerInvariant(String),
 }
 
 /// Result type used by the QCSD crate.

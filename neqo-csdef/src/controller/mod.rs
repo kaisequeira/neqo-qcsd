@@ -15,11 +15,91 @@ use control_loop::{ControlLoop, PendingClaim, PendingCredit, PendingIncoming, Pe
 use crate::{
     Capacity, CapacityAdjustment, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode,
     DefenseSignal, Direction, EventOutcome, Front, MissedSlotReason, QcsdAction, QcsdConfig,
-    QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner, QcsdRequestRole, QcsdSlotId,
-    QcsdStreamId, ResourceManifest, Result, RoundRobinScheduler, SignalKind, StaticSchedule,
-    Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad, chaff_manager::ChaffManager,
-    stream::StreamRegistry,
+    QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
+    QcsdRequestRole, QcsdSlotId, QcsdStreamId, ResourceManifest, Result, RoundRobinScheduler,
+    SignalKind, StaticSchedule, Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad,
+    chaff_manager::ChaffManager, stream::StreamRegistry,
 };
+
+/// Exact controller bookkeeping canceled after a typed receive-lifecycle rejection.
+///
+/// Canceled slots remain non-terminal and can be reassigned unless the
+/// configured drop policy explicitly terminalizes them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QcsdReceiveCancellation {
+    canceled_actions: Vec<QcsdReceiveActionIdentity>,
+    canceled_slots: Vec<QcsdSlotId>,
+}
+
+/// Pure, opaque transaction for canceling one or more unavailable receive streams.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QcsdReceiveCancellationPlan {
+    rejections: Vec<(QcsdEndpointId, QcsdStreamId, Vec<QcsdReceiveActionIdentity>)>,
+    cancellation: QcsdReceiveCancellation,
+    restored_limits: Vec<(QcsdEndpointId, QcsdStreamId, u64)>,
+    retained_actions: Vec<QcsdReceiveActionIdentity>,
+    canceled_configurations: Vec<QcsdAction>,
+}
+
+impl QcsdReceiveCancellationPlan {
+    /// Exact action identities the transaction will cancel.
+    #[must_use]
+    pub fn canceled_actions(&self) -> &[QcsdReceiveActionIdentity] {
+        self.cancellation.canceled_actions()
+    }
+
+    /// Complete transitive slot closure the transaction will return or retire.
+    #[must_use]
+    pub fn canceled_slots(&self) -> &[QcsdSlotId] {
+        self.cancellation.canceled_slots()
+    }
+
+    /// Per-stream absolute receive boundary after the planned rollback.
+    #[must_use]
+    pub fn restored_limits(&self) -> &[(QcsdEndpointId, QcsdStreamId, u64)] {
+        &self.restored_limits
+    }
+
+    /// Unadvertised prefix identities retained on transitively affected streams.
+    #[must_use]
+    pub fn retained_actions(&self) -> &[QcsdReceiveActionIdentity] {
+        &self.retained_actions
+    }
+
+    /// Queued receive configurations removed for directly rejected streams.
+    #[must_use]
+    pub fn canceled_configurations(&self) -> &[QcsdAction] {
+        &self.canceled_configurations
+    }
+}
+
+const fn receive_configuration_target(
+    action: &QcsdAction,
+) -> Option<(QcsdEndpointId, QcsdStreamId)> {
+    match action {
+        QcsdAction::ConfigureManualReceive {
+            endpoint, stream, ..
+        }
+        | QcsdAction::ConfigureAutomaticReceive {
+            endpoint, stream, ..
+        } => Some((*endpoint, *stream)),
+        _ => None,
+    }
+}
+
+impl QcsdReceiveCancellation {
+    /// Exact action identities removed from the controller ledger and queue.
+    #[must_use]
+    pub fn canceled_actions(&self) -> &[QcsdReceiveActionIdentity] {
+        &self.canceled_actions
+    }
+
+    /// Logical slots whose credit or claims were returned or retired.
+    #[must_use]
+    pub fn canceled_slots(&self) -> &[QcsdSlotId] {
+        &self.canceled_slots
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum QueuedDefenseObservation {
@@ -113,6 +193,72 @@ impl ParserLeaseRange {
 impl AdvertisedIncomingCredit {
     const fn bytes(self) -> u64 {
         self.end.saturating_sub(self.start)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnadvertisedReceiveRange {
+    Scheduled(PendingCredit),
+    Parser {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        range: ParserLeaseRange,
+    },
+}
+
+impl UnadvertisedReceiveRange {
+    const fn endpoint(self) -> QcsdEndpointId {
+        match self {
+            Self::Scheduled(credit) => credit.endpoint,
+            Self::Parser { endpoint, .. } => endpoint,
+        }
+    }
+
+    const fn stream(self) -> QcsdStreamId {
+        match self {
+            Self::Scheduled(credit) => credit.stream,
+            Self::Parser { stream, .. } => stream,
+        }
+    }
+
+    const fn start(self) -> u64 {
+        match self {
+            Self::Scheduled(credit) => credit.absolute_limit.saturating_sub(credit.increase),
+            Self::Parser { range, .. } => range.start,
+        }
+    }
+
+    const fn absolute_limit(self) -> u64 {
+        match self {
+            Self::Scheduled(credit) => credit.absolute_limit,
+            Self::Parser { range, .. } => range.end,
+        }
+    }
+
+    const fn identity(self) -> QcsdReceiveActionIdentity {
+        match self {
+            Self::Scheduled(credit) => QcsdReceiveActionIdentity::Scheduled {
+                endpoint: credit.endpoint,
+                stream: credit.stream,
+                absolute_limit: credit.absolute_limit,
+                slot: credit.slot,
+            },
+            Self::Parser {
+                endpoint,
+                stream,
+                range,
+            } => QcsdReceiveActionIdentity::ParserLease {
+                endpoint,
+                stream,
+                absolute_limit: range.end,
+                increase: range.bytes(),
+                owner: range.owner,
+            },
+        }
+    }
+
+    const fn slot(self) -> Option<QcsdSlotId> {
+        self.identity().slot()
     }
 }
 
@@ -388,6 +534,245 @@ impl QcsdController {
         self.drain_observations();
     }
 
+    /// Purely plan one atomic multi-stream receive-lifecycle cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error without mutation for an unknown/duplicate
+    /// stream or action identity, or a non-contiguous receive ledger.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "global receive cancellation validates ownership, transitive closure, and every mixed ledger before publishing one atomic plan"
+    )]
+    pub fn plan_receive_streams_unavailable(
+        &self,
+        rejections: &[(QcsdEndpointId, QcsdStreamId, Vec<QcsdReceiveActionIdentity>)],
+    ) -> Result<QcsdReceiveCancellationPlan> {
+        if rejections.is_empty() {
+            return Err(crate::Error::ControllerInvariant(
+                "receive cancellation requires at least one rejected stream".into(),
+            ));
+        }
+        let mut canceled_actions = Vec::new();
+        let mut canceled_slots = Vec::new();
+        let mut restored_limits = Vec::new();
+        for (rejection_index, (endpoint, stream, roots)) in rejections.iter().enumerate() {
+            if rejections[..rejection_index]
+                .iter()
+                .any(|(other_endpoint, other_stream, _)| {
+                    other_endpoint == endpoint && other_stream == stream
+                })
+            {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "receive cancellation repeats stream {}:{}",
+                    endpoint.0, stream.0
+                )));
+            }
+            for (index, root) in roots.iter().enumerate() {
+                if root.endpoint() != *endpoint || root.stream() != *stream {
+                    return Err(crate::Error::ControllerInvariant(format!(
+                        "receive cancellation root {index} targets a different stream"
+                    )));
+                }
+                if roots[..index].contains(root) {
+                    return Err(crate::Error::ControllerInvariant(format!(
+                        "receive cancellation root {index} duplicates an earlier identity"
+                    )));
+                }
+            }
+            if !self.streams.receive_actions_available(*endpoint, *stream) {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "receive cancellation targets unknown or unavailable controller stream {}:{}",
+                    endpoint.0, stream.0
+                )));
+            }
+            let ranges = self.receive_stream_cancellation_ranges(*endpoint, *stream, roots)?;
+            let Some((advertised_limit, _)) = self.streams.receive_limits(*endpoint, *stream)
+            else {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "receive cancellation lost controlled limits for {}:{}",
+                    endpoint.0, stream.0
+                )));
+            };
+            restored_limits.push((*endpoint, *stream, advertised_limit));
+            for range in ranges {
+                let identity = range.identity();
+                if canceled_actions.contains(&identity) {
+                    return Err(crate::Error::ControllerInvariant(format!(
+                        "receive cancellation repeats action identity {identity:?}"
+                    )));
+                }
+                canceled_actions.push(identity);
+                if let Some(slot) = range.slot()
+                    && !canceled_slots.contains(&slot)
+                {
+                    canceled_slots.push(slot);
+                }
+            }
+            for claim in self
+                .control
+                .claims
+                .iter()
+                .filter(|claim| claim.endpoint == *endpoint && claim.stream == *stream)
+            {
+                if !canceled_slots.contains(&claim.slot) {
+                    canceled_slots.push(claim.slot);
+                }
+            }
+        }
+
+        if self.config.drop_unsatisfied_events {
+            let roots: HashSet<_> = canceled_slots.iter().copied().collect();
+            let affected = self.dependent_unadvertised_slots(&roots);
+            for range in self.failed_receive_ranges(&affected) {
+                let identity = range.identity();
+                if !canceled_actions.contains(&identity) {
+                    canceled_actions.push(identity);
+                }
+                if let Some((_, _, restored)) =
+                    restored_limits.iter_mut().find(|(endpoint, stream, _)| {
+                        *endpoint == range.endpoint() && *stream == range.stream()
+                    })
+                {
+                    *restored = (*restored).min(range.start());
+                } else {
+                    restored_limits.push((range.endpoint(), range.stream(), range.start()));
+                }
+            }
+            canceled_slots = affected.into_iter().collect();
+        }
+        canceled_actions.sort_unstable_by_key(|identity| {
+            (
+                identity.endpoint(),
+                identity.stream(),
+                identity.absolute_limit(),
+            )
+        });
+        canceled_slots.sort_unstable();
+        canceled_slots.dedup();
+        restored_limits.sort_unstable_by_key(|(endpoint, stream, _)| (*endpoint, *stream));
+        let mut retained_actions = Vec::new();
+        for &(endpoint, stream, cutoff) in &restored_limits {
+            // Transitive streams did not necessarily appear in `rejections`.
+            // Validate their complete mixed scheduled/parser ledger too; a
+            // cutoff derived from a failed range must never conceal a gap,
+            // overlap, duplicate, or stranded suffix.
+            for range in self.receive_stream_cancellation_ranges(endpoint, stream, &[])? {
+                let identity = range.identity();
+                let is_canceled = canceled_actions.contains(&identity);
+                if range.absolute_limit() > cutoff {
+                    if !is_canceled {
+                        return Err(crate::Error::ControllerInvariant(format!(
+                            "receive cancellation omitted suffix action {identity:?} above restored limit {cutoff}"
+                        )));
+                    }
+                } else if is_canceled {
+                    return Err(crate::Error::ControllerInvariant(format!(
+                        "receive cancellation included retained action {identity:?} at or below restored limit {cutoff}"
+                    )));
+                } else {
+                    retained_actions.push(identity);
+                }
+            }
+        }
+        retained_actions.sort_unstable_by_key(|identity| {
+            (
+                identity.endpoint(),
+                identity.stream(),
+                identity.absolute_limit(),
+            )
+        });
+        let canceled_configurations = self
+            .actions
+            .iter()
+            .filter(|action| {
+                receive_configuration_target(action).is_some_and(|target| {
+                    rejections
+                        .iter()
+                        .any(|(endpoint, stream, _)| (*endpoint, *stream) == target)
+                })
+            })
+            .cloned()
+            .collect();
+        Ok(QcsdReceiveCancellationPlan {
+            rejections: rejections.to_vec(),
+            cancellation: QcsdReceiveCancellation {
+                canceled_actions,
+                canceled_slots,
+            },
+            restored_limits,
+            retained_actions,
+            canceled_configurations,
+        })
+    }
+
+    /// Atomically commit an unchanged pure multi-stream cancellation plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error before mutation if controller state no longer
+    /// matches the plan.
+    pub fn commit_receive_streams_unavailable(
+        &mut self,
+        plan: &QcsdReceiveCancellationPlan,
+        at: Duration,
+    ) -> Result<QcsdReceiveCancellation> {
+        let refreshed = self.plan_receive_streams_unavailable(&plan.rejections)?;
+        if refreshed != *plan {
+            return Err(crate::Error::ControllerInvariant(
+                "receive cancellation plan changed before commit".into(),
+            ));
+        }
+
+        // Complete every fallible lookup and ledger validation before the
+        // first mutation.  The prepared ranges make the commit phase
+        // structurally infallible rather than relying on sequential `?` or a
+        // debug-only postcondition after partial rollback.
+        let mut prepared = Vec::with_capacity(plan.rejections.len());
+        for (endpoint, stream, roots) in &plan.rejections {
+            prepared.push((
+                *endpoint,
+                *stream,
+                self.receive_stream_cancellation_ranges(*endpoint, *stream, roots)?,
+            ));
+        }
+
+        let mut direct_slots = Vec::new();
+        for (endpoint, stream, ranges) in prepared {
+            let cancellation = self.commit_receive_stream_suffix(endpoint, stream, &ranges);
+            direct_slots.extend(cancellation.canceled_slots);
+            self.commit_receive_stream_unavailable(endpoint, stream);
+        }
+        self.actions
+            .retain(|action| !plan.canceled_configurations.contains(action));
+        if self.config.drop_unsatisfied_events {
+            let root_slots: HashSet<_> = direct_slots.into_iter().collect();
+            let (_affected_slots, _transitive_actions) = self.fail_incoming_slots(
+                &root_slots,
+                MissedSlotReason::ReceiveCreditRetired,
+                at,
+                true,
+            );
+        }
+        Ok(plan.cancellation.clone())
+    }
+
+    /// Compatibility wrapper for one rejected receive stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error if planning or commit fails.
+    pub fn mark_receive_stream_unavailable(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        roots: &[QcsdReceiveActionIdentity],
+        at: Duration,
+    ) -> Result<QcsdReceiveCancellation> {
+        let plan = self.plan_receive_streams_unavailable(&[(endpoint, stream, roots.to_vec())])?;
+        self.commit_receive_streams_unavailable(&plan, at)
+    }
+
     /// Describe an unrecoverable failure reported by the selected defense.
     #[must_use]
     pub fn terminal_failure(&self) -> Option<&'static str> {
@@ -472,6 +857,92 @@ impl QcsdController {
     ///
     /// `at` is relative to defense start. Callers may use zero for
     /// pre-defense observations that cannot produce a [`DefenseSignal`].
+    fn receive_stream_cancellation_ranges(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        roots: &[QcsdReceiveActionIdentity],
+    ) -> Result<Vec<UnadvertisedReceiveRange>> {
+        let Some((advertised_limit, requested_limit)) =
+            self.streams.receive_limits(endpoint, stream)
+        else {
+            return Err(crate::Error::ControllerInvariant(format!(
+                "receive cancellation lacks controlled limits for {}:{}",
+                endpoint.0, stream.0
+            )));
+        };
+        let mut ranges: Vec<_> = self
+            .control
+            .credit
+            .iter()
+            .copied()
+            .filter(|credit| credit.endpoint == endpoint && credit.stream == stream)
+            .map(UnadvertisedReceiveRange::Scheduled)
+            .collect();
+        if let Some(parser_ranges) = self.parser_lease_ranges.get(&(endpoint, stream)) {
+            let mut saw_unadvertised = false;
+            for range in parser_ranges {
+                if range.advertised {
+                    if saw_unadvertised {
+                        return Err(crate::Error::ControllerInvariant(format!(
+                            "advertised parser range follows an unadvertised range on {}:{}",
+                            endpoint.0, stream.0
+                        )));
+                    }
+                } else {
+                    saw_unadvertised = true;
+                    ranges.push(UnadvertisedReceiveRange::Parser {
+                        endpoint,
+                        stream,
+                        range: *range,
+                    });
+                }
+            }
+        }
+        ranges.sort_unstable_by_key(|range| (range.start(), range.absolute_limit()));
+        let mut next_start = advertised_limit;
+        let mut identities = Vec::with_capacity(ranges.len());
+        for range in &ranges {
+            let start = range.start();
+            let end = range.absolute_limit();
+            if start != next_start || end <= start {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "receive cancellation range [{start}, {end}) does not continue {next_start} on {}:{}",
+                    endpoint.0, stream.0
+                )));
+            }
+            next_start = end;
+            let identity = range.identity();
+            if identities.contains(&identity) {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "receive cancellation ledger repeats absolute limit {} on {}:{}",
+                    identity.absolute_limit(),
+                    endpoint.0,
+                    stream.0
+                )));
+            }
+            identities.push(identity);
+        }
+        if next_start != requested_limit {
+            return Err(crate::Error::ControllerInvariant(format!(
+                "receive cancellation suffix ends at {next_start}, requested limit is {requested_limit} on {}:{}",
+                endpoint.0, stream.0
+            )));
+        }
+        for (index, root) in roots.iter().enumerate() {
+            let matches = identities
+                .iter()
+                .filter(|identity| *identity == root)
+                .count();
+            if matches != 1 {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "receive cancellation root {index} matched {matches} ledger actions"
+                )));
+            }
+        }
+        Ok(ranges)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the exhaustive observation reducer makes every state transition auditable"
@@ -1047,6 +1518,9 @@ impl QcsdController {
     /// order and never create more advertised work than the stream reports as
     /// exact capacity.
     fn release_exact_claims(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
+        if !self.streams.receive_actions_available(endpoint, stream) {
+            return;
+        }
         let Some(state) = self.streams.get_mut(endpoint, stream) else {
             return;
         };
@@ -1334,6 +1808,123 @@ impl QcsdController {
         self.resolve_slot(at, slot, outcome);
     }
 
+    fn commit_receive_stream_suffix(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        ranges: &[UnadvertisedReceiveRange],
+    ) -> QcsdReceiveCancellation {
+        let identities: Vec<_> = ranges.iter().map(|range| range.identity()).collect();
+
+        let mut returned_credit = Vec::new();
+        let mut returned_owners = Vec::new();
+        for range in ranges.iter().rev().copied() {
+            match range {
+                UnadvertisedReceiveRange::Scheduled(credit) => {
+                    assert!(
+                        self.streams.cancel_release(
+                            credit.endpoint,
+                            credit.stream,
+                            credit.absolute_limit,
+                            credit.increase,
+                        ),
+                        "pure plan guarantees scheduled LIFO rollback"
+                    );
+                    returned_credit.push(credit);
+                }
+                UnadvertisedReceiveRange::Parser { range, .. } => {
+                    assert!(
+                        self.streams.cancel_parser_lease(
+                            endpoint,
+                            stream,
+                            range.end,
+                            range.bytes(),
+                            range.unowned,
+                        ),
+                        "pure plan guarantees parser LIFO rollback"
+                    );
+                    if let Some(owner) = range.owner {
+                        returned_owners.push((owner, range.bytes()));
+                    }
+                }
+            }
+        }
+
+        self.control.credit.retain(|credit| {
+            !identities.contains(&QcsdReceiveActionIdentity::Scheduled {
+                endpoint: credit.endpoint,
+                stream: credit.stream,
+                absolute_limit: credit.absolute_limit,
+                slot: credit.slot,
+            })
+        });
+        if let Some(parser_ranges) = self.parser_lease_ranges.get_mut(&(endpoint, stream)) {
+            parser_ranges.retain(|range| range.advertised);
+            if parser_ranges.is_empty() {
+                self.parser_lease_ranges.remove(&(endpoint, stream));
+            }
+        }
+        self.actions.retain(|action| {
+            action
+                .receive_identity()
+                .is_none_or(|identity| !identities.contains(&identity))
+        });
+
+        let mut canceled_slots: Vec<_> = ranges.iter().filter_map(|range| range.slot()).collect();
+        for credit in returned_credit {
+            self.return_claim(&PendingClaim {
+                slot: credit.slot,
+                packet: credit.packet,
+                endpoint,
+                stream,
+                remaining: credit.increase,
+            });
+        }
+        for (owner, bytes) in returned_owners {
+            self.streams.restore_claim(endpoint, stream, bytes);
+            self.return_claim(&PendingClaim {
+                slot: owner.slot,
+                packet: owner.packet,
+                endpoint,
+                stream,
+                remaining: bytes,
+            });
+        }
+
+        let claims: Vec<_> = self
+            .control
+            .claims
+            .iter()
+            .copied()
+            .filter(|claim| claim.endpoint == endpoint && claim.stream == stream)
+            .collect();
+        self.control
+            .claims
+            .retain(|claim| claim.endpoint != endpoint || claim.stream != stream);
+        for claim in claims {
+            canceled_slots.push(claim.slot);
+            self.streams
+                .restore_claim(endpoint, stream, claim.remaining);
+            self.return_claim(&claim);
+        }
+
+        QcsdReceiveCancellation {
+            canceled_actions: identities,
+            canceled_slots,
+        }
+    }
+
+    fn commit_receive_stream_unavailable(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) {
+        assert!(
+            self.streams.mark_receive_unavailable(endpoint, stream),
+            "pure receive cancellation plan guarantees stream availability"
+        );
+    }
+
     fn return_stream_credit(
         &mut self,
         endpoint: QcsdEndpointId,
@@ -1568,26 +2159,49 @@ impl QcsdController {
     /// the closure is repeated because a dependent slot can itself own credit
     /// on another stream. The complete set is rolled back in descending
     /// absolute-limit order before any records or actions are removed.
+    fn unadvertised_receive_ranges(&self) -> Vec<UnadvertisedReceiveRange> {
+        let mut ranges: Vec<_> = self
+            .control
+            .credit
+            .iter()
+            .copied()
+            .map(UnadvertisedReceiveRange::Scheduled)
+            .collect();
+        ranges.extend(self.parser_lease_ranges.iter().flat_map(
+            |(&(endpoint, stream), parser_ranges)| {
+                parser_ranges.iter().filter_map(move |range| {
+                    (!range.advertised).then_some(UnadvertisedReceiveRange::Parser {
+                        endpoint,
+                        stream,
+                        range: *range,
+                    })
+                })
+            },
+        ));
+        ranges
+    }
+
     fn dependent_unadvertised_slots(&self, roots: &HashSet<QcsdSlotId>) -> HashSet<QcsdSlotId> {
+        let ranges = self.unadvertised_receive_ranges();
         let mut affected = roots.clone();
         loop {
             let mut cutoffs = HashMap::new();
-            for credit in &self.control.credit {
-                if affected.contains(&credit.slot) {
-                    let start = credit.absolute_limit.saturating_sub(credit.increase);
+            for range in &ranges {
+                if range.slot().is_some_and(|slot| affected.contains(&slot)) {
                     cutoffs
-                        .entry((credit.endpoint, credit.stream))
-                        .and_modify(|cutoff: &mut u64| *cutoff = (*cutoff).min(start))
-                        .or_insert(start);
+                        .entry((range.endpoint(), range.stream()))
+                        .and_modify(|cutoff: &mut u64| *cutoff = (*cutoff).min(range.start()))
+                        .or_insert_with(|| range.start());
                 }
             }
             let before = affected.len();
-            for credit in &self.control.credit {
+            for range in &ranges {
                 if cutoffs
-                    .get(&(credit.endpoint, credit.stream))
-                    .is_some_and(|cutoff| credit.absolute_limit > *cutoff)
+                    .get(&(range.endpoint(), range.stream()))
+                    .is_some_and(|cutoff| range.absolute_limit() > *cutoff)
+                    && let Some(slot) = range.slot()
                 {
-                    affected.insert(credit.slot);
+                    affected.insert(slot);
                 }
             }
             if affected.len() == before {
@@ -1596,68 +2210,72 @@ impl QcsdController {
         }
     }
 
-    fn rollback_unadvertised_credits(&mut self, affected: &HashSet<QcsdSlotId>) {
-        let mut credits: Vec<_> = self
-            .control
-            .credit
-            .iter()
-            .copied()
-            .filter(|credit| affected.contains(&credit.slot))
-            .collect();
-        credits.sort_unstable_by(|left, right| {
-            left.endpoint
-                .cmp(&right.endpoint)
-                .then_with(|| left.stream.cmp(&right.stream))
-                .then_with(|| right.absolute_limit.cmp(&left.absolute_limit))
-        });
-        for credit in credits {
-            let cancelled = self.streams.cancel_release(
-                credit.endpoint,
-                credit.stream,
-                credit.absolute_limit,
-                credit.increase,
-            );
-            assert!(
-                cancelled,
-                "unadvertised receive-credit rollback must be LIFO-complete"
-            );
+    /// Roll back the complete mixed scheduled/parser suffix for failed slots.
+    /// Selection is computed before mutation and cancellation is globally LIFO
+    /// per stream, so an interleaved parser range can never strand a later
+    /// ordinary release.
+    fn failed_receive_ranges(
+        &self,
+        affected: &HashSet<QcsdSlotId>,
+    ) -> Vec<UnadvertisedReceiveRange> {
+        let ranges = self.unadvertised_receive_ranges();
+        let mut cutoffs = HashMap::new();
+        for range in &ranges {
+            if range.slot().is_some_and(|slot| affected.contains(&slot)) {
+                cutoffs
+                    .entry((range.endpoint(), range.stream()))
+                    .and_modify(|cutoff: &mut u64| *cutoff = (*cutoff).min(range.start()))
+                    .or_insert_with(|| range.start());
+            }
         }
+        let mut rollback: Vec<_> = ranges
+            .into_iter()
+            .filter(|range| {
+                cutoffs
+                    .get(&(range.endpoint(), range.stream()))
+                    .is_some_and(|cutoff| range.absolute_limit() > *cutoff)
+            })
+            .collect();
+        rollback.sort_unstable_by(|left, right| {
+            left.endpoint()
+                .cmp(&right.endpoint())
+                .then_with(|| left.stream().cmp(&right.stream()))
+                .then_with(|| right.absolute_limit().cmp(&left.absolute_limit()))
+        });
+        rollback
     }
 
-    /// Detach parser continuations owned by slots that are about to fail.
-    ///
-    /// Unadvertised parser ranges are monotonically dependent suffixes just
-    /// like ordinary receive releases, so the complete suffix is rolled back
-    /// in LIFO order. Ownership belonging to unaffected slots is returned to
-    /// the input queue. An already advertised range cannot be revoked; its
-    /// owner is detached and its reservation restored, and any later bytes are
-    /// deliberately ignored because the run already carries a typed failure.
-    fn detach_failed_parser_lease_ownership(&mut self, affected: &HashSet<QcsdSlotId>) {
-        let mut keys: Vec<_> = self.parser_lease_ranges.keys().copied().collect();
-        keys.sort_unstable();
-        for (endpoint, stream) in keys {
-            let first_rollback =
-                self.parser_lease_ranges
-                    .get(&(endpoint, stream))
-                    .and_then(|ranges| {
-                        ranges.iter().position(|range| {
-                            !range.advertised
-                                && range
-                                    .owner
-                                    .is_some_and(|owner| affected.contains(&owner.slot))
-                        })
-                    });
-            if let Some(first) = first_rollback {
-                let suffix = self
-                    .parser_lease_ranges
-                    .get_mut(&(endpoint, stream))
-                    .expect("snapshotted parser stream")
-                    .split_off(first);
-                for range in suffix.into_iter().rev() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mixed-range LIFO rollback and ownership reconciliation form one transaction"
+    )]
+    fn rollback_failed_receive_ranges(
+        &mut self,
+        affected: &HashSet<QcsdSlotId>,
+    ) -> Vec<QcsdReceiveActionIdentity> {
+        let rollback = self.failed_receive_ranges(affected);
+
+        let identities: Vec<_> = rollback.iter().map(|range| range.identity()).collect();
+        let mut returned_parser_owners = Vec::new();
+        for range in rollback {
+            match range {
+                UnadvertisedReceiveRange::Scheduled(credit) => {
                     assert!(
-                        !range.advertised,
-                        "an unadvertised parser range cannot precede an advertised suffix"
+                        affected.contains(&credit.slot),
+                        "dependent scheduled suffix slot must join failure closure"
                     );
+                    assert!(self.streams.cancel_release(
+                        credit.endpoint,
+                        credit.stream,
+                        credit.absolute_limit,
+                        credit.increase,
+                    ));
+                }
+                UnadvertisedReceiveRange::Parser {
+                    endpoint,
+                    stream,
+                    range,
+                } => {
                     assert!(self.streams.cancel_parser_lease(
                         endpoint,
                         stream,
@@ -1665,53 +2283,85 @@ impl QcsdController {
                         range.bytes(),
                         range.unowned,
                     ));
-                    self.actions.retain(|action| {
-                        !matches!(action, QcsdAction::LeaseParserReceive {
-                            endpoint: candidate_endpoint,
-                            stream: candidate_stream,
-                            absolute_limit,
-                            ..
-                        } if *candidate_endpoint == endpoint
-                            && *candidate_stream == stream
-                            && *absolute_limit == range.end)
-                    });
-                    let Some(owner) = range.owner else {
-                        continue;
-                    };
-                    self.streams.restore_claim(endpoint, stream, range.bytes());
-                    if !affected.contains(&owner.slot) {
-                        self.return_claim(&PendingClaim {
-                            slot: owner.slot,
-                            packet: owner.packet,
-                            endpoint,
-                            stream,
-                            remaining: range.bytes(),
-                        });
+                    if let Some(owner) = range.owner {
+                        returned_parser_owners.push((endpoint, stream, owner, range.bytes()));
                     }
                 }
-            }
-
-            if let Some(ranges) = self.parser_lease_ranges.get_mut(&(endpoint, stream)) {
-                for range in ranges {
-                    let Some(owner) = range.owner else {
-                        continue;
-                    };
-                    if affected.contains(&owner.slot) {
-                        debug_assert!(range.advertised);
-                        self.streams.restore_claim(endpoint, stream, range.bytes());
-                        range.owner = None;
-                        range.unowned = false;
-                    }
-                }
-            }
-            if self
-                .parser_lease_ranges
-                .get(&(endpoint, stream))
-                .is_some_and(Vec::is_empty)
-            {
-                self.parser_lease_ranges.remove(&(endpoint, stream));
             }
         }
+
+        self.control.credit.retain(|credit| {
+            !identities.contains(&QcsdReceiveActionIdentity::Scheduled {
+                endpoint: credit.endpoint,
+                stream: credit.stream,
+                absolute_limit: credit.absolute_limit,
+                slot: credit.slot,
+            })
+        });
+        let mut parser_streams: Vec<_> = self.parser_lease_ranges.keys().copied().collect();
+        parser_streams.sort_unstable();
+        let mut empty_parser_streams = Vec::new();
+        for (endpoint, stream) in parser_streams {
+            let Some(parser_ranges) = self.parser_lease_ranges.get_mut(&(endpoint, stream)) else {
+                continue;
+            };
+            parser_ranges.retain(|range| {
+                !identities.contains(&QcsdReceiveActionIdentity::ParserLease {
+                    endpoint,
+                    stream,
+                    absolute_limit: range.end,
+                    increase: range.bytes(),
+                    owner: range.owner,
+                })
+            });
+            if parser_ranges.is_empty() {
+                empty_parser_streams.push((endpoint, stream));
+            }
+        }
+        for key in empty_parser_streams {
+            self.parser_lease_ranges.remove(&key);
+        }
+        self.actions.retain(|action| {
+            action
+                .receive_identity()
+                .is_none_or(|identity| !identities.contains(&identity))
+        });
+
+        for (endpoint, stream, owner, bytes) in returned_parser_owners {
+            self.streams.restore_claim(endpoint, stream, bytes);
+            if !affected.contains(&owner.slot) {
+                self.return_claim(&PendingClaim {
+                    slot: owner.slot,
+                    packet: owner.packet,
+                    endpoint,
+                    stream,
+                    remaining: bytes,
+                });
+            }
+        }
+
+        let mut parser_streams: Vec<_> = self.parser_lease_ranges.keys().copied().collect();
+        parser_streams.sort_unstable();
+        let mut advertised_owners = Vec::new();
+        for (endpoint, stream) in parser_streams {
+            let Some(parser_ranges) = self.parser_lease_ranges.get_mut(&(endpoint, stream)) else {
+                continue;
+            };
+            for range in parser_ranges {
+                if let Some(owner) = range.owner
+                    && affected.contains(&owner.slot)
+                {
+                    debug_assert!(range.advertised);
+                    advertised_owners.push((endpoint, stream, range.bytes()));
+                    range.owner = None;
+                    range.unowned = false;
+                }
+            }
+        }
+        for (endpoint, stream, bytes) in advertised_owners {
+            self.streams.restore_claim(endpoint, stream, bytes);
+        }
+        identities
     }
 
     fn fail_incoming_slots(
@@ -1720,21 +2370,14 @@ impl QcsdController {
         reason: MissedSlotReason,
         at: Duration,
         emit_root_actions: bool,
-    ) {
+    ) -> (HashSet<QcsdSlotId>, Vec<QcsdReceiveActionIdentity>) {
         if roots.is_empty() {
-            return;
+            return (HashSet::new(), Vec::new());
         }
 
         let affected = self.dependent_unadvertised_slots(roots);
-        self.detach_failed_parser_lease_ownership(&affected);
-        self.rollback_unadvertised_credits(&affected);
+        let canceled_actions = self.rollback_failed_receive_ranges(&affected);
 
-        self.actions.retain(|action| {
-            !matches!(action, QcsdAction::IncreaseReceiveLimit { slot, .. } if affected.contains(slot))
-        });
-        self.control
-            .credit
-            .retain(|credit| !affected.contains(&credit.slot));
         let claims: Vec<_> = self
             .control
             .claims
@@ -1757,7 +2400,7 @@ impl QcsdController {
             !ranges.is_empty()
         });
 
-        let mut slots: Vec<_> = affected.into_iter().collect();
+        let mut slots: Vec<_> = affected.iter().copied().collect();
         slots.sort_unstable();
         for slot in slots {
             let Some(mut ledger) = self.incoming_credit_ledger.remove(&slot) else {
@@ -1782,6 +2425,7 @@ impl QcsdController {
             }
             self.resolve_slot(at, slot, EventOutcome::Missed(reason));
         }
+        (affected, canceled_actions)
     }
 
     /// Advance the published control loop to `elapsed` and queue due actions.
@@ -2757,6 +3401,15 @@ impl QcsdController {
         self.actions.drain(..)
     }
 
+    /// Exact typed receive identities still queued inside the controller.
+    #[must_use]
+    pub fn queued_receive_action_identities(&self) -> Vec<QcsdReceiveActionIdentity> {
+        self.actions
+            .iter()
+            .filter_map(QcsdAction::receive_identity)
+            .collect()
+    }
+
     /// Whether the defense emitted its terminal action.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
@@ -2834,10 +3487,11 @@ mod tests {
     use crate::{
         Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
         EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdConfig,
-        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner, QcsdRequestRole,
-        QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, SignalKind,
-        StaticSchedule, TamarawConfig, Trace, TrafficMorphing, TrafficMorphingConfig, WalkieTalkie,
-        WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner,
+        QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId, QcsdStreamFinish, QcsdStreamId,
+        Resource, ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace,
+        TrafficMorphing, TrafficMorphingConfig, WalkieTalkie, WalkieTalkieConfig, WtfPad,
+        WtfPadConfig,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9609,6 +10263,780 @@ mod tests {
             assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
             assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 10);
         }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mixed rollback, identity reconciliation, and advertised ownership form one atomic oracle"
+    )]
+    fn unavailable_stream_rolls_back_mixed_suffix_and_preserves_advertised_bytes() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 64,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            64,
+            64,
+        );
+
+        let scheduled_packet =
+            Packet::new(Duration::ZERO, Direction::Incoming, 13).expect("scheduled packet");
+        let later_packet =
+            Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("later packet");
+        let advertised_packet =
+            Packet::new(Duration::ZERO, Direction::Incoming, 3).expect("advertised packet");
+        let scheduled_slot = QcsdSlotId(7);
+        let later_slot = QcsdSlotId(8);
+        let advertised_slot = QcsdSlotId(6);
+        for (slot, packet) in [
+            (advertised_slot, advertised_packet),
+            (scheduled_slot, scheduled_packet),
+            (later_slot, later_packet),
+        ] {
+            controller.pending_slots.insert(slot, packet);
+            controller
+                .incoming_credit_ledger
+                .insert(slot, IncomingCreditLedger::new(packet));
+        }
+        controller.scheduled_incoming_requested_bytes = 26;
+
+        assert_eq!(controller.streams.claim_stream(endpoint, stream, 6), 6);
+        let first = controller
+            .streams
+            .release_stream(endpoint, stream, 10)
+            .expect("first scheduled release");
+        let parser = controller
+            .streams
+            .release_stream(endpoint, stream, 3)
+            .expect("parser release");
+        let later = controller
+            .streams
+            .release_stream(endpoint, stream, 10)
+            .expect("later scheduled release");
+        assert_eq!(
+            (
+                first.absolute_limit,
+                parser.absolute_limit,
+                later.absolute_limit
+            ),
+            (26, 29, 39)
+        );
+
+        controller.control.credit.extend([
+            PendingCredit {
+                slot: scheduled_slot,
+                packet: scheduled_packet,
+                endpoint,
+                stream,
+                absolute_limit: first.absolute_limit,
+                increase: first.increase,
+            },
+            PendingCredit {
+                slot: later_slot,
+                packet: later_packet,
+                endpoint,
+                stream,
+                absolute_limit: later.absolute_limit,
+                increase: later.increase,
+            },
+        ]);
+        let parser_owner = QcsdParserLeaseOwner {
+            packet: scheduled_packet,
+            slot: scheduled_slot,
+        };
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![
+                ParserLeaseRange {
+                    start: 13,
+                    end: 16,
+                    owner: Some(QcsdParserLeaseOwner {
+                        packet: advertised_packet,
+                        slot: advertised_slot,
+                    }),
+                    unowned: false,
+                    advertised: true,
+                },
+                ParserLeaseRange {
+                    start: 26,
+                    end: 29,
+                    owner: Some(parser_owner),
+                    unowned: false,
+                    advertised: false,
+                },
+            ],
+        );
+        let actions = [
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit: 26,
+                packet: scheduled_packet,
+                slot: scheduled_slot,
+            },
+            QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit: 29,
+                increase: 3,
+                owner: Some(parser_owner),
+            },
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit: 39,
+                packet: later_packet,
+                slot: later_slot,
+            },
+        ];
+        controller.actions.extend(actions.clone());
+        let roots: Vec<_> = actions
+            .iter()
+            .filter_map(QcsdAction::receive_identity)
+            .collect();
+
+        let invalid = QcsdReceiveActionIdentity::Scheduled {
+            endpoint,
+            stream,
+            absolute_limit: 40,
+            slot: QcsdSlotId(99),
+        };
+        assert!(
+            controller
+                .mark_receive_stream_unavailable(endpoint, stream, &[invalid], Duration::ZERO)
+                .is_err()
+        );
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, stream),
+            Some((16, 39))
+        );
+        assert_eq!(controller.actions.len(), 3);
+
+        let cancellation = controller
+            .mark_receive_stream_unavailable(endpoint, stream, &roots, Duration::ZERO)
+            .expect("atomic cancellation");
+        assert_eq!(cancellation.canceled_actions(), roots);
+        assert_eq!(cancellation.canceled_slots(), &[scheduled_slot, later_slot]);
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, stream),
+            Some((16, 16))
+        );
+        assert!(
+            !controller
+                .streams
+                .receive_actions_available(endpoint, stream)
+        );
+        assert!(controller.control.credit.is_empty());
+        assert!(controller.actions.is_empty());
+        assert_eq!(controller.parser_lease_ranges[&(endpoint, stream)].len(), 1);
+        assert!(controller.parser_lease_ranges[&(endpoint, stream)][0].advertised);
+        assert!(
+            controller
+                .control
+                .incoming
+                .iter()
+                .any(|pending| pending.slot == scheduled_slot && pending.remaining == 13)
+        );
+        assert!(
+            controller
+                .control
+                .incoming
+                .iter()
+                .any(|pending| pending.slot == later_slot && pending.remaining == 10)
+        );
+        assert!(controller.control.terminal_incoming.is_empty());
+
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 16,
+            },
+            Duration::from_micros(1),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied {
+                slot: observed, ..
+            }) if observed == advertised_slot
+        ));
+        assert!(
+            !controller
+                .control
+                .terminal_incoming
+                .contains(&scheduled_slot)
+        );
+        assert!(!controller.control.terminal_incoming.contains(&later_slot));
+    }
+
+    #[test]
+    fn unavailable_stream_drop_policy_emits_one_explicit_retirement() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                drop_unsatisfied_events: true,
+                initial_max_stream_data: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let slot = QcsdSlotId(7);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            16,
+            32,
+        );
+        let release = controller
+            .streams
+            .release_stream(endpoint, stream, 10)
+            .expect("release");
+        controller.control.credit.push(PendingCredit {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            absolute_limit: release.absolute_limit,
+            increase: release.increase,
+        });
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 10;
+        let action = QcsdAction::IncreaseReceiveLimit {
+            endpoint,
+            stream,
+            absolute_limit: release.absolute_limit,
+            packet,
+            slot,
+        };
+        controller.actions.push_back(action.clone());
+        let identity = action.receive_identity().expect("receive identity");
+
+        let cancellation = controller
+            .mark_receive_stream_unavailable(
+                endpoint,
+                stream,
+                &[identity],
+                Duration::from_micros(1),
+            )
+            .expect("drop cancellation");
+        assert_eq!(cancellation.canceled_actions(), &[identity]);
+        assert_eq!(cancellation.canceled_slots(), &[slot]);
+        assert!(controller.control.incoming.is_empty());
+        assert!(controller.incoming_credit_ledger.is_empty());
+        assert!(controller.control.terminal_incoming.contains(&slot));
+        assert_eq!(
+            controller
+                .actions
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::SlotMissed { slot: observed, reason: MissedSlotReason::ReceiveCreditRetired, .. } if *observed == slot))
+                .count(),
+            1
+        );
+        assert!(!controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SlotSatisfied { slot: observed, .. } if *observed == slot
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 10);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn global_plan_cancels_cross_batch_suffix_from_later_root() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 64,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            64,
+            64,
+        );
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let mut identities = Vec::new();
+        for slot in [QcsdSlotId(1), QcsdSlotId(2)] {
+            let release = controller
+                .streams
+                .release_stream(endpoint, stream, 10)
+                .expect("release");
+            let action = QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit: release.absolute_limit,
+                packet,
+                slot,
+            };
+            identities.push(action.receive_identity().expect("identity"));
+            controller.actions.push_back(action);
+            controller.control.credit.push(PendingCredit {
+                slot,
+                packet,
+                endpoint,
+                stream,
+                absolute_limit: release.absolute_limit,
+                increase: release.increase,
+            });
+        }
+        let plan = controller
+            .plan_receive_streams_unavailable(&[(endpoint, stream, vec![identities[1]])])
+            .expect("pure cross-batch plan");
+        assert_eq!(plan.canceled_actions(), identities);
+        assert_eq!(plan.restored_limits(), &[(endpoint, stream, 16)]);
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, stream),
+            Some((16, 36)),
+            "planning is pure"
+        );
+        let cancellation = controller
+            .commit_receive_streams_unavailable(&plan, Duration::ZERO)
+            .expect("commit");
+        assert_eq!(cancellation.canceled_actions(), identities);
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, stream),
+            Some((16, 16))
+        );
+    }
+
+    #[test]
+    fn global_plan_terminalizes_shared_slot_once_for_two_rejected_streams() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                drop_unsatisfied_events: true,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 32,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let streams = [QcsdStreamId(4), QcsdStreamId(8)];
+        let slot = QcsdSlotId(7);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let mut identities = Vec::new();
+        for stream in streams {
+            controller.streams.open(
+                endpoint,
+                stream,
+                QcsdRequestRole::Application,
+                true,
+                16,
+                32,
+                32,
+            );
+            let release = controller
+                .streams
+                .release_stream(endpoint, stream, 10)
+                .expect("release");
+            let action = QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit: release.absolute_limit,
+                packet,
+                slot,
+            };
+            identities.push(action.receive_identity().expect("identity"));
+            controller.actions.push_back(action);
+            controller.control.credit.push(PendingCredit {
+                slot,
+                packet,
+                endpoint,
+                stream,
+                absolute_limit: release.absolute_limit,
+                increase: release.increase,
+            });
+        }
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 10;
+        let plan = controller
+            .plan_receive_streams_unavailable(&[
+                (endpoint, streams[0], vec![identities[0]]),
+                (endpoint, streams[1], vec![identities[1]]),
+            ])
+            .expect("global shared-slot plan");
+        assert_eq!(plan.canceled_slots(), &[slot]);
+        assert!(!controller.control.terminal_incoming.contains(&slot));
+        controller
+            .commit_receive_streams_unavailable(&plan, Duration::ZERO)
+            .expect("one-shot commit");
+        assert!(controller.control.terminal_incoming.contains(&slot));
+        assert_eq!(
+            controller
+                .actions
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::SlotMissed { slot: observed, .. } if *observed == slot))
+                .count(),
+            1
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_retired_bytes,
+            10
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "retained-prefix and canceled-suffix ownership form one transitive rollback oracle"
+    )]
+    fn transitive_rollback_preserves_accepted_unencoded_prefix() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                drop_unsatisfied_events: true,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 64,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let rejected = QcsdStreamId(4);
+        let transitive = QcsdStreamId(8);
+        for stream in [rejected, transitive] {
+            controller.streams.open(
+                endpoint,
+                stream,
+                QcsdRequestRole::Application,
+                true,
+                16,
+                64,
+                64,
+            );
+        }
+        let failed_slot = QcsdSlotId(10);
+        let retained_slot = QcsdSlotId(11);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let rejected_release = controller
+            .streams
+            .release_stream(endpoint, rejected, 10)
+            .expect("rejected release");
+        let prefix_release = controller
+            .streams
+            .release_stream(endpoint, transitive, 10)
+            .expect("prefix release");
+        let suffix_release = controller
+            .streams
+            .release_stream(endpoint, transitive, 10)
+            .expect("suffix release");
+        let rejected_action = QcsdAction::IncreaseReceiveLimit {
+            endpoint,
+            stream: rejected,
+            absolute_limit: rejected_release.absolute_limit,
+            packet,
+            slot: failed_slot,
+        };
+        let prefix_action = QcsdAction::IncreaseReceiveLimit {
+            endpoint,
+            stream: transitive,
+            absolute_limit: prefix_release.absolute_limit,
+            packet,
+            slot: retained_slot,
+        };
+        let suffix_action = QcsdAction::IncreaseReceiveLimit {
+            endpoint,
+            stream: transitive,
+            absolute_limit: suffix_release.absolute_limit,
+            packet,
+            slot: failed_slot,
+        };
+        for (action, release, slot, stream) in [
+            (&rejected_action, rejected_release, failed_slot, rejected),
+            (&prefix_action, prefix_release, retained_slot, transitive),
+            (&suffix_action, suffix_release, failed_slot, transitive),
+        ] {
+            controller.actions.push_back(action.clone());
+            controller.control.credit.push(PendingCredit {
+                slot,
+                packet,
+                endpoint,
+                stream,
+                absolute_limit: release.absolute_limit,
+                increase: release.increase,
+            });
+        }
+        for slot in [failed_slot, retained_slot] {
+            controller.pending_slots.insert(slot, packet);
+            controller
+                .incoming_credit_ledger
+                .insert(slot, IncomingCreditLedger::new(packet));
+        }
+        controller.scheduled_incoming_requested_bytes = 20;
+        let rejected_identity = rejected_action
+            .receive_identity()
+            .expect("rejected identity");
+        let prefix_identity = prefix_action.receive_identity().expect("prefix identity");
+        let suffix_identity = suffix_action.receive_identity().expect("suffix identity");
+        let plan = controller
+            .plan_receive_streams_unavailable(&[(endpoint, rejected, vec![rejected_identity])])
+            .expect("transitive plan");
+        assert!(plan.canceled_actions().contains(&rejected_identity));
+        assert!(plan.canceled_actions().contains(&suffix_identity));
+        assert!(!plan.canceled_actions().contains(&prefix_identity));
+        assert_eq!(plan.retained_actions(), &[prefix_identity]);
+        assert!(plan.restored_limits().contains(&(endpoint, transitive, 26)));
+        controller
+            .commit_receive_streams_unavailable(&plan, Duration::ZERO)
+            .expect("transitive commit");
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, transitive),
+            Some((16, 26))
+        );
+        assert!(
+            controller
+                .streams
+                .receive_actions_available(endpoint, transitive)
+        );
+        assert!(controller.actions.contains(&prefix_action));
+        assert!(!controller.actions.contains(&suffix_action));
+    }
+
+    fn controller_with_invalid_transitive_ledger(
+        duplicate_suffix: bool,
+    ) -> (
+        QcsdController,
+        QcsdEndpointId,
+        QcsdStreamId,
+        QcsdStreamId,
+        QcsdReceiveActionIdentity,
+    ) {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                drop_unsatisfied_events: true,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 64,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let rejected = QcsdStreamId(4);
+        let transitive = QcsdStreamId(8);
+        for stream in [rejected, transitive] {
+            controller.streams.open(
+                endpoint,
+                stream,
+                QcsdRequestRole::Application,
+                true,
+                16,
+                64,
+                64,
+            );
+        }
+        let failed_slot = QcsdSlotId(10);
+        let retained_slot = QcsdSlotId(11);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let rejected_release = controller
+            .streams
+            .release_stream(endpoint, rejected, 10)
+            .expect("rejected release");
+        let prefix_release = controller
+            .streams
+            .release_stream(endpoint, transitive, 10)
+            .expect("prefix release");
+        let suffix_release = controller
+            .streams
+            .release_stream(endpoint, transitive, if duplicate_suffix { 10 } else { 14 })
+            .expect("suffix release");
+        let rejected_credit = PendingCredit {
+            slot: failed_slot,
+            packet,
+            endpoint,
+            stream: rejected,
+            absolute_limit: rejected_release.absolute_limit,
+            increase: rejected_release.increase,
+        };
+        let rejected_identity = QcsdReceiveActionIdentity::Scheduled {
+            endpoint,
+            stream: rejected,
+            absolute_limit: rejected_credit.absolute_limit,
+            slot: rejected_credit.slot,
+        };
+        let prefix_credit = PendingCredit {
+            slot: retained_slot,
+            packet,
+            endpoint,
+            stream: transitive,
+            absolute_limit: prefix_release.absolute_limit,
+            increase: prefix_release.increase,
+        };
+        let suffix_credit = PendingCredit {
+            slot: failed_slot,
+            packet,
+            endpoint,
+            stream: transitive,
+            absolute_limit: suffix_release.absolute_limit,
+            // Gap case deliberately records [30, 40) after [16, 26).
+            increase: if duplicate_suffix {
+                suffix_release.increase
+            } else {
+                10
+            },
+        };
+        controller
+            .control
+            .credit
+            .extend([rejected_credit, prefix_credit, suffix_credit]);
+        if duplicate_suffix {
+            controller.control.credit.push(suffix_credit);
+        }
+        (
+            controller,
+            endpoint,
+            rejected,
+            transitive,
+            rejected_identity,
+        )
+    }
+
+    fn assert_invalid_transitive_plan_is_pure(duplicate_suffix: bool) {
+        let (controller, endpoint, rejected, transitive, rejected_identity) =
+            controller_with_invalid_transitive_ledger(duplicate_suffix);
+        let credit_snapshot = |credit: &PendingCredit| {
+            (
+                credit.slot,
+                credit.packet,
+                credit.endpoint,
+                credit.stream,
+                credit.absolute_limit,
+                credit.increase,
+            )
+        };
+        let credit_before: Vec<_> = controller
+            .control
+            .credit
+            .iter()
+            .map(credit_snapshot)
+            .collect();
+        let limits_before = controller.streams.receive_limits(endpoint, transitive);
+        let actions_before = controller.actions.clone();
+        let available_before = controller
+            .streams
+            .receive_actions_available(endpoint, transitive);
+        let error = controller
+            .plan_receive_streams_unavailable(&[(endpoint, rejected, vec![rejected_identity])])
+            .expect_err("malformed transitive ledger must fail pure planning");
+        assert!(matches!(error, crate::Error::ControllerInvariant(_)));
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(credit_snapshot)
+                .collect::<Vec<_>>(),
+            credit_before
+        );
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, transitive),
+            limits_before
+        );
+        assert_eq!(controller.actions, actions_before);
+        assert_eq!(
+            controller
+                .streams
+                .receive_actions_available(endpoint, transitive),
+            available_before
+        );
+    }
+
+    #[test]
+    fn transitive_gap_fails_pure_plan_without_mutation() {
+        assert_invalid_transitive_plan_is_pure(false);
+    }
+
+    #[test]
+    fn transitive_duplicate_identity_fails_pure_plan_without_mutation() {
+        assert_invalid_transitive_plan_is_pure(true);
+    }
+
+    #[test]
+    fn configure_only_plan_marks_stream_unavailable_and_removes_queued_config() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            16,
+            16,
+        );
+        let configure = QcsdAction::ConfigureManualReceive {
+            endpoint,
+            stream,
+            initial_limit: 16,
+        };
+        controller.actions.push_back(configure.clone());
+        let plan = controller
+            .plan_receive_streams_unavailable(&[(endpoint, stream, Vec::new())])
+            .expect("configure-only plan");
+        assert_eq!(plan.canceled_configurations(), &[configure]);
+        assert!(plan.canceled_actions().is_empty());
+        controller
+            .commit_receive_streams_unavailable(&plan, Duration::ZERO)
+            .expect("configure-only commit");
+        assert!(controller.actions.is_empty());
+        assert!(
+            !controller
+                .streams
+                .receive_actions_available(endpoint, stream)
+        );
     }
 
     #[test]

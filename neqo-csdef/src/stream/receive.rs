@@ -356,6 +356,23 @@ impl ReceiveState {
         }
     }
 
+    /// Current advertised and controller-requested absolute limits.
+    pub const fn limits(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                ..
+            }
+            | Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                ..
+            } => Some((*advertised_limit, *requested_limit)),
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => None,
+        }
+    }
+
     pub fn header_progress(&mut self, min_remaining: u64, awaiting_data_frame: bool) {
         // A pristine boundary does not reveal the next frame's raw extent.
         // Its parser liveness is owned by `parser_lease`, never by scheduled

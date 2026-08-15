@@ -8,8 +8,8 @@ use std::{cell::RefCell, net::SocketAddr, num::NonZeroUsize, rc::Rc, time::Durat
 
 use neqo_csdef::{
     Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-    QcsdRequestRole, QcsdSlotId, TrafficMorphingConfig, TrafficMorphingEgress,
-    TrafficMorphingOutcome,
+    QcsdReceiveActionIdentity, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole,
+    QcsdSlotId, QcsdStreamId, TrafficMorphingConfig, TrafficMorphingEgress, TrafficMorphingOutcome,
 };
 use test_fixture::{DEFAULT_ADDR, DEFAULT_ADDR_V4, fixture_init, now};
 
@@ -999,6 +999,299 @@ fn manual_receive_credit_is_reported_only_after_encoding() {
                     && *absolute_limit == limit
                     && *observed_slot == slot
             ))
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "typed lifecycle, pending-ledger monotonicity, and exact parser/scheduled identities form one transport oracle"
+)]
+fn receive_limit_action_preview_is_typed_and_includes_pending_ledger() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
+    client
+        .qcsd_set_stream_receive_limit(stream, initial)
+        .expect("initial manual limit");
+    let identity = QcsdReceiveActionIdentity::Scheduled {
+        endpoint: QcsdEndpointId(0),
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 10,
+        slot: QcsdSlotId(4),
+    };
+    assert_eq!(
+        client.qcsd_preview_stream_receive_limit_action(
+            stream,
+            initial + 10,
+            Some(identity),
+            None,
+            None,
+            true,
+        ),
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    );
+    assert_eq!(
+        client.qcsd_apply_stream_receive_limit_action(
+            stream,
+            initial + 10,
+            Some(identity),
+            None,
+            true,
+        ),
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    );
+    assert_eq!(
+        client
+            .qcsd_preview_stream_receive_limit_action(
+                stream,
+                initial + 10,
+                Some(identity),
+                None,
+                None,
+                true,
+            )
+            .expect_err("duplicate pending ledger entry")
+            .kind,
+        QcsdReceiveLimitFatal::Ledger
+    );
+    assert_eq!(
+        client
+            .qcsd_preview_stream_receive_limit_action(
+                stream,
+                initial + 9,
+                Some(QcsdReceiveActionIdentity::Scheduled {
+                    endpoint: QcsdEndpointId(0),
+                    stream: QcsdStreamId(stream.as_u64()),
+                    absolute_limit: initial + 9,
+                    slot: QcsdSlotId(5),
+                }),
+                None,
+                None,
+                true,
+            )
+            .expect_err("pending manual limit cannot decrease")
+            .kind,
+        QcsdReceiveLimitFatal::Order
+    );
+    assert_eq!(
+        client
+            .qcsd_preview_stream_receive_limit_action(
+                stream,
+                initial + 13,
+                Some(QcsdReceiveActionIdentity::ParserLease {
+                    endpoint: QcsdEndpointId(0),
+                    stream: QcsdStreamId(stream.as_u64()),
+                    absolute_limit: initial + 13,
+                    increase: 4,
+                    owner: None,
+                }),
+                None,
+                Some(initial + 9),
+                true,
+            )
+            .expect_err("parser range must join the pending limit")
+            .kind,
+        QcsdReceiveLimitFatal::Ledger
+    );
+    assert_eq!(
+        client.qcsd_preview_stream_receive_limit_action(
+            crate::StreamId::new(stream.as_u64() + 400),
+            initial + 10,
+            None,
+            None,
+            None,
+            true,
+        ),
+        Ok(QcsdReceiveLimitOutcome::Gone)
+    );
+    assert_eq!(
+        client.qcsd_pending_receive_action_identities(),
+        vec![identity]
+    );
+    client
+        .qcsd_preview_receive_action_cancellation(&[identity])
+        .expect("pending action is cancelable");
+    client
+        .qcsd_commit_receive_action_cancellation(&[identity])
+        .expect("pending action cancellation");
+    assert!(client.qcsd_pending_receive_action_identities().is_empty());
+}
+
+#[test]
+fn typed_receive_identity_is_removed_only_after_actual_encoding() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let endpoint = QcsdEndpointId(7);
+    client.qcsd_enable(endpoint, false).expect("enable QCSD");
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
+    client
+        .qcsd_set_stream_receive_limit(stream, initial)
+        .expect("manual receive");
+    let identity = QcsdReceiveActionIdentity::Scheduled {
+        endpoint,
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 10,
+        slot: QcsdSlotId(44),
+    };
+    client
+        .qcsd_apply_stream_receive_limit_action(stream, initial + 10, Some(identity), None, true)
+        .expect("apply typed limit");
+    assert_eq!(
+        client.qcsd_pending_receive_action_identities(),
+        vec![identity]
+    );
+    _ = client.process_output(now()).dgram().expect("encode limit");
+    assert!(client.qcsd_pending_receive_action_identities().is_empty());
+    assert_eq!(
+        client
+            .qcsd_preview_receive_action_cancellation(&[identity])
+            .expect_err("encoded identity cannot be revoked")
+            .kind,
+        QcsdReceiveLimitFatal::Ledger
+    );
+}
+
+#[test]
+fn retained_final_size_can_cancel_an_earlier_cross_batch_pending_limit() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let endpoint = QcsdEndpointId(7);
+    client.qcsd_enable(endpoint, false).expect("enable QCSD");
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
+    client
+        .qcsd_set_stream_receive_limit(stream, initial)
+        .expect("manual receive");
+    let first = QcsdReceiveActionIdentity::Scheduled {
+        endpoint,
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 10,
+        slot: QcsdSlotId(51),
+    };
+    client
+        .qcsd_apply_stream_receive_limit_action(stream, initial + 10, Some(first), None, true)
+        .expect("accept first batch action");
+    client
+        .streams
+        .get_recv_stream_mut(stream)
+        .expect("receive stream")
+        .inbound_stream_frame(true, 10, &[])
+        .expect("FIN with gap");
+    let second = QcsdReceiveActionIdentity::Scheduled {
+        endpoint,
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 20,
+        slot: QcsdSlotId(52),
+    };
+    assert_eq!(
+        client.qcsd_preview_stream_receive_limit_action(
+            stream,
+            initial + 20,
+            Some(second),
+            None,
+            None,
+            true,
+        ),
+        Ok(QcsdReceiveLimitOutcome::FinalKnown)
+    );
+    client
+        .qcsd_preview_receive_action_cancellation(&[first])
+        .expect("retained final-known FC previews rollback");
+    client
+        .qcsd_commit_receive_action_cancellation(&[first])
+        .expect("retained final-known FC commits rollback");
+    assert!(client.qcsd_pending_receive_action_identities().is_empty());
+}
+
+#[test]
+fn endpoint_close_retains_pending_identity_tombstone_until_reconciliation() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let endpoint = QcsdEndpointId(7);
+    client.qcsd_enable(endpoint, false).expect("enable QCSD");
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
+    client
+        .qcsd_set_stream_receive_limit(stream, initial)
+        .expect("manual receive");
+    let identity = QcsdReceiveActionIdentity::Scheduled {
+        endpoint,
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 10,
+        slot: QcsdSlotId(61),
+    };
+    client
+        .qcsd_apply_stream_receive_limit_action(stream, initial + 10, Some(identity), None, true)
+        .expect("pending action");
+    client.close(now(), 0, "close before encoding");
+    assert_eq!(
+        client.qcsd_pending_receive_action_identities(),
+        vec![identity]
+    );
+    client
+        .qcsd_preview_receive_action_cancellation(&[identity])
+        .expect("closed tombstone previews");
+    client
+        .qcsd_commit_receive_action_cancellation(&[identity])
+        .expect("closed tombstone reconciles");
+    assert!(client.qcsd_pending_receive_action_identities().is_empty());
+}
+
+#[test]
+fn terminal_automatic_receive_configuration_is_typed_noop() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    client
+        .streams
+        .get_recv_stream_mut(stream)
+        .expect("receive stream")
+        .inbound_stream_frame(true, 10, &[])
+        .expect("FIN with gap");
+    assert_eq!(
+        client.qcsd_stream_receive_lifecycle(stream),
+        QcsdReceiveLimitOutcome::FinalKnown
+    );
+    assert_eq!(
+        client.qcsd_apply_stream_auto_receive_action(stream, 1_024),
+        Ok(QcsdReceiveLimitOutcome::FinalKnown)
+    );
+    let gone = crate::StreamId::new(stream.as_u64() + 400);
+    assert_eq!(
+        client.qcsd_apply_stream_auto_receive_action(gone, 1_024),
+        Ok(QcsdReceiveLimitOutcome::Gone)
+    );
+}
+
+#[test]
+fn legacy_manual_receive_limit_preserves_terminal_error_mapping() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    client
+        .streams
+        .get_recv_stream_mut(stream)
+        .expect("receive stream")
+        .inbound_stream_frame(true, 10, &[])
+        .expect("FIN with gap");
+    assert_eq!(
+        client.qcsd_set_stream_receive_limit(stream, 1_024),
+        Err(Error::InvalidInput),
+        "legacy existing-stream terminal mapping is stable"
+    );
+    assert_eq!(
+        client.qcsd_set_stream_receive_limit(crate::StreamId::new(stream.as_u64() + 400), 1_024,),
+        Err(Error::InvalidStreamId),
+        "only an absent receive stream uses InvalidStreamId"
     );
 }
 

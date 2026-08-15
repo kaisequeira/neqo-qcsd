@@ -16,6 +16,59 @@ const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+/// Result of checking or applying one QCSD receive-limit action.
+///
+/// Lifecycle outcomes are non-fatal: a controller can cancel the stream's
+/// unadvertised suffix without treating an ordinary FIN or stream cleanup as
+/// a transport failure.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdReceiveLimitOutcome {
+    /// The action is valid for a live receiving stream.
+    Applied,
+    /// A final size is known, so further receive credit cannot be useful.
+    FinalKnown,
+    /// The receive side reached a terminal state but is still retained.
+    Terminal,
+    /// The transport no longer retains the stream.
+    Gone,
+}
+
+/// Fatal class of a rejected QCSD receive-limit action.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdReceiveLimitFatal {
+    /// The requested limit is below bytes already advertised or consumed.
+    WouldRevoke,
+    /// The action does not strictly advance the pending manual limit.
+    Order,
+    /// Action metadata disagrees with the transport or controller ledger.
+    Ledger,
+}
+
+/// Evidence for a fatal receive-limit preflight or apply rejection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QcsdReceiveLimitError {
+    /// Stable fatal classification used by runner traces and policy.
+    pub kind: QcsdReceiveLimitFatal,
+    /// Absolute limit requested by the rejected action or range boundary.
+    pub requested_limit: u64,
+    /// Transport/controller high-water mark that rejected the request.
+    pub reference_limit: u64,
+}
+
+impl std::fmt::Display for QcsdReceiveLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "QCSD receive-limit {:?}: requested {}, reference {}",
+            self.kind, self.requested_limit, self.reference_limit
+        )
+    }
+}
+
+impl std::error::Error for QcsdReceiveLimitError {}
+
 /// Logical scheduled-slot ownership carried by a parser receive lease.
 ///
 /// The transport action remains slotless: this metadata lets the runner trace
@@ -26,6 +79,79 @@ pub struct QcsdParserLeaseOwner {
     pub packet: Packet,
     /// Logical scheduled slot to trace from lease issuance to terminal state.
     pub slot: QcsdSlotId,
+}
+
+/// Transport-independent identity of one receive-limit action.
+///
+/// The runner adds the drained-batch index when matching a cancellation. This
+/// identity deliberately is not serialized into [`QcsdAction`], preserving the
+/// established action JSON and trace schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QcsdReceiveActionIdentity {
+    /// Scheduled receive credit owned directly by one logical slot.
+    Scheduled {
+        /// Endpoint adapter receiving the action.
+        endpoint: QcsdEndpointId,
+        /// QUIC receive stream whose limit advances.
+        stream: QcsdStreamId,
+        /// New absolute `MAX_STREAM_DATA` limit.
+        absolute_limit: u64,
+        /// Logical schedule slot owning this credit.
+        slot: QcsdSlotId,
+    },
+    /// Parser-liveness lease, optionally backed by a scheduled slot.
+    ParserLease {
+        /// Endpoint adapter receiving the action.
+        endpoint: QcsdEndpointId,
+        /// QUIC receive stream whose limit advances.
+        stream: QcsdStreamId,
+        /// New absolute `MAX_STREAM_DATA` limit.
+        absolute_limit: u64,
+        /// Exact contiguous lease length.
+        increase: u64,
+        /// Optional schedule ownership for consumed lease bytes.
+        owner: Option<QcsdParserLeaseOwner>,
+    },
+}
+
+impl QcsdReceiveActionIdentity {
+    /// Endpoint component of this internal identity.
+    #[must_use]
+    pub const fn endpoint(self) -> QcsdEndpointId {
+        match self {
+            Self::Scheduled { endpoint, .. } | Self::ParserLease { endpoint, .. } => endpoint,
+        }
+    }
+
+    /// Stream component of this internal identity.
+    #[must_use]
+    pub const fn stream(self) -> QcsdStreamId {
+        match self {
+            Self::Scheduled { stream, .. } | Self::ParserLease { stream, .. } => stream,
+        }
+    }
+
+    /// Absolute receive limit component of this internal identity.
+    #[must_use]
+    pub const fn absolute_limit(self) -> u64 {
+        match self {
+            Self::Scheduled { absolute_limit, .. } | Self::ParserLease { absolute_limit, .. } => {
+                absolute_limit
+            }
+        }
+    }
+
+    /// Scheduled owner, if this action carries one.
+    #[must_use]
+    pub const fn slot(self) -> Option<QcsdSlotId> {
+        match self {
+            Self::Scheduled { slot, .. } => Some(slot),
+            Self::ParserLease { owner, .. } => match owner {
+                Some(owner) => Some(owner.slot),
+                None => None,
+            },
+        }
+    }
 }
 
 /// Commands emitted by the controller for a Neqo endpoint adapter.
@@ -101,13 +227,49 @@ pub enum QcsdAction {
     DefenseComplete,
 }
 
+impl QcsdAction {
+    /// Stable internal identity used to reconcile preflight cancellation with
+    /// the exact actions already drained by the runner.
+    #[must_use]
+    pub const fn receive_identity(&self) -> Option<QcsdReceiveActionIdentity> {
+        match self {
+            Self::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot,
+                ..
+            } => Some(QcsdReceiveActionIdentity::Scheduled {
+                endpoint: *endpoint,
+                stream: *stream,
+                absolute_limit: *absolute_limit,
+                slot: *slot,
+            }),
+            Self::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit,
+                increase,
+                owner,
+            } => Some(QcsdReceiveActionIdentity::ParserLease {
+                endpoint: *endpoint,
+                stream: *stream,
+                absolute_limit: *absolute_limit,
+                increase: *increase,
+                owner: *owner,
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use serde_json::Value;
 
-    use super::{QcsdAction, QcsdParserLeaseOwner};
+    use super::{QcsdAction, QcsdParserLeaseOwner, QcsdReceiveActionIdentity};
     use crate::{Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
 
     #[test]
@@ -185,5 +347,49 @@ mod tests {
                 .expect("deserialize staged send action"),
             staged
         );
+    }
+
+    #[test]
+    fn receive_action_identity_is_internal_and_unambiguous() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("incoming packet");
+        let owner = QcsdParserLeaseOwner {
+            packet,
+            slot: QcsdSlotId(9),
+        };
+        let scheduled = QcsdAction::IncreaseReceiveLimit {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(4),
+            absolute_limit: 26,
+            packet,
+            slot: QcsdSlotId(8),
+        };
+        assert_eq!(
+            scheduled.receive_identity(),
+            Some(QcsdReceiveActionIdentity::Scheduled {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(4),
+                absolute_limit: 26,
+                slot: QcsdSlotId(8),
+            })
+        );
+        let parser = QcsdAction::LeaseParserReceive {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(4),
+            absolute_limit: 29,
+            increase: 3,
+            owner: Some(owner),
+        };
+        assert_eq!(
+            parser.receive_identity(),
+            Some(QcsdReceiveActionIdentity::ParserLease {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(4),
+                absolute_limit: 29,
+                increase: 3,
+                owner: Some(owner),
+            })
+        );
+        let json = serde_json::to_value(parser).expect("serialize parser action");
+        assert!(json.get("receive_identity").is_none());
     }
 }

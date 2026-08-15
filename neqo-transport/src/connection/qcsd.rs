@@ -12,8 +12,8 @@ use std::{
 use enum_map::EnumMap;
 use neqo_csdef::{
     Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-    QcsdObservationClock, QcsdRequestRole, QcsdSlotId, TimestampedQcsdObservation,
-    TrafficMorphingEgress,
+    QcsdObservationClock, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId,
+    TimestampedQcsdObservation, TrafficMorphingEgress,
 };
 
 use super::{Connection, Error, Res, RetransmissionPriority, StreamId, TransmissionPriority};
@@ -168,6 +168,13 @@ pub(super) struct PendingReceiveCredit {
     pub slot: QcsdSlotId,
     pub stream: StreamId,
     pub absolute_limit: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PendingReceiveAction {
+    pub identity: QcsdReceiveActionIdentity,
+    pub previous_limit: u64,
+    pub previous_frame_pending: bool,
 }
 
 impl Connection {
@@ -537,6 +544,10 @@ impl Connection {
     }
 
     pub(super) fn qcsd_receive_limit_advertised(&mut self, stream: StreamId, absolute_limit: u64) {
+        self.qcsd_pending_receive_actions.retain(|pending| {
+            pending.identity.stream().0 != stream.as_u64()
+                || pending.identity.absolute_limit() > absolute_limit
+        });
         let mut slots = Vec::new();
         self.qcsd_pending_receive_credit.retain(|credit| {
             if credit.stream == stream && credit.absolute_limit <= absolute_limit {

@@ -25,6 +25,8 @@ use std::{
 
 use enum_map::EnumMap;
 use neqo_common::{Buffer, MAX_VARINT, Role, qdebug, qtrace, to_u64};
+#[cfg(feature = "qcsd")]
+use neqo_csdef::{QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome};
 
 use crate::{
     Error, Res,
@@ -374,17 +376,174 @@ where
         self.max_active = max;
     }
 
-    /// Switch to QCSD's absolute manual receive limit.
+    /// Purely check a prospective QCSD receive limit.
     ///
-    /// Returns `false` when the limit would revoke credit already advertised or consumed.
+    /// `virtual_high_water` represents earlier actions in a runner batch that
+    /// have passed preflight but have not mutated transport yet.
     #[cfg(feature = "qcsd")]
-    pub const fn set_manual_limit(&mut self, absolute_limit: u64) -> bool {
+    pub const fn preview_manual_limit(
+        &self,
+        absolute_limit: u64,
+        virtual_high_water: Option<u64>,
+        expected_previous: Option<u64>,
+        strict_advance: bool,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        if absolute_limit > MAX_VARINT {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Order,
+                requested_limit: absolute_limit,
+                reference_limit: MAX_VARINT,
+            });
+        }
         if absolute_limit < self.max_allowed || absolute_limit < self.consumed {
-            return false;
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::WouldRevoke,
+                requested_limit: absolute_limit,
+                reference_limit: if self.max_allowed > self.consumed {
+                    self.max_allowed
+                } else {
+                    self.consumed
+                },
+            });
+        }
+        let pending = match (self.manual_limit, virtual_high_water) {
+            (Some(current), Some(virtual_limit)) => {
+                if current > virtual_limit {
+                    current
+                } else {
+                    virtual_limit
+                }
+            }
+            (Some(current), None) => current,
+            (None, Some(virtual_limit)) => virtual_limit,
+            (None, None) => self.max_allowed,
+        };
+        if let Some(expected) = expected_previous
+            && expected != pending
+        {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Ledger,
+                requested_limit: expected,
+                reference_limit: pending,
+            });
+        }
+        if absolute_limit < pending || (strict_advance && absolute_limit == pending) {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Order,
+                requested_limit: absolute_limit,
+                reference_limit: pending,
+            });
+        }
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    }
+
+    /// Switch to QCSD's absolute manual receive limit after typed validation.
+    #[cfg(feature = "qcsd")]
+    pub const fn set_manual_limit(
+        &mut self,
+        absolute_limit: u64,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        match self.preview_manual_limit(absolute_limit, None, None, false) {
+            Ok(QcsdReceiveLimitOutcome::Applied) => {}
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => return Err(error),
         }
         self.frame_pending |= absolute_limit > self.max_allowed;
         self.manual_limit = Some(absolute_limit);
-        true
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    }
+
+    /// Apply a strictly advancing action whose parser range, when present,
+    /// must begin at the current pending manual limit.
+    #[cfg(feature = "qcsd")]
+    pub const fn apply_manual_limit_action(
+        &mut self,
+        absolute_limit: u64,
+        expected_previous: Option<u64>,
+    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
+        match self.preview_manual_limit(absolute_limit, None, expected_previous, true) {
+            Ok(QcsdReceiveLimitOutcome::Applied) => {}
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => return Err(error),
+        }
+        self.frame_pending |= absolute_limit > self.max_allowed;
+        self.manual_limit = Some(absolute_limit);
+        Ok(QcsdReceiveLimitOutcome::Applied)
+    }
+
+    /// Purely validate LIFO rollback of receive credit that has not been encoded.
+    #[cfg(feature = "qcsd")]
+    pub fn preview_cancel_manual_limit(
+        &self,
+        expected_current: u64,
+        restored_limit: u64,
+    ) -> Result<(), QcsdReceiveLimitError> {
+        if self.manual_limit != Some(expected_current) {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Ledger,
+                requested_limit: expected_current,
+                reference_limit: self.manual_limit.unwrap_or(self.max_allowed),
+            });
+        }
+        if restored_limit > expected_current {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::Order,
+                requested_limit: restored_limit,
+                reference_limit: expected_current,
+            });
+        }
+        if restored_limit < self.max_allowed || restored_limit < self.consumed {
+            return Err(QcsdReceiveLimitError {
+                kind: QcsdReceiveLimitFatal::WouldRevoke,
+                requested_limit: restored_limit,
+                reference_limit: self.max_allowed.max(self.consumed),
+            });
+        }
+        Ok(())
+    }
+
+    /// Roll back a validated unencoded receive-limit suffix.
+    #[cfg(feature = "qcsd")]
+    pub fn cancel_manual_limit(
+        &mut self,
+        expected_current: u64,
+        restored_limit: u64,
+        restored_frame_pending: bool,
+    ) -> Result<(), QcsdReceiveLimitError> {
+        match self.preview_cancel_manual_limit(expected_current, restored_limit) {
+            Ok(()) => {}
+            Err(error) => return Err(error),
+        }
+        self.manual_limit = Some(restored_limit);
+        self.frame_pending = restored_frame_pending;
+        Ok(())
+    }
+
+    /// Commit a receive-limit rollback already accepted by
+    /// [`Self::preview_cancel_manual_limit`].
+    #[cfg(feature = "qcsd")]
+    pub const fn commit_cancel_manual_limit(
+        &mut self,
+        restored_limit: u64,
+        restored_frame_pending: bool,
+    ) {
+        self.manual_limit = Some(restored_limit);
+        self.frame_pending = restored_frame_pending;
+    }
+
+    /// Whether the current receive-limit frame is pending transmission.
+    #[cfg(feature = "qcsd")]
+    pub const fn manual_frame_pending(&self) -> bool {
+        self.frame_pending
+    }
+
+    /// Current effective receive limit, including an unencoded manual limit.
+    #[cfg(feature = "qcsd")]
+    pub const fn manual_reference_limit(&self) -> u64 {
+        match self.manual_limit {
+            Some(limit) => limit,
+            None => self.max_allowed,
+        }
     }
 
     /// Return a QCSD-controlled stream to automatic receive-window updates.
@@ -415,6 +574,11 @@ where
 
     pub const fn consumed(&self) -> u64 {
         self.consumed
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub const fn manual_limit(&self) -> Option<u64> {
+        self.manual_limit
     }
 
     /// Core auto-tuning logic for adjusting the maximum flow control window.
@@ -994,13 +1158,19 @@ mod test {
     #[test]
     fn qcsd_manual_limit_only_advances_explicitly() {
         let mut fc = ReceiverFlowControl::new((), 16);
-        assert!(fc.set_manual_limit(16));
+        assert_eq!(
+            fc.set_manual_limit(16),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Applied)
+        );
         fc.consume(16).unwrap();
         fc.retire(16);
         fc.send_flowc_update();
         assert!(!fc.frame_needed());
 
-        assert!(fc.set_manual_limit(128));
+        assert_eq!(
+            fc.set_manual_limit(128),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Applied)
+        );
         assert!(fc.frame_needed());
         assert_eq!(fc.next_limit(), 128);
         fc.frame_sent(128);
@@ -1014,17 +1184,79 @@ mod test {
     #[test]
     fn qcsd_manual_limit_never_revokes_credit() {
         let mut fc = ReceiverFlowControl::new((), 64);
-        assert!(!fc.set_manual_limit(16));
-        assert!(fc.set_manual_limit(64));
+        assert_eq!(
+            fc.set_manual_limit(16)
+                .expect_err("advertised credit cannot be revoked")
+                .kind,
+            neqo_csdef::QcsdReceiveLimitFatal::WouldRevoke
+        );
+        assert_eq!(
+            fc.set_manual_limit(64),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Applied)
+        );
         assert!(fc.consume(32).is_ok());
-        assert!(!fc.set_manual_limit(31));
+        assert_eq!(
+            fc.set_manual_limit(31)
+                .expect_err("consumed credit cannot be revoked")
+                .kind,
+            neqo_csdef::QcsdReceiveLimitFatal::WouldRevoke
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_preview_includes_pending_manual_and_virtual_limits() {
+        let mut fc = ReceiverFlowControl::new((), 16);
+        fc.set_manual_limit(64).expect("pending manual limit");
+        assert_eq!(
+            fc.preview_manual_limit(63, None, None, true)
+                .expect_err("pending manual limit is monotonic")
+                .kind,
+            neqo_csdef::QcsdReceiveLimitFatal::Order
+        );
+        assert_eq!(
+            fc.preview_manual_limit(79, Some(80), None, true)
+                .expect_err("virtual batch limit is monotonic")
+                .kind,
+            neqo_csdef::QcsdReceiveLimitFatal::Order
+        );
+        assert_eq!(
+            fc.preview_manual_limit(96, Some(80), Some(79), true)
+                .expect_err("parser range must be contiguous")
+                .kind,
+            neqo_csdef::QcsdReceiveLimitFatal::Ledger
+        );
+        assert_eq!(
+            fc.preview_manual_limit(96, Some(80), Some(80), true),
+            Ok(neqo_csdef::QcsdReceiveLimitOutcome::Applied)
+        );
+        assert_eq!(
+            fc.preview_manual_limit(neqo_common::MAX_VARINT + 1, None, None, true)
+                .expect_err("QUIC varint overflow is fatal")
+                .kind,
+            neqo_csdef::QcsdReceiveLimitFatal::Order
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_rollback_preserves_preexisting_pending_retransmission() {
+        let mut fc = ReceiverFlowControl::new((), 16);
+        fc.set_manual_limit(32).expect("earlier pending limit");
+        assert!(fc.frame_needed());
+        fc.apply_manual_limit_action(64, Some(32))
+            .expect("later pending action");
+        fc.cancel_manual_limit(64, 32, true)
+            .expect("LIFO cancellation");
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 32);
     }
 
     #[cfg(feature = "qcsd")]
     #[test]
     fn qcsd_can_restore_automatic_updates() {
         let mut fc = ReceiverFlowControl::new((), 16);
-        assert!(fc.set_manual_limit(16));
+        fc.set_manual_limit(16).expect("manual limit");
         fc.set_auto_window(64);
         fc.consume(16).unwrap();
         fc.retire(16);
