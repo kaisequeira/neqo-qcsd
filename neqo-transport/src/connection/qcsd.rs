@@ -158,7 +158,7 @@ pub(super) struct PacketTarget {
     pub slot: QcsdSlotId,
     pub udp_payload_size: u16,
     pub packet: Packet,
-    pub not_before: Instant,
+    pub not_before: Option<Instant>,
     pub deadline: Instant,
     pub allow_stream_data: bool,
 }
@@ -443,13 +443,39 @@ impl Connection {
         self.stream_priority(stream_id, priority, RetransmissionPriority::Same)
     }
 
-    /// Queue an attributed exact-size 1-RTT UDP payload target.
+    /// Queue an immediately eligible, attributed exact-size 1-RTT UDP payload target.
     ///
     /// # Errors
     ///
     /// Returns `NotAvailable` before 1-RTT keys/path state are usable and
-    /// `InvalidInput` when the target is outside the active path range.
+    /// `InvalidInput` when the target regresses queue order or is outside the
+    /// active path range.
     pub fn qcsd_queue_scheduled_packet_target(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: Packet,
+        deadline: Instant,
+        allow_stream_data: bool,
+    ) -> Res<()> {
+        self.qcsd_validate_packet_target_window(None, deadline)?;
+        self.qcsd_queue_scheduled_packet_target_inner(
+            slot,
+            packet,
+            None,
+            deadline,
+            allow_stream_data,
+        )
+    }
+
+    /// Queue an attributed exact-size 1-RTT UDP payload target with an
+    /// explicit eligibility window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for an empty window or one that regresses relative
+    /// to the preceding target. Otherwise returns the same errors as
+    /// [`Self::qcsd_queue_scheduled_packet_target`].
+    pub fn qcsd_queue_scheduled_packet_target_window(
         &mut self,
         slot: QcsdSlotId,
         packet: Packet,
@@ -457,15 +483,41 @@ impl Connection {
         deadline: Instant,
         allow_stream_data: bool,
     ) -> Res<()> {
-        let endpoint = self.qcsd_endpoint;
-        let udp_payload_size = packet.length();
-        if not_before >= deadline
+        self.qcsd_validate_packet_target_window(Some(not_before), deadline)?;
+        self.qcsd_queue_scheduled_packet_target_inner(
+            slot,
+            packet,
+            Some(not_before),
+            deadline,
+            allow_stream_data,
+        )
+    }
+
+    fn qcsd_validate_packet_target_window(
+        &self,
+        not_before: Option<Instant>,
+        deadline: Instant,
+    ) -> Res<()> {
+        if not_before.is_some_and(|release| release >= deadline)
             || self.qcsd_packet_targets.back().is_some_and(|previous| {
                 not_before < previous.not_before || deadline < previous.deadline
             })
         {
             return Err(Error::InvalidInput);
         }
+        Ok(())
+    }
+
+    fn qcsd_queue_scheduled_packet_target_inner(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: Packet,
+        not_before: Option<Instant>,
+        deadline: Instant,
+        allow_stream_data: bool,
+    ) -> Res<()> {
+        let endpoint = self.qcsd_endpoint;
+        let udp_payload_size = packet.length();
         if !self.state.connected() {
             if let Some(endpoint) = endpoint {
                 self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
@@ -509,8 +561,8 @@ impl Connection {
         self.qcsd_packet_targets.front().map(|target| {
             if now >= target.deadline {
                 now
-            } else if now < target.not_before {
-                target.not_before
+            } else if let Some(not_before) = target.not_before.filter(|release| now < *release) {
+                not_before
             } else {
                 target.deadline
             }
@@ -522,7 +574,10 @@ impl Connection {
             .iter()
             .find(|target| now < target.deadline)
             .copied()
-            .filter(|target| now >= target.not_before && now < target.deadline)
+            .filter(|target| {
+                target.not_before.is_none_or(|not_before| now >= not_before)
+                    && now < target.deadline
+            })
     }
 
     pub(super) fn qcsd_expire_packet_targets(

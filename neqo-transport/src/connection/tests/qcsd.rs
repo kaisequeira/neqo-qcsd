@@ -4,7 +4,13 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::{cell::RefCell, net::SocketAddr, num::NonZeroUsize, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use neqo_csdef::{
     Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
@@ -47,13 +53,140 @@ fn queue_target(
     let packet =
         Packet::new(Duration::ZERO, Direction::Outgoing, size).map_err(|_| Error::InvalidInput)?;
     let queued_at = now();
-    connection.qcsd_queue_scheduled_packet_target(
+    connection.qcsd_queue_scheduled_packet_target_window(
         QcsdSlotId(slot),
         packet,
         queued_at,
         queued_at + Duration::from_secs(1),
         allow_stream_data,
     )
+}
+
+#[test]
+fn legacy_packet_target_queue_preserves_four_argument_signature() {
+    fn accepts_legacy_signature(
+        _queue: fn(&mut Connection, QcsdSlotId, Packet, Instant, bool) -> Result<(), Error>,
+    ) {
+    }
+
+    accepts_legacy_signature(Connection::qcsd_queue_scheduled_packet_target);
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "capture a deliberately stale fake drive clock to prove the legacy API reads no clock"
+)]
+fn legacy_packet_target_is_immediately_eligible_on_a_fake_clock() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+
+    let fake_now = Instant::now();
+    let deadline = fake_now + Duration::from_secs(1);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(QcsdSlotId(39), packet, deadline, false)
+        .unwrap();
+
+    let target = client
+        .qcsd_eligible_packet_target(fake_now)
+        .expect("legacy target has no lower eligibility bound");
+    assert_eq!(target.slot, QcsdSlotId(39));
+    assert_eq!(target.not_before, None);
+    assert_eq!(client.qcsd_packet_target_wakeup(fake_now), Some(deadline));
+}
+
+#[test]
+fn legacy_target_can_precede_a_nonregressing_explicit_window() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+
+    let base = now();
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(35),
+            packet,
+            base + Duration::from_millis(20),
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        client.qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(36),
+            packet,
+            base + Duration::from_millis(10),
+            base + Duration::from_millis(15),
+            false,
+        ),
+        Err(Error::InvalidInput),
+        "deadline ordering remains queue-wide"
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+
+    client
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(36),
+            packet,
+            base + Duration::from_millis(10),
+            base + Duration::from_millis(30),
+            false,
+        )
+        .expect("None sorts before an explicit lower bound");
+    assert_eq!(client.qcsd_pending_packet_targets(), 2);
+    assert_eq!(client.qcsd_packet_targets[0].not_before, None);
+    assert_eq!(
+        client.qcsd_packet_targets[1].not_before,
+        Some(base + Duration::from_millis(10))
+    );
+}
+
+#[test]
+fn explicit_window_rejects_a_legacy_successor_without_hiding_later_regressions() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+
+    let base = now();
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(37),
+            packet,
+            base + Duration::from_millis(10),
+            base + Duration::from_millis(20),
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        client.qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(38),
+            packet,
+            base + Duration::from_millis(30),
+            false,
+        ),
+        Err(Error::InvalidInput),
+        "an immediate lower bound cannot follow a future lower bound"
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+
+    assert_eq!(
+        client.qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(39),
+            packet,
+            base + Duration::from_millis(5),
+            base + Duration::from_millis(30),
+            false,
+        ),
+        Err(Error::InvalidInput),
+        "the rejected legacy target must not hide an explicit release regression"
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
 }
 
 fn traffic_morphing_config() -> TrafficMorphingConfig {
@@ -320,7 +453,7 @@ fn target_uses_safe_partial_congestion_window_capacity() {
 
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, partial).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(2),
             packet,
             send_time,
@@ -343,7 +476,7 @@ fn attributed_target_reports_exact_satisfaction() {
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     let queued_at = now();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(11),
             packet,
             queued_at,
@@ -387,7 +520,7 @@ fn future_packet_target_is_fully_inert_until_not_before() {
     let deadline = release + Duration::from_millis(5);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(40), packet, release, deadline, false)
+        .qcsd_queue_scheduled_packet_target_window(QcsdSlotId(40), packet, release, deadline, false)
         .unwrap();
 
     let natural = client
@@ -450,11 +583,17 @@ fn resolved_target_leaves_future_successor_fully_inert() {
     let first_deadline = release + Duration::from_millis(5);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(48), packet, release, first_deadline, true)
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(48),
+            packet,
+            release,
+            first_deadline,
+            true,
+        )
         .unwrap();
     let future_release = first_deadline + Duration::from_millis(10);
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(49),
             packet,
             future_release,
@@ -585,7 +724,7 @@ fn packet_target_outcome_keeps_its_enqueue_endpoint_after_checked_rebind_attempt
     let release = now() + Duration::from_millis(10);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(50),
             packet,
             release,
@@ -625,7 +764,7 @@ fn packet_target_outcome_keeps_its_enqueue_endpoint_after_checked_rebind_attempt
     let second_release = release + Duration::from_millis(10);
     let second_deadline = second_release + Duration::from_millis(5);
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(51),
             packet,
             second_release,
@@ -676,7 +815,7 @@ fn expired_head_does_not_disable_live_successor_batch_clamp() {
         .expect("fixture instant permits subtraction");
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(52),
             packet,
             expired_release,
@@ -685,7 +824,7 @@ fn expired_head_does_not_disable_live_successor_batch_clamp() {
         )
         .unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(53),
             packet,
             drive_at,
@@ -754,7 +893,7 @@ fn mandatory_ack_before_release_is_unattributed() {
     let release = ack_at + Duration::from_secs(1);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(41),
             packet,
             release,
@@ -804,7 +943,7 @@ fn packet_target_activates_at_release_and_expires_at_deadline() {
     let deadline = release + Duration::from_millis(5);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(42), packet, release, deadline, false)
+        .qcsd_queue_scheduled_packet_target_window(QcsdSlotId(42), packet, release, deadline, false)
         .unwrap();
     let just_before_release = release
         .checked_sub(Duration::from_nanos(1))
@@ -829,7 +968,7 @@ fn packet_target_activates_at_release_and_expires_at_deadline() {
     let second_release = deadline + Duration::from_millis(10);
     let second_deadline = second_release + Duration::from_millis(5);
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(43),
             packet,
             second_release,
@@ -861,10 +1000,10 @@ fn packet_target_rejects_inverted_and_nonmonotonic_windows() {
     let release = base + Duration::from_millis(10);
     let deadline = release + Duration::from_millis(5);
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(44), packet, release, deadline, false)
+        .qcsd_queue_scheduled_packet_target_window(QcsdSlotId(44), packet, release, deadline, false)
         .unwrap();
     assert_eq!(
-        client.qcsd_queue_scheduled_packet_target(
+        client.qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(45),
             packet,
             deadline,
@@ -874,7 +1013,7 @@ fn packet_target_rejects_inverted_and_nonmonotonic_windows() {
         Err(Error::InvalidInput)
     );
     assert_eq!(
-        client.qcsd_queue_scheduled_packet_target(
+        client.qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(46),
             packet,
             release
@@ -886,7 +1025,7 @@ fn packet_target_rejects_inverted_and_nonmonotonic_windows() {
         Err(Error::InvalidInput)
     );
     assert_eq!(
-        client.qcsd_queue_scheduled_packet_target(
+        client.qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(47),
             packet,
             release + Duration::from_nanos(1),
@@ -909,7 +1048,7 @@ fn expired_target_reports_a_typed_miss() {
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     let deadline = now();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(12),
             packet,
             deadline
@@ -944,7 +1083,7 @@ fn congestion_limited_target_reports_a_typed_miss() {
     let (_dropped, exhausted_at) = fill_cwnd(&mut client, stream, now());
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(14),
             packet,
             exhausted_at
@@ -984,7 +1123,7 @@ fn pacing_limited_target_reports_a_typed_miss() {
 
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(15),
             packet,
             now.checked_sub(Duration::from_nanos(1))
@@ -1020,7 +1159,7 @@ fn endpoint_close_retires_future_target_once() {
     for slot in [20, 21] {
         let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
         client
-            .qcsd_queue_scheduled_packet_target(
+            .qcsd_queue_scheduled_packet_target_window(
                 QcsdSlotId(slot),
                 packet,
                 not_before,
@@ -1413,7 +1552,7 @@ fn shaped_slot_sends_application_before_chaff() {
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 120).unwrap();
     let queued_at = now();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(13),
             packet,
             queued_at,
@@ -1675,7 +1814,7 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).unwrap();
     let queued_at = now();
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(30),
             packet,
             queued_at,
@@ -1692,7 +1831,7 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
     assert!(server.stream_recv(application, &mut buffer).is_err());
 
     client
-        .qcsd_queue_scheduled_packet_target(
+        .qcsd_queue_scheduled_packet_target_window(
             QcsdSlotId(31),
             packet,
             recovery_time,

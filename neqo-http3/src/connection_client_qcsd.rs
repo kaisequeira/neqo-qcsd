@@ -610,7 +610,7 @@ impl Http3Client {
                 let deadline = now
                     .checked_add(Duration::from_micros(deadline_after_us))
                     .ok_or(Error::InvalidInput)?;
-                self.conn.qcsd_queue_scheduled_packet_target(
+                self.conn.qcsd_queue_scheduled_packet_target_window(
                     slot,
                     packet,
                     not_before,
