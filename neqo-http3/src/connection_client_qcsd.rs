@@ -201,7 +201,7 @@ impl Http3Client {
             .map_or(configured_max_udp_payload_size, |path_limit| {
                 path_limit.min(configured_max_udp_payload_size)
             });
-        self.conn.qcsd_enable_with_observation_clock(
+        self.conn.qcsd_try_enable_with_observation_clock(
             endpoint,
             shape_stream_sends,
             observation_clock.clone(),

@@ -8,8 +8,9 @@ use std::{cell::RefCell, net::SocketAddr, num::NonZeroUsize, rc::Rc, time::Durat
 
 use neqo_csdef::{
     Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-    QcsdReceiveActionIdentity, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole,
-    QcsdSlotId, QcsdStreamId, TrafficMorphingConfig, TrafficMorphingEgress, TrafficMorphingOutcome,
+    QcsdObservationClock, QcsdReceiveActionIdentity, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSlotId, QcsdStreamId, TrafficMorphingConfig,
+    TrafficMorphingEgress, TrafficMorphingOutcome,
 };
 use test_fixture::{DEFAULT_ADDR, DEFAULT_ADDR_V4, fixture_init, now};
 
@@ -169,7 +170,7 @@ fn traffic_morphing_pads_the_natural_packet_in_place() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     enable_traffic_morphing(&mut client);
     assert_eq!(
         client.qcsd_morphing_optional_stream_limit(
@@ -227,7 +228,7 @@ fn traffic_morphing_defers_optional_streams_before_sampling_when_capacity_is_sho
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
 
     queue_target(&mut client, 1, 300, false).unwrap();
     assert_eq!(client.process_output(now()).dgram().unwrap().len(), 300);
@@ -300,7 +301,7 @@ fn target_uses_safe_partial_congestion_window_capacity() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
 
     queue_target(&mut client, 1, 300, false).unwrap();
     assert_eq!(client.process_output(now()).dgram().unwrap().len(), 300);
@@ -338,7 +339,7 @@ fn attributed_target_reports_exact_satisfaction() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     let queued_at = now();
     client
@@ -373,7 +374,7 @@ fn future_packet_target_is_fully_inert_until_not_before() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     client.qcsd_enable_stream_transcript(true);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     fill_stream(&mut client, stream);
@@ -441,7 +442,7 @@ fn resolved_target_leaves_future_successor_fully_inert() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), true);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     fill_stream(&mut client, stream);
 
@@ -483,11 +484,103 @@ fn resolved_target_leaves_future_successor_fully_inert() {
 }
 
 #[test]
-fn packet_target_outcome_keeps_its_enqueue_endpoint_after_rebind_attempt() {
+fn legacy_qcsd_enable_methods_preserve_unit_signatures() {
+    const ENABLE: fn(&mut Connection, QcsdEndpointId, bool) = Connection::qcsd_enable;
+    const ENABLE_WITH_CLOCK: fn(&mut Connection, QcsdEndpointId, bool, QcsdObservationClock) =
+        Connection::qcsd_enable_with_observation_clock;
+
+    let mut direct = default_client();
+    ENABLE(&mut direct, QcsdEndpointId(6), false);
+    assert_eq!(direct.qcsd_endpoint, Some(QcsdEndpointId(6)));
+
+    let mut shared = default_client();
+    ENABLE_WITH_CLOCK(
+        &mut shared,
+        QcsdEndpointId(7),
+        false,
+        QcsdObservationClock::new(now()),
+    );
+    assert_eq!(shared.qcsd_endpoint, Some(QcsdEndpointId(7)));
+}
+
+#[test]
+fn checked_qcsd_rebind_is_rejected_atomically() {
+    let endpoint = QcsdEndpointId(7);
+    let mut client = default_client();
+    let clock = QcsdObservationClock::new(now());
+    client
+        .qcsd_try_enable_with_observation_clock(endpoint, false, clock.clone())
+        .expect("initial checked bind");
+    assert_eq!(
+        clock
+            .record_at(QcsdObservation::EndpointClosed { endpoint }, now())
+            .sequence(),
+        0
+    );
+
+    assert_eq!(
+        client.qcsd_try_enable(QcsdEndpointId(8), true),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        client.qcsd_try_enable_with_observation_clock(
+            QcsdEndpointId(9),
+            true,
+            QcsdObservationClock::new(now()),
+        ),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(client.qcsd_endpoint, Some(endpoint));
+    assert!(!client.qcsd_send_shaping);
+    assert_eq!(
+        client
+            .qcsd_observation_clock
+            .as_ref()
+            .expect("original clock retained")
+            .record_at(QcsdObservation::EndpointClosed { endpoint }, now())
+            .sequence(),
+        1
+    );
+}
+
+#[test]
+fn legacy_qcsd_rebind_is_a_noop_that_preserves_endpoint_and_clock() {
+    let endpoint = QcsdEndpointId(7);
+    let mut client = default_client();
+    let clock = QcsdObservationClock::new(now());
+    client.qcsd_enable_with_observation_clock(endpoint, false, clock.clone());
+    assert_eq!(
+        clock
+            .record_at(QcsdObservation::EndpointClosed { endpoint }, now())
+            .sequence(),
+        0
+    );
+
+    client.qcsd_enable(QcsdEndpointId(8), true);
+    client.qcsd_enable_with_observation_clock(
+        QcsdEndpointId(9),
+        true,
+        QcsdObservationClock::new(now()),
+    );
+    assert_eq!(client.qcsd_endpoint, Some(endpoint));
+    assert!(!client.qcsd_send_shaping);
+    assert_eq!(
+        client
+            .qcsd_observation_clock
+            .as_ref()
+            .expect("original clock retained")
+            .record_at(QcsdObservation::EndpointClosed { endpoint }, now())
+            .sequence(),
+        1
+    );
+}
+
+#[test]
+fn packet_target_outcome_keeps_its_enqueue_endpoint_after_checked_rebind_attempt() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
 
     let release = now() + Duration::from_millis(10);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
@@ -501,7 +594,7 @@ fn packet_target_outcome_keeps_its_enqueue_endpoint_after_rebind_attempt() {
         )
         .unwrap();
     assert_eq!(
-        client.qcsd_enable(QcsdEndpointId(8), false),
+        client.qcsd_try_enable(QcsdEndpointId(8), false),
         Err(Error::InvalidInput),
         "an established target binding cannot be replaced"
     );
@@ -570,7 +663,7 @@ fn expired_head_does_not_disable_live_successor_batch_clamp() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     fill_stream(&mut client, stream);
 
@@ -646,7 +739,7 @@ fn mandatory_ack_before_release_is_unattributed() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
 
     let sent_at = now();
     let stream = server.stream_create(StreamType::BiDi).unwrap();
@@ -704,7 +797,7 @@ fn packet_target_activates_at_release_and_expires_at_deadline() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
 
     let queued_at = now();
     let release = queued_at + Duration::from_millis(10);
@@ -762,7 +855,7 @@ fn packet_target_rejects_inverted_and_nonmonotonic_windows() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
     let base = now();
     let release = base + Duration::from_millis(10);
@@ -812,7 +905,7 @@ fn expired_target_reports_a_typed_miss() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     let deadline = now();
     client
@@ -846,7 +939,7 @@ fn congestion_limited_target_reports_a_typed_miss() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let (_dropped, exhausted_at) = fill_cwnd(&mut client, stream, now());
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
@@ -881,7 +974,7 @@ fn pacing_limited_target_reports_a_typed_miss() {
     let mut client = default_client();
     let mut server = default_server();
     let now = connect_rtt_idle(&mut client, &mut server, DEFAULT_RTT);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     fill_stream(&mut client, stream);
     for _ in 0..=PACING_BURST_SIZE {
@@ -920,7 +1013,7 @@ fn endpoint_close_retires_future_target_once() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let queued_at = now();
     let not_before = queued_at + Duration::from_secs(1);
     let deadline = not_before + Duration::from_secs(1);
@@ -976,7 +1069,7 @@ fn manual_receive_credit_is_reported_only_after_encoding() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let limit = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap() + 100;
     let slot = QcsdSlotId(99);
@@ -1126,7 +1219,7 @@ fn typed_receive_identity_is_removed_only_after_actual_encoding() {
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
     let endpoint = QcsdEndpointId(7);
-    client.qcsd_enable(endpoint, false).expect("enable QCSD");
+    client.qcsd_enable(endpoint, false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
     client
@@ -1162,7 +1255,7 @@ fn retained_final_size_can_cancel_an_earlier_cross_batch_pending_limit() {
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
     let endpoint = QcsdEndpointId(7);
-    client.qcsd_enable(endpoint, false).expect("enable QCSD");
+    client.qcsd_enable(endpoint, false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
     client
@@ -1215,7 +1308,7 @@ fn endpoint_close_retains_pending_identity_tombstone_until_reconciliation() {
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
     let endpoint = QcsdEndpointId(7);
-    client.qcsd_enable(endpoint, false).expect("enable QCSD");
+    client.qcsd_enable(endpoint, false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
     client
@@ -1300,7 +1393,7 @@ fn shaped_slot_sends_application_before_chaff() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), true);
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     let application = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(chaff, &[0xCC; 1_000]).unwrap();
@@ -1363,7 +1456,7 @@ fn chaff_only_target_does_not_consume_application_stream_data() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     let application = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(application, &[0xAA; 400]).unwrap();
     client
@@ -1389,7 +1482,7 @@ fn chaff_can_finish_after_outgoing_shaping_is_released() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), true);
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(chaff, &[0xCC; 400]).unwrap();
     client
@@ -1417,7 +1510,7 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), true);
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     let role = QcsdRequestRole::Chaff {
         resource_id: 1,
@@ -1513,7 +1606,7 @@ fn natural_stream_transcript_is_targetless_and_each_packet_token_is_recorded_onc
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), false);
     client.qcsd_enable_stream_transcript(true);
     let application = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(application, &[0xAA; 3_000]).unwrap();
@@ -1561,7 +1654,7 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
+    client.qcsd_enable(QcsdEndpointId(7), true);
     let application = client.stream_create(StreamType::BiDi).unwrap();
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(application, &[0xAA; 1_000]).unwrap();

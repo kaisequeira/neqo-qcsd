@@ -323,17 +323,30 @@ impl Connection {
 
     /// Bind transport target outcomes to a controller endpoint.
     ///
+    /// A repeated bind is ignored, preserving the connection's original
+    /// endpoint, observation clock, and send-shaping policy.
+    pub fn qcsd_enable(&mut self, endpoint: QcsdEndpointId, shape_stream_sends: bool) {
+        let _enable_result = self.qcsd_try_enable(endpoint, shape_stream_sends);
+    }
+
+    /// Bind transport target outcomes to a controller endpoint, reporting a
+    /// repeated bind to callers that require fail-closed setup.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidInput` when QCSD is already bound. A binding includes
     /// its observation clock and cannot be replaced while the connection is
     /// alive.
-    pub fn qcsd_enable(&mut self, endpoint: QcsdEndpointId, shape_stream_sends: bool) -> Res<()> {
+    pub fn qcsd_try_enable(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        shape_stream_sends: bool,
+    ) -> Res<()> {
         #![expect(
             clippy::disallowed_methods,
             reason = "standalone adapter callers need a monotonic observation-clock origin"
         )]
-        self.qcsd_enable_with_observation_clock(
+        self.qcsd_try_enable_with_observation_clock(
             endpoint,
             shape_stream_sends,
             QcsdObservationClock::new(Instant::now()),
@@ -342,12 +355,30 @@ impl Connection {
 
     /// Enable QCSD with a clock shared by every connection in one runner.
     ///
+    /// A repeated bind is ignored, preserving the connection's original
+    /// endpoint, observation clock, and send-shaping policy.
+    pub fn qcsd_enable_with_observation_clock(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        shape_stream_sends: bool,
+        observation_clock: QcsdObservationClock,
+    ) {
+        let _enable_result = self.qcsd_try_enable_with_observation_clock(
+            endpoint,
+            shape_stream_sends,
+            observation_clock,
+        );
+    }
+
+    /// Enable QCSD with a shared clock, reporting a repeated bind to callers
+    /// that require fail-closed setup.
+    ///
     /// # Errors
     ///
     /// Returns `InvalidInput` when QCSD is already bound. A binding includes
     /// its observation clock and cannot be replaced while the connection is
     /// alive.
-    pub fn qcsd_enable_with_observation_clock(
+    pub fn qcsd_try_enable_with_observation_clock(
         &mut self,
         endpoint: QcsdEndpointId,
         shape_stream_sends: bool,

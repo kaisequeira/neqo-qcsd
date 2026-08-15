@@ -2768,6 +2768,24 @@ mod tests {
                 ..
             }
         ));
+
+        let (mut transport_prebound, _server) = connect();
+        transport_prebound
+            .conn
+            .qcsd_enable(QcsdEndpointId(5), false);
+        assert_eq!(
+            transport_prebound.enable_qcsd(
+                QcsdEndpointId(6),
+                &origin,
+                1_200,
+                false,
+                Duration::from_millis(100),
+            ),
+            Err(Error::Transport(neqo_transport::Error::InvalidInput)),
+            "HTTP/3 must propagate the checked transport bind rejection"
+        );
+        assert_eq!(transport_prebound.qcsd_endpoint, None);
+        assert!(drain_qcsd_observations(&mut transport_prebound).is_empty());
     }
 
     #[cfg(feature = "qcsd")]
