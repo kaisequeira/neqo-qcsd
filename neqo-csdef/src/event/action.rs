@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use super::{QcsdChaffRequestId, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
 use crate::{MissedSlotReason, Packet, Resource};
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate over &T"
+)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Logical scheduled-slot ownership carried by a parser receive lease.
 ///
 /// The transport action remains slotless: this metadata lets the runner trace
@@ -60,6 +68,9 @@ pub enum QcsdAction {
         endpoint: QcsdEndpointId,
         packet: Packet,
         slot: QcsdSlotId,
+        /// Remaining monotonic time before this slot may affect transport output.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        not_before_after_us: u64,
         /// Remaining monotonic time in which the adapter may satisfy this slot.
         deadline_after_us: u64,
         allow_stream_data: bool,
@@ -131,6 +142,48 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<QcsdAction>(owned_json).expect("deserialize owned lease"),
             scheduled_lease
+        );
+    }
+
+    #[test]
+    fn send_packet_not_before_defaults_to_zero_and_zero_is_omitted() {
+        let packet =
+            Packet::new(Duration::from_micros(7), Direction::Outgoing, 1_200).expect("packet");
+        let immediate = QcsdAction::SendPacket {
+            endpoint: QcsdEndpointId(1),
+            packet,
+            slot: QcsdSlotId(3),
+            not_before_after_us: 0,
+            deadline_after_us: 5_000,
+            allow_stream_data: false,
+        };
+        let immediate_json = serde_json::to_value(&immediate).expect("serialize send action");
+        assert_eq!(immediate_json.get("not_before_after_us"), None);
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(immediate_json)
+                .expect("deserialize legacy-shaped send action"),
+            immediate
+        );
+
+        let staged = QcsdAction::SendPacket {
+            endpoint: QcsdEndpointId(1),
+            packet,
+            slot: QcsdSlotId(3),
+            not_before_after_us: 17,
+            deadline_after_us: 5_000,
+            allow_stream_data: false,
+        };
+        let staged_json = serde_json::to_value(&staged).expect("serialize staged send action");
+        assert_eq!(
+            staged_json
+                .get("not_before_after_us")
+                .and_then(Value::as_u64),
+            Some(17)
+        );
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(staged_json)
+                .expect("deserialize staged send action"),
+            staged
         );
     }
 }

@@ -43,6 +43,12 @@ impl StaticSchedule {
     pub fn from_legacy_csv<P: AsRef<std::path::Path>>(path: P, padding_only: bool) -> Result<Self> {
         Ok(Self::new(Trace::from_legacy_csv(path)?, padding_only))
     }
+
+    /// Snapshot the exact remaining global schedule order.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<Packet> {
+        self.trace.iter().copied().collect()
+    }
 }
 
 impl Defense for StaticSchedule {

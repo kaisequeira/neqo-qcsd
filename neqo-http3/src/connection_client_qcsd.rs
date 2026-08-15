@@ -146,7 +146,9 @@ impl Http3Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] unless `origin` is an absolute HTTPS URI.
+    /// Returns [`Error::InvalidInput`] unless `origin` is an absolute HTTPS URI,
+    /// the configured UDP payload size is at least 1200 bytes, and QCSD has not
+    /// already been enabled for this connection.
     pub fn enable_qcsd(
         &mut self,
         endpoint: QcsdEndpointId,
@@ -185,12 +187,12 @@ impl Http3Client {
     ) -> Res<()> {
         let scheme = origin.scheme_str().ok_or(Error::InvalidInput)?;
         let authority = origin.authority().ok_or(Error::InvalidInput)?.as_str();
-        if scheme != "https" {
+        if scheme != "https"
+            || configured_max_udp_payload_size < 1_200
+            || self.qcsd_endpoint.is_some()
+        {
             return Err(Error::InvalidInput);
         }
-        self.qcsd_endpoint = Some(endpoint);
-        self.qcsd_origin = Some((scheme.to_owned(), authority.to_owned()));
-        self.events.qcsd_enable(endpoint, observation_clock.clone());
         let qcsd_origin = format!("{scheme}://{authority}");
         let max_udp_payload_size = self
             .conn
@@ -198,17 +200,20 @@ impl Http3Client {
             .map_or(configured_max_udp_payload_size, |path_limit| {
                 path_limit.min(configured_max_udp_payload_size)
             });
+        self.conn.qcsd_enable_with_observation_clock(
+            endpoint,
+            shape_stream_sends,
+            observation_clock.clone(),
+        )?;
+        self.qcsd_endpoint = Some(endpoint);
+        self.qcsd_origin = Some((scheme.to_owned(), authority.to_owned()));
+        self.events.qcsd_enable(endpoint, observation_clock);
         self.events
             .qcsd_observe(|endpoint| QcsdObservation::EndpointReady {
                 endpoint,
                 origin: qcsd_origin,
                 max_udp_payload_size,
             });
-        self.conn.qcsd_enable_with_observation_clock(
-            endpoint,
-            shape_stream_sends,
-            observation_clock,
-        );
         self.conn
             .qcsd_set_udp_payload_ceiling(configured_max_udp_payload_size)?;
         self.conn
@@ -334,14 +339,22 @@ impl Http3Client {
                 endpoint,
                 packet,
                 slot,
+                not_before_after_us,
                 deadline_after_us,
                 allow_stream_data,
                 ..
             } if endpoint == own_endpoint => {
+                let not_before = now
+                    .checked_add(Duration::from_micros(not_before_after_us))
+                    .ok_or(Error::InvalidInput)?;
+                let deadline = now
+                    .checked_add(Duration::from_micros(deadline_after_us))
+                    .ok_or(Error::InvalidInput)?;
                 self.conn.qcsd_queue_scheduled_packet_target(
                     slot,
                     packet,
-                    now + Duration::from_micros(deadline_after_us),
+                    not_before,
+                    deadline,
                     allow_stream_data,
                 )?;
             }

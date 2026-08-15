@@ -4,11 +4,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::{cell::RefCell, net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::RefCell, net::SocketAddr, num::NonZeroUsize, rc::Rc, time::Duration};
 
 use neqo_csdef::{
-    Direction, MissedSlotReason, Packet, QcsdEndpointId, QcsdObservation, QcsdRequestRole,
-    QcsdSlotId, TrafficMorphingConfig, TrafficMorphingEgress, TrafficMorphingOutcome,
+    Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
+    QcsdRequestRole, QcsdSlotId, TrafficMorphingConfig, TrafficMorphingEgress,
+    TrafficMorphingOutcome,
 };
 use test_fixture::{DEFAULT_ADDR, DEFAULT_ADDR_V4, fixture_init, now};
 
@@ -44,10 +45,12 @@ fn queue_target(
 ) -> Result<(), Error> {
     let packet =
         Packet::new(Duration::ZERO, Direction::Outgoing, size).map_err(|_| Error::InvalidInput)?;
+    let queued_at = now();
     connection.qcsd_queue_scheduled_packet_target(
         QcsdSlotId(slot),
         packet,
-        now() + Duration::from_secs(1),
+        queued_at,
+        queued_at + Duration::from_secs(1),
         allow_stream_data,
     )
 }
@@ -166,7 +169,7 @@ fn traffic_morphing_pads_the_natural_packet_in_place() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     enable_traffic_morphing(&mut client);
     assert_eq!(
         client.qcsd_morphing_optional_stream_limit(
@@ -224,7 +227,7 @@ fn traffic_morphing_defers_optional_streams_before_sampling_when_capacity_is_sho
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
 
     queue_target(&mut client, 1, 300, false).unwrap();
     assert_eq!(client.process_output(now()).dgram().unwrap().len(), 300);
@@ -297,7 +300,7 @@ fn target_uses_safe_partial_congestion_window_capacity() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
 
     queue_target(&mut client, 1, 300, false).unwrap();
     assert_eq!(client.process_output(now()).dgram().unwrap().len(), 300);
@@ -319,6 +322,7 @@ fn target_uses_safe_partial_congestion_window_capacity() {
         .qcsd_queue_scheduled_packet_target(
             QcsdSlotId(2),
             packet,
+            send_time,
             send_time + Duration::from_secs(1),
             false,
         )
@@ -334,17 +338,22 @@ fn attributed_target_reports_exact_satisfaction() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
+    let queued_at = now();
     client
         .qcsd_queue_scheduled_packet_target(
             QcsdSlotId(11),
             packet,
-            now() + Duration::from_secs(1),
+            queued_at,
+            queued_at + Duration::from_secs(1),
             false,
         )
         .unwrap();
-    assert_eq!(client.process_output(now()).dgram().unwrap().len(), 1_000);
+    assert_eq!(
+        client.process_output(queued_at).dgram().unwrap().len(),
+        1_000
+    );
     assert!(
         drain_observations(&mut client)
             .iter()
@@ -360,16 +369,464 @@ fn attributed_target_reports_exact_satisfaction() {
 }
 
 #[test]
+fn future_packet_target_is_fully_inert_until_not_before() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    client.qcsd_enable_stream_transcript(true);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    fill_stream(&mut client, stream);
+    client
+        .qcsd_register_stream_role(stream, QcsdRequestRole::Application)
+        .unwrap();
+
+    let drive_at = now();
+    let release = drive_at + Duration::from_millis(100);
+    let deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(QcsdSlotId(40), packet, release, deadline, false)
+        .unwrap();
+
+    let natural = client
+        .process_multiple_output(drive_at, NonZeroUsize::new(2).unwrap())
+        .dgram()
+        .expect("ordinary stream output remains available");
+    assert_eq!(
+        natural.num_datagrams(),
+        2,
+        "a future target must not clamp ordinary output batching"
+    );
+    assert_eq!(client.qcsd_active_target, None);
+    assert_eq!(client.qcsd_slot_send_budget, 0);
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    let transcript = client.qcsd_stream_transmissions();
+    assert!(!transcript.is_empty());
+    assert!(transcript.iter().all(|entry| entry.slot.is_none()));
+    let observations = drain_observations(&mut client);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::StreamDataTransmitted {
+            role: QcsdRequestRole::Application,
+            slot: None,
+            ..
+        }
+    )));
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::ClassifiedDatagram {
+            direction: Direction::Outgoing,
+            class: QcsdDatagramClass::Natural,
+            ..
+        }
+    )));
+    assert!(!observations.iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::ClassifiedDatagram {
+                direction: Direction::Outgoing,
+                class: QcsdDatagramClass::DefenseCover,
+                ..
+            } | QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(40),
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn resolved_target_leaves_future_successor_fully_inert() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    fill_stream(&mut client, stream);
+
+    let release = now();
+    let first_deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(QcsdSlotId(48), packet, release, first_deadline, true)
+        .unwrap();
+    let future_release = first_deadline + Duration::from_millis(10);
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(49),
+            packet,
+            future_release,
+            future_release + Duration::from_millis(5),
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(client.process_output(release).dgram().unwrap().len(), 300);
+    assert_eq!(client.qcsd_active_target, None);
+    assert_eq!(client.qcsd_slot_send_budget, 0);
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+
+    _ = client.process_output(first_deadline);
+    assert_eq!(client.qcsd_active_target, None);
+    assert_eq!(client.qcsd_slot_send_budget, 0);
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    assert!(!drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(49),
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn packet_target_outcome_keeps_its_enqueue_endpoint_after_rebind_attempt() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+
+    let release = now() + Duration::from_millis(10);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(50),
+            packet,
+            release,
+            release + Duration::from_millis(5),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        client.qcsd_enable(QcsdEndpointId(8), false),
+        Err(Error::InvalidInput),
+        "an established target binding cannot be replaced"
+    );
+
+    assert_eq!(client.process_output(release).dgram().unwrap().len(), 900);
+    let outcomes: Vec<_> = drain_observations(&mut client)
+        .into_iter()
+        .filter(|observation| {
+            matches!(
+                observation,
+                QcsdObservation::SlotSatisfied {
+                    slot: QcsdSlotId(50),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(
+        outcomes[0],
+        QcsdObservation::SlotSatisfied {
+            endpoint: QcsdEndpointId(7),
+            slot: QcsdSlotId(50),
+            ..
+        }
+    ));
+
+    let second_release = release + Duration::from_millis(10);
+    let second_deadline = second_release + Duration::from_millis(5);
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(51),
+            packet,
+            second_release,
+            second_deadline,
+            false,
+        )
+        .unwrap();
+    _ = client.process_output(second_deadline);
+    let misses: Vec<_> = drain_observations(&mut client)
+        .into_iter()
+        .filter(|observation| {
+            matches!(
+                observation,
+                QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(51),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(misses.len(), 1);
+    assert!(matches!(
+        misses[0],
+        QcsdObservation::SlotMissed {
+            endpoint: QcsdEndpointId(7),
+            slot: QcsdSlotId(51),
+            reason: MissedSlotReason::DeadlineExpired,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn expired_head_does_not_disable_live_successor_batch_clamp() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    fill_stream(&mut client, stream);
+
+    let drive_at = now() + Duration::from_millis(10);
+    let expired_release = drive_at
+        .checked_sub(Duration::from_nanos(2))
+        .expect("fixture instant permits subtraction");
+    let expired_deadline = drive_at
+        .checked_sub(Duration::from_nanos(1))
+        .expect("fixture instant permits subtraction");
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(52),
+            packet,
+            expired_release,
+            expired_deadline,
+            false,
+        )
+        .unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(53),
+            packet,
+            drive_at,
+            drive_at + Duration::from_millis(5),
+            false,
+        )
+        .unwrap();
+
+    let batch = client
+        .process_multiple_output(drive_at, NonZeroUsize::new(2).unwrap())
+        .dgram()
+        .expect("live successor emits its target");
+    assert_eq!(
+        batch.num_datagrams(),
+        1,
+        "an eligible successor clamps the entire output batch"
+    );
+    assert_eq!(batch.iter().next().unwrap().len(), 900);
+    let observations = drain_observations(&mut client);
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|observation| matches!(
+                observation,
+                QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(52),
+                    reason: MissedSlotReason::DeadlineExpired,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|observation| matches!(
+                observation,
+                QcsdObservation::SlotSatisfied {
+                    slot: QcsdSlotId(53),
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn mandatory_ack_before_release_is_unattributed() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+
+    let sent_at = now();
+    let stream = server.stream_create(StreamType::BiDi).unwrap();
+    fill_stream(&mut server, stream);
+    let incoming = server
+        .process_output(sent_at)
+        .dgram()
+        .expect("server stream packet");
+    client.process_input(incoming, sent_at);
+
+    let ack_at = sent_at + DEFAULT_RTT;
+    let release = ack_at + Duration::from_secs(1);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(41),
+            packet,
+            release,
+            release + Duration::from_millis(5),
+            false,
+        )
+        .unwrap();
+    let acknowledgment = client
+        .process_output(ack_at)
+        .dgram()
+        .expect("mandatory acknowledgment");
+    assert_ne!(acknowledgment.len(), 1_000);
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    let observations = drain_observations(&mut client);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::ClassifiedDatagram {
+            direction: Direction::Outgoing,
+            class: QcsdDatagramClass::Natural,
+            ..
+        }
+    )));
+    assert!(!observations.iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::ClassifiedDatagram {
+                direction: Direction::Outgoing,
+                class: QcsdDatagramClass::DefenseCover,
+                ..
+            } | QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(41),
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn packet_target_activates_at_release_and_expires_at_deadline() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+
+    let queued_at = now();
+    let release = queued_at + Duration::from_millis(10);
+    let deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target(QcsdSlotId(42), packet, release, deadline, false)
+        .unwrap();
+    let just_before_release = release
+        .checked_sub(Duration::from_nanos(1))
+        .expect("release is after the fixture epoch");
+    assert_eq!(
+        client.process_output(just_before_release).callback(),
+        Duration::from_nanos(1),
+        "the transport must wake exactly at the target release"
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    assert_eq!(client.process_output(release).dgram().unwrap().len(), 900);
+    assert!(drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(42),
+                ..
+            }
+        )
+    }));
+
+    let second_release = deadline + Duration::from_millis(10);
+    let second_deadline = second_release + Duration::from_millis(5);
+    client
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(43),
+            packet,
+            second_release,
+            second_deadline,
+            false,
+        )
+        .unwrap();
+    _ = client.process_output(second_deadline);
+    assert!(drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotMissed {
+                slot: QcsdSlotId(43),
+                reason: MissedSlotReason::DeadlineExpired,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn packet_target_rejects_inverted_and_nonmonotonic_windows() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
+    let base = now();
+    let release = base + Duration::from_millis(10);
+    let deadline = release + Duration::from_millis(5);
+    client
+        .qcsd_queue_scheduled_packet_target(QcsdSlotId(44), packet, release, deadline, false)
+        .unwrap();
+    assert_eq!(
+        client.qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(45),
+            packet,
+            deadline,
+            deadline,
+            false,
+        ),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        client.qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(46),
+            packet,
+            release
+                .checked_sub(Duration::from_nanos(1))
+                .expect("release is after the fixture epoch"),
+            deadline + Duration::from_nanos(1),
+            false,
+        ),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        client.qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(47),
+            packet,
+            release + Duration::from_nanos(1),
+            deadline
+                .checked_sub(Duration::from_nanos(1))
+                .expect("deadline is after the fixture epoch"),
+            false,
+        ),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+}
+
+#[test]
 fn expired_target_reports_a_typed_miss() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
+    let deadline = now();
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(12), packet, now(), false)
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(12),
+            packet,
+            deadline
+                .checked_sub(Duration::from_nanos(1))
+                .expect("deadline is after the fixture epoch"),
+            deadline,
+            false,
+        )
         .unwrap();
-    _ = client.process_output(now());
+    _ = client.process_output(deadline);
     assert!(
         drain_observations(&mut client)
             .iter()
@@ -389,12 +846,20 @@ fn congestion_limited_target_reports_a_typed_miss() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let (_dropped, exhausted_at) = fill_cwnd(&mut client, stream, now());
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(14), packet, exhausted_at, false)
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(14),
+            packet,
+            exhausted_at
+                .checked_sub(Duration::from_nanos(1))
+                .expect("deadline is after the fixture epoch"),
+            exhausted_at,
+            false,
+        )
         .unwrap();
     _ = client.process_output(exhausted_at);
     assert!(
@@ -416,7 +881,7 @@ fn pacing_limited_target_reports_a_typed_miss() {
     let mut client = default_client();
     let mut server = default_server();
     let now = connect_rtt_idle(&mut client, &mut server, DEFAULT_RTT);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     fill_stream(&mut client, stream);
     for _ in 0..=PACING_BURST_SIZE {
@@ -426,7 +891,14 @@ fn pacing_limited_target_reports_a_typed_miss() {
 
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target(QcsdSlotId(15), packet, now, false)
+        .qcsd_queue_scheduled_packet_target(
+            QcsdSlotId(15),
+            packet,
+            now.checked_sub(Duration::from_nanos(1))
+                .expect("deadline is after the fixture epoch"),
+            now,
+            false,
+        )
         .unwrap();
     _ = client.process_output(now);
     assert!(
@@ -444,36 +916,58 @@ fn pacing_limited_target_reports_a_typed_miss() {
 }
 
 #[test]
-fn closing_endpoint_misses_every_pending_target() {
+fn endpoint_close_retires_future_target_once() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
+    let queued_at = now();
+    let not_before = queued_at + Duration::from_secs(1);
+    let deadline = not_before + Duration::from_secs(1);
     for slot in [20, 21] {
         let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
         client
             .qcsd_queue_scheduled_packet_target(
                 QcsdSlotId(slot),
                 packet,
-                now() + Duration::from_secs(1),
+                not_before,
+                deadline,
                 false,
             )
             .unwrap();
     }
     client.close(now(), 0, "test close");
-    let misses = drain_observations(&mut client)
+    let misses: Vec<_> = drain_observations(&mut client)
         .into_iter()
-        .filter(|observation| {
+        .filter_map(|observation| {
             matches!(
-                observation,
+                &observation,
                 QcsdObservation::SlotMissed {
                     reason: MissedSlotReason::EndpointClosed,
                     ..
                 }
             )
+            .then_some(observation)
         })
-        .count();
-    assert_eq!(misses, 2);
+        .collect();
+    assert_eq!(misses.len(), 2);
+    let slots: std::collections::BTreeSet<_> = misses
+        .iter()
+        .filter_map(|observation| match observation {
+            QcsdObservation::SlotMissed { slot, .. } => Some(*slot),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(slots, [QcsdSlotId(20), QcsdSlotId(21)].into());
+    assert!(misses.iter().all(|observation| matches!(
+        observation,
+        QcsdObservation::SlotMissed {
+            endpoint: QcsdEndpointId(7),
+            ..
+        }
+    )));
+    client.close(now(), 0, "duplicate close");
+    assert!(drain_observations(&mut client).is_empty());
     assert_eq!(client.qcsd_pending_packet_targets(), 0);
 }
 
@@ -482,7 +976,7 @@ fn manual_receive_credit_is_reported_only_after_encoding() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let limit = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap() + 100;
     let slot = QcsdSlotId(99);
@@ -513,7 +1007,7 @@ fn shaped_slot_sends_application_before_chaff() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true);
+    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     let application = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(chaff, &[0xCC; 1_000]).unwrap();
@@ -531,11 +1025,13 @@ fn shaped_slot_sends_application_before_chaff() {
         .qcsd_register_stream_role(application, QcsdRequestRole::Application)
         .unwrap();
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 120).unwrap();
+    let queued_at = now();
     client
         .qcsd_queue_scheduled_packet_target(
             QcsdSlotId(13),
             packet,
-            now() + Duration::from_secs(1),
+            queued_at,
+            queued_at + Duration::from_secs(1),
             true,
         )
         .unwrap();
@@ -574,7 +1070,7 @@ fn chaff_only_target_does_not_consume_application_stream_data() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     let application = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(application, &[0xAA; 400]).unwrap();
     client
@@ -600,7 +1096,7 @@ fn chaff_can_finish_after_outgoing_shaping_is_released() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true);
+    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(chaff, &[0xCC; 400]).unwrap();
     client
@@ -628,7 +1124,7 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true);
+    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     let role = QcsdRequestRole::Chaff {
         resource_id: 1,
@@ -673,7 +1169,7 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
             role: observed_role,
             offset: 0,
             bytes: 400,
-            fin: false,
+            fin: true,
             slot: Some(QcsdSlotId(41)),
         } if stream.0 == chaff.as_u64() && *observed_role == role
     )));
@@ -724,7 +1220,7 @@ fn natural_stream_transcript_is_targetless_and_each_packet_token_is_recorded_onc
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), false);
+    client.qcsd_enable(QcsdEndpointId(7), false).unwrap();
     client.qcsd_enable_stream_transcript(true);
     let application = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(application, &[0xAA; 3_000]).unwrap();
@@ -772,7 +1268,7 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
     let mut client = default_client();
     let mut server = default_server();
     connect_force_idle(&mut client, &mut server);
-    client.qcsd_enable(QcsdEndpointId(7), true);
+    client.qcsd_enable(QcsdEndpointId(7), true).unwrap();
     let application = client.stream_create(StreamType::BiDi).unwrap();
     let chaff = client.stream_create(StreamType::BiDi).unwrap();
     client.stream_send(application, &[0xAA; 1_000]).unwrap();
@@ -791,11 +1287,13 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
         .unwrap();
 
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).unwrap();
+    let queued_at = now();
     client
         .qcsd_queue_scheduled_packet_target(
             QcsdSlotId(30),
             packet,
-            now() + Duration::from_secs(1),
+            queued_at,
+            queued_at + Duration::from_secs(1),
             true,
         )
         .unwrap();
@@ -811,6 +1309,7 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
         .qcsd_queue_scheduled_packet_target(
             QcsdSlotId(31),
             packet,
+            recovery_time,
             recovery_time + Duration::from_secs(1),
             true,
         )

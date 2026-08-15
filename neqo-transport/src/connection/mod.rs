@@ -1257,12 +1257,8 @@ impl Connection {
 
         let mut delays = SmallVec::<[_; 7]>::new();
         #[cfg(feature = "qcsd")]
-        if let Some(deadline) = self
-            .qcsd_packet_targets
-            .front()
-            .map(|target| target.deadline)
-        {
-            delays.push(deadline);
+        if let Some(wakeup) = self.qcsd_packet_target_wakeup(now) {
+            delays.push(wakeup);
         }
         if let Some(ack_time) = self.acks.ack_time(now) {
             qtrace!("[{self}] Delayed ACK timer {ack_time:?}");
@@ -1357,7 +1353,7 @@ impl Connection {
         }
 
         #[cfg(feature = "qcsd")]
-        let max_datagrams = if self.qcsd_packet_targets.is_empty() {
+        let max_datagrams = if self.qcsd_eligible_packet_target(now).is_none() {
             max_datagrams
         } else {
             NonZeroUsize::MIN
@@ -3176,9 +3172,7 @@ impl Connection {
         {
             self.qcsd_expire_packet_targets(now, Some(configured_limit), profile.paced());
             self.qcsd_active_target = self
-                .qcsd_packet_targets
-                .front()
-                .copied()
+                .qcsd_eligible_packet_target(now)
                 .filter(|target| usize::from(target.udp_payload_size) <= configured_limit);
             self.qcsd_slot_send_budget = self.qcsd_active_target.map_or(0, |target| {
                 if target.allow_stream_data {
@@ -3390,6 +3384,7 @@ impl Connection {
             #[cfg(feature = "qcsd")]
             {
                 self.qcsd_active_target = None;
+                self.qcsd_slot_send_budget = 0;
             }
             qdebug!("TX blocked, profile={profile:?}");
             Ok(SendOption::No(profile.paced()))
@@ -3412,6 +3407,12 @@ impl Connection {
                     debug_assert_eq!(removed, Some(target));
                     self.qcsd_target_missed(&target, MissedSlotReason::MandatoryFrames);
                 }
+            }
+            #[cfg(feature = "qcsd")]
+            {
+                // Slot-local capacity must never survive into an inactive or
+                // future target, including partially filled shaped packets.
+                self.qcsd_slot_send_budget = 0;
             }
             #[cfg(feature = "qcsd")]
             self.qcsd_observe_outgoing_datagram(encoder.len(), qcsd_datagram_class);

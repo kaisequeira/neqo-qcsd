@@ -1277,8 +1277,8 @@ mod tests {
     #[cfg(feature = "qcsd")]
     use neqo_csdef::{
         Direction, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController,
-        QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdStreamFinish, QcsdStreamId, Resource,
-        StaticSchedule, Trace,
+        QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdSlotId, QcsdStreamFinish,
+        QcsdStreamId, Resource, StaticSchedule, Trace,
     };
     use neqo_qpack as qpack;
     use neqo_transport::{
@@ -2661,6 +2661,113 @@ mod tests {
                     )
                 })
         );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_send_packet_bridge_preserves_future_release_and_deadline_order() {
+        let (mut client, _server) = connect();
+        enable_qcsd_observations(&mut client);
+        let base = now();
+        let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 900).unwrap();
+        client
+            .apply_qcsd_action(
+                base,
+                QcsdAction::SendPacket {
+                    endpoint: QcsdEndpointId(7),
+                    packet,
+                    slot: QcsdSlotId(60),
+                    not_before_after_us: 10_000,
+                    deadline_after_us: 15_000,
+                    allow_stream_data: false,
+                },
+            )
+            .expect("stage future target");
+
+        assert_eq!(client.qcsd_pending_packet_targets(), 1);
+        _ = client.process_output(base);
+        assert_eq!(client.qcsd_pending_packet_targets(), 1);
+        assert!(
+            !drain_qcsd_observations(&mut client)
+                .iter()
+                .any(|observation| {
+                    matches!(
+                        observation,
+                        QcsdObservation::SlotSatisfied {
+                            slot: QcsdSlotId(60),
+                            ..
+                        } | QcsdObservation::SlotMissed {
+                            slot: QcsdSlotId(60),
+                            ..
+                        }
+                    )
+                })
+        );
+
+        let release = base + Duration::from_millis(10);
+        assert_eq!(client.process_output(release).dgram().unwrap().len(), 900);
+        assert!(
+            drain_qcsd_observations(&mut client)
+                .iter()
+                .any(|observation| {
+                    matches!(
+                        observation,
+                        QcsdObservation::SlotSatisfied {
+                            endpoint: QcsdEndpointId(7),
+                            slot: QcsdSlotId(60),
+                            observed_size: 900,
+                        }
+                    )
+                })
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_enable_preflight_is_atomic_and_binding_is_immutable() {
+        let (mut client, _server) = connect();
+        let origin = Uri::from_static("https://something.com/");
+        assert_eq!(
+            client.enable_qcsd(
+                QcsdEndpointId(6),
+                &origin,
+                1_199,
+                false,
+                Duration::from_millis(100),
+            ),
+            Err(Error::InvalidInput)
+        );
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &origin,
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .expect("failed preflight must not bind transport");
+        assert_eq!(
+            client.enable_qcsd(
+                QcsdEndpointId(8),
+                &origin,
+                1_200,
+                false,
+                Duration::from_millis(100),
+            ),
+            Err(Error::InvalidInput)
+        );
+        let ready: Vec<_> = drain_qcsd_observations(&mut client)
+            .into_iter()
+            .filter(|observation| matches!(observation, QcsdObservation::EndpointReady { .. }))
+            .collect();
+        assert_eq!(ready.len(), 1);
+        assert!(matches!(
+            ready[0],
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(7),
+                ..
+            }
+        ));
     }
 
     #[cfg(feature = "qcsd")]

@@ -31,6 +31,31 @@ enum QueuedDefenseObservation {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagedFixedEvent {
+    packet: crate::Packet,
+    slot: QcsdSlotId,
+}
+
+#[derive(Debug)]
+struct FixedScheduleStaging {
+    events: VecDeque<StagedFixedEvent>,
+    outgoing_prearmed: bool,
+}
+
+fn duration_as_ceil_micros(duration: Duration) -> u64 {
+    let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+    if duration.subsec_nanos().is_multiple_of(1_000) {
+        micros
+    } else {
+        micros.saturating_add(1)
+    }
+}
+
+fn duration_as_floor_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 impl QueuedDefenseObservation {
     const fn at(self) -> Duration {
         match self {
@@ -176,6 +201,9 @@ pub struct QcsdController {
     completion_emitted: bool,
     completion_due: Option<Duration>,
     released_chaff_send_shaping: HashSet<QcsdEndpointId>,
+    /// FRONT-only frozen schedule. Outgoing targets are publicly staged, but
+    /// incoming entries remain private here until their exact release time.
+    fixed_schedule: Option<FixedScheduleStaging>,
 }
 
 impl QcsdController {
@@ -273,6 +301,20 @@ impl QcsdController {
                 config.max_chaff_streams
             )));
         }
+        let mut control = ControlLoop::default();
+        let fixed_schedule = defense.fixed_schedule_snapshot().map(|packets| {
+            let events = packets
+                .into_iter()
+                .map(|packet| StagedFixedEvent {
+                    packet,
+                    slot: control.next_slot(),
+                })
+                .collect();
+            FixedScheduleStaging {
+                events,
+                outgoing_prearmed: false,
+            }
+        });
         Ok(Self {
             config,
             defense,
@@ -280,7 +322,7 @@ impl QcsdController {
             endpoint_origins: HashMap::new(),
             streams: StreamRegistry::default(),
             chaff,
-            control: ControlLoop::default(),
+            control,
             actions: VecDeque::new(),
             observations: VecDeque::new(),
             application_stream_ranges: HashMap::new(),
@@ -297,6 +339,7 @@ impl QcsdController {
             completion_emitted: false,
             completion_due: None,
             released_chaff_send_shaping: HashSet::new(),
+            fixed_schedule,
         })
     }
 
@@ -1743,6 +1786,13 @@ impl QcsdController {
 
     /// Advance the published control loop to `elapsed` and queue due actions.
     pub fn poll(&mut self, elapsed: Duration) {
+        if self.fixed_schedule.is_some() {
+            self.reconcile_due_fixed(elapsed);
+            self.release_chaff_send_shaping_if_needed();
+            self.update_completion(elapsed);
+            return;
+        }
+
         self.drain_observations();
         self.request_chaff_if_needed(true);
         self.refresh_receiver_continuation_reserves();
@@ -1763,6 +1813,118 @@ impl QcsdController {
 
         self.request_chaff_if_needed(false);
         self.update_completion(elapsed);
+    }
+
+    /// Whether this controller opted into fixed-schedule outgoing prearming.
+    #[must_use]
+    pub const fn has_fixed_schedule_staging(&self) -> bool {
+        self.fixed_schedule.is_some()
+    }
+
+    /// Reconcile every due fixed event before an eligible prearmed output flush.
+    ///
+    /// This is intentionally a FRONT-only microstep. Outgoing targets are
+    /// staged once with frozen endpoints; incoming events become controller
+    /// state only after they are due, in the original global trace order.
+    pub fn reconcile_due_fixed(&mut self, elapsed: Duration) {
+        if self.fixed_schedule.is_none() {
+            return;
+        }
+
+        self.drain_observations();
+        self.request_chaff_if_needed(true);
+        self.refresh_receiver_continuation_reserves();
+        self.emit_capacity_signal(elapsed);
+        self.drain_observations();
+        self.prearm_fixed_outgoing(elapsed);
+        self.materialize_due_fixed(elapsed);
+
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.process_incoming(elapsed_us, elapsed);
+        self.retry_pending_parser_leases();
+        self.request_chaff_if_needed(false);
+    }
+
+    fn prearm_fixed_outgoing(&mut self, elapsed: Duration) {
+        let Some(staging) = self.fixed_schedule.as_mut() else {
+            return;
+        };
+        if staging.outgoing_prearmed || self.scheduler.endpoints().is_empty() {
+            return;
+        }
+        staging.outgoing_prearmed = true;
+        let outgoing: Vec<_> = staging
+            .events
+            .iter()
+            .copied()
+            .filter(|event| event.packet.direction() == Direction::Outgoing)
+            .collect();
+
+        for event in outgoing {
+            self.pending_slots.insert(event.slot, event.packet);
+            let deadline = event
+                .packet
+                .timestamp()
+                .saturating_add(self.config.control_interval());
+            let not_before_after_us =
+                duration_as_ceil_micros(event.packet.timestamp().saturating_sub(elapsed));
+            let deadline_after_us = duration_as_floor_micros(deadline.saturating_sub(elapsed));
+            if elapsed >= deadline
+                || deadline_after_us == 0
+                || not_before_after_us >= deadline_after_us
+            {
+                self.actions.push_back(QcsdAction::SlotMissed {
+                    endpoint: None,
+                    packet: event.packet,
+                    slot: event.slot,
+                    reason: MissedSlotReason::DeadlineExpired,
+                });
+                self.resolve_slot(
+                    elapsed,
+                    event.slot,
+                    EventOutcome::Missed(MissedSlotReason::DeadlineExpired),
+                );
+                continue;
+            }
+            let Some(endpoint) = self.scheduler.next_outgoing() else {
+                debug_assert!(false, "fixed prearming requires a ready endpoint");
+                continue;
+            };
+            self.actions.push_back(QcsdAction::SendPacket {
+                endpoint,
+                packet: event.packet,
+                slot: event.slot,
+                not_before_after_us,
+                // Rounding the release upward prevents an early send; rounding
+                // the deadline downward preserves the strict half-open window.
+                deadline_after_us,
+                allow_stream_data: self.defense.mode() == DefenseMode::ChaffAndShape,
+            });
+        }
+    }
+
+    fn materialize_due_fixed(&mut self, elapsed: Duration) {
+        while let Some(event) = self
+            .fixed_schedule
+            .as_ref()
+            .and_then(|staging| staging.events.front())
+            .copied()
+            .filter(|event| event.packet.timestamp() <= elapsed)
+        {
+            let Some(packet) = self.defense.next_event(elapsed) else {
+                debug_assert!(false, "fixed snapshot diverged from defense output");
+                break;
+            };
+            debug_assert_eq!(packet, event.packet);
+            _ = self
+                .fixed_schedule
+                .as_mut()
+                .and_then(|staging| staging.events.pop_front());
+
+            if packet.direction() == Direction::Incoming {
+                self.materialize_incoming(event.slot, packet, elapsed);
+            }
+        }
     }
 
     fn refresh_receiver_continuation_reserves(&mut self) {
@@ -1836,27 +1998,46 @@ impl QcsdController {
             self.pending_slots.insert(slot, packet);
             match packet.direction() {
                 Direction::Outgoing => self.control.outgoing.push(PendingOutgoing { slot, packet }),
-                Direction::Incoming => {
-                    if let Some(disposition) = receiver_continuation {
-                        self.control
-                            .receiver_continuations
-                            .insert(slot, disposition);
-                    }
-                    self.incoming_credit_ledger
-                        .insert(slot, IncomingCreditLedger::new(packet));
-                    self.scheduled_incoming_requested_bytes = self
-                        .scheduled_incoming_requested_bytes
-                        .saturating_add(u64::from(packet.length()));
-                    self.push_signal(elapsed, SignalKind::ReceiveCreditRequested { packet });
-                    self.control.incoming.push(PendingIncoming {
-                        slot,
-                        packet,
-                        endpoint: None,
-                        remaining: u64::from(packet.length()),
-                    });
-                }
+                Direction::Incoming => self.materialize_incoming_with_disposition(
+                    slot,
+                    packet,
+                    elapsed,
+                    receiver_continuation,
+                ),
             }
         }
+    }
+
+    fn materialize_incoming(&mut self, slot: QcsdSlotId, packet: crate::Packet, elapsed: Duration) {
+        let receiver_continuation = self.defense.last_incoming_event_receiver_continuation();
+        self.pending_slots.insert(slot, packet);
+        self.materialize_incoming_with_disposition(slot, packet, elapsed, receiver_continuation);
+    }
+
+    fn materialize_incoming_with_disposition(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: crate::Packet,
+        elapsed: Duration,
+        receiver_continuation: Option<crate::ReceiverContinuationDisposition>,
+    ) {
+        if let Some(disposition) = receiver_continuation {
+            self.control
+                .receiver_continuations
+                .insert(slot, disposition);
+        }
+        self.incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        self.scheduled_incoming_requested_bytes = self
+            .scheduled_incoming_requested_bytes
+            .saturating_add(u64::from(packet.length()));
+        self.push_signal(elapsed, SignalKind::ReceiveCreditRequested { packet });
+        self.control.incoming.push(PendingIncoming {
+            slot,
+            packet,
+            endpoint: None,
+            remaining: u64::from(packet.length()),
+        });
     }
 
     fn process_outgoing(&mut self, elapsed: Duration) {
@@ -1902,6 +2083,7 @@ impl QcsdController {
                 endpoint,
                 packet: outgoing.packet,
                 slot: outgoing.slot,
+                not_before_after_us: 0,
                 deadline_after_us: u64::try_from(deadline.saturating_sub(elapsed).as_micros())
                     .unwrap_or(u64::MAX),
                 allow_stream_data: self.defense.mode() == DefenseMode::ChaffAndShape,
@@ -2646,14 +2828,15 @@ mod tests {
 
     use super::{
         AdvertisedIncomingCredit, IncomingCreditLedger, ParserLeaseRange, PendingClaim,
-        PendingCredit, PendingIncoming, QcsdController,
+        PendingCredit, PendingIncoming, QcsdController, duration_as_ceil_micros,
+        duration_as_floor_micros,
     };
     use crate::{
         Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
-        EventOutcome, MissedSlotReason, Packet, QcsdAction, QcsdConfig, QcsdDatagramClass,
-        QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner, QcsdRequestRole, QcsdSlotId,
-        QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, SignalKind, StaticSchedule,
-        TamarawConfig, Trace, TrafficMorphing, TrafficMorphingConfig, WalkieTalkie,
+        EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdConfig,
+        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner, QcsdRequestRole,
+        QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, SignalKind,
+        StaticSchedule, TamarawConfig, Trace, TrafficMorphing, TrafficMorphingConfig, WalkieTalkie,
         WalkieTalkieConfig, WtfPad, WtfPadConfig,
     };
 
@@ -5663,6 +5846,354 @@ mod tests {
         );
     }
 
+    fn front_prearm_controller() -> QcsdController {
+        let manifest = ResourceManifest {
+            resources: vec![Resource {
+                id: 7,
+                url: "https://front.example/chaff".into(),
+                kind: "Image".into(),
+                content_length: Some(1_000_000),
+                data_length: 1_000_000,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            }],
+        };
+        QcsdController::new(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                max_chaff_streams: 1,
+                low_watermark: 0,
+                max_udp_payload_size: 1_200,
+                defense: DefenseConfig::Front(FrontConfig {
+                    n_client_packets: 4,
+                    n_server_packets: 4,
+                    packet_size: 1_200,
+                    peak_minimum_seconds: 0.01,
+                    peak_maximum_seconds: 0.02,
+                }),
+                ..QcsdConfig::default()
+            },
+            42,
+            Some(manifest),
+        )
+        .expect("FRONT prearm controller")
+    }
+
+    #[test]
+    fn fixed_prearm_preserves_global_slots_and_keeps_future_incoming_private() {
+        let mut controller = front_prearm_controller();
+        let frozen: Vec<_> = controller
+            .fixed_schedule
+            .as_ref()
+            .expect("FRONT opts into fixed staging")
+            .events
+            .iter()
+            .copied()
+            .collect();
+        assert!(
+            frozen
+                .iter()
+                .any(|event| event.packet.direction() == Direction::Incoming)
+        );
+        assert!(
+            frozen
+                .iter()
+                .any(|event| event.packet.direction() == Direction::Outgoing)
+        );
+        assert!(
+            frozen
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.slot == QcsdSlotId(u64::try_from(index).unwrap()))
+        );
+
+        ready(&mut controller, 1, "https://front.example");
+        controller.reconcile_due_fixed(Duration::ZERO);
+        let sends: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::SendPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    not_before_after_us,
+                    deadline_after_us,
+                    ..
+                } => Some((
+                    endpoint,
+                    packet,
+                    slot,
+                    not_before_after_us,
+                    deadline_after_us,
+                )),
+                _ => None,
+            })
+            .collect();
+        let expected_outgoing: Vec<_> = frozen
+            .iter()
+            .copied()
+            .filter(|event| event.packet.direction() == Direction::Outgoing)
+            .collect();
+        assert_eq!(sends.len(), expected_outgoing.len());
+        for (send, expected) in sends.iter().zip(&expected_outgoing) {
+            assert_eq!(send.0, QcsdEndpointId(1));
+            assert_eq!((send.1, send.2), (expected.packet, expected.slot));
+            assert_eq!(send.3, expected.packet.timestamp_us());
+            assert_eq!(send.4.saturating_sub(send.3), 5_000);
+        }
+
+        assert!(controller.incoming_credit_ledger.is_empty());
+        assert!(controller.control.incoming.is_empty());
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 0);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_requested_bytes,
+            0
+        );
+        assert_eq!(
+            controller.pending_slots(),
+            expected_outgoing
+                .iter()
+                .map(|event| (event.slot, event.packet))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            controller
+                .fixed_schedule
+                .as_ref()
+                .expect("staging remains")
+                .events
+                .len(),
+            frozen.len()
+        );
+    }
+
+    #[test]
+    fn fixed_due_reconciliation_materializes_incoming_before_outgoing_flush() {
+        let mut controller = front_prearm_controller();
+        let endpoint = QcsdEndpointId(1);
+        ready(&mut controller, endpoint.0, "https://front.example");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: QcsdStreamId(4),
+                role: QcsdRequestRole::Chaff {
+                    resource_id: 7,
+                    request_id: None,
+                },
+                expected_response_length: Some(1_000_000),
+            },
+            Duration::ZERO,
+        );
+        _ = controller.drain_actions().collect::<Vec<_>>();
+        controller.reconcile_due_fixed(Duration::ZERO);
+        let prearmed: Vec<_> = controller.drain_actions().collect();
+        assert!(
+            prearmed
+                .iter()
+                .any(|action| matches!(action, QcsdAction::SendPacket { .. }))
+        );
+
+        let (due, incoming_slot) = controller
+            .fixed_schedule
+            .as_ref()
+            .expect("FRONT staging")
+            .events
+            .iter()
+            .find_map(|event| {
+                (event.packet.direction() == Direction::Incoming)
+                    .then_some((event.packet.timestamp(), event.slot))
+            })
+            .expect("incoming FRONT event");
+        controller.reconcile_due_fixed(due);
+        let due_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(due_actions.iter().any(|action| {
+            matches!(
+                action,
+                QcsdAction::IncreaseReceiveLimit { slot, .. } if *slot == incoming_slot
+            )
+        }));
+        assert!(
+            !due_actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::SendPacket { .. }))
+        );
+        assert!(
+            controller
+                .incoming_credit_ledger
+                .contains_key(&incoming_slot)
+        );
+        assert_eq!(
+            controller.scheduled_incoming_requested_bytes,
+            u64::from(
+                controller
+                    .pending_slots
+                    .get(&incoming_slot)
+                    .expect("due incoming is public")
+                    .length()
+            )
+        );
+    }
+
+    #[test]
+    fn fixed_prearm_does_not_advance_terminal_tail_or_completion() {
+        let mut controller = front_prearm_controller();
+        ready(&mut controller, 1, "https://front.example");
+        controller.reconcile_due_fixed(Duration::ZERO);
+        let outgoing: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::SendPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    ..
+                } => Some((endpoint, packet, slot)),
+                _ => None,
+            })
+            .collect();
+        for (endpoint, packet, slot) in outgoing {
+            controller.observe(
+                QcsdObservation::SlotSatisfied {
+                    endpoint,
+                    slot,
+                    observed_size: packet.length(),
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.poll(Duration::ZERO);
+        assert!(!controller.is_complete());
+        assert_eq!(controller.completion_due, None);
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 0);
+        assert!(controller.incoming_credit_ledger.is_empty());
+        assert!(controller.defense.next_event_at().is_some());
+    }
+
+    #[test]
+    fn dynamic_defense_does_not_prearm() {
+        let future =
+            Packet::new(Duration::from_millis(10), Direction::Outgoing, 1_200).expect("packet");
+        let (defense, _) = RecordingDefense::new([future], DefenseMode::ChaffOnly);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("dynamic controller");
+        ready(&mut controller, 1, "https://dynamic.example");
+        assert!(!controller.has_fixed_schedule_staging());
+        controller.poll(Duration::ZERO);
+        assert!(controller.pending_slots().is_empty());
+        assert!(
+            !controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::SendPacket { .. }))
+        );
+
+        controller.poll(Duration::from_millis(10));
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SendPacket {
+                packet,
+                not_before_after_us: 0,
+                deadline_after_us: 5_000,
+                ..
+            }) if packet == future
+        ));
+    }
+
+    #[test]
+    fn static_schedule_does_not_prearm() {
+        let future =
+            Packet::new(Duration::from_millis(10), Direction::Outgoing, 1_200).expect("packet");
+        let defense = StaticSchedule::new(Trace::new([future]), false);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("static controller");
+        ready(&mut controller, 1, "https://static.example");
+        assert!(!controller.has_fixed_schedule_staging());
+        controller.poll(Duration::ZERO);
+        assert!(controller.pending_slots().is_empty());
+        assert!(
+            !controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::SendPacket { .. }))
+        );
+
+        controller.poll(Duration::from_millis(10));
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SendPacket {
+                packet,
+                not_before_after_us: 0,
+                deadline_after_us: 5_000,
+                ..
+            }) if packet == future
+        ));
+    }
+
+    #[test]
+    fn fixed_prearm_rounds_release_up_and_deadline_down_to_micros() {
+        assert_eq!(duration_as_ceil_micros(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_as_ceil_micros(Duration::from_micros(1)), 1);
+        assert_eq!(duration_as_ceil_micros(Duration::from_nanos(1_001)), 2);
+        assert_eq!(duration_as_floor_micros(Duration::from_nanos(1)), 0);
+        assert_eq!(duration_as_floor_micros(Duration::from_micros(1)), 1);
+        assert_eq!(duration_as_floor_micros(Duration::from_nanos(1_001)), 1);
+    }
+
+    #[test]
+    fn fixed_prearm_rejects_a_window_collapsed_by_inward_rounding() {
+        let mut controller = front_prearm_controller();
+        controller.config.control_interval_us = 1;
+        let event = controller
+            .fixed_schedule
+            .as_ref()
+            .expect("FRONT staging")
+            .events
+            .iter()
+            .copied()
+            .find(|event| event.packet.direction() == Direction::Outgoing)
+            .expect("outgoing FRONT event");
+        let elapsed = event
+            .packet
+            .timestamp()
+            .checked_sub(Duration::from_nanos(500))
+            .expect("FRONT event is after the fixture epoch");
+        ready(&mut controller, 1, "https://front.example");
+
+        controller.reconcile_due_fixed(elapsed);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed {
+                slot,
+                reason: MissedSlotReason::DeadlineExpired,
+                ..
+            } if *slot == event.slot
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SendPacket { slot, .. } if *slot == event.slot
+        )));
+        assert!(!controller.pending_slots.contains_key(&event.slot));
+    }
+
     fn satisfy_outgoing_actions(
         controller: &mut QcsdController,
         at: Duration,
@@ -7505,9 +8036,9 @@ mod tests {
         let mut controller = QcsdController::new(
             QcsdConfig {
                 max_udp_payload_size: 1_200,
-                defense: DefenseConfig::Front(crate::FrontConfig {
+                defense: DefenseConfig::Front(FrontConfig {
                     packet_size: 1_200,
-                    ..crate::FrontConfig::default()
+                    ..FrontConfig::default()
                 }),
                 ..QcsdConfig::default()
             },
@@ -7726,9 +8257,9 @@ mod tests {
                 max_chaff_streams: 4,
                 low_watermark: 1_000,
                 max_udp_payload_size: 1_200,
-                defense: DefenseConfig::Front(crate::FrontConfig {
+                defense: DefenseConfig::Front(FrontConfig {
                     packet_size: 1_200,
-                    ..crate::FrontConfig::default()
+                    ..FrontConfig::default()
                 }),
                 ..QcsdConfig::default()
             },

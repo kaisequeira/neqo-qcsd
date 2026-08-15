@@ -321,6 +321,15 @@ pub trait Defense: Debug {
     fn observe_application_bytes(&mut self, _at: Duration, _direction: Direction, _bytes: u64) {}
     /// Return the next event at or before `elapsed`.
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet>;
+    /// Snapshot a fixed schedule whose outgoing targets may be staged before release.
+    ///
+    /// Returning `None` preserves ordinary due-time generation. Implementations
+    /// opting in must return the exact global order subsequently produced by
+    /// [`Self::next_event`]. The controller keeps future incoming events private
+    /// until their timestamps are due.
+    fn fixed_schedule_snapshot(&self) -> Option<Vec<Packet>> {
+        None
+    }
     /// Whether the most recently returned incoming event must be assigned
     /// whole to one pristine controlled chaff stream.
     ///

@@ -154,9 +154,11 @@ fn classify_outgoing_evidence(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PacketTarget {
+    pub endpoint: Option<QcsdEndpointId>,
     pub slot: QcsdSlotId,
     pub udp_payload_size: u16,
     pub packet: Packet,
+    pub not_before: Instant,
     pub deadline: Instant,
     pub allow_stream_data: bool,
 }
@@ -186,12 +188,22 @@ impl Connection {
         &mut self,
         observation: impl FnOnce(QcsdEndpointId) -> QcsdObservation,
     ) {
-        if let (Some(endpoint), Some(clock)) =
-            (self.qcsd_endpoint, self.qcsd_observation_clock.as_ref())
-        {
-            self.qcsd_observations
-                .push_back(clock.record(observation(endpoint)));
-        }
+        let Some(endpoint) = self.qcsd_endpoint else {
+            return;
+        };
+        self.qcsd_observe_at_endpoint(endpoint, observation);
+    }
+
+    fn qcsd_observe_at_endpoint(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        observation: impl FnOnce(QcsdEndpointId) -> QcsdObservation,
+    ) {
+        let Some(clock) = self.qcsd_observation_clock.as_ref() else {
+            return;
+        };
+        self.qcsd_observations
+            .push_back(clock.record(observation(endpoint)));
     }
 
     /// Drain transport-level observations with causal production metadata.
@@ -303,7 +315,13 @@ impl Connection {
     }
 
     /// Bind transport target outcomes to a controller endpoint.
-    pub fn qcsd_enable(&mut self, endpoint: QcsdEndpointId, shape_stream_sends: bool) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when QCSD is already bound. A binding includes
+    /// its observation clock and cannot be replaced while the connection is
+    /// alive.
+    pub fn qcsd_enable(&mut self, endpoint: QcsdEndpointId, shape_stream_sends: bool) -> Res<()> {
         #![expect(
             clippy::disallowed_methods,
             reason = "standalone adapter callers need a monotonic observation-clock origin"
@@ -312,19 +330,29 @@ impl Connection {
             endpoint,
             shape_stream_sends,
             QcsdObservationClock::new(Instant::now()),
-        );
+        )
     }
 
     /// Enable QCSD with a clock shared by every connection in one runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when QCSD is already bound. A binding includes
+    /// its observation clock and cannot be replaced while the connection is
+    /// alive.
     pub fn qcsd_enable_with_observation_clock(
         &mut self,
         endpoint: QcsdEndpointId,
         shape_stream_sends: bool,
         observation_clock: QcsdObservationClock,
-    ) {
+    ) -> Res<()> {
+        if self.qcsd_endpoint.is_some() {
+            return Err(Error::InvalidInput);
+        }
         self.qcsd_endpoint = Some(endpoint);
         self.qcsd_observation_clock = Some(observation_clock);
         self.qcsd_enable_send_shaping(shape_stream_sends);
+        Ok(())
     }
 
     /// Apply one UDP-payload ceiling to every packet-number space in a QCSD run.
@@ -387,17 +415,28 @@ impl Connection {
         &mut self,
         slot: QcsdSlotId,
         packet: Packet,
+        not_before: Instant,
         deadline: Instant,
         allow_stream_data: bool,
     ) -> Res<()> {
+        let endpoint = self.qcsd_endpoint;
         let udp_payload_size = packet.length();
+        if not_before >= deadline
+            || self.qcsd_packet_targets.back().is_some_and(|previous| {
+                not_before < previous.not_before || deadline < previous.deadline
+            })
+        {
+            return Err(Error::InvalidInput);
+        }
         if !self.state.connected() {
-            self.qcsd_observe(|endpoint| QcsdObservation::SlotMissed {
-                endpoint,
-                slot,
-                packet,
-                reason: MissedSlotReason::KeysUnavailable,
-            });
+            if let Some(endpoint) = endpoint {
+                self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
+                    endpoint,
+                    slot,
+                    packet,
+                    reason: MissedSlotReason::KeysUnavailable,
+                });
+            }
             return Err(Error::NotAvailable);
         }
         let path = self.paths.primary().ok_or(Error::NotAvailable)?;
@@ -406,22 +445,46 @@ impl Connection {
             .qcsd_udp_payload_ceiling
             .map_or(path_limit, |ceiling| path_limit.min(usize::from(ceiling)));
         if udp_payload_size < 64 || usize::from(udp_payload_size) > effective_limit {
-            self.qcsd_observe(|endpoint| QcsdObservation::SlotMissed {
-                endpoint,
-                slot,
-                packet,
-                reason: MissedSlotReason::PathMtu,
-            });
+            if let Some(endpoint) = endpoint {
+                self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
+                    endpoint,
+                    slot,
+                    packet,
+                    reason: MissedSlotReason::PathMtu,
+                });
+            }
             return Err(Error::InvalidInput);
         }
         self.qcsd_packet_targets.push_back(PacketTarget {
+            endpoint,
             slot,
             udp_payload_size,
             packet,
+            not_before,
             deadline,
             allow_stream_data,
         });
         Ok(())
+    }
+
+    pub(super) fn qcsd_packet_target_wakeup(&self, now: Instant) -> Option<Instant> {
+        self.qcsd_packet_targets.front().map(|target| {
+            if now >= target.deadline {
+                now
+            } else if now < target.not_before {
+                target.not_before
+            } else {
+                target.deadline
+            }
+        })
+    }
+
+    pub(super) fn qcsd_eligible_packet_target(&self, now: Instant) -> Option<PacketTarget> {
+        self.qcsd_packet_targets
+            .iter()
+            .find(|target| now < target.deadline)
+            .copied()
+            .filter(|target| now >= target.not_before && now < target.deadline)
     }
 
     pub(super) fn qcsd_expire_packet_targets(
@@ -448,30 +511,29 @@ impl Connection {
             } else {
                 MissedSlotReason::DeadlineExpired
             };
-            self.qcsd_observe(|endpoint| QcsdObservation::SlotMissed {
+            self.qcsd_target_missed(&target, reason);
+        }
+    }
+
+    pub(super) fn qcsd_target_satisfied(&mut self, target: &PacketTarget) {
+        if let Some(endpoint) = target.endpoint {
+            self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot: target.slot,
+                observed_size: target.udp_payload_size,
+            });
+        }
+    }
+
+    pub(super) fn qcsd_target_missed(&mut self, target: &PacketTarget, reason: MissedSlotReason) {
+        if let Some(endpoint) = target.endpoint {
+            self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
                 endpoint,
                 slot: target.slot,
                 packet: target.packet,
                 reason,
             });
         }
-    }
-
-    pub(super) fn qcsd_target_satisfied(&mut self, target: &PacketTarget) {
-        self.qcsd_observe(|endpoint| QcsdObservation::SlotSatisfied {
-            endpoint,
-            slot: target.slot,
-            observed_size: target.udp_payload_size,
-        });
-    }
-
-    pub(super) fn qcsd_target_missed(&mut self, target: &PacketTarget, reason: MissedSlotReason) {
-        self.qcsd_observe(|endpoint| QcsdObservation::SlotMissed {
-            endpoint,
-            slot: target.slot,
-            packet: target.packet,
-            reason,
-        });
     }
 
     pub(super) fn qcsd_receive_limit_advertised(&mut self, stream: StreamId, absolute_limit: u64) {

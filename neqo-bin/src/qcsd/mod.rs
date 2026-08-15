@@ -2522,6 +2522,7 @@ fn queue_prefix_stage_targets(
                 endpoint: QcsdEndpointId(0),
                 packet,
                 slot: QcsdSlotId(slot_id),
+                not_before_after_us: 0,
                 deadline_after_us: u64::try_from(Duration::from_secs(timeout_seconds).as_micros())
                     .unwrap_or(u64::MAX),
                 allow_stream_data: true,
@@ -4253,25 +4254,25 @@ async fn execute_run_inner(
                 }
             }
 
-            let mut next_wakeup = spec.config.control_interval();
-            for endpoint in &mut endpoints {
+            let wake_base = now();
+            let mut next_wakeup = absolute_wakeup(wake_base, spec.config.control_interval())
+                .ok_or_else(|| Error::RunAborted("runner wake deadline overflow".into()))?;
+            for endpoint_index in 0..endpoints.len() {
                 // Flush output that was already available (including newly
                 // dispatched application requests) so its Wire signals precede
                 // the defense poll.
-                let output_now = now();
-                let output_elapsed =
-                    defense_start.map(|start| output_now.saturating_duration_since(start));
-                if let Some(delay) = process_output(
-                    endpoint,
+                if let Some(wakeup) = drive_endpoint_output(
+                    endpoint_index,
+                    &mut endpoints,
                     &mut controller,
+                    spec.chaff_manifest.as_ref(),
                     &mut traces,
                     &observation_clock,
-                    output_now,
-                    output_elapsed,
+                    defense_start,
                 )
                 .await?
                 {
-                    next_wakeup = next_wakeup.min(delay);
+                    next_wakeup = next_wakeup.min(wakeup);
                 }
             }
 
@@ -4305,24 +4306,23 @@ async fn execute_run_inner(
                 )?;
             }
 
-            for endpoint in &mut endpoints {
+            for endpoint_index in 0..endpoints.len() {
                 // Retain a post-action flush so newly scheduled packet targets can
                 // be placed on the wire without waiting for another loop turn.
-                let output_now = now();
-                let output_elapsed =
-                    defense_start.map(|start| output_now.saturating_duration_since(start));
-                if let Some(delay) = process_output(
-                    endpoint,
+                if let Some(wakeup) = drive_endpoint_output(
+                    endpoint_index,
+                    &mut endpoints,
                     &mut controller,
+                    spec.chaff_manifest.as_ref(),
                     &mut traces,
                     &observation_clock,
-                    output_now,
-                    output_elapsed,
+                    defense_start,
                 )
                 .await?
                 {
-                    next_wakeup = next_wakeup.min(delay);
+                    next_wakeup = next_wakeup.min(wakeup);
                 }
+                let endpoint = &mut endpoints[endpoint_index];
                 let input_now = now();
                 let input_elapsed =
                     defense_start.map(|start| input_now.saturating_duration_since(start));
@@ -4346,18 +4346,20 @@ async fn execute_run_inner(
                 traces.ensure_no_pending_slots()?;
                 break;
             }
-            let wait_now = now();
             if let Some(defense_start) = defense_start
                 && let Some(next_deadline) = controller.next_deadline()
             {
-                let mut controller_delay =
-                    next_deadline.saturating_sub(wait_now.saturating_duration_since(defense_start));
-                if controller_delay.is_zero() {
-                    controller_delay = Duration::from_micros(1);
-                }
-                next_wakeup = next_wakeup.min(controller_delay);
+                let controller_wakeup = defense_start
+                    .checked_add(next_deadline)
+                    .ok_or_else(|| Error::RunAborted("controller wake deadline overflow".into()))?;
+                next_wakeup = next_wakeup.min(controller_wakeup);
             }
-            wait_for_activity(
+            // Time may cross a release after the final transport callback was
+            // computed. Re-enter the loop instead of sleeping past due work.
+            if remaining_wakeup_delay(next_wakeup, now()).is_none() {
+                continue;
+            }
+            wait_for_activity_until(
                 endpoints.iter().map(|endpoint| &endpoint.socket),
                 next_wakeup,
             )
@@ -5507,6 +5509,10 @@ fn apply_queued_actions(
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
     loop {
+        // FRONT's frozen schedule is reconciled before every action batch so
+        // RequestChaff-created streams can immediately receive any due credit
+        // before a prearmed outgoing target is eligible to flush.
+        controller.reconcile_due_fixed(defense_elapsed);
         let actions: Vec<_> = controller.drain_actions().collect();
         if actions.is_empty() {
             return Ok(());
@@ -5774,6 +5780,27 @@ async fn wait_for_activity<'a>(
     Ok(())
 }
 
+async fn wait_for_activity_until<'a>(
+    sockets: impl IntoIterator<Item = &'a Socket>,
+    wakeup: Instant,
+) -> Result<(), Error> {
+    // Recompute immediately before sleeping: callback durations are never
+    // allowed to accumulate against a stale transport-drive timestamp.
+    let Some(delay) = remaining_wakeup_delay(wakeup, now()) else {
+        return Ok(());
+    };
+    wait_for_activity(sockets, delay).await
+}
+
+fn absolute_wakeup(base: Instant, delay: Duration) -> Option<Instant> {
+    base.checked_add(delay)
+}
+
+fn remaining_wakeup_delay(wakeup: Instant, current: Instant) -> Option<Duration> {
+    let remaining = wakeup.saturating_duration_since(current);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 fn bounded_qualification_wait(
     delay: Duration,
     deadline: Instant,
@@ -5804,82 +5831,141 @@ fn datagram_observation(
     ))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputDrive {
+    Datagram,
+    Callback(Instant),
+    None,
+}
+
 #[expect(
     clippy::future_not_send,
     reason = "the binary deliberately uses Tokio's current-thread runtime"
 )]
-async fn process_output(
+async fn drive_endpoint_output(
+    endpoint_index: usize,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Option<Instant>,
+) -> Result<Option<Instant>, Error> {
+    loop {
+        // One fresh timestamp governs the complete fixed-schedule microstep:
+        // reconcile every event due at that instant, apply its incoming
+        // actions, and only then let transport observe target eligibility.
+        let drive_now = now();
+        if controller.has_fixed_schedule_staging()
+            && let Some(started) = defense_start
+        {
+            let drive_elapsed = drive_now.saturating_duration_since(started);
+            controller.reconcile_due_fixed(drive_elapsed);
+            apply_queued_actions(
+                endpoints,
+                controller,
+                chaff_manifest,
+                traces,
+                drive_now,
+                drive_elapsed,
+            )?;
+        }
+
+        match process_output_once(
+            &mut endpoints[endpoint_index],
+            controller,
+            traces,
+            observation_clock,
+            drive_now,
+            defense_start,
+        )
+        .await?
+        {
+            OutputDrive::Datagram => {}
+            OutputDrive::Callback(wakeup) => return Ok(Some(wakeup)),
+            OutputDrive::None => return Ok(None),
+        }
+    }
+}
+
+#[expect(
+    clippy::future_not_send,
+    reason = "the binary deliberately uses Tokio's current-thread runtime"
+)]
+async fn process_output_once(
     endpoint: &mut Endpoint,
     controller: &mut QcsdController,
     traces: &mut TraceFiles,
     observation_clock: &QcsdObservationClock,
-    base_now: Instant,
-    defense_elapsed: Option<Duration>,
-) -> Result<Option<Duration>, Error> {
-    loop {
-        let output = endpoint
-            .client
-            .process_multiple_output(base_now, NonZeroUsize::MIN);
-        let batch = match output {
-            OutputBatch::DatagramBatch(batch) => batch,
-            OutputBatch::Callback(delay) => return Ok(Some(delay)),
-            OutputBatch::None => return Ok(None),
-        };
-        let observations = endpoint.client.qcsd_timestamped_observations();
-        let mut satisfied_datagrams = satisfied_datagrams_for(endpoint, &observations)?;
-        let mut attributed_datagrams = Vec::new();
-        for datagram in batch.iter() {
-            let satisfied = satisfied_datagrams
-                .iter()
-                .position(|(_, observed_size)| *observed_size == datagram.len())
-                .map(|index| satisfied_datagrams.remove(index));
-            attributed_datagrams.push((datagram.len(), satisfied));
+    drive_now: Instant,
+    defense_start: Option<Instant>,
+) -> Result<OutputDrive, Error> {
+    let output = endpoint
+        .client
+        .process_multiple_output(drive_now, NonZeroUsize::MIN);
+    let batch = match output {
+        OutputBatch::DatagramBatch(batch) => batch,
+        OutputBatch::Callback(delay) => {
+            let wakeup = absolute_wakeup(drive_now, delay)
+                .ok_or_else(|| Error::RunAborted("transport callback deadline overflow".into()))?;
+            return Ok(OutputDrive::Callback(wakeup));
         }
-        if let Some((slot, _)) = satisfied_datagrams.first() {
-            return Err(Error::SlotInvariant(format!(
-                "satisfied outgoing slot {} had no matching datagram",
-                slot.0
-            )));
-        }
+        OutputBatch::None => return Ok(OutputDrive::None),
+    };
+    let observations = endpoint.client.qcsd_timestamped_observations();
+    let mut satisfied_datagrams = satisfied_datagrams_for(endpoint, &observations)?;
+    let mut attributed_datagrams = Vec::new();
+    for datagram in batch.iter() {
+        let satisfied = satisfied_datagrams
+            .iter()
+            .position(|(_, observed_size)| *observed_size == datagram.len())
+            .map(|index| satisfied_datagrams.remove(index));
+        attributed_datagrams.push((datagram.len(), satisfied));
+    }
+    if let Some((slot, _)) = satisfied_datagrams.first() {
+        return Err(Error::SlotInvariant(format!(
+            "satisfied outgoing slot {} had no matching datagram",
+            slot.0
+        )));
+    }
 
-        let sent_at = loop {
-            match endpoint.socket.send(&batch) {
-                Ok(()) => break now(),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    endpoint.socket.writable().await?;
-                }
-                Err(error) => return Err(error.into()),
+    let sent_at = loop {
+        match endpoint.socket.send(&batch) {
+            Ok(()) => break now(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                endpoint.socket.writable().await?;
             }
-        };
-        let wire_elapsed = defense_elapsed
-            .map(|elapsed| elapsed.saturating_add(sent_at.saturating_duration_since(base_now)));
-        for observation in observations {
-            record_qcsd_observation(endpoint, traces, &observation)?;
-            forward_qcsd_observation(controller, observation, wire_elapsed);
+            Err(error) => return Err(error.into()),
         }
-        for (observed, satisfied) in attributed_datagrams {
-            traces.packet(&PacketTraceRow {
-                now: sent_at,
-                endpoint: endpoint.id,
-                direction: "outgoing",
-                observed,
-                scheduled: satisfied
-                    .map(|(_, observed_size)| u16::try_from(observed_size).unwrap_or(u16::MAX)),
-                satisfaction: satisfied.map_or("unshaped", |_| "satisfied"),
-                slot: satisfied.map(|(slot, _)| slot),
-            })?;
-            if let Some((observation, at)) = datagram_observation(
-                endpoint.id,
-                Direction::Outgoing,
-                u16::try_from(observed).unwrap_or(u16::MAX),
-                wire_elapsed,
-            ) {
-                let record = observation_clock.record_at(observation, sent_at);
-                traces.observation(Some(endpoint.id), &record)?;
-                controller.observe(record.into_observation(), at);
-            }
+    };
+    let wire_elapsed = defense_start.map(|started| sent_at.saturating_duration_since(started));
+    for observation in observations {
+        record_qcsd_observation(endpoint, traces, &observation)?;
+        forward_qcsd_observation(controller, observation, wire_elapsed);
+    }
+    for (observed, satisfied) in attributed_datagrams {
+        traces.packet(&PacketTraceRow {
+            now: sent_at,
+            endpoint: endpoint.id,
+            direction: "outgoing",
+            observed,
+            scheduled: satisfied
+                .map(|(_, observed_size)| u16::try_from(observed_size).unwrap_or(u16::MAX)),
+            satisfaction: satisfied.map_or("unshaped", |_| "satisfied"),
+            slot: satisfied.map(|(slot, _)| slot),
+        })?;
+        if let Some((observation, at)) = datagram_observation(
+            endpoint.id,
+            Direction::Outgoing,
+            u16::try_from(observed).unwrap_or(u16::MAX),
+            wire_elapsed,
+        ) {
+            let record = observation_clock.record_at(observation, sent_at);
+            traces.observation(Some(endpoint.id), &record)?;
+            controller.observe(record.into_observation(), at);
         }
     }
+    Ok(OutputDrive::Datagram)
 }
 
 fn process_input(
@@ -6101,7 +6187,7 @@ mod tests {
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
         RuntimeChaffManifest, Socket, StaticModeArg, StreamActivationStage, StreamRecord,
         StreamType, SustainedResponseQualificationRequest, TrafficMorphingActivation,
-        action_failure_reason, activate_traffic_morphing, apply_action_batch,
+        absolute_wakeup, action_failure_reason, activate_traffic_morphing, apply_action_batch,
         bind_qualified_chaff_stream_limits, bounded_qualification_wait, create_endpoints,
         datagram_observation, deadline_error, defense_parameter_provenance,
         drain_qualifier_stream_data, ensure_defense_realizable,
@@ -6109,7 +6195,7 @@ mod tests {
         forward_qcsd_observation, has_in_flight_application_stream, now, prefix_receipts_pass,
         prefix_targetless_stream_bytes, projected_ael, projected_identity_chaff_headers,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
-        record_terminal_action, register_action_batch, resolve_run_config,
+        record_terminal_action, register_action_batch, remaining_wakeup_delay, resolve_run_config,
         resolve_run_config_with_workload, response_qualification_mode,
         sanitize_chaff_action_headers, sha256, shapes_stream_sends,
         sustained_qualification_content_encoding, sustained_representation_failure,
@@ -7782,6 +7868,7 @@ mod tests {
             endpoint: QcsdEndpointId(1),
             packet: outgoing_packet,
             slot,
+            not_before_after_us: 0,
             deadline_after_us: 1,
             allow_stream_data: false,
         };
@@ -7963,6 +8050,7 @@ mod tests {
             endpoint: QcsdEndpointId(1),
             packet: Packet::new(Duration::ZERO, Direction::Outgoing, 100).expect("packet"),
             slot: QcsdSlotId(1),
+            not_before_after_us: 0,
             deadline_after_us: 1,
             allow_stream_data: false,
         };
@@ -9027,6 +9115,39 @@ mod tests {
                 length: 1_234,
                 timestamp_us: 12_345,
             }
+        );
+    }
+
+    #[test]
+    fn runner_uses_absolute_target_wakeups_and_refreshes_now() {
+        let first_drive = now();
+        let callback_delay = Duration::from_millis(10);
+        let first_wakeup =
+            absolute_wakeup(first_drive, callback_delay).expect("first absolute wakeup");
+
+        let refreshed_drive = first_drive + Duration::from_millis(3);
+        let refreshed_wakeup =
+            absolute_wakeup(refreshed_drive, callback_delay).expect("refreshed absolute wakeup");
+        assert_eq!(first_wakeup, first_drive + callback_delay);
+        assert_eq!(refreshed_wakeup, refreshed_drive + callback_delay);
+        assert_eq!(
+            refreshed_wakeup.duration_since(first_wakeup),
+            Duration::from_millis(3)
+        );
+    }
+
+    #[test]
+    fn runner_rechecks_due_target_before_sleep() {
+        let base = now();
+        let wakeup = base + Duration::from_millis(10);
+        assert_eq!(
+            remaining_wakeup_delay(wakeup, base + Duration::from_millis(9)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(remaining_wakeup_delay(wakeup, wakeup), None);
+        assert_eq!(
+            remaining_wakeup_delay(wakeup, wakeup + Duration::from_nanos(1)),
+            None
         );
     }
 

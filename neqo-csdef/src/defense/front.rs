@@ -73,6 +73,10 @@ impl Defense for Front {
         self.schedule.next_event(elapsed)
     }
 
+    fn fixed_schedule_snapshot(&self) -> Option<Vec<Packet>> {
+        Some(self.schedule.snapshot())
+    }
+
     fn next_event_at(&self) -> Option<Duration> {
         self.schedule.next_event_at()
     }
