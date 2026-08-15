@@ -4586,7 +4586,7 @@ impl Connection {
         slot: Option<QcsdSlotId>,
     ) -> Res<()> {
         let stream = self.streams.get_recv_stream_mut(stream_id)?;
-        match stream.qcsd_set_manual_limit(absolute_limit) {
+        match stream.qcsd_apply_manual_limit_action(absolute_limit, None, false) {
             Ok(QcsdReceiveLimitOutcome::Applied) => {
                 if let Some(slot) = slot {
                     self.qcsd_pending_receive_credit

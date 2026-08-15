@@ -1237,27 +1237,12 @@ impl RecvStream {
     }
 
     /// Switch this receive stream to a monotonically increasing absolute QCSD limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed fatal outcome if the initial manual limit would revoke
-    /// already advertised or consumed credit.
     #[cfg(feature = "qcsd")]
-    pub const fn qcsd_set_manual_limit(
-        &mut self,
-        absolute_limit: u64,
-    ) -> Result<QcsdReceiveLimitOutcome, QcsdReceiveLimitError> {
-        match &mut self.state {
-            RecvStreamState::Recv { fc, .. } => fc.set_manual_limit(absolute_limit),
-            RecvStreamState::SizeKnown { .. } | RecvStreamState::SizeKnownAt { .. } => {
-                Ok(QcsdReceiveLimitOutcome::FinalKnown)
-            }
-            RecvStreamState::DataRecvd { .. }
-            | RecvStreamState::DataRead { .. }
-            | RecvStreamState::AbortReading { .. }
-            | RecvStreamState::WaitForReset { .. }
-            | RecvStreamState::ResetRecvd { .. } => Ok(QcsdReceiveLimitOutcome::Terminal),
-        }
+    pub const fn qcsd_set_manual_limit(&mut self, absolute_limit: u64) -> bool {
+        matches!(
+            self.qcsd_apply_manual_limit_action(absolute_limit, None, false),
+            Ok(QcsdReceiveLimitOutcome::Applied)
+        )
     }
 
     /// Restore automatic flow-control updates for a stream excluded from QCSD shaping.
@@ -2071,6 +2056,22 @@ mod tests {
             Rc::new(RefCell::new(ReceiverFlowControl::new((), session_fc))),
             conn_events,
         )
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_set_manual_limit_preserves_bool_api() {
+        const BOOL_API: fn(&mut RecvStream, u64) -> bool = RecvStream::qcsd_set_manual_limit;
+        let mut live = create_stream(1_024 * to_u64(INITIAL_LOCAL_MAX_STREAM_DATA));
+        let applied = BOOL_API(&mut live, to_u64(INITIAL_LOCAL_MAX_STREAM_DATA) + 1);
+        assert!(applied);
+
+        let mut final_known = create_stream(1_024 * to_u64(INITIAL_LOCAL_MAX_STREAM_DATA));
+        final_known
+            .inbound_stream_frame(true, 10, &[])
+            .expect("FIN with a gap");
+        let applied = BOOL_API(&mut final_known, 32);
+        assert!(!applied);
     }
 
     #[cfg(feature = "qcsd")]
