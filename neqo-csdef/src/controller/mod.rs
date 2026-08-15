@@ -2484,6 +2484,12 @@ impl QcsdController {
         self.materialize_due_fixed(elapsed);
 
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let boundary_us = ControlLoop::boundary_us(elapsed_us, self.config.control_interval_us);
+        // Fixed schedules retry at the exact current instant, including more
+        // than once within one control interval.  Advance only the watermark
+        // used by `next_deadline`; gating the retry would let a newly due
+        // fixed event cross a same-interval outgoing flush.
+        self.control.last_incoming_boundary_us = Some(boundary_us);
         self.process_incoming(elapsed_us, elapsed);
         self.retry_pending_parser_leases();
         self.request_chaff_if_needed(false);
@@ -6690,6 +6696,98 @@ mod tests {
                     .length()
             )
         );
+    }
+
+    #[test]
+    fn fixed_unallocatable_incoming_advances_retry_deadline_without_mutation() {
+        let mut controller = front_prearm_controller();
+        ready(&mut controller, 1, "https://front.example");
+        controller.reconcile_due_fixed(Duration::ZERO);
+        _ = controller.drain_actions().collect::<Vec<_>>();
+
+        let final_event_at = controller
+            .fixed_schedule
+            .as_ref()
+            .expect("FRONT staging")
+            .events
+            .back()
+            .expect("frozen FRONT event")
+            .packet
+            .timestamp();
+        controller.reconcile_due_fixed(final_event_at);
+        assert!(
+            controller
+                .fixed_schedule
+                .as_ref()
+                .expect("FRONT staging")
+                .events
+                .is_empty()
+        );
+
+        let pending_before: Vec<_> = controller
+            .control
+            .incoming
+            .iter()
+            .map(|incoming| (incoming.slot, incoming.packet, incoming.remaining))
+            .collect();
+        assert!(!pending_before.is_empty());
+        assert!(pending_before.iter().all(|(_, packet, remaining)| {
+            packet.direction() == Direction::Incoming && *remaining == u64::from(packet.length())
+        }));
+        let public_before = controller.pending_slots();
+        let actions_before_retry: Vec<_> = controller.drain_actions().collect();
+        assert!(!actions_before_retry.iter().any(|action| {
+            matches!(
+                action,
+                QcsdAction::SlotSatisfied { .. } | QcsdAction::SlotMissed { .. }
+            )
+        }));
+        controller.flush_defense_observations();
+
+        let first_elapsed_us = u64::try_from(final_event_at.as_micros()).unwrap();
+        let first_watermark = (first_elapsed_us / controller.config.control_interval_us)
+            * controller.config.control_interval_us;
+        assert_eq!(
+            controller.control.last_incoming_boundary_us,
+            Some(first_watermark)
+        );
+        let first_retry = controller.next_deadline().expect("pending retry deadline");
+        assert!(
+            first_retry > final_event_at,
+            "retry {first_retry:?} did not advance past reconciliation {final_event_at:?} at watermark {first_watermark}",
+        );
+
+        let retry_at = final_event_at.saturating_add(controller.config.control_interval());
+        controller.reconcile_due_fixed(retry_at);
+        let pending_after: Vec<_> = controller
+            .control
+            .incoming
+            .iter()
+            .map(|incoming| (incoming.slot, incoming.packet, incoming.remaining))
+            .collect();
+        assert_eq!(pending_after, pending_before);
+        assert_eq!(controller.pending_slots(), public_before);
+        assert!(!controller.drain_actions().any(|action| {
+            matches!(
+                action,
+                QcsdAction::IncreaseReceiveLimit { .. }
+                    | QcsdAction::SlotSatisfied { .. }
+                    | QcsdAction::SlotMissed { .. }
+            )
+        }));
+
+        let second_elapsed_us = u64::try_from(retry_at.as_micros()).unwrap();
+        let second_watermark = (second_elapsed_us / controller.config.control_interval_us)
+            * controller.config.control_interval_us;
+        assert!(second_watermark > first_watermark);
+        assert_eq!(
+            controller.control.last_incoming_boundary_us,
+            Some(second_watermark)
+        );
+        controller.flush_defense_observations();
+        let second_retry = controller.next_deadline().expect("advanced retry deadline");
+        assert!(second_retry > retry_at);
+        assert!(second_retry > first_retry);
     }
 
     #[test]

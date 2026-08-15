@@ -4358,11 +4358,6 @@ async fn execute_run_inner(
                     .ok_or_else(|| Error::RunAborted("controller wake deadline overflow".into()))?;
                 next_wakeup = next_wakeup.min(controller_wakeup);
             }
-            // Time may cross a release after the final transport callback was
-            // computed. Re-enter the loop instead of sleeping past due work.
-            if remaining_wakeup_delay(next_wakeup, now()).is_none() {
-                continue;
-            }
             wait_for_activity_until(
                 endpoints.iter().map(|endpoint| &endpoint.socket),
                 next_wakeup,
@@ -6411,10 +6406,10 @@ async fn wait_for_activity_until<'a>(
     wakeup: Instant,
 ) -> Result<(), Error> {
     // Recompute immediately before sleeping: callback durations are never
-    // allowed to accumulate against a stale transport-drive timestamp.
-    let Some(delay) = remaining_wakeup_delay(wakeup, now()) else {
-        return Ok(());
-    };
+    // allowed to accumulate against a stale transport-drive timestamp.  An
+    // already-due callback still awaits once so Tokio's current-thread reactor
+    // can publish socket readiness before the runner retries its work loop.
+    let delay = remaining_wakeup_delay(wakeup, now()).unwrap_or_else(|| Duration::from_micros(1));
     wait_for_activity(sockets, delay).await
 }
 
@@ -6786,7 +6781,10 @@ mod tests {
         fs,
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
@@ -6805,6 +6803,7 @@ mod tests {
         StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig, WalkieTalkieConfig,
         WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig, sanitize_chaff_headers,
     };
+    use neqo_udp::RecvBuf;
 
     use super::{
         ApplicationBatchLifecycle, Args, ChaffRequestHeaderModeArg, DefenseArg, Error,
@@ -6832,7 +6831,7 @@ mod tests {
         trace_files::{ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_chaff_manifest_defense,
         validate_prefix_capacity_plan, validate_qualified_chaff_binding,
-        validate_walkie_talkie_chaff_precondition, wait_for_activity,
+        validate_walkie_talkie_chaff_precondition, wait_for_activity, wait_for_activity_until,
         walkie_talkie_qualification_binding_matches, write_run_json,
     };
 
@@ -10059,6 +10058,42 @@ mod tests {
         assert_eq!(
             remaining_wakeup_delay(wakeup, wakeup + Duration::from_nanos(1)),
             None
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn past_runner_wakeup_yields_and_services_socket_readiness_before_retry() {
+        let socket = Socket::bind("127.0.0.1:0").expect("receiver socket");
+        let local_addr = socket.local_addr().expect("receiver address");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender socket");
+        let sender_polled = Arc::new(AtomicBool::new(false));
+        let sender_polled_in_task = Arc::clone(&sender_polled);
+        let sender_task = tokio::spawn(async move {
+            sender_polled_in_task.store(true, Ordering::SeqCst);
+            sender
+                .send_to(&[1], local_addr)
+                .expect("send datagram after runner yields");
+        });
+        assert!(!sender_polled.load(Ordering::SeqCst));
+
+        wait_for_activity_until([&socket], now())
+            .await
+            .expect("expired wakeup must still service reactor readiness");
+        assert!(
+            sender_polled.load(Ordering::SeqCst),
+            "an expired wakeup must yield instead of starting an await-free retry loop"
+        );
+        tokio::time::timeout(Duration::from_secs(1), sender_task)
+            .await
+            .expect("sender task timeout")
+            .expect("sender task failure");
+        let mut recv_buf = RecvBuf::default();
+        assert!(
+            socket
+                .recv(local_addr, &mut recv_buf)
+                .expect("receive queued datagram")
+                .is_some(),
+            "an expired controller wakeup must not bypass the reactor"
         );
     }
 
