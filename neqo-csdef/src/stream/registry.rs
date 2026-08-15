@@ -153,6 +153,13 @@ impl StreamRegistry {
         self.streams.get_mut(&(endpoint, stream))
     }
 
+    /// Raw response-stream offset consumed by HTTP/3.
+    pub fn consumed(&self, endpoint: QcsdEndpointId, stream: QcsdStreamId) -> Option<u64> {
+        self.streams
+            .get(&(endpoint, stream))
+            .map(|state| state.receive.consumed())
+    }
+
     /// Record unique request-stream bytes only when the transport observation
     /// matches the registered chaff role exactly.
     pub fn record_chaff_request_acknowledgment(
@@ -552,11 +559,14 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         pristine_data_boundary: bool,
         scheduled_backing: u64,
+        terminal_advertised_tail: Option<u64>,
     ) -> Option<ParserLease> {
         let state = self.get_mut(endpoint, stream)?;
-        let (absolute_limit, increase, scheduled) = state
-            .receive
-            .parser_lease(pristine_data_boundary, scheduled_backing)?;
+        let (absolute_limit, increase, scheduled) = state.receive.parser_lease(
+            pristine_data_boundary,
+            scheduled_backing,
+            terminal_advertised_tail,
+        )?;
         Some(ParserLease {
             endpoint,
             stream,

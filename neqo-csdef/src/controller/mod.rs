@@ -922,10 +922,26 @@ impl QcsdController {
             .filter(|claim| claim.endpoint == endpoint && claim.stream == stream)
             .min_by_key(|claim| claim.slot)
             .map_or(0, |claim| claim.remaining);
-        let Some(lease) =
+        let incoming_terminal = self.defense.is_incoming_complete()
+            && self.defense.pending_receiver_continuation().is_none()
+            && self.control.incoming.is_empty()
+            && self.control.receiver_continuations.is_empty();
+        let terminal_advertised_tail = if incoming_terminal && backing == 0 {
             self.streams
-                .parser_lease(endpoint, stream, pristine_data_boundary, backing)
-        else {
+                .consumed(endpoint, stream)
+                .and_then(|consumed| {
+                    self.contiguous_advertised_tail_from(endpoint, stream, consumed)
+                })
+        } else {
+            None
+        };
+        let Some(lease) = self.streams.parser_lease(
+            endpoint,
+            stream,
+            pristine_data_boundary,
+            backing,
+            terminal_advertised_tail,
+        ) else {
             return;
         };
         let owner = lease
@@ -2302,6 +2318,29 @@ impl QcsdController {
             .into_iter()
             .flatten()
             .fold(0_u64, |total, range| total.saturating_add(range.bytes()))
+    }
+
+    /// Return the complete contiguous advertised scheduled suffix beginning
+    /// at `start`. A gap rejects the proof instead of summing unrelated
+    /// ownership ranges across parser-only offsets.
+    fn contiguous_advertised_tail_from(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        start: u64,
+    ) -> Option<u64> {
+        let ranges = self.advertised_incoming_credit.get(&(endpoint, stream))?;
+        let mut end = start;
+        for range in ranges {
+            if range.end <= end {
+                continue;
+            }
+            if range.start > end {
+                return None;
+            }
+            end = range.end;
+        }
+        (end > start).then_some(end.saturating_sub(start))
     }
 
     fn incoming_slot_is_untouched(&self, incoming: &PendingIncoming) -> bool {
@@ -5767,6 +5806,93 @@ mod tests {
     }
 
     #[test]
+    fn final_front_whole_stream_preference_precedes_an_older_tail_bridge() {
+        let incoming = incoming_packet(Duration::ZERO);
+        let future_outgoing = outgoing_packet(Duration::from_millis(1));
+        let defense = StaticSchedule::with_mode(
+            Trace::new([incoming, future_outgoing]),
+            DefenseMode::ChaffOnly,
+        );
+        let mut controller = terminal_chaff_shape_controller(Box::new(defense), true);
+        let endpoint = QcsdEndpointId(1);
+        let tail_stream = QcsdStreamId(64);
+        let fresh_stream = QcsdStreamId(68);
+        let old_slot = QcsdSlotId(900);
+        let old_packet = incoming_packet(Duration::ZERO);
+
+        let receive = &mut controller
+            .streams
+            .get_mut(endpoint, tail_stream)
+            .expect("tail stream")
+            .receive;
+        receive.data_frame(3, 1_024);
+        assert_eq!(receive.release(100), Some((116, 100)));
+        receive.advertised(116);
+        receive.bytes_read(114);
+        controller.pending_slots.insert(old_slot, old_packet);
+        controller.incoming_credit_ledger.insert(
+            old_slot,
+            IncomingCreditLedger {
+                packet: old_packet,
+                endpoint: Some(endpoint),
+                multiple_endpoints: false,
+                consumed: 1_198,
+                retired: 0,
+            },
+        );
+        controller.scheduled_incoming_requested_bytes = 1_200;
+        controller.scheduled_incoming_consumed_bytes = 1_198;
+        controller.advertised_incoming_credit.insert(
+            (endpoint, tail_stream),
+            vec![AdvertisedIncomingCredit {
+                slot: old_slot,
+                start: 114,
+                end: 116,
+            }],
+        );
+
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: tail_stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(controller.next_action().is_none());
+
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit {
+                stream,
+                absolute_limit: 1_216,
+                packet,
+                ..
+            } if *stream == fresh_stream && *packet == incoming
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::LeaseParserReceive {
+                stream,
+                absolute_limit: 132,
+                increase: 16,
+                owner: None,
+                ..
+            } if *stream == tail_stream
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit { stream, .. } if *stream == tail_stream
+        )));
+        assert_eq!(controller.control.credit.len(), 1);
+        assert_eq!(controller.control.credit[0].stream, fresh_stream);
+        assert_eq!(controller.control.credit[0].increase, 1_200);
+    }
+
+    #[test]
     fn terminal_whole_stream_preference_requires_chaff_only_and_proven_incoming_completion() {
         let build_packets = || {
             [
@@ -7568,6 +7694,308 @@ mod tests {
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    fn advertised_tail_controller(
+        mode: DefenseMode,
+        excess: u64,
+        advertised_ranges: &[(u64, u64)],
+        trace: Trace,
+    ) -> (
+        QcsdController,
+        QcsdEndpointId,
+        QcsdStreamId,
+        QcsdSlotId,
+        Packet,
+    ) {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: excess,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::with_mode(trace, mode)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(20);
+        let slot = QcsdSlotId(1_371);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("packet");
+        let role = match mode {
+            DefenseMode::ChaffOnly => QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            DefenseMode::ChaffAndShape => QcsdRequestRole::Application,
+        };
+
+        ready(&mut controller, 1, "https://example.com");
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .open(endpoint, stream, role, true, 16, excess, 4_096);
+        let receive = &mut controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive;
+        receive.data_frame(3, 4_096);
+        assert_eq!(receive.release(100), Some((116, 100)));
+        receive.advertised(116);
+        receive.bytes_read(114);
+
+        controller.pending_slots.insert(slot, packet);
+        controller.incoming_credit_ledger.insert(
+            slot,
+            IncomingCreditLedger {
+                packet,
+                endpoint: Some(endpoint),
+                multiple_endpoints: false,
+                consumed: 1_198,
+                retired: 0,
+            },
+        );
+        controller.scheduled_incoming_requested_bytes = 1_200;
+        controller.scheduled_incoming_consumed_bytes = 1_198;
+        controller.advertised_incoming_credit.insert(
+            (endpoint, stream),
+            advertised_ranges
+                .iter()
+                .map(|&(start, end)| AdvertisedIncomingCredit { slot, start, end })
+                .collect(),
+        );
+
+        (controller, endpoint, stream, slot, packet)
+    }
+
+    #[test]
+    fn terminal_full_advertised_tail_gets_one_bounded_mode_agnostic_bridge() {
+        for mode in [DefenseMode::ChaffOnly, DefenseMode::ChaffAndShape] {
+            let future_outgoing = Packet::new(Duration::from_secs(1), Direction::Outgoing, 1_200)
+                .expect("future outgoing");
+            let (mut controller, endpoint, stream, slot, packet) = advertised_tail_controller(
+                mode,
+                1_000,
+                &[(114, 115), (115, 116)],
+                Trace::new([future_outgoing]),
+            );
+
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+            assert!(matches!(
+                controller.next_action(),
+                Some(QcsdAction::LeaseParserReceive {
+                    endpoint: observed_endpoint,
+                    stream: observed_stream,
+                    absolute_limit: 132,
+                    increase: 16,
+                    owner: None,
+                }) if observed_endpoint == endpoint && observed_stream == stream
+            ));
+            assert!(controller.next_action().is_none());
+
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_198);
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 2);
+            assert_eq!(controller.pending_slots(), [(slot, packet)]);
+
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit: 132,
+                    slot: None,
+                },
+                Duration::from_micros(1),
+            );
+            assert!(controller.next_action().is_none());
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_consumed_bytes,
+                1_198
+            );
+
+            // Two scheduled tail bytes plus one unowned bridge byte complete
+            // the next frame header. Only the scheduled prefix settles work.
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: 3,
+                },
+                Duration::from_micros(2),
+            );
+            assert!(matches!(
+                controller.next_action(),
+                Some(QcsdAction::SlotSatisfied {
+                    slot: observed, ..
+                }) if observed == slot
+            ));
+            assert!(controller.next_action().is_none());
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: 15,
+                },
+                Duration::from_micros(3),
+            );
+            assert!(
+                controller
+                    .drain_actions()
+                    .all(|action| !matches!(action, QcsdAction::SlotSatisfied { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_parser_bridge_requires_complete_contiguous_advertised_ownership() {
+        for advertised_ranges in [&[(114, 115)][..], &[(114, 115), (116, 117)][..]] {
+            let (mut controller, endpoint, stream, slot, packet) = advertised_tail_controller(
+                DefenseMode::ChaffOnly,
+                1_000,
+                advertised_ranges,
+                Trace::default(),
+            );
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+            assert!(controller.next_action().is_none());
+            assert_eq!(controller.pending_slots(), [(slot, packet)]);
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_unresolved_bytes,
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_parser_bridge_waits_for_terminal_unqueued_incoming_work() {
+        let future = Packet::new(Duration::from_secs(1), Direction::Incoming, 1_200)
+            .expect("future incoming");
+        let (mut nonterminal, endpoint, stream, _, _) = advertised_tail_controller(
+            DefenseMode::ChaffOnly,
+            1_000,
+            &[(114, 116)],
+            Trace::new([future]),
+        );
+        nonterminal.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(nonterminal.next_action().is_none());
+
+        let (mut queued, endpoint, stream, _, _) = advertised_tail_controller(
+            DefenseMode::ChaffOnly,
+            1_000,
+            &[(114, 116)],
+            Trace::default(),
+        );
+        queued.control.incoming.push(PendingIncoming {
+            slot: QcsdSlotId(1_372),
+            packet: future,
+            endpoint: None,
+            remaining: 1_200,
+        });
+        queued.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(queued.next_action().is_none());
+        queued.control.incoming.clear();
+        queued.poll(Duration::ZERO);
+        assert!(queued.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::LeaseParserReceive {
+                endpoint: observed_endpoint,
+                stream: observed_stream,
+                absolute_limit: 132,
+                increase: 16,
+                owner: None,
+            } if observed_endpoint == endpoint && observed_stream == stream
+        )));
+
+        let (mut continuation, endpoint, stream, _, _) = advertised_tail_controller(
+            DefenseMode::ChaffAndShape,
+            1_000,
+            &[(114, 116)],
+            Trace::default(),
+        );
+        continuation.control.receiver_continuations.insert(
+            QcsdSlotId(1_373),
+            crate::ReceiverContinuationDisposition {
+                cell_bytes: 1_200,
+                parser_ceiling_bytes: 1_000,
+            },
+        );
+        continuation.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(continuation.next_action().is_none());
+    }
+
+    #[test]
+    fn terminal_advertised_tail_does_not_bypass_exhausted_parser_allowance() {
+        let (mut controller, endpoint, stream, slot, packet) =
+            advertised_tail_controller(DefenseMode::ChaffOnly, 0, &[(114, 116)], Trace::default());
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(controller.next_action().is_none());
+        assert_eq!(controller.pending_slots(), [(slot, packet)]);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_unresolved_bytes,
+            2
+        );
     }
 
     #[test]

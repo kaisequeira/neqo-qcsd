@@ -491,7 +491,8 @@ impl ReceiveState {
     }
 
     /// Lease one maximum HTTP/3 frame-header prefix at a pristine DATA
-    /// boundary after all exact receive capacity has been consumed.
+    /// boundary after all exact receive capacity has been consumed, or after
+    /// a proven terminal scheduled tail that cannot expose the next frame.
     ///
     /// The returned raw range advances `requested_limit`, so later scheduled
     /// releases necessarily begin after it.  A boundary offset can lease once,
@@ -501,6 +502,7 @@ impl ReceiveState {
         &mut self,
         pristine_data_boundary: bool,
         scheduled_backing: u64,
+        terminal_advertised_tail: Option<u64>,
     ) -> Option<(u64, u64, bool)> {
         if !pristine_data_boundary {
             return None;
@@ -535,8 +537,24 @@ impl ReceiveState {
                 // parser lease is appended after that range; the controller's
                 // offset ledger therefore keeps the two ownership domains
                 // disjoint without reclassifying already advertised bytes.
+                // Exact capacity ordinarily retains priority.  Once the
+                // incoming schedule is terminal, however, a complete
+                // sub-header advertised tail has no future scheduled release
+                // that can expose the frame.  The controller may prove that
+                // exact tail here, while this state independently checks its
+                // raw extent and the bounded unowned allowance.
+                let raw_tail = requested_limit.saturating_sub(*consumed);
+                let remaining_parser_allowance =
+                    parser_lease_capacity.saturating_sub(*parser_lease_used);
+                let terminal_exact_tail_bridge = *known_limit > *requested_limit
+                    && scheduled_backing == 0
+                    && terminal_advertised_tail == Some(raw_tail)
+                    && raw_tail > 0
+                    && raw_tail < MAX_HTTP3_FRAME_HEADER_BYTES
+                    && remaining_parser_allowance >= MAX_HTTP3_FRAME_HEADER_BYTES
+                    && !*parser_lease_exhausted;
                 if *requested_limit != *advertised_limit
-                    || *known_limit > *requested_limit
+                    || (*known_limit > *requested_limit && !terminal_exact_tail_bridge)
                     || *pending_parser_boundary != Some(*consumed)
                     || *last_parser_lease_boundary == Some(*consumed)
                 {
@@ -921,7 +939,7 @@ const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
 
 #[cfg(test)]
 mod tests {
-    use super::ReceiveState;
+    use super::{MAX_HTTP3_FRAME_HEADER_BYTES, ReceiveState};
 
     #[test]
     fn created_stream_transitions_to_the_selected_receive_policy() {
@@ -1176,7 +1194,7 @@ mod tests {
         while typed_tail < 250 {
             state.header_progress(1, true);
             let (absolute, increase, scheduled) = state
-                .parser_lease(true, 0)
+                .parser_lease(true, 0, None)
                 .expect("remaining lifetime lease");
             assert!(!scheduled);
             assert_eq!(increase, (250 - typed_tail).min(16));
@@ -1188,7 +1206,7 @@ mod tests {
         assert_eq!(typed_tail, 250);
         state.header_progress(1, true);
         assert_eq!(
-            state.parser_lease(true, 0),
+            state.parser_lease(true, 0, None),
             None,
             "bootstrap plus typed leases cannot exceed max_stream_data_excess"
         );
@@ -1342,7 +1360,10 @@ mod tests {
         // 131,105 is two bytes ahead of consumed 131,103. Those existing raw
         // bytes remain scheduled; a disjoint parser tail begins at 131,105.
         state.header_progress(1, true);
-        assert_eq!(state.parser_lease(true, 0), Some((BODY + 49, 16, false)));
+        assert_eq!(
+            state.parser_lease(true, 0, None),
+            Some((BODY + 49, 16, false))
+        );
         assert_eq!(BODY + 33, 131_105);
         state.advertised(BODY + 49);
         state.bytes_read(2);
@@ -1352,7 +1373,10 @@ mod tests {
         // A later distinct DATA(0) boundary can extend the bounded lease even
         // while part of the prior lease remains unused.
         state.header_progress(1, true);
-        assert_eq!(state.parser_lease(true, 0), Some((BODY + 65, 16, false)));
+        assert_eq!(
+            state.parser_lease(true, 0, None),
+            Some((BODY + 65, 16, false))
+        );
         state.advertised(BODY + 65);
         state.bytes_read(2);
         state.data_frame(2, 0);
@@ -1369,25 +1393,37 @@ mod tests {
         for boundary in 0..63 {
             state.header_progress(1, true);
             let (absolute, increase, scheduled) =
-                state.parser_lease(true, 0).expect("bounded lease");
+                state.parser_lease(true, 0, None).expect("bounded lease");
             assert!(!scheduled);
             let expected = if boundary == 62 { 8 } else { 16 };
             assert_eq!(increase, expected);
             total += increase;
             assert_eq!(absolute, 1 + total);
-            assert_eq!(state.parser_lease(true, 0), None, "duplicate boundary");
+            assert_eq!(
+                state.parser_lease(true, 0, None),
+                None,
+                "duplicate boundary"
+            );
             state.advertised(absolute);
             state.bytes_read(increase);
         }
         assert_eq!(total, 1_000);
         state.header_progress(1, true);
-        assert_eq!(state.parser_lease(true, 0), None, "unowned lifetime cap");
         assert_eq!(
-            state.parser_lease(true, 7),
+            state.parser_lease(true, 0, None),
+            None,
+            "unowned lifetime cap"
+        );
+        assert_eq!(
+            state.parser_lease(true, 7, None),
             Some((1_008, 7, true)),
             "scheduled demand can continue beyond the unowned cap"
         );
-        assert_eq!(state.parser_lease(true, 7), None, "duplicate boundary");
+        assert_eq!(
+            state.parser_lease(true, 7, None),
+            None,
+            "duplicate boundary"
+        );
         state.advertised(1_008);
         state.bytes_read(7);
         assert_eq!(state.schedule_parser_lease_bytes(7, false), 7);
@@ -1397,27 +1433,115 @@ mod tests {
     #[test]
     fn parser_lease_requires_a_pristine_exhausted_boundary() {
         let mut exact_available = ReceiveState::controlled(0, 100, 10);
-        assert_eq!(exact_available.parser_lease(true, 0), None);
+        assert_eq!(exact_available.parser_lease(true, 0, None), None);
 
         let mut outstanding = ReceiveState::controlled(1, 100, 1);
         outstanding.bytes_read(1);
         outstanding.header_progress(1, true);
-        assert_eq!(outstanding.parser_lease(true, 0), Some((17, 16, false)));
-        assert_eq!(outstanding.parser_lease(false, 0), None);
+        assert_eq!(
+            outstanding.parser_lease(true, 0, None),
+            Some((17, 16, false))
+        );
+        assert_eq!(outstanding.parser_lease(false, 0, None), None);
 
         let mut unadvertised = ReceiveState::controlled(1, 100, 2);
         unadvertised.bytes_read(1);
         assert_eq!(unadvertised.release(1), Some((2, 1)));
         unadvertised.header_progress(1, true);
-        assert_eq!(unadvertised.parser_lease(true, 0), None);
+        assert_eq!(unadvertised.parser_lease(true, 0, None), None);
         unadvertised.advertised(2);
-        assert_eq!(unadvertised.parser_lease(true, 0), Some((18, 16, false)));
+        assert_eq!(
+            unadvertised.parser_lease(true, 0, None),
+            Some((18, 16, false))
+        );
 
         let mut not_pristine = ReceiveState::controlled(1, 100, 1);
         not_pristine.bytes_read(1);
         not_pristine.header_progress(8, false);
-        assert_eq!(not_pristine.parser_lease(false, 0), None);
+        assert_eq!(not_pristine.parser_lease(false, 0, None), None);
         assert_eq!(not_pristine.available(), 8);
+    }
+
+    #[test]
+    fn terminal_advertised_tail_bridge_requires_an_exact_bounded_proof() {
+        let build = || {
+            let mut state = ReceiveState::controlled(16, 1_000, 4_096);
+            state.data_frame(3, 4_096);
+            assert_eq!(state.release(100), Some((116, 100)));
+            state.advertised(116);
+            state.bytes_read(114);
+            state.header_progress(1, true);
+            state
+        };
+
+        let mut matching = build();
+        assert_eq!(matching.parser_lease(true, 0, None), None);
+        assert_eq!(matching.parser_lease(true, 0, Some(0)), None);
+        assert_eq!(matching.parser_lease(true, 0, Some(1)), None);
+        assert_eq!(matching.parser_lease(true, 1, Some(2)), None);
+        assert_eq!(
+            matching.parser_lease(true, 0, Some(2)),
+            Some((132, 16, false))
+        );
+        assert_eq!(
+            matching.parser_lease(true, 0, Some(2)),
+            None,
+            "one typed boundary can produce only one bridge"
+        );
+
+        let mut unadvertised = ReceiveState::controlled(16, 1_000, 4_096);
+        unadvertised.data_frame(3, 4_096);
+        assert_eq!(unadvertised.release(100), Some((116, 100)));
+        unadvertised.advertised(115);
+        unadvertised.bytes_read(114);
+        unadvertised.header_progress(1, true);
+        assert_eq!(unadvertised.parser_lease(true, 0, Some(2)), None);
+
+        let mut full_header = ReceiveState::controlled(16, 1_000, 4_096);
+        full_header.data_frame(3, 4_096);
+        assert_eq!(full_header.release(100), Some((116, 100)));
+        full_header.advertised(116);
+        full_header.bytes_read(100);
+        full_header.header_progress(1, true);
+        assert_eq!(full_header.parser_lease(true, 0, Some(16)), None);
+
+        let mut exhausted = ReceiveState::controlled(1, 16, 1);
+        exhausted.bytes_read(1);
+        exhausted.header_progress(1, true);
+        assert_eq!(exhausted.parser_lease(true, 0, None), Some((17, 16, false)));
+        exhausted.advertised(17);
+        exhausted.bytes_read(16);
+        exhausted.data_frame(3, 4_096);
+        assert_eq!(exhausted.release(2), Some((19, 2)));
+        exhausted.advertised(19);
+        exhausted.header_progress(1, true);
+        assert_eq!(exhausted.parser_lease(true, 0, Some(2)), None);
+
+        // Unlike an ordinary lease, the terminal exception must not spend a
+        // short final allowance and then strand a maximum-sized frame header.
+        // The ordinary short-lease behavior remains covered by
+        // `pristine_parser_lease_is_idempotent_disjoint_and_lifetime_bounded`.
+        for remaining in 1..MAX_HTTP3_FRAME_HEADER_BYTES {
+            let mut short =
+                ReceiveState::controlled(1, MAX_HTTP3_FRAME_HEADER_BYTES + remaining, 1);
+            short.bytes_read(1);
+            short.header_progress(1, true);
+            assert_eq!(
+                short.parser_lease(true, 0, None),
+                Some((17, MAX_HTTP3_FRAME_HEADER_BYTES, false))
+            );
+            short.advertised(17);
+            short.bytes_read(MAX_HTTP3_FRAME_HEADER_BYTES);
+            short.data_frame(3, 4_096);
+            assert_eq!(short.release(2), Some((19, 2)));
+            short.advertised(19);
+            short.header_progress(1, true);
+            assert_eq!(
+                short.parser_lease(true, 0, Some(2)),
+                None,
+                "remaining parser allowance {remaining} must fail closed"
+            );
+        }
     }
 
     #[test]
