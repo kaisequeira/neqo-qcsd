@@ -18,7 +18,8 @@ pub struct StreamState {
     pub receive: ReceiveState,
     pub status: Option<u16>,
     /// Exact transport proof retained only until HTTP/3 makes response-header
-    /// progress or the prepared floor can activate the one bootstrap lease.
+    /// progress or an exact prepared/scheduled prefix can activate the one
+    /// bootstrap lease.
     pre_header_blocked_at: Option<u64>,
     request_acknowledged_ranges: Vec<(u64, u64)>,
     request_acknowledged_final_size: Option<u64>,
@@ -534,15 +535,19 @@ impl StreamRegistry {
     }
 
     /// Lease the remaining prefix up to the stream's absolute framing ceiling
-    /// after its prepared floor and retained blocked proof agree.
+    /// after its retained blocked proof agrees with either the prepared floor
+    /// or the controller's exact live scheduled prefix.
     pub(crate) fn pre_header_bootstrap_lease(
         &mut self,
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
+        live_scheduled_prefix: Option<(u64, u64)>,
     ) -> Option<ParserLease> {
         let state = self.get_mut(endpoint, stream)?;
         let blocked_at = state.pre_header_blocked_at?;
-        let (absolute_limit, increase) = state.receive.pre_header_bootstrap_lease(blocked_at)?;
+        let (absolute_limit, increase) = state
+            .receive
+            .pre_header_bootstrap_lease(blocked_at, live_scheduled_prefix)?;
         state.pre_header_blocked_at = None;
         Some(ParserLease {
             endpoint,
@@ -677,7 +682,10 @@ mod tests {
             .expect("stream")
             .receive
             .advertised(250);
-        assert_eq!(registry.pre_header_bootstrap_lease(endpoint, stream), None);
+        assert_eq!(
+            registry.pre_header_bootstrap_lease(endpoint, stream, None),
+            None
+        );
     }
 
     #[test]

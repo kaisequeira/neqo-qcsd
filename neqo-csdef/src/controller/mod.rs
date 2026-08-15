@@ -875,7 +875,11 @@ impl QcsdController {
     }
 
     fn try_pre_header_bootstrap(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
-        let Some(lease) = self.streams.pre_header_bootstrap_lease(endpoint, stream) else {
+        let live_scheduled_prefix = self.live_advertised_scheduled_prefix(endpoint, stream);
+        let Some(lease) =
+            self.streams
+                .pre_header_bootstrap_lease(endpoint, stream, live_scheduled_prefix)
+        else {
             return;
         };
         debug_assert!(!lease.scheduled);
@@ -2318,6 +2322,35 @@ impl QcsdController {
             .into_iter()
             .flatten()
             .fold(0_u64, |total, range| total.saturating_add(range.bytes()))
+    }
+
+    /// Prove one positive, contiguous, still-live scheduled prefix beginning
+    /// at the configured initial receive limit. This proof is intentionally
+    /// separate from `ReceiveState`: parser liveness must not infer or create
+    /// scheduling ownership from an absolute receive limit alone.
+    fn live_advertised_scheduled_prefix(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<(u64, u64)> {
+        let start = self.config.effective_initial_max_stream_data();
+        let ranges = self.advertised_incoming_credit.get(&(endpoint, stream))?;
+        let mut end = start;
+        for range in ranges {
+            if range.end <= end {
+                continue;
+            }
+            if range.start > end
+                || self
+                    .incoming_credit_ledger
+                    .get(&range.slot)
+                    .is_none_or(|ledger| ledger.unresolved() == 0)
+            {
+                return None;
+            }
+            end = range.end;
+        }
+        (end > start).then_some((start, end))
     }
 
     /// Return the complete contiguous advertised scheduled suffix beginning
@@ -6621,6 +6654,408 @@ mod tests {
             0
         );
         assert!(controller.actions.is_empty());
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the helper reproduces one complete cross-stream scheduled-credit lifecycle"
+    )]
+    fn returned_residual_pre_header_controller(
+        residual: u16,
+    ) -> (
+        QcsdController,
+        QcsdEndpointId,
+        QcsdStreamId,
+        QcsdSlotId,
+        Packet,
+        u64,
+    ) {
+        const CELL: u16 = 1_200;
+        const INITIAL: u64 = 16;
+        const LARGE_FLOOR: u64 = 38_376;
+
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, CELL).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: INITIAL,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), true)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let source = QcsdStreamId(0);
+        let target = QcsdStreamId(4);
+        ready(&mut controller, 1, "https://example.com");
+
+        let source_scheduled = u64::from(CELL - residual);
+        let source_limit = INITIAL + source_scheduled;
+        controller.streams.open(
+            endpoint,
+            source,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            INITIAL,
+            1_000,
+            source_limit,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::ZERO);
+        let (advertised_source_limit, slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint: observed_endpoint,
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if observed_endpoint == endpoint && stream == source => {
+                    Some((absolute_limit, slot))
+                }
+                _ => None,
+            })
+            .expect("source scheduled prefix");
+        assert_eq!(advertised_source_limit, source_limit);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: source,
+                absolute_limit: source_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(1),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: source,
+                bytes: source_limit,
+            },
+            Duration::from_micros(2),
+        );
+        assert_eq!(
+            controller
+                .incoming_credit_ledger
+                .get(&slot)
+                .map(|ledger| ledger.unresolved()),
+            Some(u64::from(residual))
+        );
+
+        // Closing the first stream returns only its untouched claim. The same
+        // slot and packet must survive reassignment of that residual.
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream: source,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(3),
+        );
+        controller.streams.open(
+            endpoint,
+            target,
+            QcsdRequestRole::Chaff {
+                resource_id: 8,
+                request_id: None,
+            },
+            true,
+            INITIAL,
+            1_000,
+            LARGE_FLOOR,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint,
+                stream: target,
+                blocked_at: INITIAL,
+            },
+            Duration::from_micros(4),
+        );
+        assert!(controller.next_action().is_none());
+
+        controller.poll(Duration::from_millis(5));
+        let target_limit = INITIAL + u64::from(residual);
+        let (reassigned_limit, reassigned_slot) = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint: observed_endpoint,
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if observed_endpoint == endpoint && stream == target => {
+                    Some((absolute_limit, slot))
+                }
+                _ => None,
+            })
+            .expect("reassigned scheduled residual");
+        assert_eq!((reassigned_limit, reassigned_slot), (target_limit, slot));
+        (controller, endpoint, target, slot, packet, target_limit)
+    }
+
+    #[test]
+    fn returned_scheduled_residual_bootstraps_large_pre_header_floor() {
+        const INITIAL: u64 = 16;
+        const ATOMIC_HEADERS: u64 = 647;
+
+        for residual in [310, 322, 325] {
+            let (mut controller, endpoint, stream, slot, packet, target_limit) =
+                returned_residual_pre_header_controller(residual);
+
+            // The retained SDB is still inert while the reassigned scheduled
+            // prefix is only requested locally.
+            assert!(controller.next_action().is_none());
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit: target_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(5_001),
+            );
+            let QcsdAction::LeaseParserReceive {
+                endpoint: lease_endpoint,
+                stream: lease_stream,
+                absolute_limit,
+                increase,
+                owner,
+            } = controller.next_action().expect("large-floor bootstrap")
+            else {
+                panic!("expected slotless parser lease");
+            };
+            assert_eq!((lease_endpoint, lease_stream), (endpoint, stream));
+            assert_eq!((absolute_limit, increase), (1_000, 1_000 - target_limit));
+            assert_eq!(owner, None);
+
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(
+                diagnostics.scheduled_incoming_consumed_bytes,
+                1_200 - u64::from(residual)
+            );
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(
+                diagnostics.scheduled_incoming_unresolved_bytes,
+                u64::from(residual)
+            );
+            assert_eq!(controller.pending_slots(), [(slot, packet)]);
+
+            // Advertising the ownerless parser suffix cannot satisfy or
+            // reclassify any scheduled byte.
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: None,
+                },
+                Duration::from_micros(5_002),
+            );
+            assert!(controller.next_action().is_none());
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_unresolved_bytes,
+                u64::from(residual)
+            );
+            assert_eq!(controller.pending_slots(), [(slot, packet)]);
+
+            // A realistic atomic HEADERS extent crosses both domains. Only
+            // overlap with [16,target_limit) settles the returned slot; the
+            // ownerless [target_limit,1000) suffix remains parser overflow.
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: INITIAL,
+                },
+                Duration::from_micros(5_003),
+            );
+            assert!(controller.next_action().is_none());
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: ATOMIC_HEADERS - INITIAL,
+                },
+                Duration::from_micros(5_004),
+            );
+            assert!(matches!(
+                controller.next_action(),
+                Some(QcsdAction::SlotSatisfied {
+                    slot: satisfied,
+                    ..
+                }) if satisfied == slot
+            ));
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+            assert!(controller.pending_slots().is_empty());
+        }
+    }
+
+    #[test]
+    fn large_floor_bootstrap_requires_live_contiguous_scheduled_prefix() {
+        const INITIAL: u64 = 16;
+        const REQUESTED: u64 = 326;
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 310).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: INITIAL,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            INITIAL,
+            1_000,
+            38_376,
+        );
+        assert!(
+            controller
+                .streams
+                .record_pre_header_blocked(endpoint, stream, INITIAL)
+        );
+        assert_eq!(
+            controller
+                .streams
+                .release_stream(endpoint, stream, REQUESTED - INITIAL)
+                .map(|release| release.absolute_limit),
+            Some(REQUESTED)
+        );
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .advertised(REQUESTED);
+
+        controller.try_pre_header_bootstrap(endpoint, stream);
+        assert!(
+            controller.actions.is_empty(),
+            "absolute credit is not proof"
+        );
+
+        let slot = QcsdSlotId(0);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.advertised_incoming_credit.insert(
+            (endpoint, stream),
+            vec![AdvertisedIncomingCredit {
+                slot,
+                start: INITIAL + 1,
+                end: REQUESTED,
+            }],
+        );
+        controller.try_pre_header_bootstrap(endpoint, stream);
+        assert!(controller.actions.is_empty(), "a prefix gap fails closed");
+
+        controller.advertised_incoming_credit.insert(
+            (endpoint, stream),
+            vec![AdvertisedIncomingCredit {
+                slot,
+                start: INITIAL,
+                end: REQUESTED,
+            }],
+        );
+        controller.incoming_credit_ledger.remove(&slot);
+        controller.try_pre_header_bootstrap(endpoint, stream);
+        assert!(controller.actions.is_empty(), "stale ownership is not live");
+
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.try_pre_header_bootstrap(endpoint, stream);
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::LeaseParserReceive {
+                absolute_limit: 1_000,
+                increase: 674,
+                owner: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn returned_residual_bootstrap_rolls_back_and_retires_once_on_close() {
+        let (mut controller, endpoint, stream, slot, _, target_limit) =
+            returned_residual_pre_header_controller(310);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: target_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(5_001),
+        );
+        assert!(matches!(
+            controller.actions.front(),
+            Some(QcsdAction::LeaseParserReceive {
+                absolute_limit: 1_000,
+                increase: 674,
+                owner: None,
+                ..
+            })
+        ));
+
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream,
+                finish: QcsdStreamFinish::Reset,
+            },
+            Duration::from_micros(5_002),
+        );
+        assert!(controller.parser_lease_ranges.is_empty());
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. }))
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::SlotMissed {
+                        slot: observed,
+                        reason: MissedSlotReason::ReceiveCreditRetired,
+                        ..
+                    } if *observed == slot
+                ))
+                .count(),
+            1
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 890);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 310);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert!(controller.pending_slots().is_empty());
     }
 
     #[test]
