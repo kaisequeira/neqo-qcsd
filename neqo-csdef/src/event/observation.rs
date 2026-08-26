@@ -147,6 +147,59 @@ pub enum MissedSlotReason {
     RunAborted,
 }
 
+/// Transport-proven reason for a legal congestion-sensitive degradation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdCongestionReason {
+    /// The pacer allowed no defense-owned attempt at the release boundary.
+    PacingLimited,
+    /// Congestion control allowed no attempt or only a smaller UDP target.
+    CongestionLimited,
+}
+
+/// Byte composition of one realized scheduled client-egress UDP datagram.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QcsdSlotComposition {
+    /// Requested UDP payload size before congestion-sensitive reduction.
+    pub desired_udp_bytes: u16,
+    /// UDP payload bytes that actually crossed the adapter boundary.
+    pub observed_udp_bytes: u16,
+    /// Registered application request-stream bytes in the datagram.
+    pub application_stream_bytes: u16,
+    /// Retransmitted application or reviewed-chaff STREAM bytes.
+    pub retransmission_stream_bytes: u16,
+    /// Fresh registered reviewed-chaff request-stream bytes in the datagram.
+    pub chaff_stream_bytes: u16,
+    /// Defense-owned control bytes encoded inside this scheduled datagram,
+    /// including a scheduled PING and defense-owned `MAX_STREAM_DATA`.
+    pub defense_control_bytes: u16,
+    /// QUIC PADDING bytes added to reach the selected target.
+    pub quic_padding_bytes: u16,
+    /// Headers, authentication tag, ACK, and other non-defense QUIC bytes.
+    pub other_quic_bytes: u16,
+    /// Delay from the target's release boundary to the transport attempt.
+    pub lateness_us: u64,
+}
+
+/// Typed terminal outcome of one congestion-sensitive egress attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum QcsdSlotOutcome {
+    /// The complete requested UDP payload target was realized.
+    Full { composition: QcsdSlotComposition },
+    /// A smaller, transport-permitted target was realized once.
+    Partial {
+        composition: QcsdSlotComposition,
+        reason: QcsdCongestionReason,
+    },
+    /// No defense-owned datagram was emitted at the attempt boundary.
+    Suppressed {
+        /// Zero-observed composition preserving target and release lateness.
+        composition: QcsdSlotComposition,
+        reason: QcsdCongestionReason,
+    },
+}
+
 /// Why an otherwise valid client 1-RTT datagram could not be morphed in place.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -307,6 +360,10 @@ pub enum QcsdObservation {
     /// Every application stream belonging to the current global batch terminated.
     ApplicationBatchCompleted,
     ApplicationComplete,
+    /// Aggregate client STREAM backlog edge sampled by the single-threaded runner.
+    EgressBacklog {
+        pending: bool,
+    },
     Datagram {
         endpoint: QcsdEndpointId,
         direction: Direction,
@@ -323,6 +380,14 @@ pub enum QcsdObservation {
         direction: Direction,
         length: u16,
         class: QcsdDatagramClass,
+        /// Client packet-builder composition when locally available.
+        ///
+        /// Incoming datagrams remain `None`: this client-only adaptation does
+        /// not pretend to observe or control the server's packet builder. For
+        /// unscheduled client datagrams, `desired_udp_bytes` equals the built
+        /// UDP payload, and `lateness_us` is zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composition: Option<QcsdSlotComposition>,
     },
     /// A natural client 1-RTT datagram was handled by the in-packet Traffic
     /// Morphing adapter.
@@ -374,6 +439,13 @@ pub enum QcsdObservation {
         packet: Packet,
         reason: MissedSlotReason,
     },
+    /// Congestion-sensitive terminal outcome with realized byte composition.
+    SlotResolved {
+        endpoint: QcsdEndpointId,
+        slot: QcsdSlotId,
+        packet: Packet,
+        outcome: QcsdSlotOutcome,
+    },
 }
 
 #[cfg(test)]
@@ -381,6 +453,26 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{QcsdObservation, QcsdObservationClock};
+
+    #[test]
+    fn legacy_classified_datagram_without_composition_remains_compatible() {
+        let json = r#"{
+            "type":"classified_datagram",
+            "endpoint":1,
+            "direction":"outgoing",
+            "length":1200,
+            "class":"natural"
+        }"#;
+        let observation: QcsdObservation =
+            serde_json::from_str(json).expect("legacy classified datagram");
+        assert!(matches!(
+            observation,
+            QcsdObservation::ClassifiedDatagram {
+                composition: None,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn stream_opened_without_expected_response_length_remains_compatible() {

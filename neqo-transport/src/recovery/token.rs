@@ -22,9 +22,13 @@ pub enum StreamRecoveryToken {
     Stream(send_stream::RecoveryToken),
     ResetStream {
         stream_id: StreamId,
+        /// Exact encoded frame bytes for QCSD packet composition evidence.
+        encoded_bytes: u16,
     },
     StopSending {
         stream_id: StreamId,
+        /// Exact encoded frame bytes for QCSD packet composition evidence.
+        encoded_bytes: u16,
     },
 
     MaxData(u64),

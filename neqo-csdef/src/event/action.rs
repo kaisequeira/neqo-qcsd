@@ -16,6 +16,25 @@ const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate over &T"
+)]
+const fn is_exact_send_policy(value: &QcsdSendPolicy) -> bool {
+    matches!(value, QcsdSendPolicy::Exact)
+}
+
+/// Transport policy for one scheduled client-egress attempt.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdSendPolicy {
+    /// Preserve the existing exact-size, deadline-window behavior.
+    #[default]
+    Exact,
+    /// Attempt once at release and expose congestion-limited partial/suppressed outcomes.
+    CongestionSensitive,
+}
+
 /// Result of checking or applying one QCSD receive-limit action.
 ///
 /// Lifecycle outcomes are non-fatal: a controller can cancel the stream's
@@ -200,6 +219,9 @@ pub enum QcsdAction {
         /// Remaining monotonic time in which the adapter may satisfy this slot.
         deadline_after_us: u64,
         allow_stream_data: bool,
+        /// Adapter realization policy. Omitted legacy actions remain exact.
+        #[serde(default, skip_serializing_if = "is_exact_send_policy")]
+        send_policy: QcsdSendPolicy,
     },
     /// Permit chaff request bytes to leave without scheduled capacity after
     /// the outgoing schedule ends, allowing an incoming-only tail to finish.
@@ -210,6 +232,13 @@ pub enum QcsdAction {
         endpoint: QcsdEndpointId,
         resource: Resource,
         request_id: QcsdChaffRequestId,
+    },
+    /// Cancel one still-open reviewed-chaff request at CS-BuFLO's local
+    /// early-termination boundary. This is a client-local HTTP/3 cancellation,
+    /// not the bilateral padding-complete signal used by the source study.
+    CancelChaff {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
     },
     SlotMissed {
         endpoint: Option<QcsdEndpointId>,
@@ -269,7 +298,7 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{QcsdAction, QcsdParserLeaseOwner, QcsdReceiveActionIdentity};
+    use super::{QcsdAction, QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdSendPolicy};
     use crate::{Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
 
     #[test]
@@ -318,6 +347,7 @@ mod tests {
             not_before_after_us: 0,
             deadline_after_us: 5_000,
             allow_stream_data: false,
+            send_policy: QcsdSendPolicy::Exact,
         };
         let immediate_json = serde_json::to_value(&immediate).expect("serialize send action");
         assert_eq!(immediate_json.get("not_before_after_us"), None);
@@ -334,6 +364,7 @@ mod tests {
             not_before_after_us: 17,
             deadline_after_us: 5_000,
             allow_stream_data: false,
+            send_policy: QcsdSendPolicy::Exact,
         };
         let staged_json = serde_json::to_value(&staged).expect("serialize staged send action");
         assert_eq!(

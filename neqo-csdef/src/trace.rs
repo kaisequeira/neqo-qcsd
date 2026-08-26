@@ -289,4 +289,11 @@ mod tests {
             Some(Direction::Outgoing)
         );
     }
+
+    #[test]
+    fn zero_length_schedule_inputs_are_rejected() {
+        assert!(Packet::new(Duration::ZERO, Direction::Outgoing, 0).is_err());
+        assert!(Packet::from_legacy(0, 0).is_err());
+        assert!(Trace::from_legacy_csv_str("0,0\n").is_err());
+    }
 }

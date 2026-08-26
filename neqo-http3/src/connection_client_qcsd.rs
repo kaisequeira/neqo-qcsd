@@ -39,6 +39,13 @@ impl Http3Client {
         self.base_handler.qcsd_has_pending_stream_send() || self.conn.qcsd_has_pending_stream_send()
     }
 
+    /// Whether candidate-defense transport control remains pending or in
+    /// flight independently of STREAM send data.
+    #[must_use]
+    pub fn qcsd_has_pending_defense_control(&self) -> bool {
+        self.conn.qcsd_has_pending_defense_control()
+    }
+
     /// Whether HTTP/3/QPACK or transport retains pending STREAM output other
     /// than the explicitly allowed request streams.
     pub fn qcsd_has_pending_stream_send_excluding(&mut self, allowed: &[StreamId]) -> bool {
@@ -104,6 +111,20 @@ impl Http3Client {
         let encoded = self.base_handler.qcsd_encoded_request_bytes(stream_id)?;
         let transport = self.conn.send_stream_stats(stream_id)?.bytes_written();
         Ok(encoded.saturating_add(transport))
+    }
+
+    /// Whether a registered application request's QUIC send half is terminal
+    /// with peer confirmation.
+    ///
+    /// This is false for `DataSent`, including a fully transmitted request
+    /// whose STREAM bytes or FIN remain unacknowledged. It becomes true only
+    /// after transport reaches `DataRecvd` (all bytes and FIN acknowledged) or
+    /// `ResetRecvd` (`RESET_STREAM` acknowledged), and remains true after normal
+    /// transport stream cleanup.
+    #[must_use]
+    pub fn qcsd_application_send_stream_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        self.conn
+            .qcsd_application_send_stream_peer_confirmed(stream_id)
     }
 
     /// Open a same-origin nonblocking-QPACK request for qualification without
@@ -602,7 +623,7 @@ impl Http3Client {
                 not_before_after_us,
                 deadline_after_us,
                 allow_stream_data,
-                ..
+                send_policy,
             } if endpoint == own_endpoint => {
                 let not_before = now
                     .checked_add(Duration::from_micros(not_before_after_us))
@@ -610,13 +631,15 @@ impl Http3Client {
                 let deadline = now
                     .checked_add(Duration::from_micros(deadline_after_us))
                     .ok_or(Error::InvalidInput)?;
-                self.conn.qcsd_queue_scheduled_packet_target_window(
-                    slot,
-                    packet,
-                    not_before,
-                    deadline,
-                    allow_stream_data,
-                )?;
+                self.conn
+                    .qcsd_queue_scheduled_packet_target_window_with_policy(
+                        slot,
+                        packet,
+                        not_before,
+                        deadline,
+                        allow_stream_data,
+                        send_policy,
+                    )?;
             }
             QcsdAction::ReleaseChaffSendShaping { endpoint } if endpoint == own_endpoint => {
                 self.conn.qcsd_release_chaff_send_shaping();
@@ -628,6 +651,22 @@ impl Http3Client {
             } if endpoint == own_endpoint => {
                 let stream_id = self.apply_qcsd_chaff_request(now, resource, request_id)?;
                 return Ok(Some(stream_id));
+            }
+            QcsdAction::CancelChaff { endpoint, stream } if endpoint == own_endpoint => {
+                let stream_id = StreamId::new(stream.0);
+                let error = Error::HttpRequestCancelled.code();
+                self.cancel_fetch(stream_id, error)?;
+                // The runner closes a request's H3 send handler immediately
+                // after encoding its request/FIN. At local ET, `cancel_fetch`
+                // therefore usually sees only the receive handler and queues
+                // STOP_SENDING. Reset the still-live QUIC send half directly
+                // so an unacknowledged request/FIN cannot be lost and revive
+                // after the defense has otherwise completed.
+                match self.conn.stream_reset_send(stream_id, error) {
+                    Ok(()) | Err(neqo_transport::Error::InvalidStreamId) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                self.conn.qcsd_mark_local_et_chaff_cancellation(stream_id);
             }
             QcsdAction::SlotMissed { .. }
             | QcsdAction::SlotSatisfied { .. }

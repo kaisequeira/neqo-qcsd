@@ -126,6 +126,16 @@ impl QcsdConfig {
                 "max_udp_payload_size must satisfy QUIC's 1200-byte minimum".into(),
             ));
         }
+        if matches!(
+            &self.defense,
+            DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
+        ) && self.max_udp_payload_size != 1_200
+        {
+            return Err(Error::InvalidConfig(
+                "BuFLO and CS-BuFLO client-only adaptations require max_udp_payload_size=1200 so every candidate datagram, including PMTUD and transport control, stays within the validation ceiling"
+                    .into(),
+            ));
+        }
         self.defense.validate(self.max_udp_payload_size)
     }
 
@@ -194,6 +204,10 @@ pub enum DefenseConfig {
     WtfPad(WtfPadConfig),
     /// Walkie-Talkie half-duplex burst-molding defense.
     WalkieTalkie(WalkieTalkieConfig),
+    /// `BuFLO` constant-rate, minimum-duration defense.
+    Buflo(BufloConfig),
+    /// Congestion-sensitive `BuFLO` client-side adaptation.
+    CsBuflo(CsBufloConfig),
 }
 
 impl DefenseConfig {
@@ -205,6 +219,8 @@ impl DefenseConfig {
             Self::TrafficMorphing(config) => Some(&config.matrix),
             Self::WtfPad(config) => Some(&config.histograms),
             Self::WalkieTalkie(config) => Some(&config.molded),
+            Self::Buflo(config) => Some(&config.parameters),
+            Self::CsBuflo(config) => Some(&config.parameters),
             Self::None | Self::Front(_) | Self::Tamaraw(_) => None,
         }
     }
@@ -215,6 +231,8 @@ impl DefenseConfig {
             Self::TrafficMorphing(config) => Some(&mut config.matrix),
             Self::WtfPad(config) => Some(&mut config.histograms),
             Self::WalkieTalkie(config) => Some(&mut config.molded),
+            Self::Buflo(config) => Some(&mut config.parameters),
+            Self::CsBuflo(config) => Some(&mut config.parameters),
             Self::None | Self::Front(_) | Self::Tamaraw(_) => None,
         }
     }
@@ -260,6 +278,12 @@ impl DefenseConfig {
                 }
                 config.packet_size
             }
+            Self::Buflo(config) => {
+                return validate_parameter_path(&config.parameters, "BuFLO parameter receipt");
+            }
+            Self::CsBuflo(config) => {
+                return validate_parameter_path(&config.parameters, "CS-BuFLO parameter receipt");
+            }
             Self::TrafficMorphing(config) => return config.validate(max_udp_payload_size),
             Self::WtfPad(config) => return config.validate(max_udp_payload_size),
             Self::WalkieTalkie(config) => return config.validate(max_udp_payload_size),
@@ -274,6 +298,233 @@ impl DefenseConfig {
             return Err(Error::InvalidConfig(format!(
                 "defense packet size {packet_size} exceeds max_udp_payload_size {max_udp_payload_size}"
             )));
+        }
+        Ok(())
+    }
+}
+
+/// Path to one immutable `BuFLO` parameter receipt.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BufloConfig {
+    /// Versioned JSON receipt containing every numeric `BuFLO` parameter.
+    pub parameters: String,
+}
+
+/// Path to one immutable `CS-BuFLO` parameter receipt.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CsBufloConfig {
+    /// Versioned JSON receipt containing the numeric parameters and padding mode.
+    pub parameters: String,
+}
+
+/// Exact numeric inputs for the client-side `BuFLO` adaptation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BufloParameters {
+    /// Parameter-receipt schema. This is independent of QCSD config schema two.
+    pub schema_version: u32,
+    /// Constant inter-cell interval.
+    pub interval_us: u64,
+    /// Minimum time for which both directions remain active.
+    pub minimum_duration_us: u64,
+    /// UDP payload target or receive-credit amount for every cell.
+    pub packet_size: u16,
+    /// Per-direction bound; two directions together are capped at 20,000 cells.
+    pub max_events: u64,
+    /// Explicit adaptation boundary; no cooperating peer is implemented.
+    pub implementation_scope: QcsdImplementationScope,
+    /// Must remain false for the client-only QUIC adaptation.
+    pub paper_equivalent: bool,
+}
+
+impl BufloParameters {
+    /// Parse and validate a complete JSON parameter receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed JSON or an invalid numeric invariant.
+    pub fn from_json(input: &str, max_udp_payload_size: u16) -> Result<Self> {
+        let parameters: Self = serde_json::from_str(input)?;
+        parameters.validate(max_udp_payload_size)?;
+        Ok(parameters)
+    }
+
+    /// Load and validate a complete JSON parameter receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or is not a valid receipt.
+    pub fn from_json_file<P: AsRef<Path>>(path: P, max_udp_payload_size: u16) -> Result<Self> {
+        Self::from_json(&fs::read_to_string(path)?, max_udp_payload_size)
+    }
+
+    fn validate(&self, max_udp_payload_size: u16) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported BuFLO parameter schema_version {}; expected 1",
+                self.schema_version
+            )));
+        }
+        if self.interval_us == 0
+            || self.minimum_duration_us == 0
+            || self.max_events == 0
+            || self.max_events > 10_000
+        {
+            return Err(Error::InvalidConfig(
+                "BuFLO interval_us and minimum_duration_us must be positive and max_events must be in 1..=10000 so the two directions cannot exceed 20000 cells"
+                    .into(),
+            ));
+        }
+        let guard_duration_us = self
+            .interval_us
+            .checked_mul(self.max_events)
+            .ok_or_else(|| {
+                Error::InvalidConfig("BuFLO interval_us * max_events overflows u64".into())
+            })?;
+        if guard_duration_us > 120_000_000 || self.minimum_duration_us >= guard_duration_us {
+            return Err(Error::InvalidConfig(
+                "BuFLO per-direction event guard must be at most 120 seconds and cover the inclusive minimum-duration tick"
+                    .into(),
+            ));
+        }
+        if self.implementation_scope != QcsdImplementationScope::ClientOnlyQuic
+            || self.paper_equivalent
+        {
+            return Err(Error::InvalidConfig(
+                "BuFLO receipts must declare implementation_scope=client_only_quic and paper_equivalent=false"
+                    .into(),
+            ));
+        }
+        validate_shaped_packet_size(self.packet_size, max_udp_payload_size, "BuFLO")
+    }
+}
+
+/// Explicit scientific scope embedded in immutable parameter receipts.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdImplementationScope {
+    /// Single QCSD QUIC client; ingress is a receive-credit approximation.
+    ClientOnlyQuic,
+}
+
+/// `CS-BuFLO` padding rule selected by one immutable parameter receipt.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CsBufloPaddingMode {
+    /// Pad application payload volume to a power-of-two boundary (CPSP).
+    Payload,
+    /// Pad realized total wire volume to a power-of-two boundary (CTSP).
+    Total,
+}
+
+/// Early-termination authority used by the client-only `CS-BuFLO` adaptation.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CsBufloEarlyTermination {
+    /// Decide termination from local application, backlog, quiet, and slot state.
+    Local,
+}
+
+/// Exact numeric inputs for the client-side `CS-BuFLO` adaptation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsBufloParameters {
+    /// Parameter-receipt schema. This is independent of QCSD config schema two.
+    pub schema_version: u32,
+    /// UDP payload target or receive-credit amount for a full cell.
+    pub packet_size: u16,
+    /// Initial inter-cell interval.
+    pub initial_interval_us: u64,
+    /// Smallest interval permitted by rate adaptation.
+    pub minimum_interval_us: u64,
+    /// Largest interval permitted by rate adaptation.
+    pub maximum_interval_us: u64,
+    /// First realized-byte boundary at which the rate is reconsidered.
+    pub initial_adaptation_boundary_bytes: u64,
+    /// Required application-idle period before completion.
+    pub quiet_time_us: u64,
+    /// Outgoing/client padding rule.
+    pub outgoing_padding_mode: CsBufloPaddingMode,
+    /// Incoming/client receive-credit approximation padding rule.
+    pub incoming_padding_mode: CsBufloPaddingMode,
+    /// Maximum eligible timing intervals retained per direction.
+    pub timing_sample_limit: usize,
+    /// Denominator used by the discrete randomized interval rule.
+    pub jitter_denominator: u64,
+    /// Inclusive largest numerator sampled by the randomized interval rule.
+    pub jitter_max_numerator: u64,
+    /// Client-local early-termination authority.
+    pub early_termination: CsBufloEarlyTermination,
+    /// Hard safety bound on the combined number of scheduled cells.
+    pub max_events: u64,
+    /// Explicit adaptation boundary; no cooperating peer is implemented.
+    pub implementation_scope: QcsdImplementationScope,
+    /// Must remain false for the client-only QUIC adaptation.
+    pub paper_equivalent: bool,
+}
+
+impl CsBufloParameters {
+    /// Parse and validate a complete JSON parameter receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed JSON or an invalid numeric invariant.
+    pub fn from_json(input: &str, max_udp_payload_size: u16) -> Result<Self> {
+        let parameters: Self = serde_json::from_str(input)?;
+        parameters.validate(max_udp_payload_size)?;
+        Ok(parameters)
+    }
+
+    /// Load and validate a complete JSON parameter receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or is not a valid receipt.
+    pub fn from_json_file<P: AsRef<Path>>(path: P, max_udp_payload_size: u16) -> Result<Self> {
+        Self::from_json(&fs::read_to_string(path)?, max_udp_payload_size)
+    }
+
+    fn validate(&self, max_udp_payload_size: u16) -> Result<()> {
+        if self.schema_version != 1 {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported CS-BuFLO parameter schema_version {}; expected 1",
+                self.schema_version
+            )));
+        }
+        validate_shaped_packet_size(self.packet_size, max_udp_payload_size, "CS-BuFLO")?;
+        if self.minimum_interval_us == 0
+            || self.initial_interval_us < self.minimum_interval_us
+            || self.initial_interval_us > self.maximum_interval_us
+            || self.initial_adaptation_boundary_bytes == 0
+            || self.quiet_time_us == 0
+            || self.max_events == 0
+            || self.timing_sample_limit == 0
+            || self.timing_sample_limit > 1_000
+            || self.jitter_denominator == 0
+            || self.jitter_max_numerator == 0
+            || self.jitter_max_numerator == u64::MAX
+        {
+            return Err(Error::InvalidConfig(
+                "CS-BuFLO intervals must be nonzero and ordered, and adaptation boundary, quiet time, and max_events must be positive"
+                    .into(),
+            ));
+        }
+        if self.incoming_padding_mode != CsBufloPaddingMode::Payload {
+            return Err(Error::InvalidConfig(
+                "client-only CS-BuFLO supports CTSP total/payload or CPSP payload/payload; incoming_padding_mode must be payload"
+                    .into(),
+            ));
+        }
+        if self.early_termination != CsBufloEarlyTermination::Local
+            || self.implementation_scope != QcsdImplementationScope::ClientOnlyQuic
+            || self.paper_equivalent
+        {
+            return Err(Error::InvalidConfig(
+                "CS-BuFLO receipts must declare local early termination, implementation_scope=client_only_quic, and paper_equivalent=false"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -483,8 +734,8 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        DefenseConfig, FrontConfig, QcsdConfig, TrafficMorphingConfig, WalkieTalkieConfig,
-        WtfPadConfig,
+        BufloParameters, CsBufloPaddingMode, CsBufloParameters, DefenseConfig, FrontConfig,
+        QcsdConfig, TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
     };
 
     #[test]
@@ -561,6 +812,36 @@ mod tests {
     }
 
     #[test]
+    fn candidate_defenses_require_the_1200_byte_transport_ceiling() {
+        for defense in [
+            DefenseConfig::Buflo(super::BufloConfig {
+                parameters: "buflo.json".into(),
+            }),
+            DefenseConfig::CsBuflo(super::CsBufloConfig {
+                parameters: "cs-buflo.json".into(),
+            }),
+        ] {
+            let oversized = QcsdConfig {
+                max_udp_payload_size: 1_450,
+                defense: defense.clone(),
+                ..QcsdConfig::default()
+            };
+            let error = oversized
+                .validate()
+                .expect_err("candidate transport ceiling above 1200 must fail");
+            assert!(error.to_string().contains("max_udp_payload_size=1200"));
+
+            QcsdConfig {
+                max_udp_payload_size: 1_200,
+                defense,
+                ..QcsdConfig::default()
+            }
+            .validate()
+            .expect("canonical candidate transport ceiling");
+        }
+    }
+
+    #[test]
     fn static_schedule_is_relative_to_its_configuration() {
         let directory =
             std::env::temp_dir().join(format!("neqo-csdef-config-{}", std::process::id()));
@@ -599,6 +880,8 @@ mod tests {
         ));
         fs::create_dir_all(&directory).expect("create temporary directory");
         let cases = [
+            ("buflo", "parameters", "buflo.json", ""),
+            ("cs_buflo", "parameters", "cs-buflo.json", ""),
             (
                 "traffic_morphing",
                 "matrix",
@@ -617,10 +900,15 @@ mod tests {
             let parameter_path = directory.join(filename);
             fs::write(&parameter_path, "{}").expect("write parameter fixture");
             let config_path = directory.join(format!("{kind}.toml"));
+            let candidate_ceiling = if matches!(kind, "buflo" | "cs_buflo") {
+                "max_udp_payload_size = 1200\n"
+            } else {
+                ""
+            };
             fs::write(
                 &config_path,
                 format!(
-                    "schema_version = 2\n[defense]\nkind = \"{kind}\"\n{field} = \"{filename}\"\n{extra}"
+                    "schema_version = 2\n{candidate_ceiling}[defense]\nkind = \"{kind}\"\n{field} = \"{filename}\"\n{extra}"
                 ),
             )
             .expect("write configuration");
@@ -655,5 +943,125 @@ mod tests {
             ..QcsdConfig::default()
         };
         assert!(unbounded_padding.validate().is_err());
+    }
+
+    #[test]
+    fn buflo_receipts_are_strict_versioned_and_accept_canonical_live_cells() {
+        let parameters = BufloParameters::from_json(
+            r#"{
+                "schema_version": 1,
+                "interval_us": 20000,
+                "minimum_duration_us": 10000000,
+                "packet_size": 1200,
+                "max_events": 6000,
+                "implementation_scope": "client_only_quic",
+                "paper_equivalent": false
+            }"#,
+            1_200,
+        )
+        .expect("canonical live BuFLO receipt");
+        assert_eq!(parameters.packet_size, 1_200);
+        assert!(
+            BufloParameters::from_json(
+                r#"{
+                    "schema_version": 1,
+                    "interval_us": 10,
+                    "minimum_duration_us": 30,
+                    "packet_size": 1200,
+                    "max_events": 3,
+                    "implementation_scope": "client_only_quic",
+                    "paper_equivalent": false
+                }"#,
+                1_200,
+            )
+            .is_err(),
+            "t=0 plus the inclusive t=tau tick require floor(tau/rho)+1 events"
+        );
+        assert!(
+            BufloParameters::from_json(
+                r#"{
+                "schema_version": 2,
+                "interval_us": 20000,
+                "minimum_duration_us": 10000000,
+                "packet_size": 1200,
+                "max_events": 6000,
+                "implementation_scope": "client_only_quic",
+                "paper_equivalent": false
+            }"#,
+                1_200,
+            )
+            .is_err()
+        );
+        assert!(
+            BufloParameters::from_json(
+                r#"{
+                "schema_version": 1,
+                "interval_us": 20000,
+                "minimum_duration_us": 10000000,
+                "packet_size": 1200,
+                "max_events": 6001,
+                "implementation_scope": "client_only_quic",
+                "paper_equivalent": false
+            }"#,
+                1_200,
+            )
+            .is_err()
+        );
+        assert!(
+            BufloParameters::from_json(
+                r#"{
+                "schema_version": 1,
+                "interval_us": 5000,
+                "minimum_duration_us": 10000000,
+                "packet_size": 1200,
+                "max_events": 10001,
+                "implementation_scope": "client_only_quic",
+                "paper_equivalent": false
+            }"#,
+                1_200,
+            )
+            .is_err(),
+            "the two-direction schedule may never exceed 20,000 cells"
+        );
+    }
+
+    #[test]
+    fn cs_buflo_receipts_bind_ctsp_or_cpsp_and_accept_600_byte_udp_targets() {
+        let parse = |outgoing_padding_mode| {
+            CsBufloParameters::from_json(
+                &format!(
+                    r#"{{
+                        "schema_version": 1,
+                        "packet_size": 600,
+                        "initial_interval_us": 8192,
+                        "minimum_interval_us": 4096,
+                        "maximum_interval_us": 32768,
+                        "initial_adaptation_boundary_bytes": 16384,
+                        "quiet_time_us": 2000000,
+                        "outgoing_padding_mode": "{outgoing_padding_mode}",
+                        "incoming_padding_mode": "payload",
+                        "timing_sample_limit": 1000,
+                        "jitter_denominator": 100,
+                        "jitter_max_numerator": 200,
+                        "early_termination": "local",
+                        "max_events": 1000000,
+                        "implementation_scope": "client_only_quic",
+                        "paper_equivalent": false
+                    }}"#
+                ),
+                1_200,
+            )
+        };
+        assert_eq!(
+            parse("total").expect("CTSP receipt").outgoing_padding_mode,
+            CsBufloPaddingMode::Total
+        );
+        assert_eq!(
+            parse("payload")
+                .expect("CPSP receipt")
+                .outgoing_padding_mode,
+            CsBufloPaddingMode::Payload
+        );
+        assert!(parse("oracle_only").is_err());
     }
 }

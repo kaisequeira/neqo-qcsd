@@ -11,9 +11,10 @@ use std::{
 
 use enum_map::EnumMap;
 use neqo_csdef::{
-    Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-    QcsdObservationClock, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId,
-    TimestampedQcsdObservation, TrafficMorphingEgress,
+    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdDatagramClass, QcsdEndpointId,
+    QcsdObservation, QcsdObservationClock, QcsdReceiveActionIdentity, QcsdRequestRole,
+    QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, TimestampedQcsdObservation,
+    TrafficMorphingEgress,
 };
 
 use super::{Connection, Error, Res, RetransmissionPriority, StreamId, TransmissionPriority};
@@ -157,10 +158,16 @@ pub(super) struct PacketTarget {
     pub endpoint: Option<QcsdEndpointId>,
     pub slot: QcsdSlotId,
     pub udp_payload_size: u16,
+    pub attempt_udp_payload_size: u16,
     pub packet: Packet,
     pub not_before: Option<Instant>,
     pub deadline: Instant,
     pub allow_stream_data: bool,
+    pub send_policy: QcsdSendPolicy,
+    pub defense_control_bytes: u16,
+    pub lateness_us: u64,
+    /// UDP bytes present immediately before QUIC PADDING is applied.
+    pub unpadded_udp_bytes: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,6 +247,48 @@ impl Connection {
         self.streams.qcsd_has_pending_send_data()
     }
 
+    /// Whether candidate-defense receive control or a local-ET cancellation
+    /// remains unencoded, in flight, or awaiting loss recovery.
+    #[must_use]
+    pub fn qcsd_has_pending_defense_control(&self) -> bool {
+        !self.qcsd_pending_receive_actions.is_empty()
+            || !self.qcsd_pending_receive_credit.is_empty()
+            || self
+                .qcsd_unacked_defense_receive_limits
+                .keys()
+                .any(|stream| {
+                    self.streams
+                        .qcsd_receive_limit_pending_or_in_flight(*stream)
+                })
+            || self.qcsd_unacked_local_et_resets.iter().any(|stream| {
+                self.streams
+                    .qcsd_local_et_reset_pending_or_in_flight(*stream)
+            })
+            || self
+                .qcsd_unacked_local_et_stop_sending
+                .iter()
+                .any(|stream| {
+                    self.streams
+                        .qcsd_local_et_stop_pending_or_in_flight(*stream)
+                })
+    }
+
+    /// Mark each transport cancellation control actually queued by a
+    /// successful CS-BuFLO local-ET request cancellation as defense-owned.
+    pub fn qcsd_mark_local_et_chaff_cancellation(&mut self, stream: StreamId) {
+        // STOP_SENDING supersedes receive-window advertisement for this
+        // abandoned response. The transport will not regenerate an unacked
+        // MAX_STREAM_DATA after the receive side enters AbortReading.
+        self.qcsd_unacked_defense_receive_limits.remove(&stream);
+        let (reset, stop_sending) = self.streams.qcsd_local_et_cancellation_controls(stream);
+        if reset {
+            self.qcsd_unacked_local_et_resets.insert(stream);
+        }
+        if stop_sending {
+            self.qcsd_unacked_local_et_stop_sending.insert(stream);
+        }
+    }
+
     /// Whether any STREAM other than the explicitly allowed streams remains pending.
     pub fn qcsd_has_pending_stream_send_excluding(&mut self, allowed: &[StreamId]) -> bool {
         self.streams.qcsd_has_pending_send_data_excluding(allowed)
@@ -248,6 +297,20 @@ impl Connection {
     /// Whether one exact stream retains unsent or retransmission STREAM data.
     pub fn qcsd_has_pending_stream_send_for(&mut self, stream_id: StreamId) -> bool {
         self.streams.qcsd_has_pending_send_data_for(stream_id)
+    }
+
+    /// Whether a registered application request's QUIC send half is terminal
+    /// and peer-confirmed.
+    ///
+    /// This becomes true only in transport `DataRecvd` (all STREAM bytes and
+    /// FIN acknowledged) or `ResetRecvd` (`RESET_STREAM` acknowledged). Merely
+    /// reaching `DataSent`, `ResetSent`, or `ResetSentReliable` is not enough.
+    #[must_use]
+    pub fn qcsd_application_send_stream_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        matches!(
+            self.qcsd_stream_roles.get(&stream_id),
+            Some(QcsdRequestRole::Application)
+        ) && self.streams.qcsd_send_stream_peer_confirmed(stream_id)
     }
 
     pub(super) fn qcsd_observe_stream_transmissions(&mut self, tokens: &recovery::Tokens) {
@@ -464,6 +527,7 @@ impl Connection {
             None,
             deadline,
             allow_stream_data,
+            QcsdSendPolicy::Exact,
         )
     }
 
@@ -490,6 +554,33 @@ impl Connection {
             Some(not_before),
             deadline,
             allow_stream_data,
+            QcsdSendPolicy::Exact,
+        )
+    }
+
+    /// Queue a scheduled target with an explicit realization policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as
+    /// [`Self::qcsd_queue_scheduled_packet_target_window`].
+    pub fn qcsd_queue_scheduled_packet_target_window_with_policy(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: Packet,
+        not_before: Instant,
+        deadline: Instant,
+        allow_stream_data: bool,
+        send_policy: QcsdSendPolicy,
+    ) -> Res<()> {
+        self.qcsd_validate_packet_target_window(Some(not_before), deadline)?;
+        self.qcsd_queue_scheduled_packet_target_inner(
+            slot,
+            packet,
+            Some(not_before),
+            deadline,
+            allow_stream_data,
+            send_policy,
         )
     }
 
@@ -515,6 +606,7 @@ impl Connection {
         not_before: Option<Instant>,
         deadline: Instant,
         allow_stream_data: bool,
+        send_policy: QcsdSendPolicy,
     ) -> Res<()> {
         let endpoint = self.qcsd_endpoint;
         let udp_payload_size = packet.length();
@@ -549,10 +641,15 @@ impl Connection {
             endpoint,
             slot,
             udp_payload_size,
+            attempt_udp_payload_size: udp_payload_size,
             packet,
             not_before,
             deadline,
             allow_stream_data,
+            send_policy,
+            defense_control_bytes: 0,
+            lateness_us: 0,
+            unpadded_udp_bytes: None,
         });
         Ok(())
     }
@@ -591,20 +688,43 @@ impl Connection {
             .front()
             .is_some_and(|target| now >= target.deadline)
         {
-            let target = self
+            let mut target = self
                 .qcsd_packet_targets
                 .pop_front()
                 .expect("front target inspected");
-            let reason = if paced {
-                MissedSlotReason::PacingLimited
+            target.lateness_us = target.not_before.map_or(0, |release| {
+                u64::try_from(now.saturating_duration_since(release).as_micros())
+                    .unwrap_or(u64::MAX)
+            });
+            let congestion_reason = if paced {
+                Some(QcsdCongestionReason::PacingLimited)
             } else if congestion_limit
                 .is_some_and(|limit| limit < usize::from(target.udp_payload_size))
             {
-                MissedSlotReason::CongestionLimited
+                Some(QcsdCongestionReason::CongestionLimited)
             } else {
-                MissedSlotReason::DeadlineExpired
+                None
             };
-            self.qcsd_target_missed(&target, reason);
+            if target.send_policy == QcsdSendPolicy::CongestionSensitive
+                && let Some(reason) = congestion_reason
+            {
+                self.qcsd_target_resolved(
+                    &target,
+                    QcsdSlotOutcome::Suppressed {
+                        composition: Self::qcsd_suppressed_composition(&target),
+                        reason,
+                    },
+                );
+            } else {
+                let reason = match congestion_reason {
+                    Some(QcsdCongestionReason::PacingLimited) => MissedSlotReason::PacingLimited,
+                    Some(QcsdCongestionReason::CongestionLimited) => {
+                        MissedSlotReason::CongestionLimited
+                    }
+                    None => MissedSlotReason::DeadlineExpired,
+                };
+                self.qcsd_target_missed(&target, reason);
+            }
         }
     }
 
@@ -616,6 +736,98 @@ impl Connection {
                 observed_size: target.udp_payload_size,
             });
         }
+    }
+
+    pub(super) fn qcsd_target_resolved(&mut self, target: &PacketTarget, outcome: QcsdSlotOutcome) {
+        if let Some(endpoint) = target.endpoint {
+            self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotResolved {
+                endpoint,
+                slot: target.slot,
+                packet: target.packet,
+                outcome,
+            });
+        }
+    }
+
+    pub(super) fn qcsd_suppress_congestion_sensitive_target(
+        &mut self,
+        target: &PacketTarget,
+        reason: QcsdCongestionReason,
+    ) {
+        let removed = self.qcsd_packet_targets.pop_front();
+        debug_assert!(removed.is_some_and(|queued| queued.slot == target.slot));
+        self.qcsd_target_resolved(
+            target,
+            QcsdSlotOutcome::Suppressed {
+                composition: Self::qcsd_suppressed_composition(target),
+                reason,
+            },
+        );
+    }
+
+    const fn qcsd_suppressed_composition(target: &PacketTarget) -> QcsdSlotComposition {
+        QcsdSlotComposition {
+            desired_udp_bytes: target.udp_payload_size,
+            observed_udp_bytes: 0,
+            application_stream_bytes: 0,
+            retransmission_stream_bytes: 0,
+            chaff_stream_bytes: 0,
+            defense_control_bytes: 0,
+            quic_padding_bytes: 0,
+            other_quic_bytes: 0,
+            lateness_us: target.lateness_us,
+        }
+    }
+
+    pub(super) fn qcsd_miss_congestion_sensitive_target(
+        &mut self,
+        target: &PacketTarget,
+        reason: MissedSlotReason,
+    ) {
+        let removed = self.qcsd_packet_targets.pop_front();
+        debug_assert!(removed.is_some_and(|queued| queued.slot == target.slot));
+        self.qcsd_target_missed(target, reason);
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transport reports every mutually exclusive wire-composition category"
+    )]
+    pub(super) fn qcsd_resolve_congestion_sensitive_target(
+        &mut self,
+        target: &PacketTarget,
+        observed_udp_bytes: u16,
+        application_stream_bytes: u16,
+        retransmission_stream_bytes: u16,
+        chaff_stream_bytes: u16,
+        quic_padding_bytes: u16,
+        reason: Option<QcsdCongestionReason>,
+    ) {
+        let removed = self.qcsd_packet_targets.pop_front();
+        debug_assert!(removed.is_some_and(|queued| queued.slot == target.slot));
+        let classified_bytes = application_stream_bytes
+            .saturating_add(retransmission_stream_bytes)
+            .saturating_add(chaff_stream_bytes)
+            .saturating_add(target.defense_control_bytes)
+            .saturating_add(quic_padding_bytes);
+        let composition = QcsdSlotComposition {
+            desired_udp_bytes: target.udp_payload_size,
+            observed_udp_bytes,
+            application_stream_bytes,
+            retransmission_stream_bytes,
+            chaff_stream_bytes,
+            defense_control_bytes: target.defense_control_bytes,
+            quic_padding_bytes,
+            other_quic_bytes: observed_udp_bytes.saturating_sub(classified_bytes),
+            lateness_us: target.lateness_us,
+        };
+        let outcome = reason.map_or(QcsdSlotOutcome::Full { composition }, |reason| {
+            QcsdSlotOutcome::Partial {
+                composition,
+                reason,
+            }
+        });
+        self.qcsd_target_resolved(target, outcome);
     }
 
     pub(super) fn qcsd_target_missed(&mut self, target: &PacketTarget, reason: MissedSlotReason) {
@@ -630,6 +842,16 @@ impl Connection {
     }
 
     pub(super) fn qcsd_receive_limit_advertised(&mut self, stream: StreamId, absolute_limit: u64) {
+        if self.qcsd_receive_limit_is_defense_control(stream, absolute_limit) {
+            self.qcsd_defense_receive_limit_high_water
+                .entry(stream)
+                .and_modify(|high_water| *high_water = (*high_water).max(absolute_limit))
+                .or_insert(absolute_limit);
+            self.qcsd_unacked_defense_receive_limits
+                .entry(stream)
+                .and_modify(|pending| *pending = (*pending).max(absolute_limit))
+                .or_insert(absolute_limit);
+        }
         self.qcsd_pending_receive_actions.retain(|pending| {
             pending.identity.stream().0 != stream.as_u64()
                 || pending.identity.absolute_limit() > absolute_limit
@@ -660,6 +882,67 @@ impl Connection {
                 slot: Some(slot),
             });
         }
+    }
+
+    pub(super) fn qcsd_receive_limit_is_defense_control(
+        &self,
+        stream: StreamId,
+        absolute_limit: u64,
+    ) -> bool {
+        self.qcsd_pending_receive_actions.iter().any(|pending| {
+            pending.identity.stream().0 == stream.as_u64()
+                && pending.identity.absolute_limit() <= absolute_limit
+        }) || self
+            .qcsd_pending_receive_credit
+            .iter()
+            .any(|credit| credit.stream == stream && credit.absolute_limit <= absolute_limit)
+            || self
+                .qcsd_defense_receive_limit_high_water
+                .get(&stream)
+                .is_some_and(|high_water| absolute_limit <= *high_water)
+    }
+
+    pub(super) fn qcsd_defense_receive_control_acked(
+        &mut self,
+        stream: StreamId,
+        absolute_limit: u64,
+    ) {
+        if self
+            .qcsd_unacked_defense_receive_limits
+            .get(&stream)
+            .is_some_and(|pending| absolute_limit >= *pending)
+        {
+            self.qcsd_unacked_defense_receive_limits.remove(&stream);
+        }
+    }
+
+    pub(super) fn qcsd_defense_receive_control_lost(
+        &mut self,
+        stream: StreamId,
+        absolute_limit: u64,
+    ) {
+        if self
+            .qcsd_unacked_defense_receive_limits
+            .get(&stream)
+            .is_some_and(|pending| absolute_limit >= *pending)
+            && !self.streams.qcsd_receive_limit_pending_or_in_flight(stream)
+        {
+            self.qcsd_unacked_defense_receive_limits.remove(&stream);
+        }
+    }
+
+    pub(super) fn qcsd_local_et_receive_state_changed(&mut self, stream: StreamId) {
+        // ACKing STOP_SENDING is not terminal when the peer's final size is
+        // still unknown: the receive side enters WaitForReset until the peer
+        // supplies RESET_STREAM. Retain the defense-control identity across
+        // that interval so the runner cannot finish with an open QUIC stream.
+        if !self.streams.qcsd_local_et_stop_pending_or_in_flight(stream) {
+            self.qcsd_unacked_local_et_stop_sending.remove(&stream);
+        }
+    }
+
+    pub(super) fn qcsd_local_et_reset_acked(&mut self, stream: StreamId) {
+        self.qcsd_unacked_local_et_resets.remove(&stream);
     }
 
     fn qcsd_stream_class(&self, stream: StreamId) -> QcsdDatagramClass {
@@ -757,6 +1040,7 @@ impl Connection {
             direction: Direction::Incoming,
             length,
             class,
+            composition: None,
         });
     }
 
@@ -778,12 +1062,20 @@ impl Connection {
             Token::Stream(StreamRecoveryToken::Stream(token)) => {
                 Some(self.qcsd_stream_class(token.stream_id()))
             }
+            Token::Stream(StreamRecoveryToken::MaxStreamData {
+                stream_id,
+                max_data,
+            }) if self.qcsd_receive_limit_is_defense_control(*stream_id, *max_data) => {
+                Some(QcsdDatagramClass::DefenseCover)
+            }
             Token::Stream(
-                StreamRecoveryToken::ResetStream { stream_id }
-                | StreamRecoveryToken::StopSending { stream_id }
-                | StreamRecoveryToken::MaxStreamData { stream_id, .. }
+                StreamRecoveryToken::ResetStream { stream_id, .. }
+                | StreamRecoveryToken::StopSending { stream_id, .. }
                 | StreamRecoveryToken::StreamDataBlocked { stream_id, .. },
             ) => Some(self.qcsd_stream_class(*stream_id)),
+            Token::Stream(StreamRecoveryToken::MaxStreamData { stream_id, .. }) => {
+                Some(self.qcsd_stream_class(*stream_id))
+            }
             Token::EcnEct0 => None,
             Token::Stream(
                 StreamRecoveryToken::MaxData(_)
@@ -825,6 +1117,7 @@ impl Connection {
         &mut self,
         length: usize,
         class: Option<QcsdDatagramClass>,
+        composition: QcsdSlotComposition,
     ) {
         let length = u16::try_from(length).unwrap_or(u16::MAX);
         let class = class.unwrap_or(QcsdDatagramClass::Natural);
@@ -833,6 +1126,7 @@ impl Connection {
             direction: Direction::Outgoing,
             length,
             class,
+            composition: Some(composition),
         });
     }
 }

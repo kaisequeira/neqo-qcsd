@@ -44,6 +44,23 @@ pub struct RecvStreams {
 }
 
 impl RecvStreams {
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_stop_sending_pending_or_in_flight(&self, stream_id: StreamId) -> bool {
+        self.streams.get(&stream_id).is_some_and(|stream| {
+            matches!(
+                stream.state,
+                RecvStreamState::AbortReading { .. } | RecvStreamState::WaitForReset { .. }
+            )
+        })
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_receive_limit_pending_or_in_flight(&self, stream_id: StreamId) -> bool {
+        self.streams
+            .get(&stream_id)
+            .is_some_and(|stream| matches!(stream.state, RecvStreamState::Recv { .. }))
+    }
+
     pub fn write_frames<B: Buffer>(
         &mut self,
         builder: &mut packet::Builder<B>,
@@ -1420,18 +1437,22 @@ impl RecvStream {
             // Maybe send STOP_SENDING
             RecvStreamState::AbortReading {
                 frame_needed, err, ..
-            } if *frame_needed
-                && builder.write_varint_frame(&[
+            } if *frame_needed => {
+                let frame_start = builder.len();
+                if builder.write_varint_frame(&[
                     FrameType::StopSending.into(),
                     self.stream_id.as_u64(),
                     *err,
-                ]) =>
-            {
-                tokens.push(recovery::Token::Stream(StreamRecoveryToken::StopSending {
-                    stream_id: self.stream_id,
-                }));
-                stats.stop_sending += 1;
-                *frame_needed = false;
+                ]) {
+                    let encoded_bytes = u16::try_from(builder.len().saturating_sub(frame_start))
+                        .unwrap_or(u16::MAX);
+                    tokens.push(recovery::Token::Stream(StreamRecoveryToken::StopSending {
+                        stream_id: self.stream_id,
+                        encoded_bytes,
+                    }));
+                    stats.stop_sending += 1;
+                    *frame_needed = false;
+                }
             }
             _ => {}
         }

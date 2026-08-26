@@ -8,7 +8,10 @@ use std::{fmt::Debug, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use super::Capacity;
-use crate::{Direction, MissedSlotReason, Packet, QcsdDatagramClass, TrafficMorphingOutcome};
+use crate::{
+    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdDatagramClass, QcsdSendPolicy,
+    QcsdSlotComposition, QcsdSlotId, TrafficMorphingOutcome,
+};
 
 /// Whether a defense adds cover traffic or regulates the whole application.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,6 +34,18 @@ pub enum EventOutcome {
     Satisfied { observed: u16 },
     /// The adapter could not realise the event.
     Missed(MissedSlotReason),
+    /// Complete congestion-sensitive target with byte-level composition.
+    FullySatisfied { composition: QcsdSlotComposition },
+    /// Smaller target legally selected from congestion-controller capacity.
+    PartiallySatisfied {
+        composition: QcsdSlotComposition,
+        reason: QcsdCongestionReason,
+    },
+    /// No defense-owned datagram was legal at the one-shot attempt boundary.
+    Suppressed {
+        composition: QcsdSlotComposition,
+        reason: QcsdCongestionReason,
+    },
 }
 
 /// What a defense may learn about the connection it is shaping.
@@ -73,6 +88,20 @@ pub enum SignalKind {
     /// bytes. The terminal outcome arrives only after consumption or an
     /// explicit impossibility/retirement failure.
     ReceiveCreditRequested { packet: Packet },
+    /// A candidate defense's incoming event received its controller slot.
+    ///
+    /// This slot-bearing signal is opt-in and does not replace the established
+    /// [`Self::ReceiveCreditRequested`] observation delivered to legacy
+    /// defenses. It lets a client-only defense keep local advertisement and
+    /// eventual peer-consumption outcomes causally distinct.
+    IncomingCreditScheduled { slot: QcsdSlotId, packet: Packet },
+    /// Every receive-limit action belonging to one incoming event was encoded
+    /// on the local wire.
+    ///
+    /// This is the local opportunity realization boundary. It deliberately
+    /// does not imply that the peer produced or the client consumed any of the
+    /// scheduled response bytes.
+    IncomingCreditAdvertised { slot: QcsdSlotId, packet: Packet },
     /// Exact consumed raw STREAM offsets attributed to defense-owned work.
     ///
     /// This includes overlap with previously advertised scheduled ranges and
@@ -90,8 +119,17 @@ pub enum SignalKind {
     ReceiveCreditRetired { bytes: u64 },
     /// Releasable receive capacity aggregated across all endpoints.
     Capacity(Capacity),
+    /// Whether any client STREAM frame remains pending across all endpoints.
+    EgressBacklog { pending: bool },
     /// A previously emitted event reached a terminal outcome.
     Resolved {
+        packet: Packet,
+        outcome: EventOutcome,
+    },
+    /// Terminal incoming-credit result for a defense that opted into the split
+    /// local-advertisement/peer-consumption lifecycle.
+    IncomingCreditResolved {
+        slot: QcsdSlotId,
         packet: Packet,
         outcome: EventOutcome,
     },
@@ -157,11 +195,48 @@ pub struct WalkieTalkieBurstDiagnostics {
     pub observed_incoming_cells: u64,
 }
 
+/// One versioned `CS-BuFLO` rate-estimator decision.
+///
+/// The live client-only adaptation deliberately advances its byte boundary on
+/// real-bearing traffic, while the pinned bilateral author prototype advances
+/// on every transmitted real-or-junk write.  Keeping every decision in the
+/// terminal artifact makes that translation auditable instead of inferring it
+/// from only the final interval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CsBufloRateTransitionDiagnostics {
+    /// Transition-record schema, versioned independently of run/config schemas.
+    pub schema_version: u32,
+    /// `outgoing` or `incoming` at the client observation boundary.
+    pub direction: &'static str,
+    /// Defense-relative time at which the byte boundary was processed.
+    pub at_us: u64,
+    /// Doubling boundary which triggered this decision.
+    pub boundary_bytes: u64,
+    /// Live real-bearing byte counter at the decision.
+    pub real_bearing_bytes: u64,
+    /// Eligible direction-specific timing samples before the window was cleared.
+    pub eligible_samples: u64,
+    /// Upper median, or null when the current rate had to be retained.
+    pub median_interval_us: Option<u64>,
+    /// Interval in force before the decision.
+    pub previous_interval_us: u64,
+    /// Floored, clamped interval selected by the decision.
+    pub resulting_interval_us: u64,
+    /// Whether no eligible sample existed and the prior interval was retained.
+    pub retained_current_interval: bool,
+}
+
 /// Defense-specific counters recorded with the terminal run artifact.
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the terminal artifact intentionally flattens independent fidelity predicates"
+)]
 pub struct DefenseDiagnostics {
     /// Incoming schedule bytes handed to the shared receive-credit adapter.
     pub scheduled_incoming_requested_bytes: u64,
+    /// Scheduled receive-credit offsets confirmed encoded on the local wire.
+    pub scheduled_incoming_advertised_bytes: u64,
     /// Scheduled receive-credit offsets actually consumed as response bytes.
     pub scheduled_incoming_consumed_bytes: u64,
     /// Scheduled offsets made impossible by an adapter failure or retirement.
@@ -286,6 +361,190 @@ pub struct DefenseDiagnostics {
     pub walkie_talkie_application_batch_active: bool,
     /// Cover-traffic wire observations suppressed to avoid self-feedback.
     pub suppressed_cover_feedback: u64,
+    /// Whether `BuFLO` claims wire-equivalence to the original cooperating TCP design.
+    pub buflo_paper_equivalent: bool,
+    /// Whether `BuFLO` used only the client-side QCSD approximation.
+    pub buflo_client_only: bool,
+    /// `BuFLO` client-egress cells emitted into the controller.
+    pub buflo_scheduled_outgoing_cells: u64,
+    /// `BuFLO` incoming receive-credit cells emitted into the controller.
+    pub buflo_scheduled_incoming_cells: u64,
+    /// Exact-size `BuFLO` client-egress cells realized by transport.
+    pub buflo_full_outgoing_cells: u64,
+    /// Congestion-limited partial `BuFLO` client-egress cells (always an error).
+    pub buflo_partial_outgoing_cells: u64,
+    /// Suppressed `BuFLO` client-egress cells (always an error).
+    pub buflo_suppressed_outgoing_cells: u64,
+    /// Non-congestion `BuFLO` client-egress realization failures.
+    pub buflo_missed_outgoing_cells: u64,
+    /// Incoming `BuFLO` receive-credit cells that terminalized unsuccessfully.
+    pub buflo_missed_incoming_cells: u64,
+    /// Outgoing cells emitted at least one full rho interval after their target time.
+    pub buflo_catch_up_outgoing_cells: u64,
+    /// Incoming cells emitted at least one full rho interval after their target time.
+    pub buflo_catch_up_incoming_cells: u64,
+    /// Emitted outgoing cells that have not terminalized.
+    pub buflo_outgoing_unresolved_cells: u64,
+    /// Emitted incoming cells that have not terminalized.
+    pub buflo_incoming_unresolved_cells: u64,
+    /// Latest aggregate client STREAM backlog state.
+    pub buflo_egress_backlog_pending: bool,
+    /// Whether the application-complete signal was observed.
+    pub buflo_application_complete: bool,
+    /// Whether the configured minimum duration was reached.
+    pub buflo_minimum_duration_reached: bool,
+    /// Whether the QCSD-only `BuFLO` event guard stopped the schedule.
+    pub buflo_event_guard_triggered: bool,
+    /// Whether `CS-BuFLO` claims wire-equivalence to the cooperating TCP design.
+    pub cs_buflo_paper_equivalent: bool,
+    /// Whether `CS-BuFLO` used only the client-side QCSD approximation.
+    pub cs_buflo_client_only: bool,
+    /// True for the CPSP payload-padding ablation.
+    pub cs_buflo_payload_padding: bool,
+    /// True for the CTSP total-padding variant.
+    pub cs_buflo_total_padding: bool,
+    /// `CS-BuFLO` client-egress cells emitted into the controller.
+    pub cs_buflo_scheduled_outgoing_cells: u64,
+    /// `CS-BuFLO` incoming receive-credit cells emitted into the controller.
+    pub cs_buflo_scheduled_incoming_cells: u64,
+    /// Full-size congestion-sensitive egress attempts.
+    pub cs_buflo_full_outgoing_cells: u64,
+    /// Smaller congestion-limited egress attempts that crossed the wire.
+    pub cs_buflo_partial_outgoing_cells: u64,
+    /// Congestion-sensitive attempts that emitted no defense-owned datagram.
+    pub cs_buflo_suppressed_outgoing_cells: u64,
+    /// Outgoing cells that failed for a non-congestion adapter reason.
+    pub cs_buflo_missed_outgoing_cells: u64,
+    /// Incoming receive-credit attempts that terminalized unsuccessfully.
+    pub cs_buflo_missed_incoming_cells: u64,
+    /// Sum of desired UDP bytes over terminal `CS-BuFLO` egress attempts.
+    pub cs_buflo_desired_udp_bytes: u64,
+    /// Sum of realized UDP bytes over terminal `CS-BuFLO` egress attempts.
+    pub cs_buflo_realized_udp_bytes: u64,
+    /// Application STREAM bytes carried by realized `CS-BuFLO` datagrams.
+    pub cs_buflo_application_stream_bytes: u64,
+    /// Retransmitted application or reviewed-chaff STREAM bytes in realized attempts.
+    pub cs_buflo_retransmission_stream_bytes: u64,
+    /// Fresh reviewed-chaff STREAM bytes carried by realized `CS-BuFLO` datagrams.
+    pub cs_buflo_chaff_stream_bytes: u64,
+    /// Defense-owned scheduled PING and `MAX_STREAM_DATA` bytes.
+    pub cs_buflo_defense_control_bytes: u64,
+    /// QUIC PADDING bytes carried by realized `CS-BuFLO` datagrams.
+    pub cs_buflo_quic_padding_bytes: u64,
+    /// Remaining headers, authentication, ACK, and other QUIC bytes.
+    pub cs_buflo_other_quic_bytes: u64,
+    /// Sum of release-to-attempt delay over realized egress attempts.
+    pub cs_buflo_lateness_us_total: u64,
+    /// Largest release-to-attempt delay.
+    pub cs_buflo_lateness_us_max: u64,
+    /// Unique natural request STREAM bytes observed by the controller.
+    pub cs_buflo_natural_outgoing_bytes: u64,
+    /// Raw response request-stream offsets consumed by HTTP/3.
+    pub cs_buflo_natural_incoming_bytes: u64,
+    /// Reviewed-chaff STREAM bytes transmitted in the outgoing direction.
+    pub cs_buflo_cover_outgoing_bytes: u64,
+    /// Reviewed-chaff response STREAM bytes consumed by the client.
+    pub cs_buflo_cover_incoming_bytes: u64,
+    /// Incoming scheduled-credit bytes terminally observed by the client-only adapter.
+    pub cs_buflo_realized_incoming_credit_bytes: u64,
+    /// Frozen outgoing natural-byte input to the padding-target calculation.
+    pub cs_buflo_outgoing_padding_basis_natural_bytes: u64,
+    /// Frozen incoming natural-byte input to the padding-target calculation.
+    pub cs_buflo_incoming_padding_basis_natural_bytes: u64,
+    /// Frozen outgoing cover-byte input to the padding-target calculation.
+    pub cs_buflo_outgoing_padding_basis_cover_bytes: u64,
+    /// Frozen incoming cover-byte input to the padding-target calculation.
+    pub cs_buflo_incoming_padding_basis_cover_bytes: u64,
+    /// Frozen outgoing realized-UDP input to CTSP's total-padding calculation.
+    pub cs_buflo_outgoing_padding_basis_total_bytes: u64,
+    /// Frozen incoming realized-credit approximation (payload mode is mandatory).
+    pub cs_buflo_incoming_padding_basis_total_bytes: u64,
+    /// Live early-termination mapping identifier.
+    pub cs_buflo_early_termination_semantics: &'static str,
+    /// Source-study socket write size retained only as comparison metadata.
+    pub cs_buflo_reference_tcp_write_size_bytes: u64,
+    /// Source-study nominal IPv4/TCP packet size retained only as metadata.
+    pub cs_buflo_reference_nominal_tcp_packet_size_bytes: u64,
+    /// Configured live QUIC UDP-payload target.
+    pub cs_buflo_runtime_udp_packet_size_bytes: u64,
+    /// Client-egress observed UDP bytes used by the crossing predicate.
+    pub cs_buflo_outgoing_termination_accounted_bytes: u64,
+    /// Client-ingress realized-credit bytes used by the crossing approximation.
+    pub cs_buflo_incoming_termination_accounted_bytes: u64,
+    /// Actual observed UDP increment of the latest realized egress opportunity.
+    pub cs_buflo_outgoing_last_termination_increment_bytes: u64,
+    /// Actual realized-credit increment of the latest ingress opportunity.
+    pub cs_buflo_incoming_last_termination_increment_bytes: u64,
+    /// Whether the latest realized egress increment crossed a power-of-two boundary.
+    pub cs_buflo_outgoing_power_of_two_crossed: bool,
+    /// Whether the latest ingress-credit increment crossed a power-of-two boundary.
+    pub cs_buflo_incoming_power_of_two_crossed: bool,
+    /// Fresh outgoing application STREAM bytes used by the adaptive boundary.
+    pub cs_buflo_real_bearing_outgoing_bytes: u64,
+    /// Client-only incoming real-bearing byte approximation.
+    pub cs_buflo_real_bearing_incoming_bytes: u64,
+    /// Frozen outgoing CPSP/CTSP completion target.
+    pub cs_buflo_outgoing_padding_target_bytes: u64,
+    /// Frozen client-only incoming completion target.
+    pub cs_buflo_incoming_padding_target_bytes: u64,
+    /// Current client-egress adaptive interval.
+    pub cs_buflo_outgoing_interval_us: u64,
+    /// Current client-ingress approximation interval.
+    pub cs_buflo_incoming_interval_us: u64,
+    /// Completed outgoing power-of-two rate adaptations.
+    pub cs_buflo_outgoing_rate_adaptations: u64,
+    /// Completed incoming approximation rate adaptations.
+    pub cs_buflo_incoming_rate_adaptations: u64,
+    /// Version of the live-vs-author rate-boundary translation contract.
+    pub cs_buflo_rate_boundary_translation_version: u32,
+    /// Live counter used to trigger rate decisions.
+    pub cs_buflo_rate_boundary_counter_semantics: &'static str,
+    /// Counter used by the pinned bilateral author implementation.
+    pub cs_buflo_author_rate_boundary_counter_semantics: &'static str,
+    /// Every rate-estimator decision in causal order.
+    pub cs_buflo_rate_transitions: Vec<CsBufloRateTransitionDiagnostics>,
+    /// Outgoing opportunities armed after the adaptive interval reached its configured minimum.
+    pub cs_buflo_outgoing_minimum_interval_opportunities: u64,
+    /// Incoming opportunities armed after the adaptive interval reached its configured minimum.
+    pub cs_buflo_incoming_minimum_interval_opportunities: u64,
+    /// Incoming minimum-interval opportunities fully advertised on the local wire.
+    pub cs_buflo_incoming_minimum_interval_local_realized: u64,
+    /// Terminal outgoing opportunities that were armed at the configured minimum interval.
+    pub cs_buflo_outgoing_minimum_interval_terminal: u64,
+    /// Terminal incoming opportunities that were armed at the configured minimum interval.
+    pub cs_buflo_incoming_minimum_interval_terminal: u64,
+    /// Full outgoing datagrams among opportunities armed at the configured minimum interval.
+    pub cs_buflo_outgoing_minimum_interval_full: u64,
+    /// Fully consumed incoming credits armed at the configured minimum interval.
+    pub cs_buflo_incoming_minimum_interval_full: u64,
+    /// Incoming opportunities fully advertised on the local wire.
+    pub cs_buflo_incoming_local_realized_cells: u64,
+    /// Next outgoing real-bearing byte boundary.
+    pub cs_buflo_next_outgoing_adaptation_boundary_bytes: u64,
+    /// Next incoming approximation byte boundary.
+    pub cs_buflo_next_incoming_adaptation_boundary_bytes: u64,
+    /// Eligible outgoing IAT samples retained after the latest separator/adaptation.
+    pub cs_buflo_outgoing_estimator_samples: u64,
+    /// Eligible incoming IAT samples retained after the latest separator/adaptation.
+    pub cs_buflo_incoming_estimator_samples: u64,
+    /// Emitted outgoing cells that have not terminalized.
+    pub cs_buflo_outgoing_unresolved_cells: u64,
+    /// Emitted incoming cells that have not terminalized.
+    pub cs_buflo_incoming_unresolved_cells: u64,
+    /// Latest aggregate client STREAM backlog state.
+    pub cs_buflo_egress_backlog_pending: bool,
+    /// Whether the application-complete signal was observed.
+    pub cs_buflo_application_complete: bool,
+    /// Whether the required quiet period was reached.
+    pub cs_buflo_quiet_time_reached: bool,
+    /// Whether CS-BuFLO irreversibly entered its client-local termination state.
+    pub cs_buflo_local_termination_latched: bool,
+    /// Queued chaff requests discarded at the local termination boundary.
+    pub cs_buflo_local_et_pending_request_cancellations: u64,
+    /// Open chaff request streams explicitly canceled at the local termination boundary.
+    pub cs_buflo_local_et_stream_cancellations: u64,
+    /// Whether the QCSD-only `CS-BuFLO` event guard stopped the schedule.
+    pub cs_buflo_event_guard_triggered: bool,
 }
 
 /// Stateful generator for a QCSD packet schedule.
@@ -347,6 +606,15 @@ pub trait Defense: Debug {
     /// emitted.
     fn pending_receiver_continuation(&self) -> Option<ReceiverContinuationDisposition> {
         None
+    }
+    /// Whether a causally tagged receiver-continuation event must remain
+    /// queued until its pristine peer-acknowledged stream precondition exists.
+    ///
+    /// This is an explicit exception to the generic drop-unsatisfied switch,
+    /// used only by the established Walkie-Talkie continuation protocol. It
+    /// does not weaken exact-window BuFLO/CS-BuFLO incoming opportunities.
+    fn retain_causal_incoming_until_ready(&self) -> bool {
+        false
     }
     /// Whether the controller must provision one initial chaff-request batch
     /// to its configured stream limit before due outgoing targets are
@@ -418,6 +686,65 @@ pub trait Defense: Debug {
     }
     /// How application traffic participates in the schedule.
     fn mode(&self) -> DefenseMode;
+    /// Transport realization policy for outgoing schedule events.
+    fn outgoing_send_policy(&self) -> QcsdSendPolicy {
+        QcsdSendPolicy::Exact
+    }
+    /// Whether each incoming credit opportunity must be allocated as one exact
+    /// action inside its single controller window without fragmentation or retry.
+    ///
+    /// Legacy and burst-molding defenses retain their established retry
+    /// semantics. Constant-rate `BuFLO` variants override this because carrying
+    /// a residual allocation into a later cadence would falsely report one
+    /// exact cell. Peer consumption can occur after the window and remains
+    /// separately accounted because a client-only adapter has no authority
+    /// over server packet timing.
+    fn incoming_slot_must_resolve_in_window(&self) -> bool {
+        false
+    }
+    /// Whether incoming events use slot-bearing local-advertisement and
+    /// eventual-consumption signals.
+    ///
+    /// This remains disabled by default so established defenses retain their
+    /// exact observation stream and terminal behavior.
+    fn split_incoming_credit_lifecycle(&self) -> bool {
+        false
+    }
+    /// Whether terminal completion must wait for candidate-defense chaff
+    /// requests to leave both the controller queue and chaff manager.
+    ///
+    /// This is scoped to the new constant-rate client-only adaptations so the
+    /// established seven runtime identities retain their prior lifecycle.
+    fn requires_terminal_chaff_drain(&self) -> bool {
+        false
+    }
+    /// Whether locally complete candidate semantics explicitly cancel any
+    /// remaining reviewed-chaff request streams instead of continuing to
+    /// allocate receive credit until their peer responses finish.
+    ///
+    /// CS-BuFLO uses this for its client-side early-termination adaptation.
+    /// `BuFLO` deliberately retains the default and drains data through its
+    /// post-tau cadence.
+    fn cancel_open_chaff_on_completion(&self) -> bool {
+        false
+    }
+    /// Whether outgoing reviewed-chaff STREAM payload is counted once per
+    /// unique stream offset instead of once per wire transmission.
+    ///
+    /// CS-BuFLO's payload-padding counter models bytes handed to the socket;
+    /// retransmission of an already-counted offset must therefore not advance
+    /// its CPSP target. Other defenses retain their historical wire-observation
+    /// semantics.
+    fn deduplicate_chaff_payload_offsets(&self) -> bool {
+        false
+    }
+    /// Whether unique application/chaff offset provenance survives response
+    /// completion until endpoint teardown. CS-BuFLO needs this because a
+    /// request retransmission can occur after its response stream finishes and
+    /// must not re-enter either payload-padding basis.
+    fn retain_stream_offset_provenance_after_close(&self) -> bool {
+        false
+    }
     /// Defense-specific counters for reproducibility and failure auditing.
     fn diagnostics(&self) -> DefenseDiagnostics {
         DefenseDiagnostics::default()

@@ -548,6 +548,18 @@ impl StreamRegistry {
             .count()
     }
 
+    pub fn open_chaff_streams(&self) -> Vec<(QcsdEndpointId, QcsdStreamId)> {
+        let mut streams: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|((endpoint, stream), state)| {
+                matches!(state.role, QcsdRequestRole::Chaff { .. }).then_some((*endpoint, *stream))
+            })
+            .collect();
+        streams.sort_unstable();
+        streams
+    }
+
     pub fn header_progress(
         &mut self,
         endpoint: QcsdEndpointId,

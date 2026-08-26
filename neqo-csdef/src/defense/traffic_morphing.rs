@@ -709,6 +709,10 @@ impl Defense for TrafficMorphing {
             | SignalKind::PayloadBytes { .. }
             | SignalKind::ApplicationBatchStarted
             | SignalKind::ApplicationBatchCompleted
+            | SignalKind::EgressBacklog { .. }
+            | SignalKind::IncomingCreditScheduled { .. }
+            | SignalKind::IncomingCreditAdvertised { .. }
+            | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::Capacity(_) => {}
         }
     }

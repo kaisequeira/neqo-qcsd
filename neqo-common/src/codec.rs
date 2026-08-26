@@ -326,7 +326,7 @@ impl<B: Buffer> Encoder<B> {
     ///
     /// When `v` is longer than 2^n.
     pub fn encode_vec(&mut self, n: usize, v: &[u8]) -> &mut Self {
-        self.encode_uint(n, to_u64(v.as_ref().len())).encode(v)
+        self.encode_uint(n, to_u64(v.len())).encode(v)
     }
 
     /// Encode a vector in TLS style using a closure for the contents.
@@ -357,7 +357,7 @@ impl<B: Buffer> Encoder<B> {
     ///
     /// When `v` is longer than 2^62.
     pub fn encode_vvec(&mut self, v: &[u8]) -> &mut Self {
-        self.encode_len(v.as_ref().len()).encode(v)
+        self.encode_len(v.len()).encode(v)
     }
 
     /// Encode a vector with a varint length using a closure.

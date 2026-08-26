@@ -1504,6 +1504,15 @@ impl WalkieTalkie {
                 *to_emit = to_emit.saturating_add(1);
                 self.retried_outgoing_events = self.retried_outgoing_events.saturating_add(1);
             }
+            EventOutcome::FullySatisfied { .. }
+            | EventOutcome::PartiallySatisfied { .. }
+            | EventOutcome::Suppressed { .. } => {
+                // Only congestion-sensitive defenses request typed transport
+                // outcomes. Preserve strict retry behavior if one is routed
+                // here by a future adapter.
+                *to_emit = to_emit.saturating_add(1);
+                self.retried_outgoing_events = self.retried_outgoing_events.saturating_add(1);
+            }
         }
         self.normalize_turn();
     }
@@ -1602,8 +1611,12 @@ impl Defense for WalkieTalkie {
                 ..
             }
             | SignalKind::Capacity(_)
+            | SignalKind::EgressBacklog { .. }
             | SignalKind::TrafficMorphingEgress { .. }
             | SignalKind::ReceiveCreditRequested { .. }
+            | SignalKind::IncomingCreditScheduled { .. }
+            | SignalKind::IncomingCreditAdvertised { .. }
+            | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::Resolved { .. } => {}
         }
         if let SignalKind::Capacity(capacity) = signal.kind {
@@ -1721,6 +1734,10 @@ impl Defense for WalkieTalkie {
             cell_bytes: u64::from(self.packet_size),
             parser_ceiling_bytes: self.receiver_parser_allowance_ceiling_bytes,
         })
+    }
+
+    fn retain_causal_incoming_until_ready(&self) -> bool {
+        true
     }
 
     fn preprovision_chaff_once_to_stream_limit(&self) -> bool {

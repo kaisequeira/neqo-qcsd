@@ -890,7 +890,10 @@ impl WtfPad {
                 let unrequested = u64::from(packet.length().saturating_sub(observed));
                 self.abandon_incoming_bytes(unrequested);
             }
-            EventOutcome::Missed(_) => {
+            EventOutcome::Missed(_)
+            | EventOutcome::FullySatisfied { .. }
+            | EventOutcome::PartiallySatisfied { .. }
+            | EventOutcome::Suppressed { .. } => {
                 self.abandon_incoming_bytes(u64::from(packet.length()));
             }
         }
@@ -1154,8 +1157,12 @@ impl Defense for WtfPad {
                 ..
             }
             | SignalKind::Capacity(_)
+            | SignalKind::EgressBacklog { .. }
             | SignalKind::ApplicationBatchStarted
             | SignalKind::ApplicationBatchCompleted
+            | SignalKind::IncomingCreditScheduled { .. }
+            | SignalKind::IncomingCreditAdvertised { .. }
+            | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::TrafficMorphingEgress { .. } => {}
         }
     }

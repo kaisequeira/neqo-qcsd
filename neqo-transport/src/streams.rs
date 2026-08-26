@@ -95,6 +95,11 @@ pub struct Streams {
 
 impl Streams {
     #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_send_stream_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        self.send.qcsd_peer_confirmed(stream_id)
+    }
+
+    #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_has_pending_send_data(&mut self) -> bool {
         self.send.qcsd_has_pending_data()
     }
@@ -107,6 +112,41 @@ impl Streams {
     #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_has_pending_send_data_for(&mut self, stream_id: StreamId) -> bool {
         self.send.qcsd_has_pending_data_for(stream_id)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_local_et_cancellation_controls(&self, stream_id: StreamId) -> (bool, bool) {
+        (
+            self.send.qcsd_reset_pending_or_in_flight(stream_id),
+            self.recv.qcsd_stop_sending_pending_or_in_flight(stream_id),
+        )
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_local_et_reset_pending_or_in_flight(&self, stream_id: StreamId) -> bool {
+        self.send.qcsd_reset_pending_or_in_flight(stream_id)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_write_local_et_reset_frames<B: Buffer>(
+        &mut self,
+        stream_ids: &[StreamId],
+        builder: &mut packet::Builder<B>,
+        tokens: &mut recovery::Tokens,
+        stats: &mut FrameStats,
+    ) {
+        self.send
+            .qcsd_write_local_et_reset_frames(stream_ids, builder, tokens, stats);
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_local_et_stop_pending_or_in_flight(&self, stream_id: StreamId) -> bool {
+        self.recv.qcsd_stop_sending_pending_or_in_flight(stream_id)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_receive_limit_pending_or_in_flight(&self, stream_id: StreamId) -> bool {
+        self.recv.qcsd_receive_limit_pending_or_in_flight(stream_id)
     }
 
     pub fn new(
@@ -369,7 +409,7 @@ impl Streams {
     pub fn lost(&mut self, token: &StreamRecoveryToken) {
         match token {
             StreamRecoveryToken::Stream(st) => self.send.lost(st),
-            StreamRecoveryToken::ResetStream { stream_id } => self.send.reset_lost(*stream_id),
+            StreamRecoveryToken::ResetStream { stream_id, .. } => self.send.reset_lost(*stream_id),
             StreamRecoveryToken::StreamDataBlocked { stream_id, limit } => {
                 self.send.blocked_lost(*stream_id, *limit);
             }
@@ -381,7 +421,7 @@ impl Streams {
                     rs.max_stream_data_lost(*max_data);
                 }
             }
-            StreamRecoveryToken::StopSending { stream_id } => {
+            StreamRecoveryToken::StopSending { stream_id, .. } => {
                 if let Ok((_, Some(rs))) = self.obtain_stream(*stream_id) {
                     rs.stop_sending_lost();
                 }
@@ -407,8 +447,8 @@ impl Streams {
     pub fn acked(&mut self, token: &StreamRecoveryToken) {
         match token {
             StreamRecoveryToken::Stream(st) => self.send.acked(st),
-            StreamRecoveryToken::ResetStream { stream_id } => self.send.reset_acked(*stream_id),
-            StreamRecoveryToken::StopSending { stream_id } => {
+            StreamRecoveryToken::ResetStream { stream_id, .. } => self.send.reset_acked(*stream_id),
+            StreamRecoveryToken::StopSending { stream_id, .. } => {
                 self.recv.stop_sending_acked(*stream_id);
             }
             // We only worry when these are lost

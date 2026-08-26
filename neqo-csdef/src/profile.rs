@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DefenseConfig, FrontConfig, QcsdConfig, Result, TamarawConfig, TrafficMorphingConfig,
-    WalkieTalkieConfig, WtfPadConfig,
+    BufloConfig, CsBufloConfig, DefenseConfig, FrontConfig, QcsdConfig, Result, TamarawConfig,
+    TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
 };
 
 /// A complete family of QCSD controller and defense parameters.
@@ -69,6 +69,16 @@ pub enum DefenseKind {
         /// Workload identity bound to exactly one symmetric pair profile.
         workload_id: String,
     },
+    /// Use the profile controller with an explicit `BuFLO` parameter receipt.
+    Buflo {
+        /// Versioned immutable `BuFLO` parameter JSON.
+        parameters: String,
+    },
+    /// Use the profile controller with an explicit `CS-BuFLO` parameter receipt.
+    CsBuflo {
+        /// Versioned immutable `CS-BuFLO` parameter JSON, including CTSP/CPSP mode.
+        parameters: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +91,8 @@ struct ProfileDefinition {
     traffic_morphing: TrafficMorphingConfig,
     wtf_pad: WtfPadConfig,
     walkie_talkie: WalkieTalkieConfig,
+    buflo: BufloConfig,
+    cs_buflo: CsBufloConfig,
 }
 
 impl ProfileDefinition {
@@ -157,8 +169,26 @@ impl QcsdProfile {
                 config.workload_id = workload_id;
                 DefenseConfig::WalkieTalkie(config)
             }
+            DefenseKind::Buflo { parameters } => {
+                let mut config = profile.buflo;
+                config.parameters = parameters;
+                DefenseConfig::Buflo(config)
+            }
+            DefenseKind::CsBuflo { parameters } => {
+                let mut config = profile.cs_buflo;
+                config.parameters = parameters;
+                DefenseConfig::CsBuflo(config)
+            }
         };
         let controller = profile.controller;
+        let max_udp_payload_size = if matches!(
+            &defense,
+            DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
+        ) {
+            1_200
+        } else {
+            controller.max_udp_payload_size
+        };
         let config = QcsdConfig {
             schema_version: 2,
             control_interval_us: controller.control_interval_us,
@@ -168,7 +198,7 @@ impl QcsdProfile {
             low_watermark: controller.low_watermark,
             use_empty_resources: controller.use_empty_resources,
             max_stream_data_excess: controller.max_stream_data_excess,
-            max_udp_payload_size: controller.max_udp_payload_size,
+            max_udp_payload_size,
             drop_unsatisfied_events: controller.drop_unsatisfied_events,
             keep_alive_lead_time_us: controller.keep_alive_lead_time_us,
             tail_wait_us: controller.tail_wait_us,
@@ -185,8 +215,8 @@ mod tests {
 
     use super::{DefenseKind, ProfileDefinition, QcsdProfile, StaticMode};
     use crate::{
-        DefenseConfig, FrontConfig, TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig,
-        WtfPadConfig,
+        BufloConfig, CsBufloConfig, DefenseConfig, FrontConfig, TamarawConfig,
+        TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
     };
 
     fn assert_research_1200_snapshot(defense: DefenseKind, expected_defense: &Value) {
@@ -229,6 +259,30 @@ mod tests {
         assert_eq!(
             tamaraw.defense,
             DefenseConfig::Tamaraw(TamarawConfig::default())
+        );
+        let buflo = QcsdProfile::Published
+            .resolve(DefenseKind::Buflo {
+                parameters: "buflo.json".into(),
+            })
+            .expect("published BuFLO");
+        assert_eq!(buflo.max_udp_payload_size, 1_200);
+        assert_eq!(
+            buflo.defense,
+            DefenseConfig::Buflo(BufloConfig {
+                parameters: "buflo.json".into(),
+            })
+        );
+        let cs_buflo = QcsdProfile::Published
+            .resolve(DefenseKind::CsBuflo {
+                parameters: "cs-buflo.json".into(),
+            })
+            .expect("published CS-BuFLO");
+        assert_eq!(cs_buflo.max_udp_payload_size, 1_200);
+        assert_eq!(
+            cs_buflo.defense,
+            DefenseConfig::CsBuflo(CsBufloConfig {
+                parameters: "cs-buflo.json".into(),
+            })
         );
         let static_config = QcsdProfile::Published
             .resolve(DefenseKind::Static {
@@ -286,6 +340,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one profile contract test enumerates every defense family"
+    )]
     fn live_profile_resolves_every_defense() {
         let baseline = QcsdProfile::Live
             .resolve(DefenseKind::None)
@@ -316,6 +374,28 @@ mod tests {
                 outgoing_interval_us: 30_000,
                 packet_size: 1_200,
                 modulo: 20,
+            })
+        );
+        assert_eq!(
+            QcsdProfile::Live
+                .resolve(DefenseKind::Buflo {
+                    parameters: "live-buflo.json".into(),
+                })
+                .expect("live BuFLO")
+                .defense,
+            DefenseConfig::Buflo(BufloConfig {
+                parameters: "live-buflo.json".into(),
+            })
+        );
+        assert_eq!(
+            QcsdProfile::Live
+                .resolve(DefenseKind::CsBuflo {
+                    parameters: "live-cs-buflo.json".into(),
+                })
+                .expect("live CS-BuFLO")
+                .defense,
+            DefenseConfig::CsBuflo(CsBufloConfig {
+                parameters: "live-cs-buflo.json".into(),
             })
         );
         let static_config = QcsdProfile::Live
@@ -408,6 +488,24 @@ mod tests {
                 "outgoing_interval_us": 20_000,
                 "packet_size": 1_200,
                 "modulo": 100,
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::Buflo {
+                parameters: "research-buflo.json".into(),
+            },
+            &json!({
+                "kind": "buflo",
+                "parameters": "research-buflo.json",
+            }),
+        );
+        assert_research_1200_snapshot(
+            DefenseKind::CsBuflo {
+                parameters: "research-cs-buflo.json".into(),
+            },
+            &json!({
+                "kind": "cs_buflo",
+                "parameters": "research-cs-buflo.json",
             }),
         );
         assert_research_1200_snapshot(

@@ -11,11 +11,12 @@ mod observation;
 
 pub use action::{
     QcsdAction, QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
-    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome,
+    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdSendPolicy,
 };
 pub use ids::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
 pub use observation::{
-    MissedSlotReason, QcsdDatagramClass, QcsdObservation, QcsdObservationClock, QcsdStreamFinish,
+    MissedSlotReason, QcsdCongestionReason, QcsdDatagramClass, QcsdObservation,
+    QcsdObservationClock, QcsdSlotComposition, QcsdSlotOutcome, QcsdStreamFinish,
     QcsdStreamTransmission, TimestampedQcsdObservation, TrafficMorphingBypassReason,
     TrafficMorphingOutcome,
 };

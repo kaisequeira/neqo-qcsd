@@ -668,7 +668,7 @@ mod tests {
             let buf = self
                 .encoder
                 .encode_header_block(&mut self.conn, headers, stream_id);
-            assert_eq!(buf.as_ref(), expected_encoding);
+            assert_eq!(&buf[..], expected_encoding);
             self.send_instructions(inst);
         }
 
@@ -925,7 +925,7 @@ mod tests {
             let buf = encoder
                 .encoder
                 .encode_header_block(&mut encoder.conn, &t.headers, STREAM_1);
-            assert_eq!(buf.as_ref(), t.header_block);
+            assert_eq!(&buf[..], t.header_block);
             encoder.send_instructions(t.encoder_inst);
         }
     }
@@ -999,7 +999,7 @@ mod tests {
             let buf = encoder
                 .encoder
                 .encode_header_block(&mut encoder.conn, &t.headers, STREAM_1);
-            assert_eq!(buf.as_ref(), t.header_block);
+            assert_eq!(&buf[..], t.header_block);
             encoder.send_instructions(t.encoder_inst);
         }
     }
@@ -1071,7 +1071,7 @@ mod tests {
             &[Header::new("content-length", "1234")],
             STREAM_1,
         );
-        assert_eq!(buf.as_ref(), ENCODE_INDEXED_REF_DYNAMIC);
+        assert_eq!(&buf[..], ENCODE_INDEXED_REF_DYNAMIC);
         encoder.send_instructions(&[]);
 
         // insert "content-length: 12345 which will fail because the entry in the table cannot be

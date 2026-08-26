@@ -14,7 +14,8 @@
 use std::{collections::HashMap, fs::File, io::Write as _, path::Path, time::Instant};
 
 use neqo_csdef::{
-    Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId, TimestampedQcsdObservation,
+    Direction, Packet, QcsdCongestionReason, QcsdEndpointId, QcsdObservation, QcsdSendPolicy,
+    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamId, TimestampedQcsdObservation,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -27,6 +28,8 @@ pub(super) struct PendingSlot {
     pub(super) packet: Packet,
     /// First adapter action issued for this logical scheduled slot.
     pub(super) action_time_us: u64,
+    /// Latest on-wire `MAX_STREAM_DATA` encoding time for this logical slot.
+    pub(super) credit_advertised_at_us: Option<u64>,
 }
 
 pub(super) struct PacketTraceRow<'a> {
@@ -37,6 +40,7 @@ pub(super) struct PacketTraceRow<'a> {
     pub(super) scheduled: Option<u16>,
     pub(super) satisfaction: &'a str,
     pub(super) slot: Option<QcsdSlotId>,
+    pub(super) qcsd: QcsdTraceColumns,
 }
 
 pub(super) struct ScheduleTraceRow<'a> {
@@ -48,6 +52,197 @@ pub(super) struct ScheduleTraceRow<'a> {
     pub(super) observed: Option<usize>,
     pub(super) miss_reason: &'a str,
     pub(super) slot: QcsdSlotId,
+    pub(super) qcsd: QcsdTraceColumns,
+}
+
+/// Versioned nullable extension shared by packets/events/schedule traces.
+///
+/// The historical columns remain an exact prefix; absent metadata serializes
+/// as empty fields so old prefix readers continue to work.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct QcsdTraceColumns {
+    schema_version: Option<u8>,
+    send_policy: Option<&'static str>,
+    desired_udp_bytes: Option<u16>,
+    observed_udp_bytes: Option<u16>,
+    application_stream_bytes: Option<u16>,
+    retransmission_stream_bytes: Option<u16>,
+    chaff_stream_bytes: Option<u16>,
+    defense_control_bytes: Option<u16>,
+    quic_padding_bytes: Option<u16>,
+    other_quic_bytes: Option<u16>,
+    lateness_us: Option<u64>,
+    congestion_reason: Option<&'static str>,
+    credit_advertised_at_us: Option<u64>,
+    credit_advertisement_delay_us: Option<u64>,
+    /// Terminal reconciliation time for a fully consumed incoming credit.
+    ///
+    /// This is deliberately later and semantically distinct from the local
+    /// `MAX_STREAM_DATA` advertisement boundary. It does not claim a server
+    /// packet timestamp or server-side padding-complete signal.
+    credit_consumed_at_us: Option<u64>,
+    credit_consumption_delay_us: Option<u64>,
+}
+
+impl QcsdTraceColumns {
+    pub(super) const fn exact(desired_udp_bytes: u16, observed_udp_bytes: Option<u16>) -> Self {
+        Self {
+            schema_version: Some(1),
+            send_policy: Some("exact"),
+            desired_udp_bytes: Some(desired_udp_bytes),
+            observed_udp_bytes,
+            application_stream_bytes: None,
+            retransmission_stream_bytes: None,
+            chaff_stream_bytes: None,
+            defense_control_bytes: None,
+            quic_padding_bytes: None,
+            other_quic_bytes: None,
+            lateness_us: None,
+            congestion_reason: None,
+            credit_advertised_at_us: None,
+            credit_advertisement_delay_us: None,
+            credit_consumed_at_us: None,
+            credit_consumption_delay_us: None,
+        }
+    }
+
+    pub(super) const fn from_outcome(_packet: Packet, outcome: QcsdSlotOutcome) -> Self {
+        match outcome {
+            QcsdSlotOutcome::Full { composition } => Self::composition(composition, None),
+            QcsdSlotOutcome::Partial {
+                composition,
+                reason,
+            }
+            | QcsdSlotOutcome::Suppressed {
+                composition,
+                reason,
+            } => Self::composition(composition, Some(reason)),
+        }
+    }
+
+    /// Attach the transport's packet-builder composition to a raw packet row.
+    ///
+    /// Scheduled rows retain their exact/congestion-sensitive policy and
+    /// reason. Unscheduled maintenance and local-ET control packets are
+    /// labelled explicitly instead of receiving an empty composition suffix.
+    pub(super) fn with_built_composition(mut self, composition: QcsdSlotComposition) -> Self {
+        self.schema_version = Some(2);
+        self.send_policy = Some(self.send_policy.unwrap_or("unscheduled"));
+        self.desired_udp_bytes = Some(composition.desired_udp_bytes);
+        self.observed_udp_bytes = Some(composition.observed_udp_bytes);
+        self.application_stream_bytes = Some(composition.application_stream_bytes);
+        self.retransmission_stream_bytes = Some(composition.retransmission_stream_bytes);
+        self.chaff_stream_bytes = Some(composition.chaff_stream_bytes);
+        self.defense_control_bytes = Some(composition.defense_control_bytes);
+        self.quic_padding_bytes = Some(composition.quic_padding_bytes);
+        self.other_quic_bytes = Some(composition.other_quic_bytes);
+        self.lateness_us = Some(composition.lateness_us);
+        self
+    }
+
+    const fn composition(
+        composition: QcsdSlotComposition,
+        reason: Option<QcsdCongestionReason>,
+    ) -> Self {
+        Self {
+            schema_version: Some(1),
+            send_policy: Some("congestion_sensitive"),
+            desired_udp_bytes: Some(composition.desired_udp_bytes),
+            observed_udp_bytes: Some(composition.observed_udp_bytes),
+            application_stream_bytes: Some(composition.application_stream_bytes),
+            retransmission_stream_bytes: Some(composition.retransmission_stream_bytes),
+            chaff_stream_bytes: Some(composition.chaff_stream_bytes),
+            defense_control_bytes: Some(composition.defense_control_bytes),
+            quic_padding_bytes: Some(composition.quic_padding_bytes),
+            other_quic_bytes: Some(composition.other_quic_bytes),
+            lateness_us: Some(composition.lateness_us),
+            congestion_reason: match reason {
+                Some(reason) => Some(congestion_reason(reason)),
+                None => None,
+            },
+            credit_advertised_at_us: None,
+            credit_advertisement_delay_us: None,
+            credit_consumed_at_us: None,
+            credit_consumption_delay_us: None,
+        }
+    }
+
+    fn from_observation(
+        observation: &QcsdObservation,
+        terminal_slots: &HashMap<QcsdSlotId, Packet>,
+    ) -> Self {
+        match observation {
+            QcsdObservation::SlotResolved {
+                packet, outcome, ..
+            } => Self::from_outcome(*packet, *outcome),
+            QcsdObservation::SlotSatisfied {
+                slot,
+                observed_size,
+                ..
+            } => terminal_slots
+                .get(slot)
+                .map_or_else(Self::default, |packet| {
+                    Self::exact(packet.length(), Some(*observed_size))
+                }),
+            _ => Self::default(),
+        }
+    }
+
+    fn from_serialized_event(details: &Value) -> Self {
+        if details.get("type").and_then(Value::as_str) != Some("send_packet") {
+            return Self::default();
+        }
+        let policy = match details.get("send_policy").and_then(Value::as_str) {
+            Some("congestion_sensitive") => QcsdSendPolicy::CongestionSensitive,
+            _ => QcsdSendPolicy::Exact,
+        };
+        let desired = details
+            .get("packet")
+            .and_then(|packet| packet.get("length"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok());
+        Self {
+            schema_version: Some(1),
+            send_policy: Some(match policy {
+                QcsdSendPolicy::Exact => "exact",
+                QcsdSendPolicy::CongestionSensitive => "congestion_sensitive",
+            }),
+            desired_udp_bytes: desired,
+            ..Self::default()
+        }
+    }
+
+    fn csv_suffix(self) -> String {
+        fn number<T: ToString>(value: Option<T>) -> String {
+            value.map_or_else(String::new, |value| value.to_string())
+        }
+        [
+            number(self.schema_version),
+            self.send_policy.unwrap_or_default().into(),
+            number(self.desired_udp_bytes),
+            number(self.observed_udp_bytes),
+            number(self.application_stream_bytes),
+            number(self.retransmission_stream_bytes),
+            number(self.chaff_stream_bytes),
+            number(self.defense_control_bytes),
+            number(self.quic_padding_bytes),
+            number(self.other_quic_bytes),
+            number(self.lateness_us),
+            self.congestion_reason.unwrap_or_default().into(),
+            number(self.credit_advertised_at_us),
+            number(self.credit_advertisement_delay_us),
+            number(self.credit_consumed_at_us),
+            number(self.credit_consumption_delay_us),
+        ]
+        .join(",")
+    }
+}
+
+const fn congestion_reason(reason: QcsdCongestionReason) -> &'static str {
+    match reason {
+        QcsdCongestionReason::PacingLimited => "pacing_limited",
+        QcsdCongestionReason::CongestionLimited => "congestion_limited",
+    }
 }
 
 struct EventTraceRow {
@@ -58,6 +253,7 @@ struct EventTraceRow {
     event: String,
     outcome: String,
     details: String,
+    qcsd: QcsdTraceColumns,
 }
 
 pub(super) struct TraceFiles {
@@ -78,14 +274,17 @@ impl TraceFiles {
         let mut packets = File::create(output_dir.join("packets.csv"))?;
         writeln!(
             packets,
-            "direction,monotonic_us,connection,observed_udp_length,scheduled_target,satisfaction,slot_id"
+            "direction,monotonic_us,connection,observed_udp_length,scheduled_target,satisfaction,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
         )?;
         let mut events = File::create(output_dir.join("events.csv"))?;
-        writeln!(events, "monotonic_us,connection,event,outcome,details")?;
+        writeln!(
+            events,
+            "monotonic_us,connection,event,outcome,details,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
+        )?;
         let mut schedule = File::create(output_dir.join("schedule.csv"))?;
         writeln!(
             schedule,
-            "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id"
+            "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
         )?;
         Ok(Self {
             packets,
@@ -117,7 +316,7 @@ impl TraceFiles {
     pub(super) fn packet(&mut self, row: &PacketTraceRow<'_>) -> Result<(), Error> {
         writeln!(
             self.packets,
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             row.direction,
             self.elapsed_us(row.now),
             row.endpoint.0,
@@ -127,6 +326,7 @@ impl TraceFiles {
             row.satisfaction,
             row.slot
                 .map_or_else(String::new, |value| value.0.to_string()),
+            row.qcsd.csv_suffix(),
         )?;
         Ok(())
     }
@@ -163,6 +363,7 @@ impl TraceFiles {
                 endpoint,
                 packet,
                 action_time_us,
+                credit_advertised_at_us: None,
             },
         );
         Ok(())
@@ -226,6 +427,7 @@ impl TraceFiles {
                     endpoint,
                     packet,
                     action_time_us,
+                    credit_advertised_at_us: None,
                 },
             );
         }
@@ -278,7 +480,9 @@ impl TraceFiles {
         outcome: &str,
         details: &impl Serialize,
     ) -> Result<(), Error> {
-        let details = serde_json::to_string(details)?.replace('"', "\"\"");
+        let details_value = serde_json::to_value(details)?;
+        let qcsd = QcsdTraceColumns::from_serialized_event(&details_value);
+        let details = serde_json::to_string(&details_value)?.replace('"', "\"\"");
         self.push_event(EventTraceRow {
             monotonic_ns: self.elapsed_ns(now),
             production_sequence: None,
@@ -287,6 +491,7 @@ impl TraceFiles {
             event: event.into(),
             outcome: outcome.into(),
             details,
+            qcsd,
         })
     }
 
@@ -295,6 +500,29 @@ impl TraceFiles {
         endpoint: Option<QcsdEndpointId>,
         record: &TimestampedQcsdObservation,
     ) -> Result<(), Error> {
+        let mut qcsd =
+            QcsdTraceColumns::from_observation(record.observation(), &self.terminal_slots);
+        if let QcsdObservation::ReceiveLimitAdvertised {
+            slot: Some(slot), ..
+        } = record.observation()
+        {
+            let advertised_at_us = record.produced_monotonic_ns() / 1_000;
+            let pending = self.pending_slots.get_mut(slot).ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "receive-credit advertisement targeted unknown slot {}",
+                    slot.0
+                ))
+            })?;
+            pending.credit_advertised_at_us = Some(
+                pending
+                    .credit_advertised_at_us
+                    .map_or(advertised_at_us, |previous| previous.max(advertised_at_us)),
+            );
+            qcsd.schema_version = Some(2);
+            qcsd.credit_advertised_at_us = Some(advertised_at_us);
+            qcsd.credit_advertisement_delay_us =
+                Some(advertised_at_us.saturating_sub(pending.action_time_us));
+        }
         let mut details = serde_json::to_value(record.observation())?;
         let Value::Object(fields) = &mut details else {
             return Err(Error::SlotInvariant(
@@ -315,6 +543,7 @@ impl TraceFiles {
             event: "observation".into(),
             outcome: "recorded".into(),
             details,
+            qcsd,
         })
     }
 
@@ -344,12 +573,13 @@ impl TraceFiles {
         for row in self.event_rows.drain(..) {
             writeln!(
                 self.events,
-                "{},{},{},{},\"{}\"",
+                "{},{},{},{},\"{}\",{}",
                 row.monotonic_ns / 1_000,
                 row.connection,
                 row.event,
                 row.outcome,
                 row.details,
+                row.qcsd.csv_suffix(),
             )?;
         }
         self.events.flush()?;
@@ -358,6 +588,7 @@ impl TraceFiles {
     }
 
     pub(super) fn schedule(&mut self, row: &ScheduleTraceRow<'_>) -> Result<(), Error> {
+        let terminal_time_us = row.action_time_us;
         let mut action_time_us = row.action_time_us;
         let endpoint = row.endpoint;
         let packet = row.packet;
@@ -370,6 +601,7 @@ impl TraceFiles {
             };
             return Err(Error::SlotInvariant(format!("slot {} {detail}", slot.0)));
         }
+        let mut qcsd = row.qcsd;
         if let Some(pending) = self.pending_slots.get(&slot) {
             if pending.packet != packet {
                 return Err(Error::SlotInvariant(format!(
@@ -378,13 +610,25 @@ impl TraceFiles {
                 )));
             }
             action_time_us = pending.action_time_us;
+            if packet.direction() == Direction::Incoming {
+                qcsd.schema_version = Some(2);
+                qcsd.credit_advertised_at_us = pending.credit_advertised_at_us;
+                qcsd.credit_advertisement_delay_us = pending
+                    .credit_advertised_at_us
+                    .map(|advertised| advertised.saturating_sub(pending.action_time_us));
+                if row.satisfaction == "satisfied" || row.satisfaction == "full" {
+                    qcsd.credit_consumed_at_us = Some(terminal_time_us);
+                    qcsd.credit_consumption_delay_us =
+                        Some(terminal_time_us.saturating_sub(pending.action_time_us));
+                }
+            }
         }
         self.pending_slots.remove(&slot);
         self.incoming_target_limits.remove(&slot);
         self.terminal_slots.insert(slot, packet);
         writeln!(
             self.schedule,
-            "{},{},{},{},{action_time_us},{},{},{},{}",
+            "{},{},{},{},{action_time_us},{},{},{},{},{}",
             packet.timestamp_us(),
             match packet.direction() {
                 Direction::Outgoing => "outgoing",
@@ -397,6 +641,7 @@ impl TraceFiles {
                 .map_or_else(String::new, |value| value.to_string()),
             row.miss_reason,
             slot.0,
+            qcsd.csv_suffix(),
         )?;
         Ok(())
     }

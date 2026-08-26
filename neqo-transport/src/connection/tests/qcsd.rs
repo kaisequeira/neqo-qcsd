@@ -13,10 +13,10 @@ use std::{
 };
 
 use neqo_csdef::{
-    Direction, MissedSlotReason, Packet, QcsdDatagramClass, QcsdEndpointId, QcsdObservation,
-    QcsdObservationClock, QcsdReceiveActionIdentity, QcsdReceiveLimitFatal,
-    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSlotId, QcsdStreamId, TrafficMorphingConfig,
-    TrafficMorphingEgress, TrafficMorphingOutcome,
+    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdDatagramClass, QcsdEndpointId,
+    QcsdObservation, QcsdObservationClock, QcsdReceiveActionIdentity, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotId, QcsdSlotOutcome,
+    QcsdStreamId, TrafficMorphingConfig, TrafficMorphingEgress, TrafficMorphingOutcome,
 };
 use test_fixture::{DEFAULT_ADDR, DEFAULT_ADDR_V4, fixture_init, now};
 
@@ -26,8 +26,8 @@ use super::{
 };
 use crate::{
     Connection, ConnectionParameters, Error, StreamType,
-    connection::params::INITIAL_LOCAL_MAX_STREAM_DATA, sender::PACING_BURST_SIZE,
-    tracking::PacketNumberSpace,
+    connection::params::INITIAL_LOCAL_MAX_STREAM_DATA, frame::Frame, recovery::StreamRecoveryToken,
+    sender::PACING_BURST_SIZE, tracking::PacketNumberSpace,
 };
 
 fn qcsd_client_for(remote: SocketAddr) -> Connection {
@@ -59,6 +59,25 @@ fn queue_target(
         queued_at,
         queued_at + Duration::from_secs(1),
         allow_stream_data,
+    )
+}
+
+fn queue_congestion_sensitive_target(
+    connection: &mut Connection,
+    slot: u64,
+    size: u16,
+    allow_stream_data: bool,
+    queued_at: Instant,
+) -> Result<(), Error> {
+    let packet =
+        Packet::new(Duration::ZERO, Direction::Outgoing, size).map_err(|_| Error::InvalidInput)?;
+    connection.qcsd_queue_scheduled_packet_target_window_with_policy(
+        QcsdSlotId(slot),
+        packet,
+        queued_at,
+        queued_at + Duration::from_secs(1),
+        allow_stream_data,
+        QcsdSendPolicy::CongestionSensitive,
     )
 }
 
@@ -503,6 +522,499 @@ fn attributed_target_reports_exact_satisfaction() {
 }
 
 #[test]
+fn congestion_sensitive_full_target_reports_complete_composition() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+    let queued_at = now();
+    queue_congestion_sensitive_target(&mut client, 111, 300, false, queued_at).unwrap();
+
+    let attempted_at = queued_at + Duration::from_micros(123);
+    assert_eq!(
+        client.process_output(attempted_at).dgram().unwrap().len(),
+        300
+    );
+    let observations = drain_observations(&mut client);
+    let composition = observations
+        .iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(111),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(*composition),
+            _ => None,
+        })
+        .expect("typed full outcome");
+    assert_eq!(composition.desired_udp_bytes, 300);
+    assert_eq!(composition.observed_udp_bytes, 300);
+    assert_eq!(composition.application_stream_bytes, 0);
+    assert_eq!(composition.retransmission_stream_bytes, 0);
+    assert_eq!(composition.chaff_stream_bytes, 0);
+    assert_eq!(composition.defense_control_bytes, 1);
+    assert!(composition.quic_padding_bytes > 0);
+    assert_eq!(composition.lateness_us, 123);
+    assert_eq!(
+        composition
+            .application_stream_bytes
+            .saturating_add(composition.retransmission_stream_bytes)
+            .saturating_add(composition.chaff_stream_bytes)
+            .saturating_add(composition.defense_control_bytes)
+            .saturating_add(composition.quic_padding_bytes)
+            .saturating_add(composition.other_quic_bytes),
+        composition.observed_udp_bytes
+    );
+}
+
+#[test]
+fn real_bearing_target_does_not_add_a_redundant_defense_ping() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(stream, &[0xA5; 100]).unwrap();
+    client
+        .qcsd_register_stream_role(stream, QcsdRequestRole::Application)
+        .unwrap();
+    let queued_at = now();
+    queue_congestion_sensitive_target(&mut client, 119, 300, true, queued_at).unwrap();
+
+    let dropped = client.process_output(queued_at).dgram().unwrap();
+    assert_eq!(dropped.len(), 300);
+    let composition = drain_observations(&mut client)
+        .into_iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(119),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(composition),
+            _ => None,
+        })
+        .expect("real-bearing target has typed composition");
+    assert!(composition.application_stream_bytes > 0);
+    assert_eq!(composition.defense_control_bytes, 0);
+    assert!(composition.quic_padding_bytes > 0);
+}
+
+#[test]
+fn scheduled_receive_credit_is_counted_as_defense_control() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    let limit = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap() + 100;
+    client
+        .qcsd_set_stream_receive_limit_for_slot(stream, limit, QcsdSlotId(199))
+        .unwrap();
+    let queued_at = now();
+    queue_congestion_sensitive_target(&mut client, 120, 300, false, queued_at).unwrap();
+
+    assert_eq!(client.process_output(queued_at).dgram().unwrap().len(), 300);
+    let composition = drain_observations(&mut client)
+        .into_iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(120),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(composition),
+            _ => None,
+        })
+        .expect("credit-bearing target has typed composition");
+    assert!(composition.defense_control_bytes > 1);
+    assert!(composition.quic_padding_bytes > 0);
+    assert!(client.qcsd_has_pending_defense_control());
+
+    let recovery_at = queued_at + AT_LEAST_PTO;
+    queue_congestion_sensitive_target(&mut client, 121, 300, false, recovery_at).unwrap();
+    let retransmission = client
+        .process_output(recovery_at)
+        .dgram()
+        .expect("lost receive control is retransmitted in the next target");
+    assert_eq!(retransmission.len(), 300);
+    let retransmitted_composition = drain_observations(&mut client)
+        .into_iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(121),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(composition),
+            _ => None,
+        })
+        .expect("retransmitted credit has typed composition");
+    assert!(retransmitted_composition.defense_control_bytes > 1);
+    server.process_input(retransmission, recovery_at);
+    let ack_at = recovery_at + DEFAULT_RTT;
+    let acknowledgment = server
+        .process_output(ack_at)
+        .dgram()
+        .expect("peer acknowledges retransmitted receive control");
+    client.process_input(acknowledgment, ack_at);
+    assert!(!client.qcsd_has_pending_defense_control());
+}
+
+#[test]
+fn terminal_receive_stream_drops_unrecoverable_receive_control_backlog() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(stream, b"request").unwrap();
+    client.stream_close_send(stream).unwrap();
+    let started_at = now();
+    let request = client
+        .process_output(started_at)
+        .dgram()
+        .expect("request datagram");
+    server.process_input(request, started_at);
+
+    let limit = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap() + 100;
+    client
+        .qcsd_set_stream_receive_limit_for_slot(stream, limit, QcsdSlotId(198))
+        .unwrap();
+    let control_at = started_at + DEFAULT_RTT;
+    let lost_control = client
+        .process_output(control_at)
+        .dgram()
+        .expect("MAX_STREAM_DATA datagram");
+    assert!(client.qcsd_has_pending_defense_control());
+    drop(lost_control);
+
+    server.stream_send(stream, b"response").unwrap();
+    server.stream_close_send(stream).unwrap();
+    let response_at = control_at + DEFAULT_RTT;
+    let response = server
+        .process_output(response_at)
+        .dgram()
+        .expect("terminal response datagram");
+    client.process_input(response, response_at);
+    assert!(
+        !client.qcsd_has_pending_defense_control(),
+        "a known final size makes the lost receive window irrelevant"
+    );
+
+    // Drive loss declaration as well: the stale provenance entry is removed,
+    // rather than surviving forever after Recv -> DataRecvd/SizeKnown.
+    drop(client.process_output(control_at + AT_LEAST_PTO));
+    assert!(
+        client.qcsd_unacked_defense_receive_limits.is_empty(),
+        "unrecoverable receive control is terminalized on loss"
+    );
+}
+
+#[test]
+fn congestion_sensitive_target_uses_and_reports_partial_cwnd_capacity() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+    // Consume an exact non-MTU-sized target first so filling with full-size
+    // packets leaves a deterministic usable partial window.
+    let send_time = now();
+    queue_congestion_sensitive_target(&mut client, 112, 300, false, send_time).unwrap();
+    assert_eq!(client.process_output(send_time).dgram().unwrap().len(), 300);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    fill_stream(&mut client, stream);
+    let mut send_time = send_time;
+    while cwnd_avail(&client) > client.plpmtu() {
+        match client.process_output(send_time) {
+            crate::Output::Datagram(datagram) => assert_eq!(datagram.len(), client.plpmtu()),
+            crate::Output::Callback(delay) => send_time += delay,
+            crate::Output::None => panic!("stream data should fill the remaining window"),
+        }
+    }
+    let partial = u16::try_from(cwnd_avail(&client)).unwrap();
+    assert!((64..1_200).contains(&partial));
+    queue_congestion_sensitive_target(&mut client, 113, 1_200, false, send_time).unwrap();
+
+    assert_eq!(
+        client.process_output(send_time).dgram().unwrap().len(),
+        usize::from(partial)
+    );
+    assert!(drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(113),
+                outcome: QcsdSlotOutcome::Partial {
+                    composition,
+                    reason: QcsdCongestionReason::CongestionLimited,
+                },
+                ..
+            } if composition.desired_udp_bytes == 1_200
+                && composition.observed_udp_bytes == partial
+        )
+    }));
+}
+
+#[test]
+fn local_et_waits_for_split_stop_ack_and_lost_reset_recovery() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(stream, b"request").unwrap();
+    let established_at = now();
+    let request = client
+        .process_output(established_at)
+        .dgram()
+        .expect("request datagram");
+    server.process_input(request, established_at);
+    client.qcsd_enable_send_shaping(true);
+
+    // Emit RESET_STREAM first and deliberately lose that datagram. Send
+    // shaping remains enabled with no slot: the exact local-ET identity must
+    // use the maintenance path rather than releasing arbitrary stream bytes.
+    client.stream_reset_send(stream, 0).unwrap();
+    client.qcsd_mark_local_et_chaff_cancellation(stream);
+    assert!(client.qcsd_unacked_local_et_resets.contains(&stream));
+    let reset_frames_before = client.stats().frame_tx.reset_stream;
+    let reset_at = established_at + DEFAULT_RTT;
+    let lost_reset = client
+        .process_output(reset_at)
+        .dgram()
+        .expect("local-ET reset datagram");
+    assert_eq!(
+        client.stats().frame_tx.reset_stream,
+        reset_frames_before + 1,
+        "the first cancellation datagram contains exactly the queued reset"
+    );
+    assert!(client.qcsd_unacked_local_et_resets.contains(&stream));
+    assert!(client.qcsd_has_pending_defense_control());
+    drop(lost_reset);
+
+    // Queue STOP_SENDING only after RESET_STREAM is in flight, forcing the two
+    // cancellation controls into separate packets. The STOP acknowledgment
+    // must not erase the independently lost reset obligation.
+    client.stream_stop_sending(stream, 0).unwrap();
+    client.qcsd_mark_local_et_chaff_cancellation(stream);
+    assert!(client.qcsd_unacked_local_et_resets.contains(&stream));
+    let reset_frames_before_stop = client.stats().frame_tx.reset_stream;
+    let stop_frames_before = client.stats().frame_tx.stop_sending;
+    // Keep this inside the established connection's PTO. `connect_force_idle`
+    // has a near-zero synthetic RTT, so a full DEFAULT_RTT delay would make
+    // the reset timer-expire and legitimately coalesce its retransmission with
+    // STOP_SENDING instead of exercising split recovery identities.
+    let stop_at = reset_at + Duration::from_millis(1);
+    let stop = client
+        .process_output(stop_at)
+        .dgram()
+        .expect("local-ET stop-sending datagram");
+    assert_eq!(
+        client.stats().frame_tx.reset_stream,
+        reset_frames_before_stop,
+        "the later STOP_SENDING datagram must not also carry the lost reset"
+    );
+    assert_eq!(
+        client.stats().frame_tx.stop_sending,
+        stop_frames_before + 1,
+        "the later cancellation datagram carries STOP_SENDING"
+    );
+    assert!(client.qcsd_unacked_local_et_resets.contains(&stream));
+    server.process_input(stop, stop_at);
+    let stop_ack_at = stop_at + DEFAULT_RTT;
+    let stop_ack = server
+        .process_output(stop_ack_at)
+        .dgram()
+        .expect("STOP_SENDING acknowledgment");
+    client.process_input(stop_ack, stop_ack_at);
+    assert!(
+        client.qcsd_unacked_local_et_resets.contains(&stream),
+        "the STOP acknowledgment must not clear the RESET identity"
+    );
+    assert!(
+        client
+            .streams
+            .qcsd_local_et_reset_pending_or_in_flight(stream),
+        "the unacknowledged RESET remains queued, in flight, or recoverable"
+    );
+    assert!(
+        client.qcsd_has_pending_defense_control(),
+        "lost RESET_STREAM remains terminal backlog after STOP_SENDING is ACKed"
+    );
+
+    let recovery_at = reset_at + AT_LEAST_PTO;
+    let recovered_reset = client
+        .process_output(recovery_at)
+        .dgram()
+        .expect("lost local-ET reset retransmission");
+    server.process_input(recovered_reset, recovery_at);
+    let reset_ack_at = recovery_at + DEFAULT_RTT;
+    let reset_ack = server
+        .process_output(reset_ack_at)
+        .dgram()
+        .expect("RESET_STREAM acknowledgment");
+    client.process_input(reset_ack, reset_ack_at);
+    assert!(!client.qcsd_has_pending_defense_control());
+}
+
+#[test]
+fn local_et_stop_ack_waits_for_peer_reset_when_final_size_is_unknown() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(stream, b"request").unwrap();
+    client.stream_close_send(stream).unwrap();
+    client.stream_stop_sending(stream, 0).unwrap();
+    client.qcsd_mark_local_et_chaff_cancellation(stream);
+    assert!(client.qcsd_unacked_local_et_stop_sending.contains(&stream));
+    assert!(client.qcsd_unacked_local_et_resets.is_empty());
+
+    // ACKing STOP_SENDING with no known final size moves the receive half to
+    // WaitForReset. That state remains terminal defense-control backlog.
+    let stop_token = StreamRecoveryToken::StopSending {
+        stream_id: stream,
+        encoded_bytes: 4,
+    };
+    client.streams.acked(&stop_token);
+    client.qcsd_local_et_receive_state_changed(stream);
+    assert!(
+        client
+            .streams
+            .qcsd_local_et_stop_pending_or_in_flight(stream)
+    );
+    assert!(client.qcsd_has_pending_defense_control());
+
+    // The ordinary peer's RESET_STREAM supplies final size and is the exact
+    // receive-side terminal boundary for this client-only cancellation.
+    client
+        .streams
+        .input_frame(
+            &Frame::ResetStream {
+                stream_id: stream,
+                application_error_code: 0,
+                final_size: 0,
+            },
+            &mut client.stats.borrow_mut().frame_rx,
+        )
+        .unwrap();
+    client.qcsd_local_et_receive_state_changed(stream);
+    assert!(!client.qcsd_has_pending_defense_control());
+    assert!(!client.qcsd_unacked_local_et_stop_sending.contains(&stream));
+}
+
+#[test]
+fn suppressed_outcomes_accept_only_typed_congestion_evidence() {
+    for (slot, reason) in [
+        (113, QcsdCongestionReason::CongestionLimited),
+        (114, QcsdCongestionReason::PacingLimited),
+    ] {
+        let mut client = default_client();
+        let mut server = default_server();
+        connect_force_idle(&mut client, &mut server);
+        client.qcsd_enable(QcsdEndpointId(7), false);
+        let queued_at = now();
+        queue_congestion_sensitive_target(&mut client, slot, 300, false, queued_at).unwrap();
+        let target = client
+            .qcsd_eligible_packet_target(queued_at)
+            .expect("eligible target");
+        client.qcsd_suppress_congestion_sensitive_target(&target, reason);
+        assert!(drain_observations(&mut client).iter().any(|observation| {
+            matches!(
+                observation,
+                QcsdObservation::SlotResolved {
+                    slot: observed_slot,
+                    outcome: QcsdSlotOutcome::Suppressed {
+                        reason: observed,
+                        ..
+                    },
+                    ..
+                } if *observed_slot == QcsdSlotId(slot) && *observed == reason
+            )
+        }));
+    }
+}
+
+#[test]
+fn pacing_limited_congestion_sensitive_target_is_suppressed_exactly_once() {
+    let mut client = default_client();
+    let mut server = default_server();
+    let now = connect_rtt_idle(&mut client, &mut server, DEFAULT_RTT);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    fill_stream(&mut client, stream);
+    for _ in 0..=PACING_BURST_SIZE {
+        assert!(client.process_output(now).dgram().is_some());
+    }
+    assert!(!client.process_output(now).callback().is_zero());
+
+    queue_congestion_sensitive_target(&mut client, 116, 1_000, false, now).unwrap();
+    _ = client.process_output(now);
+    let first = drain_observations(&mut client);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|observation| matches!(
+                observation,
+                QcsdObservation::SlotResolved {
+                    slot: QcsdSlotId(116),
+                    outcome: QcsdSlotOutcome::Suppressed {
+                        reason: QcsdCongestionReason::PacingLimited,
+                        ..
+                    },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 0);
+
+    _ = client.process_output(now);
+    assert!(!drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(116),
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn mandatory_frame_failure_remains_a_missed_fidelity_error() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+    let queued_at = now();
+    queue_congestion_sensitive_target(&mut client, 115, 300, false, queued_at).unwrap();
+    let target = client
+        .qcsd_eligible_packet_target(queued_at)
+        .expect("eligible target");
+    client.qcsd_miss_congestion_sensitive_target(&target, MissedSlotReason::MandatoryFrames);
+    let observations = drain_observations(&mut client);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::SlotMissed {
+            slot: QcsdSlotId(115),
+            reason: MissedSlotReason::MandatoryFrames,
+            ..
+        }
+    )));
+    assert!(!observations.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::SlotResolved {
+            slot: QcsdSlotId(115),
+            ..
+        }
+    )));
+}
+
+#[test]
 fn future_packet_target_is_fully_inert_until_not_before() {
     let mut client = default_client();
     let mut server = default_server();
@@ -893,12 +1405,13 @@ fn mandatory_ack_before_release_is_unattributed() {
     let release = ack_at + Duration::from_secs(1);
     let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
     client
-        .qcsd_queue_scheduled_packet_target_window(
+        .qcsd_queue_scheduled_packet_target_window_with_policy(
             QcsdSlotId(41),
             packet,
             release,
             release + Duration::from_millis(5),
             false,
+            QcsdSendPolicy::CongestionSensitive,
         )
         .unwrap();
     let acknowledgment = client
@@ -924,6 +1437,9 @@ fn mandatory_ack_before_release_is_unattributed() {
                 class: QcsdDatagramClass::DefenseCover,
                 ..
             } | QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(41),
+                ..
+            } | QcsdObservation::SlotResolved {
                 slot: QcsdSlotId(41),
                 ..
             }
@@ -1830,17 +2346,22 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
     let mut buffer = [0; 1_024];
     assert!(server.stream_recv(application, &mut buffer).is_err());
 
-    client
-        .qcsd_queue_scheduled_packet_target_window(
-            QcsdSlotId(31),
-            packet,
-            recovery_time,
-            recovery_time + Duration::from_secs(1),
-            true,
-        )
-        .unwrap();
+    queue_congestion_sensitive_target(&mut client, 31, 1_200, true, recovery_time).unwrap();
     let retransmission = client.process_output(recovery_time).dgram().unwrap();
     assert_eq!(retransmission.len(), 1_200);
+    let composition = drain_observations(&mut client)
+        .into_iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(31),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(composition),
+            _ => None,
+        })
+        .expect("retransmission target has typed wire composition");
+    assert_eq!(composition.application_stream_bytes, 0);
+    assert!(composition.retransmission_stream_bytes > 0);
     server.process_input(retransmission, recovery_time);
     let (read, _) = server.stream_recv(application, &mut buffer).unwrap();
     assert_eq!(read, 1_000);
@@ -1848,4 +2369,117 @@ fn lost_application_data_waits_for_a_later_shaped_slot() {
     if let Ok((read, _)) = server.stream_recv(chaff, &mut buffer) {
         assert!(buffer[..read].iter().all(|byte| *byte == 0xCC));
     }
+}
+
+#[test]
+fn mixed_lost_prefix_and_fresh_suffix_keep_exact_composition_and_fill_the_slot() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let application = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(application, &[0xAB; 3_000]).unwrap();
+    client
+        .qcsd_register_stream_role(application, QcsdRequestRole::Application)
+        .unwrap();
+
+    let queued_at = now();
+    let first = Packet::new(Duration::ZERO, Direction::Outgoing, 600).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(34),
+            first,
+            queued_at,
+            queued_at + Duration::from_secs(1),
+            true,
+        )
+        .unwrap();
+    let dropped = client.process_output(queued_at).dgram().unwrap();
+    assert_eq!(dropped.len(), 600);
+    _ = drain_observations(&mut client);
+
+    let recovery_time = queued_at + AT_LEAST_PTO;
+    _ = client.process_output(recovery_time);
+    queue_congestion_sensitive_target(&mut client, 35, 1_200, true, recovery_time).unwrap();
+    let mixed = client.process_output(recovery_time).dgram().unwrap();
+    assert_eq!(mixed.len(), 1_200);
+    let composition = drain_observations(&mut client)
+        .into_iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(35),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(composition),
+            _ => None,
+        })
+        .expect("mixed recovery target has typed wire composition");
+    assert!(composition.retransmission_stream_bytes > 0);
+    assert!(composition.application_stream_bytes > 0);
+    assert_eq!(composition.chaff_stream_bytes, 0);
+    assert!(composition.quic_padding_bytes < 600);
+
+    server.process_input(mixed, recovery_time);
+    let mut buffer = [0; 2_048];
+    let (read, _) = server.stream_recv(application, &mut buffer).unwrap();
+    assert!(read > 1_000);
+    assert!(buffer[..read].iter().all(|byte| *byte == 0xAB));
+}
+
+#[test]
+fn lost_chaff_data_is_reported_as_retransmission_not_fresh_chaff() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let chaff = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(chaff, &[0xCC; 1_000]).unwrap();
+    client
+        .qcsd_register_stream_role(
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 1,
+                request_id: None,
+            },
+        )
+        .unwrap();
+
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).unwrap();
+    let queued_at = now();
+    client
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(32),
+            packet,
+            queued_at,
+            queued_at + Duration::from_secs(1),
+            true,
+        )
+        .unwrap();
+    let dropped = client.process_output(queued_at).dgram().unwrap();
+    assert_eq!(dropped.len(), 1_200);
+
+    let recovery_time = queued_at + AT_LEAST_PTO;
+    _ = client.process_output(recovery_time);
+    queue_congestion_sensitive_target(&mut client, 33, 1_200, true, recovery_time).unwrap();
+    let retransmission = client.process_output(recovery_time).dgram().unwrap();
+    let composition = drain_observations(&mut client)
+        .into_iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(33),
+                outcome: QcsdSlotOutcome::Full { composition },
+                ..
+            } => Some(composition),
+            _ => None,
+        })
+        .expect("chaff retransmission has typed wire composition");
+    assert_eq!(composition.application_stream_bytes, 0);
+    assert!(composition.retransmission_stream_bytes > 0);
+    assert_eq!(composition.chaff_stream_bytes, 0);
+
+    server.process_input(retransmission, recovery_time);
+    let mut buffer = [0; 1_024];
+    let (read, _) = server.stream_recv(chaff, &mut buffer).unwrap();
+    assert_eq!(read, 1_000);
+    assert!(buffer[..read].iter().all(|byte| *byte == 0xCC));
 }

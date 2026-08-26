@@ -24,25 +24,28 @@ mod stream;
 mod trace;
 
 pub use config::{
-    DefenseConfig, FrontConfig, QcsdConfig, TamarawConfig, TrafficMorphingConfig,
-    WalkieTalkieConfig, WtfPadConfig,
+    BufloConfig, BufloParameters, CsBufloConfig, CsBufloEarlyTermination, CsBufloPaddingMode,
+    CsBufloParameters, DefenseConfig, FrontConfig, QcsdConfig, QcsdImplementationScope,
+    TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
 };
 pub use controller::{QcsdController, QcsdReceiveCancellation, QcsdReceiveCancellationPlan};
 pub use defense::{
-    BurstPair, Capacity, CapacityAdjustment, Defense, DefenseDiagnostics, DefenseMode,
-    DefenseSignal, EventOutcome, Front, HistoricalWalkieTalkieSchemaFiveDiagnostic,
-    MIN_SHAPED_PAYLOAD, ReceiverContinuationDisposition, RoundRobinScheduler, SignalKind,
-    StaticSchedule, Tamaraw, TrafficMorphing, TrafficMorphingEgress, WalkieTalkie,
-    WalkieTalkieBurstDiagnostics, WalkieTalkieQualificationBinding, WtfPad, clamp_packet_size,
+    Buflo, BurstPair, Capacity, CapacityAdjustment, CsBuflo, CsBufloRateTransitionDiagnostics,
+    Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, Front,
+    HistoricalWalkieTalkieSchemaFiveDiagnostic, MIN_SHAPED_PAYLOAD,
+    ReceiverContinuationDisposition, RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw,
+    TrafficMorphing, TrafficMorphingEgress, WalkieTalkie, WalkieTalkieBurstDiagnostics,
+    WalkieTalkieQualificationBinding, WtfPad, clamp_packet_size,
 };
 pub use dependency_tracker::{DependencyTracker, ResourceRunState};
 pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
-    MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdDatagramClass, QcsdEndpointId,
-    QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
-    QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole,
-    QcsdSlotId, QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, TimestampedQcsdObservation,
-    TrafficMorphingBypassReason, TrafficMorphingOutcome,
+    MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdCongestionReason, QcsdDatagramClass,
+    QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner,
+    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
+    QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission,
+    TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{

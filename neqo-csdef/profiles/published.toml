@@ -36,3 +36,9 @@ max_padding_events = 100000
 
 [walkie_talkie]
 packet_size = 1450
+
+[buflo]
+parameters = ""
+
+[cs_buflo]
+parameters = ""

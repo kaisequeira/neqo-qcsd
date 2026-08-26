@@ -6,7 +6,7 @@
 // The class implementing a QUIC connection.
 
 #[cfg(feature = "qcsd")]
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::{
     cell::RefCell,
     cmp::{max, min},
@@ -31,8 +31,9 @@ use neqo_common::{
 use neqo_csdef::{
     MissedSlotReason, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
     QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
-    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSlotId, TimestampedQcsdObservation,
-    TrafficMorphingBypassReason, TrafficMorphingEgress, TrafficMorphingOutcome,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotId,
+    TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingEgress,
+    TrafficMorphingOutcome,
 };
 use nss::{
     Agent, AntiReplay, AuthenticationStatus, Cipher, Client, Group, HandshakeState, PrivateKey,
@@ -380,6 +381,20 @@ pub struct Connection {
     qcsd_pending_receive_credit: VecDeque<QcsdPendingReceiveCredit>,
     #[cfg(feature = "qcsd")]
     qcsd_pending_receive_actions: VecDeque<QcsdPendingReceiveAction>,
+    /// Highest defense-owned `MAX_STREAM_DATA` value encoded per stream.
+    /// Retaining this provenance classifies loss retransmissions after the
+    /// pending action ledger has terminalized.
+    #[cfg(feature = "qcsd")]
+    qcsd_defense_receive_limit_high_water: HashMap<StreamId, u64>,
+    /// Highest encoded defense-owned receive limit still awaiting an ACK.
+    #[cfg(feature = "qcsd")]
+    qcsd_unacked_defense_receive_limits: HashMap<StreamId, u64>,
+    /// CS-BuFLO local-ET `STOP_SENDING` frames queued, in flight, or lost.
+    #[cfg(feature = "qcsd")]
+    qcsd_unacked_local_et_stop_sending: HashSet<StreamId>,
+    /// CS-BuFLO local-ET `RESET_STREAM` frames queued, in flight, or lost.
+    #[cfg(feature = "qcsd")]
+    qcsd_unacked_local_et_resets: HashSet<StreamId>,
     /// Whether non-critical stream data is restricted to controller grants.
     #[cfg(feature = "qcsd")]
     qcsd_send_shaping: bool,
@@ -574,6 +589,14 @@ impl Connection {
             qcsd_pending_receive_credit: VecDeque::new(),
             #[cfg(feature = "qcsd")]
             qcsd_pending_receive_actions: VecDeque::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_defense_receive_limit_high_water: HashMap::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_unacked_defense_receive_limits: HashMap::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_unacked_local_et_stop_sending: HashSet::new(),
+            #[cfg(feature = "qcsd")]
+            qcsd_unacked_local_et_resets: HashSet::new(),
             #[cfg(feature = "qcsd")]
             qcsd_send_shaping: false,
             #[cfg(feature = "qcsd")]
@@ -2524,6 +2547,26 @@ impl Connection {
             return;
         }
 
+        #[cfg(feature = "qcsd")]
+        {
+            // These exact, defense-owned reset identities are termination
+            // controls, not permission to release any application/chaff STREAM
+            // payload. Keep them loss-recoverable after CS-BuFLO stops issuing
+            // ordinary shaping slots.
+            let mut local_et_resets: Vec<_> =
+                self.qcsd_unacked_local_et_resets.iter().copied().collect();
+            local_et_resets.sort_unstable();
+            self.streams.qcsd_write_local_et_reset_frames(
+                &local_et_resets,
+                builder,
+                tokens,
+                frame_stats,
+            );
+            if builder.is_full() {
+                return;
+            }
+        }
+
         self.streams
             .write_maintenance_frames(builder, tokens, frame_stats, now, rtt);
         if builder.is_full() {
@@ -2732,6 +2775,13 @@ impl Connection {
         reason = "packet assembly keeps transport and QCSD invariants in wire order"
     )]
     #[cfg_attr(
+        test,
+        expect(
+            clippy::cognitive_complexity,
+            reason = "test-only frame sources add branches while preserving production wire order"
+        )
+    )]
+    #[cfg_attr(
         not(feature = "qcsd"),
         expect(
             unused_variables,
@@ -2863,10 +2913,15 @@ impl Connection {
             && self.qcsd_active_target.is_some()
             && !profile.ack_only()
             && !builder.is_full()
+            && builder.len() == ack_end
         {
-            // A scheduled packet is always ack-eliciting, even if no application or
-            // control frame was ready. Padding below then fills the exact target.
+            // Add a PING only when the scheduled target would otherwise contain
+            // no ack-eliciting work beyond its ACK prefix. Real-bearing STREAM
+            // cells are already ack-eliciting and retain the byte for payload.
             builder.encode_frame(FrameType::Ping, |_| {});
+            if let Some(target) = self.qcsd_active_target.as_mut() {
+                target.defense_control_bytes = target.defense_control_bytes.saturating_add(1);
+            }
             builder.enable_padding(true);
             self.stats.borrow_mut().frame_tx.ping += 1;
             ack_eliciting = true;
@@ -2977,6 +3032,23 @@ impl Connection {
         // And avoid padding packets that otherwise only contain ACK because adding PADDING
         // causes those packets to consume congestion window, which is not tracked (yet).
         // And avoid padding if we don't have a full MTU available.
+        #[cfg(feature = "qcsd")]
+        if space == PacketNumberSpace::ApplicationData
+            && let Some(target) = self.qcsd_active_target.as_mut()
+        {
+            // A scheduled cell must be padded to its packet-local UDP target
+            // even when it already carries an ack-eliciting STREAM or control
+            // frame.  Cover-only cells enable padding when their synthetic
+            // PING is written above; real-bearing cells need the same setting
+            // without adding a redundant PING.
+            builder.enable_padding(true);
+            // This must be sampled before `builder.pad()`. Sampling the built
+            // packet later loses the distinction between QUIC PADDING and
+            // other header/control bytes.
+            target.unpadded_udp_bytes = Some(
+                u16::try_from(builder.len().saturating_add(aead_expansion)).unwrap_or(u16::MAX),
+            );
+        }
         let stats = &mut self.stats.borrow_mut().frame_tx;
         #[cfg(feature = "qcsd")]
         let target_padding = self.qcsd_active_target.is_some();
@@ -3147,6 +3219,14 @@ impl Connection {
         let mut needs_padding = false;
         #[cfg(feature = "qcsd")]
         let mut qcsd_datagram_class = None;
+        #[cfg(feature = "qcsd")]
+        let mut qcsd_target_application_stream_bytes = 0_u64;
+        #[cfg(feature = "qcsd")]
+        let mut qcsd_target_retransmission_stream_bytes = 0_u64;
+        #[cfg(feature = "qcsd")]
+        let mut qcsd_target_chaff_stream_bytes = 0_u64;
+        #[cfg(feature = "qcsd")]
+        let mut qcsd_target_defense_control_bytes = 0_u64;
         let grease_quic_bit = self.can_grease_quic_bit();
         let version = self.version();
 
@@ -3179,12 +3259,40 @@ impl Connection {
         #[cfg(feature = "qcsd")]
         {
             self.qcsd_expire_packet_targets(now, Some(configured_limit), profile.paced());
-            self.qcsd_active_target = self
-                .qcsd_eligible_packet_target(now)
-                .filter(|target| usize::from(target.udp_payload_size) <= configured_limit);
+            self.qcsd_active_target = None;
+            if let Some(mut target) = self.qcsd_eligible_packet_target(now) {
+                if target.send_policy == QcsdSendPolicy::CongestionSensitive {
+                    target.lateness_us = target.not_before.map_or(0, |release| {
+                        u64::try_from(now.saturating_duration_since(release).as_micros())
+                            .unwrap_or(u64::MAX)
+                    });
+                    if profile.ack_only() {
+                        let reason = if profile.paced() {
+                            neqo_csdef::QcsdCongestionReason::PacingLimited
+                        } else {
+                            neqo_csdef::QcsdCongestionReason::CongestionLimited
+                        };
+                        self.qcsd_suppress_congestion_sensitive_target(&target, reason);
+                    } else {
+                        let attempt = usize::from(target.udp_payload_size).min(configured_limit);
+                        if attempt < usize::from(neqo_csdef::MIN_SHAPED_PAYLOAD) {
+                            self.qcsd_suppress_congestion_sensitive_target(
+                                &target,
+                                neqo_csdef::QcsdCongestionReason::CongestionLimited,
+                            );
+                        } else {
+                            target.attempt_udp_payload_size =
+                                u16::try_from(attempt).unwrap_or(u16::MAX);
+                            self.qcsd_active_target = Some(target);
+                        }
+                    }
+                } else if usize::from(target.udp_payload_size) <= configured_limit {
+                    self.qcsd_active_target = Some(target);
+                }
+            }
             self.qcsd_slot_send_budget = self.qcsd_active_target.map_or(0, |target| {
                 if target.allow_stream_data {
-                    usize::from(target.udp_payload_size)
+                    usize::from(target.attempt_udp_payload_size)
                 } else {
                     0
                 }
@@ -3221,7 +3329,7 @@ impl Connection {
             #[cfg(feature = "qcsd")]
             let limit = if space == PacketNumberSpace::ApplicationData {
                 self.qcsd_active_target.map_or(limit, |target| {
-                    limit.min(usize::from(target.udp_payload_size))
+                    limit.min(usize::from(target.attempt_udp_payload_size))
                 })
             } else {
                 limit
@@ -3273,6 +3381,64 @@ impl Connection {
                 encoder = builder.abort();
 
                 continue;
+            }
+
+            #[cfg(feature = "qcsd")]
+            if space == PacketNumberSpace::ApplicationData {
+                for token in &tokens {
+                    match token {
+                        recovery::Token::Stream(recovery::StreamRecoveryToken::Stream(token)) => {
+                            let bytes = u64::try_from(token.length()).unwrap_or(u64::MAX);
+                            let retransmission_bytes = u64::try_from(token.retransmission_bytes())
+                                .unwrap_or(u64::MAX)
+                                .min(bytes);
+                            let fresh_bytes = bytes.saturating_sub(retransmission_bytes);
+                            match self.qcsd_stream_roles.get(&token.stream_id()) {
+                                Some(QcsdRequestRole::Application) => {
+                                    qcsd_target_retransmission_stream_bytes =
+                                        qcsd_target_retransmission_stream_bytes
+                                            .saturating_add(retransmission_bytes);
+                                    qcsd_target_application_stream_bytes =
+                                        qcsd_target_application_stream_bytes
+                                            .saturating_add(fresh_bytes);
+                                }
+                                Some(QcsdRequestRole::Chaff { .. }) => {
+                                    qcsd_target_retransmission_stream_bytes =
+                                        qcsd_target_retransmission_stream_bytes
+                                            .saturating_add(retransmission_bytes);
+                                    qcsd_target_chaff_stream_bytes =
+                                        qcsd_target_chaff_stream_bytes.saturating_add(fresh_bytes);
+                                }
+                                None => {}
+                            }
+                        }
+                        recovery::Token::Stream(recovery::StreamRecoveryToken::MaxStreamData {
+                            stream_id,
+                            max_data,
+                        }) if self.qcsd_receive_limit_is_defense_control(*stream_id, *max_data) => {
+                            let bytes = Encoder::varint_len(u64::from(FrameType::MaxStreamData))
+                                .saturating_add(Encoder::varint_len(stream_id.as_u64()))
+                                .saturating_add(Encoder::varint_len(*max_data));
+                            qcsd_target_defense_control_bytes = qcsd_target_defense_control_bytes
+                                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+                        }
+                        recovery::Token::Stream(recovery::StreamRecoveryToken::ResetStream {
+                            stream_id,
+                            encoded_bytes,
+                        }) if self.qcsd_unacked_local_et_resets.contains(stream_id) => {
+                            qcsd_target_defense_control_bytes = qcsd_target_defense_control_bytes
+                                .saturating_add(u64::from(*encoded_bytes));
+                        }
+                        recovery::Token::Stream(recovery::StreamRecoveryToken::StopSending {
+                            stream_id,
+                            encoded_bytes,
+                        }) if self.qcsd_unacked_local_et_stop_sending.contains(stream_id) => {
+                            qcsd_target_defense_control_bytes = qcsd_target_defense_control_bytes
+                                .saturating_add(u64::from(*encoded_bytes));
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             if packet_tos.is_ecn_marked() {
@@ -3391,6 +3557,14 @@ impl Connection {
         if encoder.is_empty() {
             #[cfg(feature = "qcsd")]
             {
+                if let Some(target) = self.qcsd_active_target
+                    && target.send_policy == QcsdSendPolicy::CongestionSensitive
+                {
+                    self.qcsd_miss_congestion_sensitive_target(
+                        &target,
+                        MissedSlotReason::MandatoryFrames,
+                    );
+                }
                 self.qcsd_active_target = None;
                 self.qcsd_slot_send_budget = 0;
             }
@@ -3405,14 +3579,65 @@ impl Connection {
                 self.loss_recovery.on_packet_sent(path, initial, now);
             }
             #[cfg(feature = "qcsd")]
-            if let Some(target) = self.qcsd_active_target.take() {
-                if encoder.len() == usize::from(target.udp_payload_size) {
+            let qcsd_built_target = self.qcsd_active_target.map(|target| {
+                (
+                    target.udp_payload_size,
+                    target.lateness_us,
+                    target.defense_control_bytes,
+                    target.unpadded_udp_bytes,
+                )
+            });
+            #[cfg(feature = "qcsd")]
+            if let Some(mut target) = self.qcsd_active_target.take() {
+                target.defense_control_bytes = target.defense_control_bytes.saturating_add(
+                    u16::try_from(qcsd_target_defense_control_bytes).unwrap_or(u16::MAX),
+                );
+                if target.send_policy == QcsdSendPolicy::CongestionSensitive {
+                    let attempt = usize::from(target.attempt_udp_payload_size);
+                    if encoder.len() > attempt {
+                        self.qcsd_miss_congestion_sensitive_target(
+                            &target,
+                            MissedSlotReason::MandatoryFrames,
+                        );
+                    } else {
+                        let observed = u16::try_from(encoder.len()).unwrap_or(u16::MAX);
+                        let application_stream_bytes =
+                            u16::try_from(qcsd_target_application_stream_bytes).unwrap_or(u16::MAX);
+                        let retransmission_stream_bytes =
+                            u16::try_from(qcsd_target_retransmission_stream_bytes)
+                                .unwrap_or(u16::MAX);
+                        let chaff_stream_bytes =
+                            u16::try_from(qcsd_target_chaff_stream_bytes).unwrap_or(u16::MAX);
+                        let quic_padding_bytes = target
+                            .unpadded_udp_bytes
+                            .map_or(0, |unpadded| observed.saturating_sub(unpadded));
+                        let reason = (encoder.len() == attempt
+                            && target.attempt_udp_payload_size < target.udp_payload_size)
+                            .then_some(neqo_csdef::QcsdCongestionReason::CongestionLimited);
+                        if encoder.len() == attempt {
+                            self.qcsd_resolve_congestion_sensitive_target(
+                                &target,
+                                observed,
+                                application_stream_bytes,
+                                retransmission_stream_bytes,
+                                chaff_stream_bytes,
+                                quic_padding_bytes,
+                                reason,
+                            );
+                        } else {
+                            self.qcsd_miss_congestion_sensitive_target(
+                                &target,
+                                MissedSlotReason::MandatoryFrames,
+                            );
+                        }
+                    }
+                } else if encoder.len() == usize::from(target.udp_payload_size) {
                     let removed = self.qcsd_packet_targets.pop_front();
-                    debug_assert_eq!(removed, Some(target));
+                    debug_assert!(removed.is_some_and(|queued| queued.slot == target.slot));
                     self.qcsd_target_satisfied(&target);
                 } else if encoder.len() > usize::from(target.udp_payload_size) {
                     let removed = self.qcsd_packet_targets.pop_front();
-                    debug_assert_eq!(removed, Some(target));
+                    debug_assert!(removed.is_some_and(|queued| queued.slot == target.slot));
                     self.qcsd_target_missed(&target, MissedSlotReason::MandatoryFrames);
                 }
             }
@@ -3423,7 +3648,46 @@ impl Connection {
                 self.qcsd_slot_send_budget = 0;
             }
             #[cfg(feature = "qcsd")]
-            self.qcsd_observe_outgoing_datagram(encoder.len(), qcsd_datagram_class);
+            {
+                let observed_udp_bytes = u16::try_from(encoder.len()).unwrap_or(u16::MAX);
+                let (
+                    desired_udp_bytes,
+                    lateness_us,
+                    target_defense_control_bytes,
+                    unpadded_udp_bytes,
+                ) = qcsd_built_target.unwrap_or((observed_udp_bytes, 0, 0, None));
+                let application_stream_bytes =
+                    u16::try_from(qcsd_target_application_stream_bytes).unwrap_or(u16::MAX);
+                let retransmission_stream_bytes =
+                    u16::try_from(qcsd_target_retransmission_stream_bytes).unwrap_or(u16::MAX);
+                let chaff_stream_bytes =
+                    u16::try_from(qcsd_target_chaff_stream_bytes).unwrap_or(u16::MAX);
+                let defense_control_bytes = target_defense_control_bytes.saturating_add(
+                    u16::try_from(qcsd_target_defense_control_bytes).unwrap_or(u16::MAX),
+                );
+                let quic_padding_bytes = unpadded_udp_bytes
+                    .map_or(0, |unpadded| observed_udp_bytes.saturating_sub(unpadded));
+                let classified_bytes = application_stream_bytes
+                    .saturating_add(retransmission_stream_bytes)
+                    .saturating_add(chaff_stream_bytes)
+                    .saturating_add(defense_control_bytes)
+                    .saturating_add(quic_padding_bytes);
+                self.qcsd_observe_outgoing_datagram(
+                    encoder.len(),
+                    qcsd_datagram_class,
+                    neqo_csdef::QcsdSlotComposition {
+                        desired_udp_bytes,
+                        observed_udp_bytes,
+                        application_stream_bytes,
+                        retransmission_stream_bytes,
+                        chaff_stream_bytes,
+                        defense_control_bytes,
+                        quic_padding_bytes,
+                        other_quic_bytes: observed_udp_bytes.saturating_sub(classified_bytes),
+                        lateness_us,
+                    },
+                );
+            }
             path.borrow_mut().add_sent(encoder.len());
             Ok(SendOption::Yes)
         }
@@ -3849,6 +4113,13 @@ impl Connection {
         let space = PacketNumberSpace::from(packet_type);
         if frame.is_stream() {
             #[cfg(feature = "qcsd")]
+            let local_et_receive_stream = match &frame {
+                Frame::ResetStream { stream_id, .. } | Frame::ResetStreamAt { stream_id, .. } => {
+                    Some(*stream_id)
+                }
+                _ => None,
+            };
+            #[cfg(feature = "qcsd")]
             if let Frame::StreamDataBlocked {
                 stream_id,
                 stream_data_limit,
@@ -3860,9 +4131,16 @@ impl Connection {
                     blocked_at: *stream_data_limit,
                 });
             }
-            return self
+            let result = self
                 .streams
                 .input_frame(&frame, &mut self.stats.borrow_mut().frame_rx);
+            #[cfg(feature = "qcsd")]
+            if result.is_ok()
+                && let Some(stream) = local_et_receive_stream
+            {
+                self.qcsd_local_et_receive_state_changed(stream);
+            }
+            return result;
         }
         match frame {
             Frame::Padding(length) => {
@@ -4089,7 +4367,17 @@ impl Connection {
                     }
                     recovery::Token::AckFrequency(rate) => self.paths.lost_ack_frequency(rate),
                     recovery::Token::KeepAlive => self.idle_timeout.lost_keep_alive(),
-                    recovery::Token::Stream(stream_token) => self.streams.lost(stream_token),
+                    recovery::Token::Stream(stream_token) => {
+                        self.streams.lost(stream_token);
+                        #[cfg(feature = "qcsd")]
+                        if let recovery::StreamRecoveryToken::MaxStreamData {
+                            stream_id,
+                            max_data,
+                        } = stream_token
+                        {
+                            self.qcsd_defense_receive_control_lost(*stream_id, *max_data);
+                        }
+                    }
                     recovery::Token::Datagram(dgram_tracker) => {
                         self.events
                             .datagram_outcome(dgram_tracker, OutgoingDatagramOutcome::Lost);
@@ -4154,10 +4442,31 @@ impl Connection {
                 match token {
                     recovery::Token::Stream(stream_token) => {
                         #[cfg(feature = "qcsd")]
-                        if let recovery::StreamRecoveryToken::Stream(token) = stream_token {
-                            self.qcsd_observe_stream_acknowledgment(token);
+                        match stream_token {
+                            recovery::StreamRecoveryToken::Stream(token) => {
+                                self.qcsd_observe_stream_acknowledgment(token);
+                            }
+                            recovery::StreamRecoveryToken::MaxStreamData {
+                                stream_id,
+                                max_data,
+                            } => {
+                                self.qcsd_defense_receive_control_acked(*stream_id, *max_data);
+                            }
+                            recovery::StreamRecoveryToken::ResetStream { stream_id, .. } => {
+                                self.qcsd_local_et_reset_acked(*stream_id);
+                            }
+                            _ => {}
                         }
                         self.streams.acked(stream_token);
+                        #[cfg(feature = "qcsd")]
+                        if let recovery::StreamRecoveryToken::StopSending { stream_id, .. } =
+                            stream_token
+                        {
+                            // `streams.acked()` decides whether final size was
+                            // already known or the receive half must remain in
+                            // WaitForReset. Reconcile only after that transition.
+                            self.qcsd_local_et_receive_state_changed(*stream_id);
+                        }
                     }
                     recovery::Token::Ack(at) => self.acks.acked(at),
                     recovery::Token::Crypto(ct) => self.crypto.acked(ct),
@@ -4285,6 +4594,10 @@ impl Connection {
                     self.qcsd_active_target = None;
                     self.qcsd_slot_send_budget = 0;
                     self.qcsd_pending_receive_credit.clear();
+                    self.qcsd_defense_receive_limit_high_water.clear();
+                    self.qcsd_unacked_defense_receive_limits.clear();
+                    self.qcsd_unacked_local_et_stop_sending.clear();
+                    self.qcsd_unacked_local_et_resets.clear();
                     // Accepted typed identities remain as close tombstones
                     // until runner/controller cancellation reconciles them.
                     while let Some(target) = self.qcsd_packet_targets.pop_front() {
@@ -4881,7 +5194,13 @@ impl Connection {
                 }
             }
             let first = pending[first_selected];
-            let last = *pending.last().expect("selected pending suffix is nonempty");
+            let Some(last) = pending.last().copied() else {
+                return Err(QcsdReceiveLimitError {
+                    kind: QcsdReceiveLimitFatal::Ledger,
+                    requested_limit: stream.as_u64(),
+                    reference_limit: 0,
+                });
+            };
             if let Some(recv_stream) = self.streams.qcsd_get_recv_stream(stream) {
                 recv_stream.qcsd_preview_cancel_manual_limit(
                     last.identity.absolute_limit(),

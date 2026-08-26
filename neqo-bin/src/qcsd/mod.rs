@@ -30,12 +30,12 @@ use neqo_csdef::{
     DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
     QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
     QcsdObservationClock, QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
-    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSlotId,
-    QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
-    ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
-    ResponseOnlyChaffQualificationV4, StaticMode, TimestampedQcsdObservation,
-    TrafficMorphingEgress, WalkieTalkie, WalkieTalkieQualificationBinding, derive,
-    normalize_content_encoding, sanitize_chaff_headers,
+    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy,
+    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamTransmission, Resource,
+    ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
+    ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4, StaticMode,
+    TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
+    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -52,7 +52,7 @@ use crate::udp::Socket;
 
 mod trace_files;
 
-use trace_files::{PacketTraceRow, ScheduleTraceRow, TraceFiles};
+use trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles};
 
 const NEQO_BASE_COMMIT: &str = "8a04d065c2d35c8e8fd804f91c7081ab6bb60b89";
 const PUBLISHED_QCSD_COMMIT: &str = "39e293fb384dd341156eedd1e4b833d24904b1f6";
@@ -131,6 +131,8 @@ enum DefenseArg {
     TrafficMorphing,
     WtfPad,
     WalkieTalkie,
+    Buflo,
+    CsBuflo,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -205,6 +207,10 @@ pub struct Args {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap owns one selected command and its audited path-valued options"
+)]
 enum Command {
     /// Verify HTTP/3 connectivity and build a same-origin resource manifest.
     Probe {
@@ -293,6 +299,8 @@ enum Command {
                 "defense",
                 "schedule",
                 "static_mode",
+                "buflo_parameters",
+                "cs_buflo_parameters",
                 "morphing_matrix",
                 "wtf_pad_histograms",
                 "walkie_talkie_molded"
@@ -311,6 +319,12 @@ enum Command {
         /// Whether Static capacity is chaff-only or shapes application traffic.
         #[arg(long, value_enum)]
         static_mode: Option<StaticModeArg>,
+        /// Immutable versioned `BuFLO` numeric-parameter receipt.
+        #[arg(long)]
+        buflo_parameters: Option<PathBuf>,
+        /// Immutable versioned CS-BuFLO receipt selecting CTSP or CPSP.
+        #[arg(long)]
+        cs_buflo_parameters: Option<PathBuf>,
         /// Workload-bound Traffic Morphing source-to-decoy matrix bundle.
         #[arg(long)]
         morphing_matrix: Option<PathBuf>,
@@ -391,6 +405,8 @@ impl Args {
                 defense,
                 schedule,
                 static_mode,
+                buflo_parameters,
+                cs_buflo_parameters,
                 morphing_matrix,
                 wtf_pad_histograms,
                 walkie_talkie_molded,
@@ -409,6 +425,8 @@ impl Args {
                     defense,
                     schedule.as_deref(),
                     static_mode,
+                    buflo_parameters.as_deref(),
+                    cs_buflo_parameters.as_deref(),
                     morphing_matrix.as_deref(),
                     wtf_pad_histograms.as_deref(),
                     walkie_talkie_molded.as_deref(),
@@ -549,6 +567,8 @@ fn resolve_run_config_with_workload(
     defense: Option<DefenseArg>,
     schedule: Option<&Path>,
     static_mode: Option<StaticModeArg>,
+    buflo_parameters: Option<&Path>,
+    cs_buflo_parameters: Option<&Path>,
     morphing_matrix: Option<&Path>,
     wtf_pad_histograms: Option<&Path>,
     walkie_talkie_molded: Option<&Path>,
@@ -556,6 +576,8 @@ fn resolve_run_config_with_workload(
 ) -> Result<QcsdConfig, Error> {
     let has_defense_options = schedule.is_some()
         || static_mode.is_some()
+        || buflo_parameters.is_some()
+        || cs_buflo_parameters.is_some()
         || morphing_matrix.is_some()
         || wtf_pad_histograms.is_some()
         || walkie_talkie_molded.is_some();
@@ -594,6 +616,8 @@ fn resolve_run_config_with_workload(
         defense,
         schedule,
         static_mode,
+        buflo_parameters,
+        cs_buflo_parameters,
         morphing_matrix,
         wtf_pad_histograms,
         walkie_talkie_molded,
@@ -611,6 +635,26 @@ fn resolve_run_config_with_workload(
         DefenseArg::None => DefenseKind::None,
         DefenseArg::Front => DefenseKind::Front,
         DefenseArg::Tamaraw => DefenseKind::Tamaraw,
+        DefenseArg::Buflo => {
+            let Some(parameters) = buflo_parameters else {
+                return Err(Error::Argument(
+                    "--defense buflo requires --buflo-parameters".into(),
+                ));
+            };
+            DefenseKind::Buflo {
+                parameters: parameters.to_string_lossy().into_owned(),
+            }
+        }
+        DefenseArg::CsBuflo => {
+            let Some(parameters) = cs_buflo_parameters else {
+                return Err(Error::Argument(
+                    "--defense cs-buflo requires --cs-buflo-parameters".into(),
+                ));
+            };
+            DefenseKind::CsBuflo {
+                parameters: parameters.to_string_lossy().into_owned(),
+            }
+        }
         DefenseArg::Static => {
             let Some(schedule) = schedule else {
                 return Err(Error::Argument(
@@ -702,6 +746,8 @@ fn resolve_run_config(
         defense,
         schedule,
         static_mode,
+        None,
+        None,
         morphing_matrix,
         wtf_pad_histograms,
         walkie_talkie_molded,
@@ -709,16 +755,24 @@ fn resolve_run_config(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every mutually exclusive defense receipt is audited explicitly"
+)]
 fn reject_foreign_defense_options(
     selected: DefenseArg,
     schedule: Option<&Path>,
     static_mode: Option<StaticModeArg>,
+    buflo_parameters: Option<&Path>,
+    cs_buflo_parameters: Option<&Path>,
     morphing_matrix: Option<&Path>,
     wtf_pad_histograms: Option<&Path>,
     walkie_talkie_molded: Option<&Path>,
 ) -> Result<(), Error> {
     let has_foreign = (selected != DefenseArg::Static
         && (schedule.is_some() || static_mode.is_some()))
+        || (selected != DefenseArg::Buflo && buflo_parameters.is_some())
+        || (selected != DefenseArg::CsBuflo && cs_buflo_parameters.is_some())
         || (selected != DefenseArg::TrafficMorphing && morphing_matrix.is_some())
         || (selected != DefenseArg::WtfPad && wtf_pad_histograms.is_some())
         || (selected != DefenseArg::WalkieTalkie && walkie_talkie_molded.is_some());
@@ -735,25 +789,85 @@ struct DefenseParameterProvenance {
     kind: &'static str,
     path: String,
     sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implementation_scope: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paper_equivalent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    early_termination_semantics: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_tcp_write_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_nominal_tcp_packet_size_bytes: Option<u64>,
 }
 
 fn defense_parameter_provenance(
     config: &QcsdConfig,
 ) -> Result<Option<DefenseParameterProvenance>, Error> {
-    let (kind, path) = match &config.defense {
-        DefenseConfig::Static { schedule, .. } => ("static", schedule.as_str()),
-        DefenseConfig::TrafficMorphing(config) => ("traffic_morphing", config.matrix.as_str()),
-        DefenseConfig::WtfPad(config) => ("wtf_pad", config.histograms.as_str()),
-        DefenseConfig::WalkieTalkie(config) => ("walkie_talkie", config.molded.as_str()),
-        DefenseConfig::None | DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_) => {
-            return Ok(None);
-        }
-    };
+    let (kind, path, scope, paper_equivalent, early_termination, reference_write, reference_packet) =
+        match &config.defense {
+            DefenseConfig::Static { schedule, .. } => {
+                ("static", schedule.as_str(), None, None, None, None, None)
+            }
+            DefenseConfig::TrafficMorphing(config) => (
+                "traffic_morphing",
+                config.matrix.as_str(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            DefenseConfig::WtfPad(config) => (
+                "wtf_pad",
+                config.histograms.as_str(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            DefenseConfig::WalkieTalkie(config) => (
+                "walkie_talkie",
+                config.molded.as_str(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            DefenseConfig::Buflo(config) => (
+                "buflo",
+                config.parameters.as_str(),
+                Some("client_only_quic"),
+                Some(false),
+                None,
+                None,
+                None,
+            ),
+            DefenseConfig::CsBuflo(config) => (
+                "cs_buflo",
+                config.parameters.as_str(),
+                Some("client_only_quic"),
+                Some(false),
+                Some("udp_client_only_observed_udp_power_of_two_crossing"),
+                Some(548),
+                Some(600),
+            ),
+            DefenseConfig::None | DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_) => {
+                return Ok(None);
+            }
+        };
     let contents = fs::read(path)?;
     Ok(Some(DefenseParameterProvenance {
         kind,
         path: path.to_string(),
         sha256: sha256(&contents)?,
+        implementation_scope: scope,
+        paper_equivalent,
+        early_termination_semantics: early_termination,
+        reference_tcp_write_size_bytes: reference_write,
+        reference_nominal_tcp_packet_size_bytes: reference_packet,
     }))
 }
 
@@ -908,10 +1022,16 @@ fn validate_chaff_manifest_defense(
     chaff: &RuntimeChaffManifest,
 ) -> Result<(), Error> {
     if chaff.is_response_only()
-        && !matches!(defense, DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_))
+        && !matches!(
+            defense,
+            DefenseConfig::Front(_)
+                | DefenseConfig::Tamaraw(_)
+                | DefenseConfig::Buflo(_)
+                | DefenseConfig::CsBuflo(_)
+        )
     {
         return Err(Error::Argument(
-            "response-only schema-three/four chaff manifests are accepted only for FRONT and Tamaraw"
+            "response-only schema-three/four chaff manifests are accepted only for FRONT, Tamaraw, BuFLO, and CS-BuFLO"
                 .into(),
         ));
     }
@@ -968,6 +1088,50 @@ struct RunCompletion<'a> {
     defense_start_monotonic_ns: Option<u64>,
     application_completion_monotonic_ns: Option<u64>,
     defense_diagnostics: Option<DefenseDiagnostics>,
+    runner_wakeup_metrics: Option<RunnerWakeupMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct RunnerWakeupMetrics {
+    schema_version: u32,
+    semantics: &'static str,
+    wait_returns: u64,
+    socket_readiness_wakeups: u64,
+    timer_wakeups: u64,
+    controller_deadline_timer_wakeups: u64,
+    other_timer_wakeups: u64,
+}
+
+impl RunnerWakeupMetrics {
+    const fn new() -> Self {
+        Self {
+            schema_version: 1,
+            semantics: "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups",
+            wait_returns: 0,
+            socket_readiness_wakeups: 0,
+            timer_wakeups: 0,
+            controller_deadline_timer_wakeups: 0,
+            other_timer_wakeups: 0,
+        }
+    }
+
+    const fn record(&mut self, wake: ActivityWake, controller_deadline_selected: bool) {
+        self.wait_returns = self.wait_returns.saturating_add(1);
+        match wake {
+            ActivityWake::SocketReady => {
+                self.socket_readiness_wakeups = self.socket_readiness_wakeups.saturating_add(1);
+            }
+            ActivityWake::Timer => {
+                self.timer_wakeups = self.timer_wakeups.saturating_add(1);
+                if controller_deadline_selected {
+                    self.controller_deadline_timer_wakeups =
+                        self.controller_deadline_timer_wakeups.saturating_add(1);
+                } else {
+                    self.other_timer_wakeups = self.other_timer_wakeups.saturating_add(1);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1314,6 +1478,19 @@ struct ApplicationRequest {
 struct ScheduledOutgoing {
     slot: QcsdSlotId,
     packet: Packet,
+    /// Absolute adapter deadline derived from the same action timestamp and
+    /// relative window passed to transport. A target is not accepted unless
+    /// the committed UDP datagram reaches the OS socket before this instant.
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SatisfiedDatagram {
+    slot: QcsdSlotId,
+    observed_size: usize,
+    status: &'static str,
+    qcsd: QcsdTraceColumns,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1333,6 +1510,10 @@ struct Endpoint {
     client: Http3Client,
     pending: VecDeque<ApplicationRequest>,
     streams: HashMap<StreamId, StreamRecord>,
+    /// Every application request send half opened on this endpoint. Entries
+    /// remain after response retirement so candidate-defense completion can
+    /// require peer confirmation of the corresponding QUIC bytes and FIN.
+    application_send_streams: BTreeSet<StreamId>,
     completed: Vec<StreamRecord>,
     connected: bool,
     retired_applications: Vec<(u32, ResourceRunState)>,
@@ -2530,6 +2711,7 @@ fn queue_prefix_stage_targets(
                 deadline_after_us: u64::try_from(Duration::from_secs(timeout_seconds).as_micros())
                     .unwrap_or(u64::MAX),
                 allow_stream_data: true,
+                send_policy: QcsdSendPolicy::Exact,
             },
         )?;
         scheduled_slots.insert(slot_id);
@@ -3742,6 +3924,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
             defense_start_monotonic_ns: None,
             application_completion_monotonic_ns: None,
             defense_diagnostics: None,
+            runner_wakeup_metrics: None,
         },
     )?;
     let result = execute_run_inner(&spec, wall_start, process_start).await;
@@ -3762,6 +3945,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
                 defense_start_monotonic_ns: None,
                 application_completion_monotonic_ns: None,
                 defense_diagnostics: None,
+                runner_wakeup_metrics: None,
             },
         )?;
     }
@@ -4135,8 +4319,10 @@ async fn execute_run_inner(
     let mut defense_start = None;
     let mut application_completion = None;
     let mut application_complete_observed = false;
+    let mut last_egress_backlog = None;
     let mut application_batches =
         ApplicationBatchLifecycle::new(&spec.config.defense, spec.request_policy);
+    let mut runner_wakeup_metrics = RunnerWakeupMetrics::new();
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
 
     let loop_result: Result<(), Error> = async {
@@ -4261,6 +4447,7 @@ async fn execute_run_inner(
             let wake_base = now();
             let mut next_wakeup = absolute_wakeup(wake_base, spec.config.control_interval())
                 .ok_or_else(|| Error::RunAborted("runner wake deadline overflow".into()))?;
+            let mut controller_deadline_selected = false;
             for endpoint_index in 0..endpoints.len() {
                 // Flush output that was already available (including newly
                 // dispatched application requests) so its Wire signals precede
@@ -4275,8 +4462,10 @@ async fn execute_run_inner(
                     defense_start,
                 )
                 .await?
+                    && wakeup < next_wakeup
                 {
-                    next_wakeup = next_wakeup.min(wakeup);
+                    next_wakeup = wakeup;
+                    controller_deadline_selected = false;
                 }
             }
 
@@ -4290,6 +4479,22 @@ async fn execute_run_inner(
                     &mut traces,
                     defense_elapsed,
                 )?;
+                let candidate_defense = matches!(
+                    spec.config.defense,
+                    DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
+                );
+                let egress_backlog_pending = endpoints.iter_mut().any(|endpoint| {
+                    endpoint.client.qcsd_has_pending_stream_send()
+                        || (candidate_defense && endpoint.client.qcsd_has_pending_defense_control())
+                });
+                if last_egress_backlog != Some(egress_backlog_pending) {
+                    last_egress_backlog = Some(egress_backlog_pending);
+                    let record = observation_clock.record(QcsdObservation::EgressBacklog {
+                        pending: egress_backlog_pending,
+                    });
+                    traces.observation(None, &record)?;
+                    controller.observe(record.into_observation(), defense_elapsed);
+                }
                 if !application_complete_observed && dependencies.is_complete() {
                     application_complete_observed = true;
                     application_completion = Some(control_now);
@@ -4323,8 +4528,10 @@ async fn execute_run_inner(
                     defense_start,
                 )
                 .await?
+                    && wakeup < next_wakeup
                 {
-                    next_wakeup = next_wakeup.min(wakeup);
+                    next_wakeup = wakeup;
+                    controller_deadline_selected = false;
                 }
                 let endpoint = &mut endpoints[endpoint_index];
                 let input_now = now();
@@ -4342,9 +4549,17 @@ async fn execute_run_inner(
 
             if application_complete_observed
                 && controller.is_complete()
-                && endpoints.iter().all(|endpoint| {
-                    endpoint.scheduled_outgoing.is_empty()
+                && endpoints.iter_mut().all(|endpoint| {
+                    endpoint.connected
+                        && matches!(endpoint.client.state(), Http3State::Connected)
+                        && endpoint.scheduled_outgoing.is_empty()
                         && endpoint.client.qcsd_pending_packet_targets() == 0
+                        && (!matches!(
+                            spec.config.defense,
+                            DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
+                        ) || (!endpoint.client.qcsd_has_pending_stream_send()
+                            && !endpoint.client.qcsd_has_pending_defense_control()
+                            && application_send_halves_peer_confirmed(endpoint)))
                 })
             {
                 traces.ensure_no_pending_slots()?;
@@ -4356,13 +4571,17 @@ async fn execute_run_inner(
                 let controller_wakeup = defense_start
                     .checked_add(next_deadline)
                     .ok_or_else(|| Error::RunAborted("controller wake deadline overflow".into()))?;
-                next_wakeup = next_wakeup.min(controller_wakeup);
+                if controller_wakeup <= next_wakeup {
+                    next_wakeup = controller_wakeup;
+                    controller_deadline_selected = true;
+                }
             }
-            wait_for_activity_until(
+            let wake = wait_for_activity_until(
                 endpoints.iter().map(|endpoint| &endpoint.socket),
                 next_wakeup,
             )
             .await?;
+            runner_wakeup_metrics.record(wake, controller_deadline_selected);
         }
         Ok(())
     }
@@ -4405,6 +4624,7 @@ async fn execute_run_inner(
                 application_completion_monotonic_ns: application_completion
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
+                runner_wakeup_metrics: Some(runner_wakeup_metrics),
             },
         )?;
         return Err(error);
@@ -4431,6 +4651,7 @@ async fn execute_run_inner(
             application_completion_monotonic_ns: application_completion
                 .map(|instant| elapsed_ns(process_start, instant)),
             defense_diagnostics: Some(controller.defense_diagnostics()),
+            runner_wakeup_metrics: Some(runner_wakeup_metrics),
         },
     )?;
     Ok(responses)
@@ -4462,6 +4683,8 @@ const fn shapes_stream_sends(defense: &DefenseConfig) -> bool {
     matches!(
         defense,
         DefenseConfig::Tamaraw(_)
+            | DefenseConfig::Buflo(_)
+            | DefenseConfig::CsBuflo(_)
             | DefenseConfig::WalkieTalkie(_)
             | DefenseConfig::Static {
                 padding_only: false,
@@ -4522,6 +4745,10 @@ fn activate_traffic_morphing(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "endpoint construction validates and binds one fail-closed multi-origin QCSD unit"
+)]
 fn create_endpoints(
     spec: &RunSpec,
     start: Instant,
@@ -4612,6 +4839,7 @@ fn create_endpoints(
                 client,
                 pending,
                 streams: HashMap::new(),
+                application_send_streams: BTreeSet::new(),
                 completed: Vec::new(),
                 connected: false,
                 retired_applications: Vec::new(),
@@ -4733,6 +4961,7 @@ fn dispatch_ready_requests(
             )?;
             let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream)?;
             endpoint.client.stream_close_send(stream, now)?;
+            endpoint.application_send_streams.insert(stream);
             dependencies.mark_in_flight(request.resource_id)?;
             started_requests += 1;
             endpoint.streams.insert(stream, {
@@ -4759,6 +4988,21 @@ fn has_in_flight_application_stream<'a>(
     streams
         .into_iter()
         .any(|record| record.role == QcsdRequestRole::Application && record.outcome == "in_flight")
+}
+
+fn application_send_halves_peer_confirmed(endpoint: &Endpoint) -> bool {
+    tracked_application_send_halves_peer_confirmed(&endpoint.application_send_streams, |stream| {
+        endpoint
+            .client
+            .qcsd_application_send_stream_peer_confirmed(stream)
+    })
+}
+
+fn tracked_application_send_halves_peer_confirmed(
+    streams: &BTreeSet<StreamId>,
+    mut peer_confirmed: impl FnMut(StreamId) -> bool,
+) -> bool {
+    streams.iter().copied().all(&mut peer_confirmed)
 }
 
 fn ready_request_batch(
@@ -4820,7 +5064,7 @@ fn handle_http_events(
                 endpoint.client.authenticated(AuthenticationStatus::Ok, now);
             }
             Http3ClientEvent::StateChange(Http3State::Connected) => endpoint.connected = true,
-            Http3ClientEvent::StateChange(Http3State::Closed(_)) => {
+            Http3ClientEvent::StateChange(Http3State::Closed(reason)) => {
                 endpoint.connected = false;
                 let streams: Vec<_> = endpoint.streams.keys().copied().collect();
                 for stream_id in streams {
@@ -4841,6 +5085,10 @@ fn handle_http_events(
                         "endpoint_closed",
                     ));
                 }
+                return Err(Error::RunAborted(format!(
+                    "HTTP/3 endpoint {} closed before accepted run completion: {reason:?}",
+                    endpoint.id.0
+                )));
             }
             Http3ClientEvent::HeaderReady {
                 stream_id,
@@ -5114,6 +5362,7 @@ const fn action_endpoint(action: &QcsdAction) -> Option<QcsdEndpointId> {
         | QcsdAction::LeaseParserReceive { endpoint, .. }
         | QcsdAction::SendPacket { endpoint, .. }
         | QcsdAction::RequestChaff { endpoint, .. }
+        | QcsdAction::CancelChaff { endpoint, .. }
         | QcsdAction::ReleaseChaffSendShaping { endpoint } => Some(*endpoint),
         QcsdAction::SlotMissed { endpoint, .. } | QcsdAction::SlotSatisfied { endpoint, .. } => {
             *endpoint
@@ -5200,7 +5449,7 @@ fn handle_defense_activation_observations(
 fn satisfied_datagrams_for(
     endpoint: &Endpoint,
     observations: &[TimestampedQcsdObservation],
-) -> Result<Vec<(QcsdSlotId, usize)>, Error> {
+) -> Result<Vec<SatisfiedDatagram>, Error> {
     let mut scheduled_slots: BTreeSet<_> = endpoint
         .scheduled_outgoing
         .iter()
@@ -5210,16 +5459,68 @@ fn satisfied_datagrams_for(
         .iter()
         .filter_map(|record| {
             let observation = record.observation();
-            let QcsdObservation::SlotSatisfied {
-                slot,
-                observed_size,
-                ..
-            } = observation
-            else {
-                return None;
+            let (slot, observed_size, status, qcsd) = match observation {
+                QcsdObservation::SlotSatisfied {
+                    slot,
+                    observed_size,
+                    ..
+                } => {
+                    let desired = endpoint
+                        .scheduled_outgoing
+                        .iter()
+                        .find(|scheduled| scheduled.slot == *slot)
+                        .map_or(*observed_size, |scheduled| scheduled.packet.length());
+                    (
+                        *slot,
+                        *observed_size,
+                        "satisfied",
+                        QcsdTraceColumns::exact(desired, Some(*observed_size)),
+                    )
+                }
+                QcsdObservation::SlotResolved {
+                    slot,
+                    packet,
+                    outcome,
+                    ..
+                } => match outcome {
+                    QcsdSlotOutcome::Full { composition } => (
+                        *slot,
+                        composition.observed_udp_bytes,
+                        "full",
+                        QcsdTraceColumns::from_outcome(*packet, *outcome),
+                    ),
+                    QcsdSlotOutcome::Partial { composition, .. } => (
+                        *slot,
+                        composition.observed_udp_bytes,
+                        "partial",
+                        QcsdTraceColumns::from_outcome(*packet, *outcome),
+                    ),
+                    QcsdSlotOutcome::Suppressed { .. } => return None,
+                },
+                _ => return None,
             };
-            Some(if scheduled_slots.remove(slot) {
-                Ok((*slot, usize::from(*observed_size)))
+            Some(if scheduled_slots.remove(&slot) {
+                endpoint
+                    .scheduled_outgoing
+                    .iter()
+                    .find(|scheduled| scheduled.slot == slot)
+                    .map_or_else(
+                        || {
+                            Err(Error::SlotInvariant(format!(
+                                "transport satisfied outgoing slot {} without a handoff deadline",
+                                slot.0
+                            )))
+                        },
+                        |scheduled| {
+                            Ok(SatisfiedDatagram {
+                                slot,
+                                observed_size: usize::from(observed_size),
+                                status,
+                                qcsd,
+                                deadline: scheduled.deadline,
+                            })
+                        },
+                    )
             } else {
                 Err(Error::SlotInvariant(format!(
                     "transport satisfied unknown outgoing slot {}",
@@ -5230,6 +5531,27 @@ fn satisfied_datagrams_for(
         .collect()
 }
 
+fn built_outgoing_datagrams_for(
+    observations: &[TimestampedQcsdObservation],
+) -> Vec<(usize, QcsdSlotComposition)> {
+    observations
+        .iter()
+        .filter_map(|record| match record.observation() {
+            QcsdObservation::ClassifiedDatagram {
+                direction: Direction::Outgoing,
+                length,
+                composition: Some(composition),
+                ..
+            } => Some((usize::from(*length), *composition)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one reducer atomically terminalizes every typed slot observation"
+)]
 fn record_qcsd_observation(
     endpoint: &mut Endpoint,
     traces: &mut TraceFiles,
@@ -5264,6 +5586,7 @@ fn record_qcsd_observation(
                 observed: Some(usize::from(*observed_size)),
                 miss_reason: "",
                 slot: scheduled.slot,
+                qcsd: QcsdTraceColumns::exact(scheduled.packet.length(), Some(*observed_size)),
             })?;
         }
         QcsdObservation::SlotMissed {
@@ -5287,6 +5610,48 @@ fn record_qcsd_observation(
                 observed: None,
                 miss_reason: &miss_reason,
                 slot: *slot,
+                qcsd: QcsdTraceColumns::default(),
+            })?;
+        }
+        QcsdObservation::SlotResolved {
+            slot,
+            packet,
+            outcome,
+            ..
+        } => {
+            let scheduled = endpoint
+                .scheduled_outgoing
+                .iter()
+                .position(|scheduled| scheduled.slot == *slot)
+                .and_then(|index| endpoint.scheduled_outgoing.remove(index));
+            let scheduled_packet = scheduled.map_or(*packet, |value| value.packet);
+            let (satisfaction, observed, miss_reason) = match outcome {
+                QcsdSlotOutcome::Full { composition } => (
+                    "full",
+                    Some(usize::from(composition.observed_udp_bytes)),
+                    String::new(),
+                ),
+                QcsdSlotOutcome::Partial {
+                    composition,
+                    reason,
+                } => (
+                    "partial",
+                    Some(usize::from(composition.observed_udp_bytes)),
+                    format!("{reason:?}"),
+                ),
+                QcsdSlotOutcome::Suppressed { reason, .. } => {
+                    ("suppressed", None, format!("{reason:?}"))
+                }
+            };
+            traces.schedule(&ScheduleTraceRow {
+                action_time_us: record.produced_monotonic_ns() / 1_000,
+                endpoint: Some(endpoint.id),
+                packet: scheduled_packet,
+                satisfaction,
+                observed,
+                miss_reason: &miss_reason,
+                slot: *slot,
+                qcsd: QcsdTraceColumns::from_outcome(scheduled_packet, *outcome),
             })?;
         }
         _ => {}
@@ -5324,6 +5689,7 @@ fn record_terminal_action(
         observed: None,
         miss_reason: &miss_reason,
         slot,
+        qcsd: QcsdTraceColumns::exact(packet.length(), None),
     })?;
     traces.event(now, endpoint, "action", event_outcome, action)?;
     Ok(true)
@@ -6098,6 +6464,85 @@ fn apply_queued_actions(
     }
 }
 
+fn validate_local_et_chaff_target(
+    streams: &HashMap<StreamId, StreamRecord>,
+    stream: neqo_csdef::QcsdStreamId,
+) -> Result<StreamId, Error> {
+    let stream_id = StreamId::new(stream.0);
+    let Some(record) = streams.get(&stream_id) else {
+        return Err(Error::SlotInvariant(format!(
+            "local CS-BuFLO termination targeted unknown chaff stream {}",
+            stream.0
+        )));
+    };
+    if !matches!(record.role, QcsdRequestRole::Chaff { .. }) {
+        return Err(Error::SlotInvariant(format!(
+            "local CS-BuFLO termination targeted application stream {}",
+            stream.0
+        )));
+    }
+    Ok(stream_id)
+}
+
+/// Validate a local-ET cancellation before touching HTTP/3, then atomically
+/// roll back any receive-limit action that transport accepted but has not yet
+/// encoded. The controller has already closed this chaff stream and removed
+/// the matching unadvertised suffix before it emits `CancelChaff`; leaving the
+/// adapter suffix alive would strand terminal defense-control backlog once
+/// `STOP_SENDING` moves the transport receive state out of `Recv`.
+fn prepare_local_et_chaff_cancellation(
+    endpoint: &mut Endpoint,
+    traces: &mut TraceFiles,
+    now: Instant,
+    action: &QcsdAction,
+) -> Result<Option<StreamId>, Error> {
+    let QcsdAction::CancelChaff { stream, .. } = action else {
+        return Ok(None);
+    };
+    let stream_id = validate_local_et_chaff_target(&endpoint.streams, *stream)?;
+
+    let identities: Vec<QcsdReceiveActionIdentity> = endpoint
+        .client
+        .qcsd_pending_receive_action_identities()
+        .into_iter()
+        .filter(|identity| {
+            identity.endpoint() == endpoint.id && identity.stream().0 == stream_id.as_u64()
+        })
+        .collect();
+    if !identities.is_empty() {
+        endpoint
+            .client
+            .preview_qcsd_receive_action_cancellation(&identities)?;
+        let boundaries = endpoint
+            .client
+            .qcsd_receive_action_cancellation_boundaries(&identities)?;
+        endpoint
+            .client
+            .commit_qcsd_receive_action_cancellation(&identities)?;
+        traces.event(
+            now,
+            Some(endpoint.id),
+            "receive_cancellation",
+            "local_et_unencoded_rollback",
+            &json!({
+                "stream": stream.0,
+                "identities": identities
+                    .iter()
+                    .map(|identity| format!("{identity:?}"))
+                    .collect::<Vec<_>>(),
+                "restored_boundaries": boundaries
+                    .iter()
+                    .map(|(_, candidate, limit)| json!({
+                        "stream": candidate.0,
+                        "absolute_limit": limit,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        )?;
+    }
+    Ok(Some(stream_id))
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -6179,13 +6624,23 @@ fn apply_action(
                 observed: None,
                 miss_reason: &miss_reason,
                 slot,
+                qcsd: QcsdTraceColumns::default(),
             })?;
         }
         traces.event(now, endpoint_id, "action", "missing_endpoint", &action)?;
         return Ok(());
     };
+    // This is deliberately before `apply_qcsd_action`: a stale or invalid
+    // CancelChaff identity must never mutate an application or unknown stream.
+    let local_et_stream =
+        prepare_local_et_chaff_cancellation(endpoint, traces, now, &trace_action)?;
     let scheduled_packet = match &trace_action {
-        QcsdAction::SendPacket { packet, slot, .. } => Some((*packet, *slot)),
+        QcsdAction::SendPacket {
+            packet,
+            slot,
+            deadline_after_us,
+            ..
+        } => Some((*packet, *slot, *deadline_after_us)),
         _ => None,
     };
     if let Some((_, _, absolute_limit)) = receive_action_target(&trace_action) {
@@ -6243,10 +6698,20 @@ fn apply_action(
     }
     match endpoint.client.apply_qcsd_action(now, action) {
         Ok(chaff_stream) => {
-            if let Some((packet, slot)) = scheduled_packet {
-                endpoint
-                    .scheduled_outgoing
-                    .push_back(ScheduledOutgoing { slot, packet });
+            if let Some((packet, slot, deadline_after_us)) = scheduled_packet {
+                let deadline = now
+                    .checked_add(Duration::from_micros(deadline_after_us))
+                    .ok_or_else(|| {
+                        Error::SlotInvariant(format!(
+                            "outgoing slot {} succeeded without a representable handoff deadline",
+                            slot.0
+                        ))
+                    })?;
+                endpoint.scheduled_outgoing.push_back(ScheduledOutgoing {
+                    slot,
+                    packet,
+                    deadline,
+                });
             }
             if let Some(stream_id) = chaff_stream {
                 let (resource_id, request_id, url, request_headers) = match &trace_action {
@@ -6332,6 +6797,22 @@ fn apply_action(
                 // request is eligible for its first transport output.
                 handle_qcsd_observations(endpoint, controller, traces, defense_elapsed)?;
             }
+            if let Some(stream_id) = local_et_stream {
+                let Some(record) = endpoint.streams.get_mut(&stream_id) else {
+                    return Err(Error::SlotInvariant(format!(
+                        "local CS-BuFLO termination targeted unknown chaff stream {}",
+                        stream_id.as_u64()
+                    )));
+                };
+                if !matches!(record.role, QcsdRequestRole::Chaff { .. }) {
+                    return Err(Error::SlotInvariant(format!(
+                        "local CS-BuFLO termination targeted application stream {}",
+                        stream_id.as_u64()
+                    )));
+                }
+                record.outcome = "local_early_termination_cancelled";
+                finish_stream(endpoint, stream_id)?;
+            }
             traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
         }
         Err(error) => {
@@ -6358,6 +6839,7 @@ fn apply_action(
                     observed: None,
                     miss_reason: &miss_reason,
                     slot,
+                    qcsd: QcsdTraceColumns::default(),
                 })?;
             }
             record_adapter_action_error(traces, now, &trace_action, &error)?;
@@ -6381,30 +6863,37 @@ const fn action_failure_reason(action: &QcsdAction, error: &neqo_http3::Error) -
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityWake {
+    SocketReady,
+    Timer,
+}
+
 async fn wait_for_activity<'a>(
     sockets: impl IntoIterator<Item = &'a Socket>,
     delay: Duration,
-) -> Result<(), Error> {
+) -> Result<ActivityWake, Error> {
     let readiness: Vec<_> = sockets
         .into_iter()
         .map(|socket| Box::pin(socket.readable()))
         .collect();
     if readiness.is_empty() {
         tokio::time::sleep(delay).await;
-        return Ok(());
+        return Ok(ActivityWake::Timer);
     }
-    let sockets_ready = select_all(readiness).map(|(result, _, _)| result);
-    let timeout_ready = Box::pin(tokio::time::sleep(delay).map(|()| Ok(())));
+    let sockets_ready =
+        select_all(readiness).map(|(result, _, _)| result.map(|()| ActivityWake::SocketReady));
+    let timeout_ready = Box::pin(tokio::time::sleep(delay).map(|()| Ok(ActivityWake::Timer)));
     select(sockets_ready, timeout_ready)
         .map(|either| either.factor_first().0)
-        .await?;
-    Ok(())
+        .await
+        .map_err(Error::from)
 }
 
 async fn wait_for_activity_until<'a>(
     sockets: impl IntoIterator<Item = &'a Socket>,
     wakeup: Instant,
-) -> Result<(), Error> {
+) -> Result<ActivityWake, Error> {
     // Recompute immediately before sleeping: callback durations are never
     // allowed to accumulate against a stale transport-drive timestamp.  An
     // already-due callback still awaits once so Tokio's current-thread reactor
@@ -6457,6 +6946,46 @@ enum OutputDrive {
     Datagram,
     Callback(Instant),
     None,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketHandoff {
+    Sent(Instant),
+    RetryUnshaped,
+}
+
+fn attempt_socket_handoff(
+    target_deadlines: &[Instant],
+    send: impl FnOnce() -> io::Result<()>,
+    clock: impl FnOnce() -> Instant,
+) -> Result<SocketHandoff, Error> {
+    match send() {
+        Ok(()) => {
+            let sent_at = clock();
+            if let Some(deadline) = target_deadlines
+                .iter()
+                .copied()
+                .find(|deadline| sent_at >= *deadline)
+            {
+                return Err(Error::SlotInvariant(format!(
+                    "target-bearing UDP datagram reached the socket at or after its adapter deadline ({sent_at:?} >= {deadline:?})"
+                )));
+            }
+            Ok(SocketHandoff::Sent(sent_at))
+        }
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock && !target_deadlines.is_empty() =>
+        {
+            Err(Error::SlotInvariant(
+                "target-bearing UDP datagram encountered socket backpressure after transport commit; refusing a late retry"
+                    .into(),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Ok(SocketHandoff::RetryUnshaped)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[expect(
@@ -6535,28 +7064,48 @@ async fn process_output_once(
     };
     let observations = endpoint.client.qcsd_timestamped_observations();
     let mut satisfied_datagrams = satisfied_datagrams_for(endpoint, &observations)?;
+    let built_datagrams = built_outgoing_datagrams_for(&observations);
+    let batch_datagrams = batch.iter().count();
+    if built_datagrams.len() != batch_datagrams {
+        return Err(Error::SlotInvariant(format!(
+            "transport reported {} packet-build compositions for {batch_datagrams} outgoing datagrams",
+            built_datagrams.len()
+        )));
+    }
     let mut attributed_datagrams = Vec::new();
-    for datagram in batch.iter() {
+    for (datagram, (built_length, composition)) in batch.iter().zip(built_datagrams) {
+        if datagram.len() != built_length
+            || composition.observed_udp_bytes != u16::try_from(datagram.len()).unwrap_or(u16::MAX)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "packet-build composition length {built_length}/{} did not match raw outgoing datagram {}",
+                composition.observed_udp_bytes,
+                datagram.len()
+            )));
+        }
         let satisfied = satisfied_datagrams
             .iter()
-            .position(|(_, observed_size)| *observed_size == datagram.len())
+            .position(|candidate| candidate.observed_size == datagram.len())
             .map(|index| satisfied_datagrams.remove(index));
-        attributed_datagrams.push((datagram.len(), satisfied));
+        attributed_datagrams.push((datagram.len(), satisfied, composition));
     }
-    if let Some((slot, _)) = satisfied_datagrams.first() {
+    if let Some(satisfied) = satisfied_datagrams.first() {
         return Err(Error::SlotInvariant(format!(
             "satisfied outgoing slot {} had no matching datagram",
-            slot.0
+            satisfied.slot.0
         )));
     }
 
+    let target_deadlines: Vec<_> = attributed_datagrams
+        .iter()
+        .filter_map(|(_, satisfied, _)| satisfied.map(|target| target.deadline))
+        .collect();
     let sent_at = loop {
-        match endpoint.socket.send(&batch) {
-            Ok(()) => break now(),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        match attempt_socket_handoff(&target_deadlines, || endpoint.socket.send(&batch), now)? {
+            SocketHandoff::Sent(sent_at) => break sent_at,
+            SocketHandoff::RetryUnshaped => {
                 endpoint.socket.writable().await?;
             }
-            Err(error) => return Err(error.into()),
         }
     };
     let wire_elapsed = defense_start.map(|started| sent_at.saturating_duration_since(started));
@@ -6564,16 +7113,20 @@ async fn process_output_once(
         record_qcsd_observation(endpoint, traces, &observation)?;
         forward_qcsd_observation(controller, observation, wire_elapsed);
     }
-    for (observed, satisfied) in attributed_datagrams {
+    for (observed, satisfied, composition) in attributed_datagrams {
+        let qcsd = satisfied
+            .map_or_else(QcsdTraceColumns::default, |target| target.qcsd)
+            .with_built_composition(composition);
         traces.packet(&PacketTraceRow {
             now: sent_at,
             endpoint: endpoint.id,
             direction: "outgoing",
             observed,
             scheduled: satisfied
-                .map(|(_, observed_size)| u16::try_from(observed_size).unwrap_or(u16::MAX)),
-            satisfaction: satisfied.map_or("unshaped", |_| "satisfied"),
-            slot: satisfied.map(|(slot, _)| slot),
+                .map(|target| u16::try_from(target.observed_size).unwrap_or(u16::MAX)),
+            satisfaction: satisfied.map_or("unshaped", |target| target.status),
+            slot: satisfied.map(|target| target.slot),
+            qcsd,
         })?;
         if let Some((observation, at)) = datagram_observation(
             endpoint.id,
@@ -6610,6 +7163,7 @@ fn process_input(
                 scheduled: None,
                 satisfaction: "observed",
                 slot: None,
+                qcsd: QcsdTraceColumns::default(),
             })?;
             if let Some((observation, at)) = datagram_observation(
                 endpoint.id,
@@ -6682,6 +7236,56 @@ fn collect_chaff_responses(endpoints: &[Endpoint]) -> Result<Vec<ChaffResponseRe
     Ok(responses)
 }
 
+fn buflo_run_summary(
+    defense: &DefenseConfig,
+    diagnostics: Option<&DefenseDiagnostics>,
+) -> Option<serde_json::Value> {
+    let DefenseConfig::Buflo(_) = defense else {
+        return None;
+    };
+    diagnostics.map(|diagnostics| {
+        json!({
+            "schema_version": 1,
+            "kind": "buflo",
+            "implementation_scope": "client_only_quic",
+            "paper_equivalent": false,
+            "incoming_opportunity_semantics": "client_receive_credit_and_response_qualified_chaff_attempt",
+            "unavailable_peer_properties": [
+                "scheduled_server_datagram_timing",
+                "scheduled_server_datagram_size",
+            ],
+            "diagnostics": diagnostics,
+        })
+    })
+}
+
+fn cs_buflo_run_summary(
+    defense: &DefenseConfig,
+    diagnostics: Option<&DefenseDiagnostics>,
+) -> Option<serde_json::Value> {
+    let DefenseConfig::CsBuflo(_) = defense else {
+        return None;
+    };
+    diagnostics.map(|diagnostics| {
+        json!({
+            "schema_version": 2,
+            "kind": "cs_buflo",
+            "implementation_scope": "client_only_quic",
+            "paper_equivalent": false,
+            "incoming_opportunity_semantics": "client_receive_credit_and_response_qualified_chaff_attempt",
+            "incoming_cadence_boundary": "complete_local_on_wire_max_stream_data_advertisement",
+            "incoming_terminal_boundary": "eventual_peer_stream_offset_consumption",
+            "incoming_boundary_separation": "advertisement_rearms_cadence_but_does_not_claim_peer_datagram_or_consumption",
+            "unavailable_peer_properties": [
+                "scheduled_server_datagram_timing",
+                "scheduled_server_datagram_size",
+            ],
+            "early_termination_semantics": diagnostics.cs_buflo_early_termination_semantics,
+            "diagnostics": diagnostics,
+        })
+    })
+}
+
 fn write_run_json(
     spec: &RunSpec,
     endpoints: &[Endpoint],
@@ -6690,6 +7294,14 @@ fn write_run_json(
     completion: &RunCompletion<'_>,
 ) -> Result<(), Error> {
     let chaff_responses = collect_chaff_responses(endpoints)?;
+    let buflo_summary = buflo_run_summary(
+        &spec.config.defense,
+        completion.defense_diagnostics.as_ref(),
+    );
+    let cs_buflo_summary = cs_buflo_run_summary(
+        &spec.config.defense,
+        completion.defense_diagnostics.as_ref(),
+    );
     let endpoint_data: Vec<_> = endpoints
         .iter()
         .map(|endpoint| {
@@ -6728,6 +7340,9 @@ fn write_run_json(
         "defense_start_monotonic_ns": completion.defense_start_monotonic_ns,
         "application_completion_monotonic_ns": completion.application_completion_monotonic_ns,
         "defense_diagnostics": completion.defense_diagnostics,
+        "runner_wakeup_metrics": completion.runner_wakeup_metrics,
+        "buflo_summary": buflo_summary,
+        "cs_buflo_summary": cs_buflo_summary,
         "completion_status": completion.status,
         "error": completion.error,
         "endpoints": endpoint_data,
@@ -6790,12 +7405,13 @@ mod tests {
 
     use clap::Parser as _;
     use neqo_csdef::{
-        ChaffManifest, ChaffQualification, Defense, DefenseConfig, DefenseMode, DefenseSignal,
-        DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig,
+        ChaffManifest, ChaffQualification, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode,
+        DefenseSignal, DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig,
         IdentityChaffRequestHeaderPrimitive, MissedSlotReason, Packet, QcsdAction,
-        QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdDatagramClass, QcsdEndpointId,
-        QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
-        QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdSlotId,
+        QcsdChaffRequestId, QcsdConfig, QcsdCongestionReason, QcsdController, QcsdDatagramClass,
+        QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner,
+        QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+        QcsdReceiveLimitOutcome, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome,
         QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource,
         ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
         ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
@@ -6804,35 +7420,39 @@ mod tests {
         WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig, sanitize_chaff_headers,
     };
     use neqo_udp::RecvBuf;
+    use serde_json::json;
 
     use super::{
-        ApplicationBatchLifecycle, Args, ChaffRequestHeaderModeArg, DefenseArg, Error,
-        ExpectedChaffIdentity, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
+        ActivityWake, ApplicationBatchLifecycle, Args, ChaffRequestHeaderModeArg, DefenseArg,
+        Error, ExpectedChaffIdentity, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
         PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg, QcsdRequestRole,
         QualificationAcknowledgement, QualifierStream, RequestPolicyArg, ResourceRunState,
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
-        RuntimeChaffManifest, Socket, StaticModeArg, StreamActivationStage, StreamRecord,
-        StreamType, SustainedResponseQualificationRequest, TrafficMorphingActivation,
-        absolute_wakeup, action_failure_reason, activate_traffic_morphing, apply_action_batch,
-        bind_qualified_chaff_stream_limits, bounded_qualification_wait, create_endpoints,
-        datagram_observation, deadline_error, defense_parameter_provenance,
-        drain_qualifier_stream_data, ensure_defense_realizable,
-        expected_application_response_length, finish_application_record, finish_chaff_record,
-        forward_qcsd_observation, has_in_flight_application_stream, now,
-        pending_receive_identity_is_reconciled, prefix_receipts_pass,
-        prefix_targetless_stream_bytes, preflight_receive_actions_with, projected_ael,
-        projected_identity_chaff_headers, qcsd_connection_parameters,
-        qualification_content_encoding, ready_request_batch, record_adapter_action_error,
-        record_receive_limit_error, record_terminal_action, register_action_batch,
-        remaining_wakeup_delay, resolve_run_config, resolve_run_config_with_workload,
-        response_qualification_mode, sanitize_chaff_action_headers, sha256, shapes_stream_sends,
+        RunnerWakeupMetrics, RuntimeChaffManifest, Socket, SocketHandoff, StaticModeArg,
+        StreamActivationStage, StreamRecord, StreamType, SustainedResponseQualificationRequest,
+        TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
+        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
+        attempt_socket_handoff, bind_qualified_chaff_stream_limits, bounded_qualification_wait,
+        buflo_run_summary, create_endpoints, cs_buflo_run_summary, datagram_observation,
+        deadline_error, defense_parameter_provenance, drain_qualifier_stream_data,
+        ensure_defense_realizable, expected_application_response_length, finish_application_record,
+        finish_chaff_record, finish_stream, forward_qcsd_observation, handle_http_events,
+        has_in_flight_application_stream, now, pending_receive_identity_is_reconciled,
+        prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
+        prepare_local_et_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
+        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
+        record_adapter_action_error, record_receive_limit_error, record_terminal_action,
+        register_action_batch, remaining_wakeup_delay, resolve_run_config,
+        resolve_run_config_with_workload, response_qualification_mode,
+        sanitize_chaff_action_headers, sha256, shapes_stream_sends,
         sustained_qualification_content_encoding, sustained_representation_failure,
         sustained_requests_are_classifiable, terminalize_pending_slots,
-        trace_files::{ScheduleTraceRow, TraceFiles},
+        trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_chaff_manifest_defense,
-        validate_prefix_capacity_plan, validate_qualified_chaff_binding,
-        validate_walkie_talkie_chaff_precondition, wait_for_activity, wait_for_activity_until,
-        walkie_talkie_qualification_binding_matches, write_run_json,
+        validate_local_et_chaff_target, validate_prefix_capacity_plan,
+        validate_qualified_chaff_binding, validate_walkie_talkie_chaff_precondition,
+        wait_for_activity, wait_for_activity_until, walkie_talkie_qualification_binding_matches,
+        write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -6895,6 +7515,356 @@ mod tests {
                 body_sha256: sha256(body).expect("hash body"),
             }),
         }
+    }
+
+    #[test]
+    fn local_et_chaff_target_is_validated_before_adapter_mutation() {
+        let application_stream = neqo_transport::StreamId::new(0);
+        let chaff_stream = neqo_transport::StreamId::new(4);
+        let streams = HashMap::from([
+            (application_stream, application(Some(200), false)),
+            (chaff_stream, chaff(b"cover", false)),
+        ]);
+
+        assert!(matches!(
+            validate_local_et_chaff_target(&streams, QcsdStreamId(8)),
+            Err(Error::SlotInvariant(message)) if message.contains("unknown chaff stream 8")
+        ));
+        assert!(matches!(
+            validate_local_et_chaff_target(&streams, QcsdStreamId(0)),
+            Err(Error::SlotInvariant(message)) if message.contains("application stream 0")
+        ));
+        assert_eq!(
+            validate_local_et_chaff_target(&streams, QcsdStreamId(4)).expect("known chaff"),
+            chaff_stream
+        );
+        assert_eq!(streams.len(), 2, "validation is side-effect free");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the real cross-layer cancellation lifecycle is one regression oracle"
+    )]
+    async fn local_et_rolls_back_real_unencoded_receive_identities_and_reaches_terminal_transport()
+    {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("local-et-real-receive-rollback");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let config = QcsdConfig {
+            initial_max_stream_data: 16,
+            defense: DefenseConfig::Front(FrontConfig::default()),
+            ..QcsdConfig::default()
+        };
+        let mut client = test_fixture::http3_client_with_params(
+            neqo_http3::Http3Parameters::default().connection_parameters(
+                qcsd_connection_parameters(&config, test_fixture::DEFAULT_ADDR.ip()),
+            ),
+        );
+        let mut server = test_fixture::default_http3_server();
+        let trailing = test_fixture::connect_peers(&mut client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut client, &mut server, false, server_output);
+        client
+            .enable_qcsd_with_observation_clock(
+                QcsdEndpointId(0),
+                &http::Uri::from_static("https://example.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+                clock.clone(),
+            )
+            .expect("enable the connected QCSD adapter");
+        for _ in 0..8 {
+            if !client.qcsd_has_pending_stream_send() {
+                break;
+            }
+            let client_output = client.process_output(test_fixture::now());
+            let server_output = server.process(client_output.dgram(), test_fixture::now());
+            drop(client.process(server_output.dgram(), test_fixture::now()));
+        }
+        assert!(
+            !client.qcsd_has_pending_stream_send(),
+            "preflush every HTTP/3 critical stream before shaping"
+        );
+        client.qcsd_enable_send_shaping(true);
+
+        let spec = RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+            },
+            workload_hash: "local-et-real-receive-rollback".into(),
+            application_workload_source: None,
+            config,
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 7,
+            output_dir: output.clone(),
+            max_response_bytes: 1,
+            timeout_seconds: 1,
+        };
+        let mut endpoint = create_endpoints(&spec, started, &clock)
+            .expect("construct runner endpoint")
+            .remove(0);
+        endpoint.client = client;
+        endpoint.connected = true;
+        endpoint.pending.clear();
+
+        let request_id = QcsdChaffRequestId(7);
+        let stream = endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::RequestChaff {
+                    endpoint: endpoint.id,
+                    resource: Resource {
+                        id: 0,
+                        url: "https://example.com/chaff".into(),
+                        kind: "Other".into(),
+                        content_length: Some(5),
+                        data_length: 5,
+                        chaff_priority: true,
+                        known_valid: true,
+                        depends_on: Vec::new(),
+                        headers: Vec::new(),
+                    },
+                    request_id,
+                },
+            )
+            .expect("create real chaff request")
+            .expect("chaff request stream");
+        endpoint
+            .client
+            .stream_close_send(stream, started)
+            .expect("close chaff request send handler");
+        endpoint.streams.insert(stream, chaff(b"cover", false));
+
+        let stream = QcsdStreamId(stream.as_u64());
+        let configure = QcsdAction::ConfigureManualReceive {
+            endpoint: endpoint.id,
+            stream,
+            initial_limit: 16,
+        };
+        assert_eq!(
+            endpoint
+                .client
+                .apply_qcsd_receive_action(&configure)
+                .expect("configure manual receive"),
+            Some(QcsdReceiveLimitOutcome::Applied)
+        );
+        let scheduled_packet =
+            Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("scheduled packet");
+        let scheduled = QcsdAction::IncreaseReceiveLimit {
+            endpoint: endpoint.id,
+            stream,
+            absolute_limit: 26,
+            packet: scheduled_packet,
+            slot: QcsdSlotId(90),
+        };
+        let parser_packet =
+            Packet::new(Duration::from_micros(1), Direction::Incoming, 3).expect("parser packet");
+        let parser = QcsdAction::LeaseParserReceive {
+            endpoint: endpoint.id,
+            stream,
+            absolute_limit: 29,
+            increase: 3,
+            owner: Some(QcsdParserLeaseOwner {
+                packet: parser_packet,
+                slot: QcsdSlotId(91),
+            }),
+        };
+        for action in [&scheduled, &parser] {
+            assert_eq!(
+                endpoint
+                    .client
+                    .apply_qcsd_receive_action(action)
+                    .expect("accept typed receive action"),
+                Some(QcsdReceiveLimitOutcome::Applied)
+            );
+        }
+        let expected_identities = vec![
+            scheduled.receive_identity().expect("scheduled identity"),
+            parser.receive_identity().expect("parser identity"),
+        ];
+        assert_eq!(
+            endpoint.client.qcsd_pending_receive_action_identities(),
+            expected_identities,
+            "both actions are accepted but still unencoded"
+        );
+
+        let cancel = QcsdAction::CancelChaff {
+            endpoint: endpoint.id,
+            stream,
+        };
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        assert_eq!(
+            prepare_local_et_chaff_cancellation(&mut endpoint, &mut traces, started, &cancel,)
+                .expect("prepare exact local-ET rollback"),
+            Some(neqo_transport::StreamId::new(stream.0))
+        );
+        assert!(
+            endpoint
+                .client
+                .qcsd_pending_receive_action_identities()
+                .is_empty(),
+            "the exact scheduled and parser suffix is reconciled"
+        );
+        let restored_probe = QcsdAction::LeaseParserReceive {
+            endpoint: endpoint.id,
+            stream,
+            absolute_limit: 19,
+            increase: 3,
+            owner: None,
+        };
+        assert_eq!(
+            endpoint
+                .client
+                .preview_qcsd_receive_action(&restored_probe, None)
+                .expect("preview restored boundary"),
+            Some(QcsdReceiveLimitOutcome::Applied),
+            "rollback restores the original 16-byte receive boundary"
+        );
+
+        endpoint
+            .client
+            .apply_qcsd_action(started, cancel)
+            .expect("apply local-ET RESET_STREAM and STOP_SENDING");
+        endpoint
+            .streams
+            .get_mut(&neqo_transport::StreamId::new(stream.0))
+            .expect("tracked chaff stream")
+            .outcome = "local_early_termination_cancelled";
+        finish_stream(&mut endpoint, neqo_transport::StreamId::new(stream.0))
+            .expect("retire chaff record");
+        assert!(endpoint.streams.is_empty());
+        assert!(endpoint.client.qcsd_has_pending_defense_control());
+
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert_eq!(endpoint.client.state(), neqo_http3::Http3State::Connected);
+        let qpack_decoder = endpoint
+            .client
+            .qcsd_qpack_decoder_stream_id()
+            .expect("fixture QPACK decoder stream");
+        let pending_except_qpack_decoder = endpoint
+            .client
+            .qcsd_has_pending_stream_send_excluding(&[qpack_decoder]);
+        let qpack_decoder_handler_pending = endpoint.client.qcsd_qpack_decoder_handler_pending();
+        let qpack_decoder_transport_pending =
+            endpoint.client.qcsd_qpack_decoder_transport_pending();
+        assert!(
+            !pending_except_qpack_decoder,
+            "the cancelled request has no STREAM backlog; only the fixture's lazily created QPACK decoder stream may remain"
+        );
+        assert!(!qpack_decoder_handler_pending);
+        assert!(qpack_decoder_transport_pending);
+        assert!(!endpoint.client.qcsd_has_pending_defense_control());
+        assert!(application_send_halves_peer_confirmed(&endpoint));
+
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events trace");
+        assert!(events.contains("local_et_unencoded_rollback"));
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    async fn unexpected_endpoint_close_cannot_complete_and_aborts_with_reason() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("unexpected-endpoint-close");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let config = QcsdConfig {
+            initial_max_stream_data: 16,
+            defense: DefenseConfig::Front(FrontConfig::default()),
+            ..QcsdConfig::default()
+        };
+        let mut client = test_fixture::http3_client_with_params(
+            neqo_http3::Http3Parameters::default().connection_parameters(
+                qcsd_connection_parameters(&config, test_fixture::DEFAULT_ADDR.ip()),
+            ),
+        );
+        let mut server = test_fixture::default_http3_server();
+        let trailing = test_fixture::connect_peers(&mut client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut client, &mut server, false, server_output);
+        client
+            .enable_qcsd_with_observation_clock(
+                QcsdEndpointId(0),
+                &http::Uri::from_static("https://example.com/"),
+                1_200,
+                true,
+                Duration::from_millis(100),
+                clock.clone(),
+            )
+            .expect("enable the connected QCSD adapter");
+        let spec = RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+            },
+            workload_hash: "unexpected-endpoint-close".into(),
+            application_workload_source: None,
+            config,
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 9,
+            output_dir: output.clone(),
+            max_response_bytes: 1,
+            timeout_seconds: 1,
+        };
+        let mut endpoint = create_endpoints(&spec, started, &clock)
+            .expect("construct runner endpoint")
+            .remove(0);
+        endpoint.client = client;
+        endpoint.connected = true;
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+
+        endpoint
+            .client
+            .close(started, 85, "unexpected runner close");
+        assert!(matches!(
+            endpoint.client.state(),
+            neqo_http3::Http3State::Closing(_)
+        ));
+        handle_http_events(&mut endpoint, &spec, started, &mut traces)
+            .expect("the closing phase is guarded while transport finishes closing");
+        assert!(endpoint.connected);
+        assert!(
+            !(endpoint.connected
+                && matches!(endpoint.client.state(), neqo_http3::Http3State::Connected)),
+            "a Closing endpoint cannot satisfy the runner completion guard"
+        );
+
+        let closed_at = started + Duration::from_secs(60);
+        drop(endpoint.client.process_output(closed_at));
+        assert!(matches!(
+            endpoint.client.state(),
+            neqo_http3::Http3State::Closed(_)
+        ));
+        let error = handle_http_events(&mut endpoint, &spec, closed_at, &mut traces)
+            .expect_err("a terminal close must abort the run");
+        assert!(matches!(
+            error,
+            Error::RunAborted(message)
+                if message.contains("HTTP/3 endpoint 0 closed before accepted run completion")
+                    && message.contains("Application(85)")
+        ));
+        assert!(!endpoint.connected);
+        assert!(endpoint.pending.is_empty());
+        assert_eq!(endpoint.completed.len(), 1);
+        assert_eq!(endpoint.completed[0].outcome, "endpoint_closed");
+
+        drop(traces);
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     fn qualified_chaff_manifest(resources: Vec<Resource>) -> ChaffManifest {
@@ -7178,7 +8148,7 @@ mod tests {
     }
 
     #[test]
-    fn response_only_runtime_contract_is_exclusive_to_front_and_tamaraw() {
+    fn response_only_runtime_contract_is_exclusive_to_sustained_padding_defenses() {
         let manifests: Vec<RuntimeChaffManifest> = vec![
             response_only_chaff_manifest().into(),
             response_only_chaff_manifest_v4(
@@ -7193,6 +8163,12 @@ mod tests {
             for defense in [
                 DefenseConfig::Front(FrontConfig::default()),
                 DefenseConfig::Tamaraw(TamarawConfig::default()),
+                DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                    parameters: "buflo.json".into(),
+                }),
+                DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                    parameters: "cs-buflo.json".into(),
+                }),
             ] {
                 validate_chaff_manifest_defense(&defense, manifest)
                     .expect("response-only defense is supported");
@@ -7557,6 +8533,15 @@ mod tests {
                 defense_start_monotonic_ns: Some(3),
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
+                runner_wakeup_metrics: Some(RunnerWakeupMetrics {
+                    schema_version: 1,
+                    semantics: "test-select-return-semantics",
+                    wait_returns: 3,
+                    socket_readiness_wakeups: 1,
+                    timer_wakeups: 2,
+                    controller_deadline_timer_wakeups: 1,
+                    other_timer_wakeups: 1,
+                }),
             },
         )
         .expect("write run receipt");
@@ -7567,6 +8552,8 @@ mod tests {
         assert!(receipt.get("resolved_workload").is_none());
         assert!(receipt.get("urls").is_none());
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 1);
+        assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
         for retained in [
             "resolved_configuration",
             "responses",
@@ -7575,6 +8562,75 @@ mod tests {
         ] {
             assert!(receipt.get(retained).is_some(), "missing {retained}");
         }
+    }
+
+    #[test]
+    fn run_receipt_summaries_are_versioned_and_mode_specific() {
+        let diagnostics = DefenseDiagnostics {
+            buflo_client_only: true,
+            cs_buflo_client_only: true,
+            cs_buflo_early_termination_semantics: "udp_client_only_observed_udp_power_of_two_crossing",
+            ..DefenseDiagnostics::default()
+        };
+        let buflo = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: "buflo.json".into(),
+        });
+        let cs_buflo = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "cs-buflo.json".into(),
+        });
+
+        let buflo_summary = buflo_run_summary(&buflo, Some(&diagnostics)).expect("BuFLO summary");
+        assert_eq!(buflo_summary["schema_version"], 1);
+        assert_eq!(buflo_summary["kind"], "buflo");
+        assert_eq!(buflo_summary["implementation_scope"], "client_only_quic");
+        assert_eq!(buflo_summary["paper_equivalent"], false);
+        assert_eq!(
+            buflo_summary["incoming_opportunity_semantics"],
+            "client_receive_credit_and_response_qualified_chaff_attempt"
+        );
+        assert_eq!(
+            buflo_summary["unavailable_peer_properties"],
+            json!([
+                "scheduled_server_datagram_timing",
+                "scheduled_server_datagram_size"
+            ])
+        );
+        assert_eq!(buflo_summary["diagnostics"]["buflo_client_only"], true);
+        assert!(cs_buflo_run_summary(&buflo, Some(&diagnostics)).is_none());
+
+        let cs_summary =
+            cs_buflo_run_summary(&cs_buflo, Some(&diagnostics)).expect("CS-BuFLO summary");
+        assert_eq!(cs_summary["schema_version"], 2);
+        assert_eq!(cs_summary["kind"], "cs_buflo");
+        assert_eq!(cs_summary["implementation_scope"], "client_only_quic");
+        assert_eq!(cs_summary["paper_equivalent"], false);
+        assert_eq!(
+            cs_summary["incoming_opportunity_semantics"],
+            "client_receive_credit_and_response_qualified_chaff_attempt"
+        );
+        assert_eq!(
+            cs_summary["incoming_cadence_boundary"],
+            "complete_local_on_wire_max_stream_data_advertisement"
+        );
+        assert_eq!(
+            cs_summary["incoming_terminal_boundary"],
+            "eventual_peer_stream_offset_consumption"
+        );
+        assert_eq!(
+            cs_summary["unavailable_peer_properties"],
+            json!([
+                "scheduled_server_datagram_timing",
+                "scheduled_server_datagram_size"
+            ])
+        );
+        assert_eq!(
+            cs_summary["early_termination_semantics"],
+            "udp_client_only_observed_udp_power_of_two_crossing"
+        );
+        assert_eq!(cs_summary["diagnostics"]["cs_buflo_client_only"], true);
+        assert!(buflo_run_summary(&cs_buflo, Some(&diagnostics)).is_none());
+        assert!(buflo_run_summary(&buflo, None).is_none());
+        assert!(cs_buflo_run_summary(&cs_buflo, None).is_none());
     }
 
     const TRAFFIC_MORPHING_PARAMETERS: &str = r#"{
@@ -7653,6 +8709,7 @@ mod tests {
                 direction: Direction::Outgoing,
                 length: 1_200,
                 class: QcsdDatagramClass::Natural,
+                composition: None,
             },
         ] {
             forward_qcsd_observation(&mut controller, clock.record(observation), None);
@@ -7683,6 +8740,7 @@ mod tests {
                 direction: Direction::Outgoing,
                 length: 1_200,
                 class: QcsdDatagramClass::Natural,
+                composition: None,
             }),
             Some(Duration::from_secs(2)),
         );
@@ -7867,6 +8925,27 @@ mod tests {
             Some(QcsdObservation::ApplicationBatchStarted)
         );
         assert!(lifecycle.after_dispatch(1).is_err());
+    }
+
+    #[test]
+    fn candidate_completion_requires_every_tracked_application_send_half() {
+        let streams = BTreeSet::from([
+            neqo_transport::StreamId::new(0),
+            neqo_transport::StreamId::new(4),
+        ]);
+        let mut queried = Vec::new();
+        assert!(!super::tracked_application_send_halves_peer_confirmed(
+            &streams,
+            |stream| {
+                queried.push(stream);
+                stream == neqo_transport::StreamId::new(0)
+            },
+        ));
+        assert_eq!(queried, streams.iter().copied().collect::<Vec<_>>());
+        assert!(super::tracked_application_send_halves_peer_confirmed(
+            &streams,
+            |_| true,
+        ));
     }
 
     #[test]
@@ -8210,6 +9289,109 @@ mod tests {
     }
 
     #[test]
+    fn trace_files_preserve_historical_prefixes_and_append_typed_outcome_v1() {
+        let output = trace_output_dir("typed-outcome-columns");
+        let started = now();
+        let clock = QcsdObservationClock::new(started);
+        let endpoint = QcsdEndpointId(7);
+        let slot = QcsdSlotId(31);
+        let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 600).expect("packet");
+        let composition = QcsdSlotComposition {
+            desired_udp_bytes: 600,
+            observed_udp_bytes: 400,
+            application_stream_bytes: 100,
+            retransmission_stream_bytes: 50,
+            chaff_stream_bytes: 75,
+            defense_control_bytes: 1,
+            quic_padding_bytes: 100,
+            other_quic_bytes: 74,
+            lateness_us: 23,
+        };
+        let outcome = QcsdSlotOutcome::Partial {
+            composition,
+            reason: QcsdCongestionReason::CongestionLimited,
+        };
+        let qcsd = QcsdTraceColumns::from_outcome(packet, outcome);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        traces
+            .packet(&PacketTraceRow {
+                now: started,
+                endpoint,
+                direction: "outgoing",
+                observed: 400,
+                scheduled: Some(400),
+                satisfaction: "partial",
+                slot: Some(slot),
+                qcsd,
+            })
+            .expect("packet row");
+        traces
+            .schedule(&ScheduleTraceRow {
+                action_time_us: 0,
+                endpoint: Some(endpoint),
+                packet,
+                satisfaction: "partial",
+                observed: Some(400),
+                miss_reason: "CongestionLimited",
+                slot,
+                qcsd,
+            })
+            .expect("schedule row");
+        let observation = clock.record(QcsdObservation::SlotResolved {
+            endpoint,
+            slot,
+            packet,
+            outcome,
+        });
+        traces
+            .observation(Some(endpoint), &observation)
+            .expect("event row");
+        traces.flush_events().expect("events");
+        drop(traces);
+
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packets");
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        assert!(packets.lines().next().expect("header").starts_with(
+            "direction,monotonic_us,connection,observed_udp_length,scheduled_target,satisfaction,slot_id,"
+        ));
+        assert!(
+            events
+                .lines()
+                .next()
+                .expect("header")
+                .starts_with("monotonic_us,connection,event,outcome,details,")
+        );
+        assert!(schedule.lines().next().expect("header").starts_with(
+            "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id,"
+        ));
+        let expected_suffix =
+            ",1,congestion_sensitive,600,400,100,50,75,1,100,74,23,congestion_limited,,,,";
+        assert!(
+            packets
+                .lines()
+                .nth(1)
+                .expect("packet row")
+                .ends_with(expected_suffix)
+        );
+        assert!(
+            events
+                .lines()
+                .nth(1)
+                .expect("event row")
+                .ends_with(expected_suffix)
+        );
+        assert!(
+            schedule
+                .lines()
+                .nth(1)
+                .expect("schedule row")
+                .ends_with(expected_suffix)
+        );
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
     fn logical_slot_registration_allows_strict_incoming_continuation() {
         let output = trace_output_dir("logical-slot");
         let started = now();
@@ -8267,6 +9449,7 @@ mod tests {
                 observed: None,
                 miss_reason: "EndpointClosed",
                 slot,
+                qcsd: QcsdTraceColumns::default(),
             })
             .expect("terminal row");
         assert!(
@@ -8364,6 +9547,18 @@ mod tests {
         traces
             .register_incoming_action(started, endpoint, QcsdStreamId(0), 116, packet, slot)
             .expect("incoming registration");
+        let advertisement = QcsdObservationClock::new(started).record_at(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: QcsdStreamId(0),
+                absolute_limit: 116,
+                slot: Some(slot),
+            },
+            started + Duration::from_micros(3),
+        );
+        traces
+            .observation(Some(endpoint), &advertisement)
+            .expect("credit advertisement");
 
         assert!(
             record_terminal_action(
@@ -8389,8 +9584,11 @@ mod tests {
         assert_eq!(fields.next(), Some(""));
         assert_eq!(fields.next(), Some(""));
         assert_eq!(fields.next(), Some("21"));
-        assert_eq!(fields.next(), None);
-        assert!(!schedule.contains("credit_advertised"));
+        assert_eq!(fields.next(), Some("2"));
+        assert_eq!(fields.next(), Some("exact"));
+        assert!(schedule.contains("credit_advertised_at_us"));
+        assert!(schedule.contains("credit_consumed_at_us"));
+        assert!(row.ends_with(",3,3,7,7"));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -8419,6 +9617,7 @@ mod tests {
                 observed: None,
                 miss_reason: "RunAborted",
                 slot,
+                qcsd: QcsdTraceColumns::default(),
             })
             .expect("terminal row");
         assert!(
@@ -8499,6 +9698,7 @@ mod tests {
             not_before_after_us: 0,
             deadline_after_us: 1,
             allow_stream_data: false,
+            send_policy: QcsdSendPolicy::Exact,
         };
         assert!(register_action_batch(&mut outgoing, started, &[send.clone(), send]).is_err());
         drop(outgoing);
@@ -8681,6 +9881,7 @@ mod tests {
             not_before_after_us: 0,
             deadline_after_us: 1,
             allow_stream_data: false,
+            send_policy: QcsdSendPolicy::Exact,
         };
         assert_eq!(
             action_failure_reason(
@@ -9028,6 +10229,7 @@ mod tests {
                 observed: None,
                 miss_reason: "RunAborted",
                 slot,
+                qcsd: QcsdTraceColumns::default(),
             })
             .expect("terminal row");
         assert!(
@@ -9040,6 +10242,7 @@ mod tests {
                     observed: None,
                     miss_reason: "RunAborted",
                     slot,
+                    qcsd: QcsdTraceColumns::default(),
                 })
                 .is_err()
         );
@@ -9192,7 +10395,18 @@ mod tests {
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
         assert_eq!(schedule.lines().count(), 2);
         assert_eq!(schedule.matches("RunAborted").count(), 1);
-        assert!(schedule.ends_with("RunAborted,0\n"));
+        let fields: Vec<_> = schedule
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
+        assert_eq!(fields[7], "RunAborted");
+        assert_eq!(fields[8], "0");
+        assert_eq!(fields[9], "2");
+        assert_eq!(fields[10], "exact");
+        assert_eq!(fields[11], "100");
+        assert!(fields[12..].iter().all(|field| field.is_empty()));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -9705,6 +10919,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the single table-style test deliberately covers every CLI defense"
+    )]
     fn profile_cli_resolves_every_defense() {
         let front = resolve_run_config(
             None,
@@ -9767,6 +10985,8 @@ mod tests {
             Some(DefenseArg::TrafficMorphing),
             None,
             None,
+            None,
+            None,
             Some(std::path::Path::new("matrix.json")),
             None,
             None,
@@ -9801,6 +11021,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(std::path::Path::new("molded.json")),
             Some("test-workload"),
         )
@@ -9816,6 +11038,16 @@ mod tests {
         assert!(!shapes_stream_sends(&DefenseConfig::None));
         assert!(shapes_stream_sends(&DefenseConfig::Tamaraw(
             TamarawConfig::default()
+        )));
+        assert!(shapes_stream_sends(&DefenseConfig::Buflo(
+            neqo_csdef::BufloConfig {
+                parameters: "buflo.json".into(),
+            }
+        )));
+        assert!(shapes_stream_sends(&DefenseConfig::CsBuflo(
+            neqo_csdef::CsBufloConfig {
+                parameters: "cs-buflo.json".into(),
+            }
         )));
         assert!(shapes_stream_sends(&DefenseConfig::WalkieTalkie(
             WalkieTalkieConfig::default()
@@ -9928,6 +11160,8 @@ mod tests {
                 Some(DefenseArg::TrafficMorphing),
                 None,
                 None,
+                None,
+                None,
                 Some(std::path::Path::new("matrix.json")),
                 None,
                 None,
@@ -9980,6 +11214,93 @@ mod tests {
     }
 
     #[test]
+    fn buflo_parameter_flags_are_required_scoped_and_keep_ctsp_cpsp_distinct() {
+        let buflo_path = std::path::Path::new("buflo.json");
+        let ctsp_path = std::path::Path::new("cs-buflo-ctsp.json");
+        let cpsp_path = std::path::Path::new("cs-buflo-cpsp.json");
+        assert!(
+            resolve_run_config_with_workload(
+                None,
+                None,
+                Some(ProfileArg::Live),
+                Some(DefenseArg::Buflo),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        let buflo = resolve_run_config_with_workload(
+            None,
+            None,
+            Some(ProfileArg::Live),
+            Some(DefenseArg::Buflo),
+            None,
+            None,
+            Some(buflo_path),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("BuFLO parameter override");
+        assert!(matches!(
+            &buflo.defense,
+            DefenseConfig::Buflo(config) if config.parameters == "buflo.json"
+        ));
+
+        let resolve_cs = |parameters| {
+            resolve_run_config_with_workload(
+                None,
+                None,
+                Some(ProfileArg::Live),
+                Some(DefenseArg::CsBuflo),
+                None,
+                None,
+                None,
+                Some(parameters),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let total_payload = resolve_cs(ctsp_path).expect("CTSP override");
+        let payload_payload = resolve_cs(cpsp_path).expect("CPSP override");
+        assert!(matches!(
+            &total_payload.defense,
+            DefenseConfig::CsBuflo(config) if config.parameters == "cs-buflo-ctsp.json"
+        ));
+        assert!(matches!(
+            &payload_payload.defense,
+            DefenseConfig::CsBuflo(config) if config.parameters == "cs-buflo-cpsp.json"
+        ));
+        assert!(
+            resolve_run_config_with_workload(
+                None,
+                None,
+                Some(ProfileArg::Live),
+                Some(DefenseArg::Buflo),
+                None,
+                None,
+                Some(buflo_path),
+                Some(ctsp_path),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn external_defense_parameters_have_raw_sha256_provenance() {
         test_fixture::fixture_init();
         let path = std::env::temp_dir().join(format!(
@@ -9998,10 +11319,56 @@ mod tests {
             .expect("hash parameter file")
             .expect("file-backed defense");
         assert_eq!(provenance.kind, "static");
+        assert_eq!(provenance.implementation_scope, None);
+        assert_eq!(provenance.early_termination_semantics, None);
         assert_eq!(
             provenance.sha256,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        for (defense, expected_kind) in [
+            (
+                DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                    parameters: path.to_string_lossy().into_owned(),
+                }),
+                "buflo",
+            ),
+            (
+                DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                    parameters: path.to_string_lossy().into_owned(),
+                }),
+                "cs_buflo",
+            ),
+        ] {
+            let config = QcsdConfig {
+                defense,
+                ..QcsdConfig::default()
+            };
+            let provenance = defense_parameter_provenance(&config)
+                .expect("hash parameter file")
+                .expect("file-backed defense");
+            assert_eq!(provenance.kind, expected_kind);
+            assert_eq!(provenance.implementation_scope, Some("client_only_quic"));
+            assert_eq!(provenance.paper_equivalent, Some(false));
+            if expected_kind == "cs_buflo" {
+                assert_eq!(
+                    provenance.early_termination_semantics,
+                    Some("udp_client_only_observed_udp_power_of_two_crossing")
+                );
+                assert_eq!(provenance.reference_tcp_write_size_bytes, Some(548));
+                assert_eq!(
+                    provenance.reference_nominal_tcp_packet_size_bytes,
+                    Some(600)
+                );
+            } else {
+                assert_eq!(provenance.early_termination_semantics, None);
+                assert_eq!(provenance.reference_tcp_write_size_bytes, None);
+                assert_eq!(provenance.reference_nominal_tcp_packet_size_bytes, None);
+            }
+            assert_eq!(
+                provenance.sha256,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+        }
         fs::remove_file(path).expect("remove parameter fixture");
     }
 
@@ -10059,6 +11426,59 @@ mod tests {
             remaining_wakeup_delay(wakeup, wakeup + Duration::from_nanos(1)),
             None
         );
+    }
+
+    #[test]
+    fn target_socket_backpressure_aborts_without_retrying_committed_datagram() {
+        let deadline = now() + Duration::from_millis(5);
+        let mut attempts = 0;
+        let error = attempt_socket_handoff(
+            &[deadline],
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            },
+            now,
+        )
+        .expect_err("target-bearing WouldBlock must abort");
+        assert_eq!(attempts, 1, "a committed defense datagram is never retried");
+        assert!(matches!(
+            error,
+            Error::SlotInvariant(message) if message.contains("socket backpressure")
+        ));
+
+        assert_eq!(
+            attempt_socket_handoff(
+                &[],
+                || Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                now,
+            )
+            .expect("unshaped datagrams retain ordinary readiness retry"),
+            SocketHandoff::RetryUnshaped
+        );
+    }
+
+    #[test]
+    fn target_socket_handoff_must_precede_absolute_adapter_deadline() {
+        let base = now();
+        let deadline = base + Duration::from_millis(5);
+        let before_deadline = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("deadline has a predecessor");
+        assert_eq!(
+            attempt_socket_handoff(&[deadline], || Ok(()), || before_deadline)
+                .expect("pre-deadline handoff"),
+            SocketHandoff::Sent(before_deadline)
+        );
+
+        for sent_at in [deadline, deadline + Duration::from_nanos(1)] {
+            let error = attempt_socket_handoff(&[deadline], || Ok(()), || sent_at)
+                .expect_err("at-or-after-deadline handoff must reject the run");
+            assert!(matches!(
+                error,
+                Error::SlotInvariant(message) if message.contains("adapter deadline")
+            ));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10166,13 +11586,45 @@ mod tests {
             .send_to(&[1], socket.local_addr().expect("receiver address"))
             .expect("queue datagram");
 
-        tokio::time::timeout(
+        let wake = tokio::time::timeout(
             Duration::from_secs(1),
             wait_for_activity([&socket], Duration::from_secs(60)),
         )
         .await
         .expect("readiness should beat the timeout")
         .expect("readiness wait");
+        assert_eq!(wake, ActivityWake::SocketReady);
+    }
+
+    #[tokio::test]
+    async fn empty_socket_wait_reports_an_actual_timer_return() {
+        let wake = wait_for_activity(std::iter::empty(), Duration::from_micros(1))
+            .await
+            .expect("timer wait");
+        assert_eq!(wake, ActivityWake::Timer);
+    }
+
+    #[test]
+    fn runner_wakeup_metrics_partition_actual_select_returns() {
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.record(ActivityWake::SocketReady, true);
+        metrics.record(ActivityWake::Timer, false);
+        metrics.record(ActivityWake::Timer, true);
+        assert_eq!(metrics.schema_version, 1);
+        assert_eq!(metrics.wait_returns, 3);
+        assert_eq!(metrics.socket_readiness_wakeups, 1);
+        assert_eq!(metrics.timer_wakeups, 2);
+        assert_eq!(metrics.controller_deadline_timer_wakeups, 1);
+        assert_eq!(metrics.other_timer_wakeups, 1);
+        assert_eq!(
+            metrics.timer_wakeups,
+            metrics.controller_deadline_timer_wakeups + metrics.other_timer_wakeups
+        );
+        assert!(
+            metrics
+                .semantics
+                .contains("scheduled_cells_are_not_wakeups")
+        );
     }
 
     #[test]

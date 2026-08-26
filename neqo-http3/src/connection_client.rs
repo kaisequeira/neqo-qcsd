@@ -1277,8 +1277,8 @@ mod tests {
     #[cfg(feature = "qcsd")]
     use neqo_csdef::{
         Direction, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController,
-        QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdSlotId, QcsdStreamFinish,
-        QcsdStreamId, Resource, StaticSchedule, Trace,
+        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdSlotId,
+        QcsdStreamFinish, QcsdStreamId, Resource, StaticSchedule, Trace,
     };
     use neqo_qpack as qpack;
     use neqo_transport::{
@@ -2680,6 +2680,7 @@ mod tests {
                     not_before_after_us: 10_000,
                     deadline_after_us: 15_000,
                     allow_stream_data: false,
+                    send_policy: neqo_csdef::QcsdSendPolicy::Exact,
                 },
             )
             .expect("stage future target");
@@ -2990,6 +2991,109 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    fn qcsd_local_et_resets_transport_send_half_after_h3_send_close() {
+        let (mut client, mut server) = connect();
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                true,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let stream = client
+            .apply_qcsd_action(
+                now(),
+                QcsdAction::RequestChaff {
+                    endpoint: QcsdEndpointId(7),
+                    resource: Resource {
+                        id: 9,
+                        url: "https://something.com/chaff".into(),
+                        kind: "Image".into(),
+                        content_length: Some(100),
+                        data_length: 100,
+                        chaff_priority: true,
+                        known_valid: true,
+                        depends_on: Vec::new(),
+                        headers: Vec::new(),
+                    },
+                    request_id: QcsdChaffRequestId(41),
+                },
+            )
+            .unwrap()
+            .expect("chaff stream");
+        client.stream_close_send(stream, now()).unwrap();
+        assert_eq!(
+            client.qcsd_request_stream_bytes(stream),
+            Err(Error::InvalidStreamId),
+            "the H3 send handler is already gone"
+        );
+
+        let before = client.transport_stats().frame_tx;
+        client
+            .apply_qcsd_action(
+                now(),
+                QcsdAction::CancelChaff {
+                    endpoint: QcsdEndpointId(7),
+                    stream: QcsdStreamId(stream.as_u64()),
+                },
+            )
+            .expect("local-ET cancellation");
+        assert!(client.qcsd_has_pending_defense_control());
+
+        let cancellation = client
+            .process_output(now())
+            .dgram()
+            .expect("RESET_STREAM and STOP_SENDING datagram");
+        let composition = client
+            .qcsd_timestamped_observations()
+            .into_iter()
+            .find_map(|record| match record.into_observation() {
+                QcsdObservation::ClassifiedDatagram {
+                    direction: Direction::Outgoing,
+                    class: QcsdDatagramClass::DefenseCover,
+                    composition: Some(composition),
+                    ..
+                } if composition.defense_control_bytes > 0 => Some(composition),
+                _ => None,
+            })
+            .expect("local-ET packet-build composition");
+        assert_eq!(
+            usize::from(composition.observed_udp_bytes),
+            cancellation.len()
+        );
+        assert_eq!(
+            composition.desired_udp_bytes,
+            composition.observed_udp_bytes
+        );
+        assert_eq!(composition.application_stream_bytes, 0);
+        assert_eq!(composition.retransmission_stream_bytes, 0);
+        assert_eq!(composition.chaff_stream_bytes, 0);
+        assert_eq!(composition.quic_padding_bytes, 0);
+        assert_eq!(composition.lateness_us, 0);
+        assert_eq!(
+            composition
+                .defense_control_bytes
+                .saturating_add(composition.other_quic_bytes),
+            composition.observed_udp_bytes
+        );
+        let after = client.transport_stats().frame_tx;
+        assert_eq!(after.reset_stream, before.reset_stream + 1);
+        assert_eq!(after.stop_sending, before.stop_sending + 1);
+
+        server.conn.process_input(cancellation, now());
+        let response = server
+            .conn
+            .process_output(now())
+            .dgram()
+            .expect("peer reset and cancellation acknowledgment");
+        client.process_input(response, now());
+        assert!(!client.qcsd_has_pending_defense_control());
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_unshaped_regular_request_bytes_are_available_until_send_close() {
         let (mut client, _server) = connect();
         client
@@ -3020,6 +3124,82 @@ mod tests {
         assert_eq!(
             client.qcsd_request_stream_bytes(stream),
             Err(Error::InvalidStreamId)
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_application_send_half_waits_for_peer_ack() {
+        let (mut client, mut server) = connect();
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+
+        let stream = client
+            .fetch(
+                now(),
+                "GET",
+                &Uri::from_static("https://something.com/application"),
+                &[],
+                Priority::default(),
+            )
+            .unwrap();
+        client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, None)
+            .unwrap();
+        client.stream_close_send(stream, now()).unwrap();
+
+        assert!(
+            !client.qcsd_application_send_stream_peer_confirmed(stream),
+            "DataSent is not peer-confirmed"
+        );
+
+        let request = client
+            .process_output(now())
+            .dgram()
+            .expect("request STREAM bytes and FIN");
+        assert!(
+            !client.qcsd_has_pending_stream_send(),
+            "fully transmitted DataSent/FIN has no send backlog"
+        );
+        server.conn.process_input(request, now());
+        assert!(
+            !client.qcsd_application_send_stream_peer_confirmed(stream),
+            "putting bytes on wire does not peer-confirm them"
+        );
+
+        let first_output = server.conn.process_output(now());
+        let (ack, ack_at) = if let Some(ack) = first_output.as_dgram_ref().cloned() {
+            (ack, now())
+        } else {
+            let ack_at = now() + first_output.callback();
+            (
+                server
+                    .conn
+                    .process_output(ack_at)
+                    .dgram()
+                    .expect("delayed acknowledgment"),
+                ack_at,
+            )
+        };
+        client.process_input(ack, ack_at);
+
+        assert!(
+            matches!(
+                client.conn.send_stream_stats(stream),
+                Err(neqo_transport::Error::InvalidStreamId)
+            ),
+            "normal cleanup removed the ended transport send stream"
+        );
+        assert!(
+            client.qcsd_application_send_stream_peer_confirmed(stream),
+            "the peer-confirmed tombstone survives stream cleanup"
         );
     }
 

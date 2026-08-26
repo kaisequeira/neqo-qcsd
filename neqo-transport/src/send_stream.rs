@@ -20,6 +20,8 @@ use std::{
 use indexmap::IndexMap;
 use neqo_common::{Buffer, Encoder, Role, qdebug, qerror, qtrace, to_u64};
 use rustc_hash::FxBuildHasher;
+#[cfg(feature = "qcsd")]
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use static_assertions::const_assert;
 
@@ -1063,7 +1065,7 @@ impl SendStream {
         tokens: &mut recovery::Tokens,
         stats: &mut FrameStats,
     ) {
-        let retransmission = if priority == self.priority {
+        let retransmission_only = if priority == self.priority {
             false
         } else if priority == self.effective_priority {
             true
@@ -1079,7 +1081,17 @@ impl SendStream {
             State::DataSent { send_buf, .. } => Some(send_buf.used()),
             _ => None,
         };
-        if let Some((offset, data)) = self.next_bytes(retransmission) {
+        let bytes_sent = self.bytes_sent;
+        if let Some((offset, data)) = self.next_bytes(retransmission_only) {
+            // `RetransmissionPriority::Same` deliberately schedules lost and
+            // fresh bytes at the same priority, so priority alone cannot
+            // identify their provenance.  Sends are monotonic: any unmarked
+            // byte below the highest offset previously sent is loss recovery.
+            // Retain the prefix length instead of splitting the wire frame:
+            // one STREAM frame can then fill the cell with the adjacent fresh
+            // suffix while composition accounting keeps the two byte classes
+            // exact.
+            let retransmission_available = bytes_sent.saturating_sub(offset);
             let overhead = 1 // Frame type
                 + Encoder::varint_len(id.as_u64())
                 + if offset > 0 {
@@ -1093,6 +1105,9 @@ impl SendStream {
             }
 
             let (length, fill) = Self::length_and_fill(data.len(), builder.remaining() - overhead);
+            let retransmission_bytes = usize::try_from(retransmission_available)
+                .unwrap_or(usize::MAX)
+                .min(length);
             let fin = fin_offset.is_some_and(|fo| fo == offset + to_u64(length));
             if length == 0 && !fin {
                 qtrace!("[{self}] write_frame no data, no fin");
@@ -1124,6 +1139,7 @@ impl SendStream {
                     offset,
                     length,
                     fin,
+                    retransmission_bytes,
                 },
             )));
             stats.stream += 1;
@@ -1225,6 +1241,7 @@ impl SendStream {
             return false;
         }
         // `reliable_size == 0` ⇒ plain `RESET_STREAM`; otherwise `RESET_STREAM_AT`.
+        let frame_start = builder.len();
         let written = if *reliable_size == 0 {
             builder.write_varint_frame(&[
                 FrameType::ResetStream.into(),
@@ -1242,8 +1259,11 @@ impl SendStream {
             ])
         };
         if written {
+            let encoded_bytes =
+                u16::try_from(builder.len().saturating_sub(frame_start)).unwrap_or(u16::MAX);
             tokens.push(recovery::Token::Stream(StreamRecoveryToken::ResetStream {
                 stream_id: self.stream_id,
+                encoded_bytes,
             }));
             if *reliable_size == 0 {
                 stats.reset_stream += 1;
@@ -1881,6 +1901,13 @@ impl PerGroupQueues {
 pub struct SendStreams {
     map: IndexMap<StreamId, SendStream, FxBuildHasher>,
 
+    /// QCSD completion evidence for send streams removed after entering the
+    /// peer-confirmed `DataRecvd` or `ResetRecvd` state. QUIC stream IDs are
+    /// never reused within a connection, so these tombstones remain
+    /// unambiguous until the connection clears its streams.
+    #[cfg(feature = "qcsd")]
+    qcsd_peer_confirmed: FxHashSet<StreamId>,
+
     // What we really want is a Priority Queue that we can do arbitrary
     // removes from (so we can reprioritize). BinaryHeap doesn't work,
     // because there's no remove().  BTreeMap doesn't work, since you can't
@@ -1921,6 +1948,58 @@ pub struct SendStreams {
 const NULL_GROUP_ID: SendGroupId = SendGroupId::new(0);
 
 impl SendStreams {
+    /// Whether this send half reached a peer-confirmed terminal state.
+    ///
+    /// `DataSent`, `ResetSent`, and `ResetSentReliable` are deliberately not
+    /// terminal: bytes, FIN, or `RESET_STREAM` can still be unacknowledged. An
+    /// ended stream remains queryable after normal cleanup via the tombstone
+    /// recorded by [`Self::remove_ended`].
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        self.qcsd_peer_confirmed.contains(&stream_id)
+            || self.map.get(&stream_id).is_some_and(SendStream::is_ended)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_reset_pending_or_in_flight(&self, stream_id: StreamId) -> bool {
+        self.map.get(&stream_id).is_some_and(|stream| {
+            matches!(
+                stream.state,
+                State::ResetSent { .. } | State::ResetSentReliable { .. }
+            )
+        })
+    }
+
+    /// Write only the `RESET_STREAM` identities proven to belong to CS-BuFLO
+    /// local termination. Unlike ordinary stream frames, these controls must
+    /// remain recoverable after the defense has stopped issuing send slots.
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_write_local_et_reset_frames<B: Buffer>(
+        &mut self,
+        stream_ids: &[StreamId],
+        builder: &mut packet::Builder<B>,
+        tokens: &mut recovery::Tokens,
+        stats: &mut FrameStats,
+    ) {
+        for stream_id in stream_ids {
+            let Some(stream) = self.map.get_mut(stream_id) else {
+                continue;
+            };
+            for priority in [
+                TransmissionPriority::Critical,
+                TransmissionPriority::Important,
+                TransmissionPriority::High,
+                TransmissionPriority::Normal,
+                TransmissionPriority::Low,
+            ] {
+                stream.write_reset_frame(priority, builder, tokens, stats);
+                if builder.is_full() {
+                    return;
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_has_pending_data(&mut self) -> bool {
         [
@@ -2198,6 +2277,8 @@ impl SendStreams {
 
     pub fn clear(&mut self) {
         self.map.clear();
+        #[cfg(feature = "qcsd")]
+        self.qcsd_peer_confirmed.clear();
         self.has_ended = false;
         self.per_group.clear();
         self.per_group_next = 0;
@@ -2214,6 +2295,8 @@ impl SendStreams {
         let mut removed = false;
         for (stream_id, stream) in self.map.extract_if(.., |_, s| s.is_ended()) {
             removed = true;
+            #[cfg(feature = "qcsd")]
+            self.qcsd_peer_confirmed.insert(stream_id);
             if stream.is_fair() {
                 let group_id = stream.send_group().unwrap_or(NULL_GROUP_ID);
                 if let Some(grp_queues) = self.per_group.get_mut(&group_id) {
@@ -2466,6 +2549,7 @@ pub struct RecoveryToken {
     offset: u64,
     length: usize,
     fin: bool,
+    retransmission_bytes: usize,
 }
 
 #[cfg(feature = "qcsd")]
@@ -2484,6 +2568,10 @@ impl RecoveryToken {
 
     pub(crate) const fn fin(&self) -> bool {
         self.fin
+    }
+
+    pub(crate) const fn retransmission_bytes(&self) -> usize {
+        self.retransmission_bytes
     }
 }
 
