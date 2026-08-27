@@ -2096,6 +2096,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
+        clippy::cognitive_complexity,
         reason = "the 12-credit RTT pipeline regression audits the complete immutable stop receipt"
     )]
     fn eligible_incoming_crossing_stops_new_opportunities_then_drains_advertised_credit() {
@@ -2635,6 +2636,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "the backlog-resumption regression audits both direction-specific stop ledgers"
+    )]
     fn pre_onload_pending_backlog_invalidates_both_stops_and_resumes_incoming_credit() {
         let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1508);
         defense.natural = [1_000, 1_000];
