@@ -11554,6 +11554,7 @@ mod tests {
 
     #[test]
     #[expect(
+        clippy::cognitive_complexity,
         clippy::too_many_lines,
         reason = "advertise, stream return, retry, and consumption form one ownership oracle"
     )]
