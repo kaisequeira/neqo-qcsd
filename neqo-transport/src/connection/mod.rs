@@ -292,6 +292,10 @@ impl AddressValidationInfo {
 ///
 /// After the connection is closed (either by calling `close()` or by the
 /// remote) continue processing until `state()` returns `Closed`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "connection protocol and QCSD release latches are independent state-machine facts"
+)]
 pub struct Connection {
     role: Role,
     version: Version,
@@ -401,6 +405,9 @@ pub struct Connection {
     /// Chaff request bytes may leave after the outgoing schedule has ended.
     #[cfg(feature = "qcsd")]
     qcsd_chaff_send_released: bool,
+    /// Application request bytes may leave after CS-BuFLO local termination.
+    #[cfg(feature = "qcsd")]
+    qcsd_application_send_released: bool,
     /// Remaining encoded stream-frame budget for the current QCSD slot.
     #[cfg(feature = "qcsd")]
     qcsd_slot_send_budget: usize,
@@ -502,6 +509,10 @@ impl Connection {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "connection construction keeps every protocol and QCSD latch initialized together"
+    )]
     fn new<P: AsRef<str>>(
         role: Role,
         agent: Agent,
@@ -601,6 +612,8 @@ impl Connection {
             qcsd_send_shaping: false,
             #[cfg(feature = "qcsd")]
             qcsd_chaff_send_released: false,
+            #[cfg(feature = "qcsd")]
+            qcsd_application_send_released: false,
             #[cfg(feature = "qcsd")]
             qcsd_slot_send_budget: 0,
             #[cfg(feature = "qcsd")]
@@ -3261,11 +3274,11 @@ impl Connection {
             self.qcsd_expire_packet_targets(now, Some(configured_limit), profile.paced());
             self.qcsd_active_target = None;
             if let Some(mut target) = self.qcsd_eligible_packet_target(now) {
+                target.lateness_us = target.not_before.map_or(0, |release| {
+                    u64::try_from(now.saturating_duration_since(release).as_micros())
+                        .unwrap_or(u64::MAX)
+                });
                 if target.send_policy == QcsdSendPolicy::CongestionSensitive {
-                    target.lateness_us = target.not_before.map_or(0, |release| {
-                        u64::try_from(now.saturating_duration_since(release).as_micros())
-                            .unwrap_or(u64::MAX)
-                    });
                     if profile.ack_only() {
                         let reason = if profile.paced() {
                             neqo_csdef::QcsdCongestionReason::PacingLimited
@@ -4601,7 +4614,9 @@ impl Connection {
                     // Accepted typed identities remain as close tombstones
                     // until runner/controller cancellation reconciles them.
                     while let Some(target) = self.qcsd_packet_targets.pop_front() {
-                        self.qcsd_target_missed(&target, MissedSlotReason::EndpointClosed);
+                        if target.committed {
+                            self.qcsd_target_missed(&target, MissedSlotReason::EndpointClosed);
+                        }
                     }
                 }
                 self.streams.clear_streams();
@@ -5325,6 +5340,7 @@ impl Connection {
     pub const fn qcsd_enable_send_shaping(&mut self, enabled: bool) {
         self.qcsd_send_shaping = enabled;
         self.qcsd_chaff_send_released = false;
+        self.qcsd_application_send_released = false;
         if !enabled {
             self.qcsd_slot_send_budget = 0;
         }
@@ -5334,6 +5350,13 @@ impl Connection {
     #[cfg(feature = "qcsd")]
     pub const fn qcsd_release_chaff_send_shaping(&mut self) {
         self.qcsd_chaff_send_released = true;
+    }
+
+    /// Permit application request streams, but not chaff, to transmit after
+    /// CS-BuFLO's client-local early-termination boundary.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_release_application_send_shaping(&mut self) {
+        self.qcsd_application_send_released = true;
     }
 
     /// Mark a receive stream as being important enough to keep the connection alive

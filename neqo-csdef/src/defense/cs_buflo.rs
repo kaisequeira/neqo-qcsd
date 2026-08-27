@@ -125,6 +125,8 @@ pub struct CsBuflo {
     padding_targets: [Option<u64>; 2],
     completion_at_us: Option<u64>,
     local_termination_latched: bool,
+    local_termination_latched_at_us: Option<u64>,
+    post_local_termination_natural: [u64; 2],
     latest_elapsed_us: u64,
     egress_backlog_pending: bool,
     quiet_backlog_snapshot_fresh: bool,
@@ -198,6 +200,8 @@ impl CsBuflo {
             padding_targets: [None; 2],
             completion_at_us: None,
             local_termination_latched: false,
+            local_termination_latched_at_us: None,
+            post_local_termination_natural: [0; 2],
             latest_elapsed_us: 0,
             egress_backlog_pending: true,
             quiet_backlog_snapshot_fresh: false,
@@ -267,6 +271,31 @@ impl CsBuflo {
             self.freeze_padding_target(direction);
         }
         self.completion_at_us = Some(at_us);
+    }
+
+    /// A strict-quiet target is provisional until both directions jointly
+    /// terminate. A later real byte in that direction proves the channel was
+    /// not terminal, so discard its stale basis and let the next eligible
+    /// quiet/onLoad boundary freeze a target that includes the resumed
+    /// activity. Joint local termination remains irreversible and is handled
+    /// separately by `post_local_termination_natural`.
+    fn invalidate_provisional_padding_target(&mut self, direction: Direction) {
+        let index = direction_index(direction);
+        if self.local_termination_latched || self.padding_targets[index].is_none() {
+            return;
+        }
+        self.padding_basis_natural[index] = None;
+        self.padding_basis_cover[index] = None;
+        self.padding_basis_total[index] = None;
+        self.padding_targets[index] = None;
+
+        // onLoad is itself a permanent idle boundary. Re-freeze immediately
+        // for the rare case where a causally later fresh-byte observation is
+        // reduced before joint termination; strict-quiet targets instead wait
+        // for another fresh aggregate-idle proof.
+        if self.application_complete() {
+            self.freeze_padding_target(direction);
+        }
     }
 
     fn freeze_strict_quiet_targets(&mut self) {
@@ -347,6 +376,7 @@ impl CsBuflo {
             && self.direction_complete(Direction::Incoming)
         {
             self.local_termination_latched = true;
+            self.local_termination_latched_at_us = Some(self.latest_elapsed_us);
         }
     }
 
@@ -439,6 +469,13 @@ impl CsBuflo {
         self.record_termination_increment(OUTGOING, outgoing_termination_increment(composition));
         self.realized_total[OUTGOING] =
             self.realized_total[OUTGOING].saturating_add(u64::from(composition.observed_udp_bytes));
+        if composition.application_stream_bytes > 0 {
+            // Stream-range evidence is emitted before the enclosing slot
+            // outcome. If onLoad froze a CTSP target between those two ordered
+            // observations, refresh once more after the UDP total is known so
+            // the immutable basis cannot retain the pre-composition total.
+            self.invalidate_provisional_padding_target(Direction::Outgoing);
+        }
         self.application_stream_bytes = self
             .application_stream_bytes
             .saturating_add(u64::from(composition.application_stream_bytes));
@@ -720,9 +757,15 @@ impl Defense for CsBuflo {
     fn observe_application_bytes(&mut self, at: Duration, direction: Direction, bytes: u64) {
         let at_us = u64::try_from(at.as_micros()).unwrap_or(u64::MAX);
         self.latest_elapsed_us = self.latest_elapsed_us.max(at_us);
-        self.quiet_backlog_snapshot_fresh = false;
         let index = direction_index(direction);
         self.natural[index] = self.natural[index].saturating_add(bytes);
+        if self.local_termination_latched {
+            self.post_local_termination_natural[index] =
+                self.post_local_termination_natural[index].saturating_add(bytes);
+            return;
+        }
+        self.invalidate_provisional_padding_target(direction);
+        self.quiet_backlog_snapshot_fresh = false;
         self.last_natural_us[index] = Some(at_us);
         if direction == Direction::Incoming {
             // No cooperating peer exposes incoming packet composition. The
@@ -941,6 +984,13 @@ impl Defense for CsBuflo {
                 .into_iter()
                 .all(|direction| self.channel_idle(direction)),
             cs_buflo_local_termination_latched: self.local_termination_latched,
+            cs_buflo_local_et_latched_at_us: self
+                .local_termination_latched_at_us
+                .unwrap_or_default(),
+            cs_buflo_post_local_et_natural_outgoing_bytes: self.post_local_termination_natural
+                [OUTGOING],
+            cs_buflo_post_local_et_natural_incoming_bytes: self.post_local_termination_natural
+                [INCOMING],
             cs_buflo_event_guard_triggered: self.event_guard_triggered,
             ..DefenseDiagnostics::default()
         }
@@ -1185,6 +1235,44 @@ mod tests {
     }
 
     #[test]
+    fn onload_ctsp_refreeze_waits_for_the_matching_outgoing_composition_total() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 71);
+        defense.natural = [1_000, 1_000];
+        defense.cover_payload = [0, 0];
+        defense.realized_total = [1_100, 1_000];
+        defense.observe(DefenseSignal {
+            at: Duration::from_millis(1),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert!(!defense.local_termination_latched);
+        assert_eq!(defense.padding_basis_total[OUTGOING], Some(1_100));
+        assert_eq!(defense.padding_targets[OUTGOING], Some(2_048));
+
+        // Production emits the unique STREAM range before SlotResolved. The
+        // first observation updates natural bytes; the second must refresh the
+        // CTSP basis after the enclosing UDP total becomes available.
+        defense.observe_application_bytes(Duration::from_micros(1_001), Direction::Outgoing, 500);
+        assert_eq!(defense.padding_basis_natural[OUTGOING], Some(1_500));
+        assert_eq!(defense.padding_basis_total[OUTGOING], Some(1_100));
+        defense.record_composition(
+            1_002,
+            QcsdSlotComposition {
+                desired_udp_bytes: 1_100,
+                observed_udp_bytes: 1_100,
+                application_stream_bytes: 500,
+                other_quic_bytes: 600,
+                ..QcsdSlotComposition::default()
+            },
+        );
+        assert_eq!(defense.realized_total[OUTGOING], 2_200);
+        assert_eq!(defense.padding_basis_natural[OUTGOING], Some(1_500));
+        assert_eq!(defense.padding_basis_total[OUTGOING], Some(2_200));
+        assert_eq!(defense.padding_targets[OUTGOING], Some(4_096));
+        assert_eq!(defense.real_bearing_bytes[OUTGOING], 500);
+        assert_eq!(defense.rate_adaptations[OUTGOING], 0);
+    }
+
+    #[test]
     fn onload_is_immediately_idle_but_quiet_fallback_is_strict() {
         let mut quiet = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 8);
         quiet.last_natural_us = [Some(0), Some(0)];
@@ -1234,6 +1322,70 @@ mod tests {
         assert_eq!(defense.next_event(Duration::from_micros(4_000_003)), None);
         assert_eq!(defense.padding_basis_natural, [Some(1_000), Some(100)]);
         assert_eq!(defense.padding_targets, [Some(1_024), Some(128)]);
+    }
+
+    #[test]
+    fn staggered_quiet_direction_refreezes_after_pre_latch_natural_activity() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 92);
+        defense.next_us = [u64::MAX; 2];
+        defense.natural = [1_000, 1_000];
+        defense.cover_payload = [448, 24];
+        defense.realized_total = [1_448, 1_024];
+        defense.last_natural_us = [Some(0), Some(1_500_000)];
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert_eq!(defense.next_event(Duration::from_micros(2_000_001)), None);
+        assert_eq!(defense.padding_basis_natural, [Some(1_000), None]);
+        assert_eq!(defense.padding_targets, [Some(2_048), None]);
+        assert!(!defense.local_termination_latched);
+
+        let estimator_last = defense.estimator_last_us;
+        let samples = defense.iat_samples_us.clone();
+        let intervals = defense.current_interval_us;
+        defense.observe_application_bytes(
+            Duration::from_micros(2_000_002),
+            Direction::Outgoing,
+            600,
+        );
+        assert_eq!(defense.padding_basis_natural, [None, None]);
+        assert_eq!(defense.padding_targets, [None, None]);
+        assert_eq!(defense.estimator_last_us, estimator_last);
+        assert_eq!(defense.iat_samples_us, samples);
+        assert_eq!(defense.current_interval_us, intervals);
+
+        defense.record_composition(
+            2_000_003,
+            QcsdSlotComposition {
+                desired_udp_bytes: 600,
+                observed_udp_bytes: 600,
+                application_stream_bytes: 600,
+                ..QcsdSlotComposition::default()
+            },
+        );
+        assert_eq!(defense.real_bearing_bytes[OUTGOING], 600);
+        assert_eq!(defense.rate_adaptations[OUTGOING], 0);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(4_000_003),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert!(defense.local_termination_latched);
+        assert_eq!(defense.padding_basis_natural, [Some(1_600), Some(1_000)]);
+        assert_eq!(defense.padding_targets, [Some(2_048), Some(1_024)]);
+        let diagnostics = defense.diagnostics();
+        assert_eq!(
+            diagnostics.cs_buflo_natural_outgoing_bytes,
+            diagnostics.cs_buflo_outgoing_padding_basis_natural_bytes
+                + diagnostics.cs_buflo_post_local_et_natural_outgoing_bytes
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_natural_incoming_bytes,
+            diagnostics.cs_buflo_incoming_padding_basis_natural_bytes
+                + diagnostics.cs_buflo_post_local_et_natural_incoming_bytes
+        );
     }
 
     #[test]
@@ -1551,15 +1703,45 @@ mod tests {
         assert!(defense.local_termination_latched);
 
         let scheduled = defense.scheduled;
+        let intervals = defense.current_interval_us;
+        let boundaries = defense.next_adaptation_boundary_bytes;
+        let last_natural = defense.last_natural_us;
+        let estimator_last = defense.estimator_last_us;
+        let samples = defense.iat_samples_us.clone();
+        let transitions = defense.rate_transitions.clone();
         defense.observe_application_bytes(
             Duration::from_micros(2_000_100),
             Direction::Outgoing,
             10,
         );
+        defense.observe_application_bytes(
+            Duration::from_micros(2_000_200),
+            Direction::Incoming,
+            11,
+        );
         assert!(defense.is_complete(), "local ET is irreversible");
         assert_eq!(defense.next_event(Duration::from_millis(2_100)), None);
         assert_eq!(defense.scheduled, scheduled);
-        assert!(defense.diagnostics().cs_buflo_local_termination_latched);
+        assert_eq!(defense.current_interval_us, intervals);
+        assert_eq!(defense.next_adaptation_boundary_bytes, boundaries);
+        assert_eq!(defense.last_natural_us, last_natural);
+        assert_eq!(defense.estimator_last_us, estimator_last);
+        assert_eq!(defense.iat_samples_us, samples);
+        assert_eq!(defense.rate_transitions, transitions);
+        assert_eq!(defense.padding_basis_natural, [Some(1_000), Some(1_000)]);
+        assert_eq!(defense.natural, [1_010, 1_011]);
+        assert_eq!(defense.completion_at_us, None);
+        let diagnostics = defense.diagnostics();
+        assert!(diagnostics.cs_buflo_local_termination_latched);
+        assert_eq!(diagnostics.cs_buflo_local_et_latched_at_us, 2_000_001);
+        assert_eq!(
+            diagnostics.cs_buflo_post_local_et_natural_outgoing_bytes,
+            10
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_post_local_et_natural_incoming_bytes,
+            11
+        );
     }
 
     #[test]

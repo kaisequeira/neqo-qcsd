@@ -157,6 +157,13 @@ impl StreamRegistry {
         self.streams.get_mut(&(endpoint, stream))
     }
 
+    /// Whether the exact live request stream belongs to the application.
+    pub fn is_application_stream(&self, endpoint: QcsdEndpointId, stream: QcsdStreamId) -> bool {
+        self.streams
+            .get(&(endpoint, stream))
+            .is_some_and(|state| state.role == QcsdRequestRole::Application)
+    }
+
     /// Raw response-stream offset consumed by HTTP/3.
     pub fn consumed(&self, endpoint: QcsdEndpointId, stream: QcsdStreamId) -> Option<u64> {
         self.streams
@@ -560,6 +567,41 @@ impl StreamRegistry {
         streams
     }
 
+    /// Atomically transfer every live application response to ordinary Neqo
+    /// receive-window management. A stream with an unadvertised suffix blocks
+    /// the complete batch, so a partial handoff can never occur.
+    pub fn handoff_application_receive_to_automatic(
+        &mut self,
+    ) -> Result<Vec<(QcsdEndpointId, QcsdStreamId)>, (QcsdEndpointId, QcsdStreamId)> {
+        let mut streams: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|(key, state)| {
+                (state.role == QcsdRequestRole::Application
+                    && state.receive_actions_available
+                    && state.receive.is_controlled())
+                .then_some(*key)
+            })
+            .collect();
+        streams.sort_unstable();
+        if let Some(key) = streams.iter().copied().find(|key| {
+            !self
+                .streams
+                .get(key)
+                .is_some_and(|state| state.receive.can_handoff_to_automatic())
+        }) {
+            return Err(key);
+        }
+        for key in &streams {
+            let state = self.streams.get_mut(key).ok_or(*key)?;
+            state.pre_header_blocked_at = None;
+            if !state.receive.handoff_to_automatic() {
+                return Err(*key);
+            }
+        }
+        Ok(streams)
+    }
+
     pub fn header_progress(
         &mut self,
         endpoint: QcsdEndpointId,
@@ -696,10 +738,35 @@ impl StreamRegistry {
         pending
     }
 
+    #[cfg(test)]
     pub fn has_any_pending_parser_boundary(&self) -> bool {
         self.streams.values().any(|state| {
             state.receive_actions_available && state.receive.has_pending_parser_boundary()
         })
+    }
+
+    /// Whether application response parsing still requires receive capacity.
+    ///
+    /// A client-local defense may cancel an exhausted reviewed-chaff response,
+    /// including its retained HTTP/3 frame boundary. Application boundaries
+    /// are never cancellable defense work and must remain part of the terminal
+    /// backlog even when no parser lease is currently in flight.
+    pub fn has_pending_application_parser_boundary(&self) -> bool {
+        self.pending_application_parser_boundary_count() > 0
+    }
+
+    /// Number of application response parsers retained at an exact frame
+    /// boundary. Unlike reviewed-chaff boundaries, these can never be erased
+    /// by a client-local defense-tail cancellation.
+    pub fn pending_application_parser_boundary_count(&self) -> usize {
+        self.streams
+            .values()
+            .filter(|state| {
+                state.receive_actions_available
+                    && state.role == QcsdRequestRole::Application
+                    && state.receive.has_pending_parser_boundary()
+            })
+            .count()
     }
 
     pub fn clear_parser_boundaries(&mut self) {
@@ -738,6 +805,65 @@ fn merge_ranges(ranges: &mut Vec<(u64, u64)>) {
 mod tests {
     use super::StreamRegistry;
     use crate::{DefenseMode, QcsdEndpointId, QcsdRequestRole, QcsdStreamId};
+
+    #[test]
+    fn application_handoff_is_atomic_preserves_counters_and_accepts_a_parser_boundary() {
+        let endpoint = QcsdEndpointId(1);
+        let first = QcsdStreamId(0);
+        let blocked = QcsdStreamId(4);
+        let mut registry = StreamRegistry::default();
+        for stream in [first, blocked] {
+            registry.open(
+                endpoint,
+                stream,
+                QcsdRequestRole::Application,
+                true,
+                16,
+                1_000,
+                2_000,
+            );
+        }
+        {
+            let state = registry
+                .get_mut(endpoint, first)
+                .expect("first application");
+            state.receive.data_frame(2, 31);
+            state.receive.bytes_read(40);
+            state.receive.header_progress(0, true);
+        }
+        let release = registry
+            .release_stream(endpoint, blocked, 32)
+            .expect("unadvertised suffix");
+        assert_eq!(
+            registry.handoff_application_receive_to_automatic(),
+            Err((endpoint, blocked)),
+            "one unsafe stream blocks the complete batch"
+        );
+        assert!(
+            registry
+                .get_mut(endpoint, first)
+                .expect("first remains registered")
+                .receive
+                .is_controlled()
+        );
+
+        registry
+            .get_mut(endpoint, blocked)
+            .expect("blocked application")
+            .receive
+            .advertised(release.absolute_limit);
+        assert_eq!(
+            registry
+                .handoff_application_receive_to_automatic()
+                .expect("atomic application handoff"),
+            [(endpoint, first), (endpoint, blocked)]
+        );
+        let first_state = registry
+            .get_mut(endpoint, first)
+            .expect("handed-off application");
+        assert!(!first_state.receive.is_controlled());
+        assert_eq!(first_state.receive.consumed(), 40);
+    }
 
     #[test]
     fn typed_header_progress_invalidates_retained_pre_header_blocked_proof() {

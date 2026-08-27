@@ -16,9 +16,10 @@ use crate::{
     Buflo, Capacity, CapacityAdjustment, CsBuflo, Defense, DefenseConfig, DefenseDiagnostics,
     DefenseMode, DefenseSignal, Direction, EventOutcome, Front, MissedSlotReason, QcsdAction,
     QcsdChaffCancellationReason, QcsdConfig, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner,
-    QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId, QcsdStreamId, ResourceManifest, Result,
-    RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw, TrafficMorphing, WalkieTalkie,
-    WtfPad, chaff_manager::ChaffManager, stream::StreamRegistry,
+    QcsdPrearmCancellationReason, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId,
+    QcsdStreamId, ResourceManifest, Result, RoundRobinScheduler, SignalKind, StaticSchedule,
+    Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad, chaff_manager::ChaffManager,
+    stream::StreamRegistry,
 };
 
 /// Exact controller bookkeeping canceled after a typed receive-lifecycle rejection.
@@ -121,6 +122,13 @@ struct StagedFixedEvent {
 struct FixedScheduleStaging {
     events: VecDeque<StagedFixedEvent>,
     outgoing_prearmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RollingOutgoingPrearm {
+    endpoint: QcsdEndpointId,
+    packet: crate::Packet,
+    slot: QcsdSlotId,
 }
 
 fn duration_as_ceil_micros(duration: Duration) -> u64 {
@@ -321,6 +329,10 @@ impl IncomingCreditLedger {
 /// This is the single-owner modern equivalent of the published `FlowShaper`.
 /// It deliberately contains no Neqo types or synchronization primitives.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "The booleans are independent controller lifecycle proofs, not one shared state machine."
+)]
 pub struct QcsdController {
     config: QcsdConfig,
     defense: Box<dyn Defense>,
@@ -353,6 +365,11 @@ pub struct QcsdController {
     last_delivered_observation_at: Option<Duration>,
     pending_slots: HashMap<QcsdSlotId, crate::Packet>,
     application_complete: bool,
+    /// Whether the application-complete signal has crossed the ordered
+    /// defense-observation boundary.  `application_complete` is set when the
+    /// runner queues the observation, which is intentionally too early to
+    /// decide whether a preceding signal latched CS-BuFLO local termination.
+    application_complete_delivered_to_defense: bool,
     adapter_egress_backlog_pending: bool,
     last_effective_egress_backlog_pending: Option<bool>,
     buflo_terminal_subcell_pending_request_cancellations: u64,
@@ -362,14 +379,29 @@ pub struct QcsdController {
     buflo_terminal_subcell_open_streams_at_latch: u64,
     buflo_terminal_subcell_parser_lease_bytes_at_latch: u64,
     buflo_terminal_subcell_pending_parser_boundaries_at_latch: u64,
+    buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: u64,
     cs_buflo_local_et_pending_request_cancellations: u64,
     cs_buflo_local_et_stream_cancellations: u64,
+    cs_buflo_application_passthrough: bool,
+    cs_buflo_local_et_before_application_complete: bool,
+    cs_buflo_local_et_application_receive_streams_handed_off: u64,
+    cs_buflo_local_et_application_parser_boundaries_handed_off: u64,
+    cs_buflo_local_et_application_parser_lease_bytes_handed_off: u64,
+    cs_buflo_local_et_application_send_endpoints_released: u64,
     completion_emitted: bool,
     completion_due: Option<Duration>,
     released_chaff_send_shaping: HashSet<QcsdEndpointId>,
+    released_application_send_shaping: HashSet<QcsdEndpointId>,
     /// FRONT-only frozen schedule. Outgoing targets are publicly staged, but
     /// incoming entries remain private here until their exact release time.
     fixed_schedule: Option<FixedScheduleStaging>,
+    /// One pure future `BuFLO` preview staged in transport. It is not a defense
+    /// event or pending slot until committed at its release boundary.
+    rolling_outgoing_prearm: Option<RollingOutgoingPrearm>,
+    /// A closed endpoint abandoned a preview at or after its release. The
+    /// runner consumes this marker only after its complete globally ordered
+    /// observation batch has reached the controller.
+    rolling_reconcile_due: Option<crate::Packet>,
 }
 
 impl QcsdController {
@@ -427,6 +459,10 @@ impl QcsdController {
         Self::build(config, resources, defense, true)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Explicitly initializing every controller proof and counter makes the fail-closed defaults auditable."
+    )]
     fn build(
         config: QcsdConfig,
         resources: Option<ResourceManifest>,
@@ -508,6 +544,7 @@ impl QcsdController {
             last_delivered_observation_at: None,
             pending_slots: HashMap::new(),
             application_complete: false,
+            application_complete_delivered_to_defense: false,
             adapter_egress_backlog_pending: true,
             last_effective_egress_backlog_pending: None,
             buflo_terminal_subcell_pending_request_cancellations: 0,
@@ -517,12 +554,22 @@ impl QcsdController {
             buflo_terminal_subcell_open_streams_at_latch: 0,
             buflo_terminal_subcell_parser_lease_bytes_at_latch: 0,
             buflo_terminal_subcell_pending_parser_boundaries_at_latch: 0,
+            buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: 0,
             cs_buflo_local_et_pending_request_cancellations: 0,
             cs_buflo_local_et_stream_cancellations: 0,
+            cs_buflo_application_passthrough: false,
+            cs_buflo_local_et_before_application_complete: false,
+            cs_buflo_local_et_application_receive_streams_handed_off: 0,
+            cs_buflo_local_et_application_parser_boundaries_handed_off: 0,
+            cs_buflo_local_et_application_parser_lease_bytes_handed_off: 0,
+            cs_buflo_local_et_application_send_endpoints_released: 0,
             completion_emitted: false,
             completion_due: None,
             released_chaff_send_shaping: HashSet::new(),
+            released_application_send_shaping: HashSet::new(),
             fixed_schedule,
+            rolling_outgoing_prearm: None,
+            rolling_reconcile_due: None,
         })
     }
 
@@ -585,16 +632,39 @@ impl QcsdController {
             self.buflo_terminal_subcell_parser_lease_bytes_at_latch;
         diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch =
             self.buflo_terminal_subcell_pending_parser_boundaries_at_latch;
+        diagnostics.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch =
+            self.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch;
         diagnostics.cs_buflo_local_et_pending_request_cancellations =
             self.cs_buflo_local_et_pending_request_cancellations;
         diagnostics.cs_buflo_local_et_stream_cancellations =
             self.cs_buflo_local_et_stream_cancellations;
+        diagnostics.cs_buflo_local_et_before_application_complete =
+            self.cs_buflo_local_et_before_application_complete;
+        diagnostics.cs_buflo_local_et_application_receive_streams_handed_off =
+            self.cs_buflo_local_et_application_receive_streams_handed_off;
+        diagnostics.cs_buflo_local_et_application_parser_boundaries_handed_off =
+            self.cs_buflo_local_et_application_parser_boundaries_handed_off;
+        diagnostics.cs_buflo_local_et_application_parser_lease_bytes_handed_off =
+            self.cs_buflo_local_et_application_parser_lease_bytes_handed_off;
+        diagnostics.cs_buflo_local_et_application_send_endpoints_released =
+            self.cs_buflo_local_et_application_send_endpoints_released;
         diagnostics
     }
 
     /// Whether the selected defense permits opening another application batch.
     #[must_use]
     pub fn can_start_application_batch(&self) -> bool {
+        // A CS-BuFLO quiet-time decision is irreversible.  Do not admit a
+        // dependent request in the interval between causally reducing the
+        // observation that latched local termination and polling the
+        // controller actions that hand application traffic back to Neqo.
+        if self.defense.is_complete()
+            && self.defense.terminal_chaff_cancellation_reason()
+                == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+            && !self.cs_buflo_application_passthrough
+        {
+            return false;
+        }
         self.defense.can_start_application_batch()
     }
 
@@ -875,6 +945,9 @@ impl QcsdController {
     /// without polling the defense and creating replacement work during
     /// shutdown.
     pub fn abort_pending_slots(&mut self, at: Duration, reason: MissedSlotReason) {
+        if let Some(action) = self.take_rolling_prearm_for_abort() {
+            self.actions.push_back(action);
+        }
         // Parser leases are slotless liveness actions.  Once the run aborts
         // they must not escape after every scheduled slot has terminalized.
         self.actions
@@ -1028,8 +1101,10 @@ impl QcsdController {
                 self.scheduler.add_endpoint(endpoint);
                 self.endpoint_origins.insert(endpoint, origin);
                 self.release_chaff_send_shaping_for(endpoint);
+                self.release_application_send_shaping_for(endpoint);
             }
             QcsdObservation::EndpointClosed { endpoint } => {
+                let abandoned_prearm = self.abandon_closed_endpoint_prearm(endpoint);
                 self.actions.retain(|action| {
                     !matches!(action, QcsdAction::LeaseParserReceive { endpoint: candidate, .. } if *candidate == endpoint)
                 });
@@ -1052,6 +1127,13 @@ impl QcsdController {
                 self.retire_endpoint_advertised_credit(endpoint, at);
                 self.control.reassign_endpoint(endpoint);
                 self.released_chaff_send_shaping.remove(&endpoint);
+                self.released_application_send_shaping.remove(&endpoint);
+                // An uncommitted rolling preview is not a defense event. If
+                // another origin survives, transfer the same event at the
+                // close observation's causal instant. A close reduced at or
+                // just after release must materialize immediately rather than
+                // stranding the exact cell until the outer control poll.
+                self.recover_abandoned_rolling_prearm(abandoned_prearm, at);
             }
             QcsdObservation::StreamOpened {
                 endpoint,
@@ -1448,7 +1530,9 @@ impl QcsdController {
                 stream,
                 initial_limit,
             });
-        } else if !matches!(self.config.defense, DefenseConfig::None) {
+        } else if self.cs_buflo_application_passthrough
+            || !matches!(self.config.defense, DefenseConfig::None)
+        {
             self.actions
                 .push_back(QcsdAction::ConfigureAutomaticReceive {
                     endpoint,
@@ -2699,6 +2783,7 @@ impl QcsdController {
         // Deliver it now so due events use the freshly reserve-adjusted value.
         self.drain_observations();
         self.collect_due_events(elapsed);
+        self.cancel_closed_rolling_prearm();
         if candidate_terminal_drain {
             // Candidate quiet termination observes the backlog that existed at
             // the timer boundary. Proactive low-watermark replenishment must
@@ -2721,12 +2806,420 @@ impl QcsdController {
             self.drain_observations();
         }
         self.update_completion(elapsed);
+        self.arm_next_rolling_outgoing(elapsed);
     }
 
     /// Whether this controller opted into fixed-schedule outgoing prearming.
     #[must_use]
     pub const fn has_fixed_schedule_staging(&self) -> bool {
         self.fixed_schedule.is_some()
+    }
+
+    /// Whether a pure future outgoing preview is staged in the adapter.
+    #[must_use]
+    pub const fn has_rolling_outgoing_prearm(&self) -> bool {
+        self.rolling_outgoing_prearm.is_some()
+    }
+
+    /// Whether endpoint-loss recovery requires one post-observation-barrier
+    /// reconciliation even when no survivor could own a replacement preview.
+    #[must_use]
+    pub const fn has_due_rolling_reconciliation(&self) -> bool {
+        self.rolling_reconcile_due.is_some()
+    }
+
+    /// Exact preview identity retained for fail-closed abort evidence when a
+    /// due endpoint-loss reconciliation cannot be completed.
+    #[must_use]
+    pub const fn rolling_reconciliation_due_packet(&self) -> Option<crate::Packet> {
+        self.rolling_reconcile_due
+    }
+
+    /// Endpoint owning the currently staged rolling preview, if any.
+    #[must_use]
+    pub const fn rolling_outgoing_prearm_endpoint(&self) -> Option<QcsdEndpointId> {
+        match self.rolling_outgoing_prearm {
+            Some(prearm) => Some(prearm.endpoint),
+            None => None,
+        }
+    }
+
+    /// Retract the controller's provisional rolling target during abnormal
+    /// shutdown and return its single typed adapter reconciliation action.
+    ///
+    /// The returned preview is not a defense event. Callers that own an
+    /// adapter must either apply the cancellation or receipt that the preview
+    /// never reached (or was already discarded by) that adapter.
+    pub fn take_rolling_prearm_for_abort(&mut self) -> Option<QcsdAction> {
+        self.rolling_reconcile_due = None;
+        if let Some(prearm) = self.rolling_outgoing_prearm.take() {
+            self.actions.retain(|action| {
+                !matches!(
+                    action,
+                    QcsdAction::PrearmPacket {
+                        endpoint,
+                        packet,
+                        slot,
+                        ..
+                    } if *endpoint == prearm.endpoint && *packet == prearm.packet && *slot == prearm.slot
+                )
+            });
+            return Some(QcsdAction::CancelPrearmedPacket {
+                endpoint: prearm.endpoint,
+                packet: prearm.packet,
+                slot: prearm.slot,
+                reason: QcsdPrearmCancellationReason::RunAborted,
+            });
+        }
+
+        // A terminal/failure poll can already have transferred ownership into
+        // a queued DefenseTerminal cancellation before the runner notices the
+        // enclosing abort. Consume and reason-normalize that same identity so
+        // cleanup produces exactly one lifecycle receipt.
+        let index = self
+            .actions
+            .iter()
+            .position(|action| matches!(action, QcsdAction::CancelPrearmedPacket { .. }))?;
+        let QcsdAction::CancelPrearmedPacket {
+            endpoint,
+            packet,
+            slot,
+            ..
+        } = self.actions.remove(index)?
+        else {
+            return None;
+        };
+        Some(QcsdAction::CancelPrearmedPacket {
+            endpoint,
+            packet,
+            slot,
+            reason: QcsdPrearmCancellationReason::RunAborted,
+        })
+    }
+
+    /// Reconcile a due rolling preview before transport can build output.
+    ///
+    /// The runner invokes this at the start of every output drive. Calling the
+    /// ordinary poll preserves observation/capacity/terminal ordering while
+    /// ensuring commit or cancellation is applied before target eligibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the staged rolling identity diverges from the
+    /// defense oracle or if a due event cannot be materialized exactly once.
+    pub fn reconcile_due_rolling(&mut self, elapsed: Duration) -> Result<()> {
+        // Keep the marker live until reconciliation succeeds. A controller
+        // invariant must not erase the abandoned preview identity before the
+        // runner records explicit fail-closed abort evidence.
+        let abandoned_due = self.rolling_reconcile_due;
+        if let Some(packet) = abandoned_due {
+            let deadline = packet
+                .timestamp()
+                .saturating_add(self.config.control_interval());
+            if (elapsed > packet.timestamp()
+                || duration_as_floor_micros(deadline.saturating_sub(elapsed)) == 0)
+                && !self.defense.is_complete()
+                && self.defense.terminal_failure().is_none()
+            {
+                self.fail_late_abandoned_rolling(packet, elapsed)?;
+                self.rolling_reconcile_due = None;
+                return Ok(());
+            }
+        }
+        let ordinary_due = self
+            .rolling_outgoing_prearm
+            .filter(|prearm| prearm.packet.timestamp() <= elapsed)
+            .map(|prearm| prearm.packet);
+        let expected_due = match (abandoned_due, ordinary_due) {
+            (Some(abandoned), Some(prearmed)) if abandoned != prearmed => {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "due abandoned rolling identity {abandoned:?} conflicts with live preview {prearmed:?}"
+                )));
+            }
+            (Some(packet), _) | (None, Some(packet)) => Some(packet),
+            (None, None) => None,
+        };
+        if let Some(expected) = expected_due {
+            let enforce_identity =
+                !self.defense.is_complete() && self.defense.terminal_failure().is_none();
+            if enforce_identity {
+                let preview = self.defense.next_outgoing_prearm();
+                if preview != Some(expected) {
+                    return Err(crate::Error::ControllerInvariant(format!(
+                        "due rolling identity {expected:?} diverged from the defense preview {preview:?}"
+                    )));
+                }
+            }
+            self.poll(elapsed);
+            let still_active =
+                !self.defense.is_complete() && self.defense.terminal_failure().is_none();
+            if enforce_identity && still_active && !self.rolling_event_has_receipt(expected) {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "defense did not materialize due rolling identity {expected:?}"
+                )));
+            }
+            self.rolling_reconcile_due = None;
+        }
+        Ok(())
+    }
+
+    fn rolling_event_has_receipt(&self, packet: crate::Packet) -> bool {
+        self.pending_slots
+            .values()
+            .any(|pending| *pending == packet)
+            || self.actions.iter().any(|action| match action {
+                QcsdAction::CommitPrearmedPacket {
+                    packet: observed, ..
+                }
+                | QcsdAction::SendPacket {
+                    packet: observed, ..
+                }
+                | QcsdAction::SlotMissed {
+                    packet: observed, ..
+                }
+                | QcsdAction::SlotSatisfied {
+                    packet: observed, ..
+                } => *observed == packet,
+                _ => false,
+            })
+    }
+
+    fn arm_next_rolling_outgoing(&mut self, elapsed: Duration) {
+        if self.fixed_schedule.is_some()
+            || self.rolling_outgoing_prearm.is_some()
+            || self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || self.scheduler.endpoints().is_empty()
+        {
+            return;
+        }
+        let Some(packet) = self.defense.next_outgoing_prearm() else {
+            return;
+        };
+        if packet.direction() != Direction::Outgoing || packet.timestamp() <= elapsed {
+            return;
+        }
+        let deadline = packet
+            .timestamp()
+            .saturating_add(self.config.control_interval());
+        let not_before_after_us =
+            duration_as_ceil_micros(packet.timestamp().saturating_sub(elapsed));
+        let deadline_after_us = duration_as_floor_micros(deadline.saturating_sub(elapsed));
+        if deadline_after_us == 0 || not_before_after_us >= deadline_after_us {
+            return;
+        }
+        let Some(endpoint) = self.scheduler.next_outgoing() else {
+            return;
+        };
+        let slot = self.control.next_slot();
+        self.rolling_outgoing_prearm = Some(RollingOutgoingPrearm {
+            endpoint,
+            packet,
+            slot,
+        });
+        self.actions.push_back(QcsdAction::PrearmPacket {
+            endpoint,
+            packet,
+            slot,
+            not_before_after_us,
+            deadline_after_us,
+            allow_stream_data: self.defense.mode() == DefenseMode::ChaffAndShape,
+        });
+    }
+
+    fn cancel_closed_rolling_prearm(&mut self) {
+        if self.rolling_outgoing_prearm.is_none()
+            || (!self.defense.is_complete() && self.defense.terminal_failure().is_none())
+        {
+            return;
+        }
+        let prearm = self
+            .rolling_outgoing_prearm
+            .take()
+            .expect("rolling prearm inspected");
+        let queued_index = self.actions.iter().position(|action| {
+            matches!(
+                action,
+                QcsdAction::PrearmPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    ..
+                } if *endpoint == prearm.endpoint && *packet == prearm.packet && *slot == prearm.slot
+            )
+        });
+        if let Some(index) = queued_index {
+            _ = self.actions.remove(index);
+        } else {
+            self.actions.push_back(QcsdAction::CancelPrearmedPacket {
+                endpoint: prearm.endpoint,
+                packet: prearm.packet,
+                slot: prearm.slot,
+                reason: QcsdPrearmCancellationReason::DefenseTerminal,
+            });
+        }
+    }
+
+    fn abandon_closed_endpoint_prearm(
+        &mut self,
+        endpoint: QcsdEndpointId,
+    ) -> Option<RollingOutgoingPrearm> {
+        let prearm = self
+            .rolling_outgoing_prearm
+            .filter(|prearm| prearm.endpoint == endpoint)?;
+        self.rolling_outgoing_prearm = None;
+        self.actions.retain(|action| {
+            !matches!(
+                action,
+                QcsdAction::PrearmPacket {
+                    endpoint: candidate,
+                    packet,
+                    slot,
+                    ..
+                } if *candidate == endpoint && *packet == prearm.packet && *slot == prearm.slot
+            )
+        });
+        Some(prearm)
+    }
+
+    fn recover_abandoned_rolling_prearm(
+        &mut self,
+        abandoned: Option<RollingOutgoingPrearm>,
+        elapsed: Duration,
+    ) {
+        let Some(abandoned) = abandoned else {
+            return;
+        };
+        if abandoned.packet.timestamp() > elapsed {
+            self.arm_next_rolling_outgoing(elapsed);
+            return;
+        }
+
+        self.rolling_reconcile_due = Some(abandoned.packet);
+
+        let deadline = abandoned
+            .packet
+            .timestamp()
+            .saturating_add(self.config.control_interval());
+        let deadline_after_us = duration_as_floor_micros(deadline.saturating_sub(elapsed));
+        if deadline_after_us > 0
+            && self.defense.terminal_failure().is_none()
+            && let Some(endpoint) = self.scheduler.next_outgoing()
+        {
+            let slot = self.control.next_slot();
+            self.rolling_outgoing_prearm = Some(RollingOutgoingPrearm {
+                endpoint,
+                packet: abandoned.packet,
+                slot,
+            });
+            self.actions.push_back(QcsdAction::PrearmPacket {
+                endpoint,
+                packet: abandoned.packet,
+                slot,
+                not_before_after_us: 0,
+                deadline_after_us,
+                allow_stream_data: self.defense.mode() == DefenseMode::ChaffAndShape,
+            });
+        }
+
+        // Do not poll here: `EndpointClosed` can be followed by later records
+        // in the same globally ordered observation batch. The runner consumes
+        // `rolling_reconcile_due` only after that complete causal prefix and
+        // all resulting defense signals have been reduced.
+    }
+
+    fn fail_late_abandoned_rolling(
+        &mut self,
+        packet: crate::Packet,
+        elapsed: Duration,
+    ) -> Result<()> {
+        let replacement = match self.rolling_outgoing_prearm {
+            Some(prearm) if prearm.packet == packet => Some(prearm),
+            Some(prearm) => {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "late abandoned rolling identity {packet:?} conflicts with live preview {:?}",
+                    prearm.packet
+                )));
+            }
+            None => None,
+        };
+
+        let defense_preview = self.defense.next_outgoing_prearm();
+        if defense_preview != Some(packet) {
+            return Err(crate::Error::ControllerInvariant(format!(
+                "late abandoned rolling identity {packet:?} diverged from the defense preview {defense_preview:?}"
+            )));
+        }
+
+        // Consume the exact outgoing event at its logical release so BuFLO's
+        // no-catch-up guard cannot erase its terminal identity. Validate the
+        // oracle result before mutating the live preview or queued adapter
+        // action; any divergence is fatal and remains available to abort
+        // reconciliation.
+        let realized = self.defense.next_event(packet.timestamp()).ok_or_else(|| {
+            crate::Error::ControllerInvariant(format!(
+                "defense returned no event for late abandoned rolling identity {packet:?}"
+            ))
+        })?;
+        if realized != packet {
+            return Err(crate::Error::ControllerInvariant(format!(
+                "defense returned {realized:?} for late abandoned rolling identity {packet:?}"
+            )));
+        }
+
+        if let Some(prearm) = replacement {
+            self.rolling_outgoing_prearm = None;
+            self.actions.retain(|action| {
+                !matches!(
+                    action,
+                    QcsdAction::PrearmPacket {
+                        endpoint,
+                        packet: queued_packet,
+                        slot,
+                        ..
+                    } if *endpoint == prearm.endpoint
+                        && *queued_packet == prearm.packet
+                        && *slot == prearm.slot
+                )
+            });
+        }
+        let slot = replacement.map_or_else(|| self.control.next_slot(), |prearm| prearm.slot);
+        let deadline = packet
+            .timestamp()
+            .saturating_add(self.config.control_interval());
+        let reason = if elapsed >= deadline {
+            MissedSlotReason::DeadlineExpired
+        } else {
+            MissedSlotReason::TimerLate
+        };
+        self.pending_slots.insert(slot, packet);
+        self.actions.push_back(QcsdAction::SlotMissed {
+            endpoint: None,
+            packet,
+            slot,
+            reason,
+        });
+        self.resolve_slot(elapsed, slot, EventOutcome::Missed(reason));
+
+        // Preserve outgoing-before-incoming at the abandoned tick, then give
+        // the paired incoming opportunity its own typed late/deadline failure.
+        self.collect_due_events(packet.timestamp());
+        let incoming_slots: Vec<_> = self
+            .pending_slots
+            .iter()
+            .filter_map(|(slot, candidate)| {
+                (candidate.timestamp() == packet.timestamp()
+                    && candidate.direction() == Direction::Incoming)
+                    .then_some(*slot)
+            })
+            .collect();
+        for incoming_slot in incoming_slots {
+            self.fail_incoming_slot(incoming_slot, reason, elapsed, true);
+        }
+        self.drain_observations();
+        self.cancel_closed_rolling_prearm();
+        self.update_completion(elapsed);
+        Ok(())
     }
 
     /// Reconcile every due fixed event before an eligible prearmed output flush.
@@ -2889,6 +3382,22 @@ impl QcsdController {
         }
     }
 
+    /// Preserve whether CS-BuFLO's irreversible local termination preceded
+    /// the ordered application-complete signal.  The runner can enqueue both
+    /// observations in one barrier, so the eager controller flag alone cannot
+    /// represent their causal order.
+    fn record_cs_buflo_local_et_ordering(&mut self) {
+        if !self.cs_buflo_local_et_before_application_complete
+            && !self.application_complete_delivered_to_defense
+            && self.defense.is_complete()
+            && self.defense.terminal_failure().is_none()
+            && self.defense.terminal_chaff_cancellation_reason()
+                == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+        {
+            self.cs_buflo_local_et_before_application_complete = true;
+        }
+    }
+
     fn drain_observations(&mut self) {
         let mut pending: Vec<_> = self.observations.drain(..).collect();
         pending.sort_by_key(|observation| observation.at());
@@ -2900,22 +3409,43 @@ impl QcsdController {
             match observation {
                 QueuedDefenseObservation::Signal(mut signal) => {
                     signal.at = at;
+                    if matches!(signal.kind, SignalKind::ApplicationComplete) {
+                        // Mark this before delivery: a termination transition
+                        // caused by onLoad itself is not a pre-onLoad latch.
+                        self.application_complete_delivered_to_defense = true;
+                    }
                     self.defense.observe(signal);
                 }
                 QueuedDefenseObservation::ApplicationBytes {
                     direction, bytes, ..
                 } => self.defense.observe_application_bytes(at, direction, bytes),
             }
+            self.record_cs_buflo_local_et_ordering();
         }
     }
 
     fn collect_due_events(&mut self, elapsed: Duration) {
         while let Some(packet) = self.defense.next_event(elapsed) {
             let receiver_continuation = self.defense.last_incoming_event_receiver_continuation();
-            let slot = self.control.next_slot();
+            let prearmed = (packet.direction() == Direction::Outgoing)
+                .then_some(self.rolling_outgoing_prearm)
+                .flatten()
+                .filter(|prearm| prearm.packet == packet);
+            let slot = prearmed.map_or_else(|| self.control.next_slot(), |prearm| prearm.slot);
             self.pending_slots.insert(slot, packet);
             match packet.direction() {
-                Direction::Outgoing => self.control.outgoing.push(PendingOutgoing { slot, packet }),
+                Direction::Outgoing => {
+                    if let Some(prearm) = prearmed {
+                        self.rolling_outgoing_prearm = None;
+                        self.actions.push_back(QcsdAction::CommitPrearmedPacket {
+                            endpoint: prearm.endpoint,
+                            packet,
+                            slot,
+                        });
+                    } else {
+                        self.control.outgoing.push(PendingOutgoing { slot, packet });
+                    }
+                }
                 Direction::Incoming => self.materialize_incoming_with_disposition(
                     slot,
                     packet,
@@ -3633,7 +4163,7 @@ impl QcsdController {
     fn candidate_defense_control_backlog_pending(&self) -> bool {
         let terminal_parser_backlog = self.defense.terminal_chaff_backlog_cell_bytes().is_some()
             && (!self.parser_lease_ranges.is_empty()
-                || self.streams.has_any_pending_parser_boundary());
+                || self.streams.has_pending_application_parser_boundary());
         let open_chaff_schedule_backlog = self.streams.open_chaff_count() > 0
             && self
                 .defense
@@ -3663,9 +4193,12 @@ impl QcsdController {
                     action,
                     QcsdAction::RequestChaff { .. }
                         | QcsdAction::CancelChaff { .. }
+                        | QcsdAction::ConfigureManualReceive { .. }
+                        | QcsdAction::ConfigureAutomaticReceive { .. }
                         | QcsdAction::SendPacket { .. }
                         | QcsdAction::IncreaseReceiveLimit { .. }
                         | QcsdAction::LeaseParserReceive { .. }
+                        | QcsdAction::ReleaseApplicationSendShaping { .. }
                 )
             })
     }
@@ -3716,6 +4249,9 @@ impl QcsdController {
                 .fold(0_u64, |total, range| total.saturating_add(range.bytes()));
             self.buflo_terminal_subcell_pending_parser_boundaries_at_latch =
                 u64::try_from(self.streams.pending_parser_boundaries().len()).unwrap_or(u64::MAX);
+            self.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch =
+                u64::try_from(self.streams.pending_application_parser_boundary_count())
+                    .unwrap_or(u64::MAX);
         }
 
         let queued = std::mem::take(&mut self.actions);
@@ -3768,8 +4304,138 @@ impl QcsdController {
         }
     }
 
+    /// Transfer application traffic back to ordinary Neqo flow control after
+    /// CS-BuFLO terminates locally before the client onLoad analogue.
+    ///
+    /// Chaff cancellation is queued first by `terminalize_local_chaff`. This
+    /// transition then atomically replaces any still-queued manual application
+    /// configuration with automatic receive and releases only Important
+    /// application sends. Scheduled or unadvertised receive ownership keeps
+    /// the transition fail-closed until a later poll.  Aggregate adapter
+    /// egress backlog cannot block this post-latch transition: pending
+    /// application data or retransmission is precisely the work that the send
+    /// release must allow to drain, while the quiet-time latch already consumed
+    /// a fresh pre-latch aggregate backlog snapshot.
+    fn handoff_cs_buflo_application_after_local_et(&mut self) {
+        if !self.cs_buflo_local_et_before_application_complete
+            || self.cs_buflo_application_passthrough
+            || !self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || self.defense.terminal_chaff_cancellation_reason()
+                != Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+            || !self.control.incoming.is_empty()
+            || !self.control.outgoing.is_empty()
+            || !self.control.credit.is_empty()
+            || !self.control.claims.is_empty()
+            || !self.control.receiver_continuations.is_empty()
+            || !self.incoming_credit_ledger.is_empty()
+            || !self.advertised_incoming_credit.is_empty()
+            || !self.pending_slots.is_empty()
+        {
+            return;
+        }
+
+        let has_nontransferable_application_action =
+            self.actions.iter().any(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint, stream, ..
+                }
+                | QcsdAction::LeaseParserReceive {
+                    endpoint, stream, ..
+                }
+                | QcsdAction::ConfigureAutomaticReceive {
+                    endpoint, stream, ..
+                } => self.streams.is_application_stream(*endpoint, *stream),
+                _ => false,
+            });
+        if has_nontransferable_application_action {
+            return;
+        }
+
+        let application_parser_keys: Vec<_> = self
+            .parser_lease_ranges
+            .keys()
+            .copied()
+            .filter(|(endpoint, stream)| self.streams.is_application_stream(*endpoint, *stream))
+            .collect();
+        if application_parser_keys.iter().any(|key| {
+            self.parser_lease_ranges.get(key).is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|range| range.owner.is_some() || !range.unowned || !range.advertised)
+            })
+        }) {
+            return;
+        }
+
+        let parser_boundaries = self.streams.pending_application_parser_boundary_count();
+        let Ok(streams) = self.streams.handoff_application_receive_to_automatic() else {
+            return;
+        };
+        let parser_lease_bytes = application_parser_keys
+            .into_iter()
+            .filter_map(|key| self.parser_lease_ranges.remove(&key))
+            .flatten()
+            .fold(0_u64, |total, range| total.saturating_add(range.bytes()));
+
+        self.actions.retain(|action| {
+            !matches!(
+                action,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint,
+                    stream,
+                    ..
+                } if self.streams.is_application_stream(*endpoint, *stream)
+            )
+        });
+        self.cs_buflo_application_passthrough = true;
+        self.cs_buflo_local_et_application_receive_streams_handed_off =
+            u64::try_from(streams.len()).unwrap_or(u64::MAX);
+        self.cs_buflo_local_et_application_parser_boundaries_handed_off =
+            u64::try_from(parser_boundaries).unwrap_or(u64::MAX);
+        self.cs_buflo_local_et_application_parser_lease_bytes_handed_off = parser_lease_bytes;
+
+        for (endpoint, stream) in streams {
+            self.actions
+                .push_back(QcsdAction::ConfigureAutomaticReceive {
+                    endpoint,
+                    stream,
+                    window: self.config.automatic_receive_window,
+                });
+        }
+        let endpoints = self.scheduler.endpoints().to_vec();
+        for endpoint in endpoints {
+            self.release_application_send_shaping_for(endpoint);
+        }
+    }
+
+    /// Release application sends after an onLoad-first CS-BuFLO completion so
+    /// lost request bytes or FIN can still be retransmitted and peer-confirmed.
+    /// This is transport cleanup, not the pre-onLoad automatic-receive
+    /// handoff, and therefore does not mutate any early-termination counters.
+    fn release_cs_buflo_application_send_cleanup_if_needed(&mut self) {
+        if !self.application_complete_delivered_to_defense
+            || !self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || self.defense.terminal_chaff_cancellation_reason()
+                != Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+        {
+            return;
+        }
+        let endpoints = self.scheduler.endpoints().to_vec();
+        for endpoint in endpoints {
+            self.release_application_send_shaping_for(endpoint);
+        }
+    }
+
     fn update_completion(&mut self, elapsed: Duration) {
+        // `next_event` can itself perform CS-BuFLO's strict-quiet decision, so
+        // reconcile the ordering even when no transport observation caused the
+        // transition.
+        self.record_cs_buflo_local_et_ordering();
         self.terminalize_local_chaff(elapsed);
+        self.handoff_cs_buflo_application_after_local_et();
+        self.release_cs_buflo_application_send_cleanup_if_needed();
         let has_backlog = self.control.incoming_backlog() > 0
             || self.control.claim_backlog() > 0
             || !self.control.receiver_continuations.is_empty()
@@ -3779,11 +4445,20 @@ impl QcsdController {
             || !self.advertised_incoming_credit.is_empty()
             || !self.pending_slots.is_empty()
             || !self.observations.is_empty()
+            || (self.defense.terminal_chaff_cancellation_reason()
+                == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+                && self.cs_buflo_local_et_before_application_complete
+                && !self.cs_buflo_application_passthrough)
             || (self.defense.requires_terminal_chaff_drain()
                 && (self.actions.iter().any(|action| {
                     matches!(
                         action,
-                        QcsdAction::RequestChaff { .. } | QcsdAction::CancelChaff { .. }
+                        QcsdAction::RequestChaff { .. }
+                            | QcsdAction::CancelChaff { .. }
+                            | QcsdAction::CancelPrearmedPacket { .. }
+                            | QcsdAction::ConfigureManualReceive { .. }
+                            | QcsdAction::ConfigureAutomaticReceive { .. }
+                            | QcsdAction::ReleaseApplicationSendShaping { .. }
                     )
                 }) || self
                     .chaff
@@ -3831,6 +4506,26 @@ impl QcsdController {
         {
             self.actions
                 .push_back(QcsdAction::ReleaseChaffSendShaping { endpoint });
+        }
+    }
+
+    fn release_application_send_shaping_for(&mut self, endpoint: QcsdEndpointId) {
+        let early_handoff = self.cs_buflo_application_passthrough;
+        let post_onload_cleanup = self.application_complete_delivered_to_defense
+            && self.defense.is_complete()
+            && self.defense.terminal_failure().is_none()
+            && self.defense.terminal_chaff_cancellation_reason()
+                == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination);
+        if (early_handoff || post_onload_cleanup)
+            && self.released_application_send_shaping.insert(endpoint)
+        {
+            if early_handoff {
+                self.cs_buflo_local_et_application_send_endpoints_released = self
+                    .cs_buflo_local_et_application_send_endpoints_released
+                    .saturating_add(1);
+            }
+            self.actions
+                .push_back(QcsdAction::ReleaseApplicationSendShaping { endpoint });
         }
     }
 
@@ -3900,8 +4595,9 @@ impl QcsdController {
     }
 
     fn controls(&self, role: QcsdRequestRole) -> bool {
-        self.defense.mode() == DefenseMode::ChaffAndShape
-            || matches!(role, QcsdRequestRole::Chaff { .. })
+        matches!(role, QcsdRequestRole::Chaff { .. })
+            || (self.defense.mode() == DefenseMode::ChaffAndShape
+                && !(self.cs_buflo_application_passthrough && role == QcsdRequestRole::Application))
     }
 
     fn request_chaff_if_needed(&mut self, before_due_outgoing: bool) {
@@ -3981,11 +4677,11 @@ mod tests {
         CsBufloParameters, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal,
         Direction, EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction,
         QcsdChaffCancellationReason, QcsdConfig, QcsdDatagramClass, QcsdEndpointId,
-        QcsdImplementationScope, QcsdObservation, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
-        QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome,
-        QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, SignalKind, StaticSchedule,
-        TamarawConfig, Trace, TrafficMorphing, TrafficMorphingConfig, WalkieTalkie,
-        WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        QcsdImplementationScope, QcsdObservation, QcsdParserLeaseOwner,
+        QcsdPrearmCancellationReason, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSendPolicy,
+        QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, Resource,
+        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphing,
+        TrafficMorphingConfig, WalkieTalkie, WalkieTalkieConfig, WtfPad, WtfPadConfig,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4086,6 +4782,41 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct DivergentRollingDefense {
+        preview: Packet,
+        event: Option<Packet>,
+    }
+
+    impl Defense for DivergentRollingDefense {
+        fn observe(&mut self, _signal: DefenseSignal) {}
+
+        fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
+            self.event.filter(|packet| packet.timestamp() <= elapsed)?;
+            self.event.take()
+        }
+
+        fn next_outgoing_prearm(&self) -> Option<Packet> {
+            Some(self.preview)
+        }
+
+        fn next_event_at(&self) -> Option<Duration> {
+            Some(self.preview.timestamp())
+        }
+
+        fn is_complete(&self) -> bool {
+            false
+        }
+
+        fn is_outgoing_complete(&self) -> bool {
+            false
+        }
+
+        fn mode(&self) -> DefenseMode {
+            DefenseMode::ChaffAndShape
+        }
+    }
+
+    #[derive(Debug)]
     struct CongestionSensitiveOneShot {
         event: Option<Packet>,
     }
@@ -4143,6 +4874,50 @@ mod tests {
 
         fn is_outgoing_complete(&self) -> bool {
             true
+        }
+
+        fn mode(&self) -> DefenseMode {
+            DefenseMode::ChaffAndShape
+        }
+
+        fn requires_terminal_chaff_drain(&self) -> bool {
+            true
+        }
+
+        fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
+            Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BacklogLatchedLocalEtDefense {
+        complete: bool,
+    }
+
+    impl Defense for BacklogLatchedLocalEtDefense {
+        fn observe(&mut self, signal: DefenseSignal) {
+            if matches!(
+                signal.kind,
+                SignalKind::EgressBacklog { pending: false } | SignalKind::Wire { .. }
+            ) {
+                self.complete = true;
+            }
+        }
+
+        fn next_event(&mut self, _elapsed: Duration) -> Option<Packet> {
+            None
+        }
+
+        fn next_event_at(&self) -> Option<Duration> {
+            None
+        }
+
+        fn is_complete(&self) -> bool {
+            self.complete
+        }
+
+        fn is_outgoing_complete(&self) -> bool {
+            self.complete
         }
 
         fn mode(&self) -> DefenseMode {
@@ -4356,6 +5131,11 @@ mod tests {
                     packet,
                     slot,
                     ..
+                }
+                | QcsdAction::CommitPrearmedPacket {
+                    endpoint,
+                    packet,
+                    slot,
                 } => {
                     replay.terminals.push(ReplayTerminal {
                         endpoint: Some(endpoint),
@@ -4426,8 +5206,11 @@ mod tests {
                 | QcsdAction::ConfigureAutomaticReceive { .. }
                 | QcsdAction::LeaseParserReceive { .. }
                 | QcsdAction::ReleaseChaffSendShaping { .. }
+                | QcsdAction::ReleaseApplicationSendShaping { .. }
                 | QcsdAction::RequestChaff { .. }
-                | QcsdAction::CancelChaff { .. } => {}
+                | QcsdAction::CancelChaff { .. }
+                | QcsdAction::PrearmPacket { .. }
+                | QcsdAction::CancelPrearmedPacket { .. } => {}
             }
         }
     }
@@ -4536,14 +5319,18 @@ mod tests {
             .filter_map(|action| match action {
                 QcsdAction::IncreaseReceiveLimit { slot, .. }
                 | QcsdAction::SendPacket { slot, .. }
+                | QcsdAction::CommitPrearmedPacket { slot, .. }
                 | QcsdAction::SlotMissed { slot, .. }
                 | QcsdAction::SlotSatisfied { slot, .. } => Some(*slot),
                 QcsdAction::ConfigureManualReceive { .. }
                 | QcsdAction::ConfigureAutomaticReceive { .. }
                 | QcsdAction::LeaseParserReceive { .. }
                 | QcsdAction::ReleaseChaffSendShaping { .. }
+                | QcsdAction::ReleaseApplicationSendShaping { .. }
                 | QcsdAction::RequestChaff { .. }
                 | QcsdAction::CancelChaff { .. }
+                | QcsdAction::PrearmPacket { .. }
+                | QcsdAction::CancelPrearmedPacket { .. }
                 | QcsdAction::DefenseComplete => None,
             })
             .collect();
@@ -9680,6 +10467,28 @@ mod tests {
                     *packet,
                 ));
             }
+            QcsdAction::CommitPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+            } => {
+                assert_eq!(expected_send_policy, QcsdSendPolicy::Exact);
+                assert!(endpoints.iter().any(|candidate| candidate.0 == *endpoint));
+                assert_eq!(packet.direction(), Direction::Outgoing);
+                assert_eq!(packet.length(), expected_packet_size);
+                assert!(
+                    state.scheduled_slots.insert(*slot),
+                    "slot identity was reused"
+                );
+                state.outgoing_endpoints.push(*endpoint);
+                tick.terminal_observations.push(successful_candidate_send(
+                    QcsdSendPolicy::Exact,
+                    *endpoint,
+                    *slot,
+                    *packet,
+                ));
+            }
+            QcsdAction::PrearmPacket { .. } => {}
             QcsdAction::IncreaseReceiveLimit {
                 endpoint,
                 stream,
@@ -14308,7 +15117,12 @@ mod tests {
         assert_eq!(
             next_pair
                 .iter()
-                .filter(|action| matches!(action, QcsdAction::SendPacket { .. }))
+                .filter(|action| {
+                    matches!(
+                        action,
+                        QcsdAction::SendPacket { .. } | QcsdAction::CommitPrearmedPacket { .. }
+                    )
+                })
                 .count(),
             1
         );
@@ -14418,6 +15232,10 @@ mod tests {
             0
         );
         assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch,
+            0
+        );
+        assert_eq!(
             diagnostics.buflo_terminal_subcell_exact_capacity_bytes_cancelled,
             1_199
         );
@@ -14459,7 +15277,12 @@ mod tests {
         assert_eq!(
             next_pair
                 .iter()
-                .filter(|action| matches!(action, QcsdAction::SendPacket { .. }))
+                .filter(|action| {
+                    matches!(
+                        action,
+                        QcsdAction::SendPacket { .. } | QcsdAction::CommitPrearmedPacket { .. }
+                    )
+                })
                 .count(),
             1
         );
@@ -14648,6 +15471,10 @@ mod tests {
             diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch,
             0
         );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch,
+            0
+        );
     }
 
     #[test]
@@ -14689,6 +15516,908 @@ mod tests {
             diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch,
             0
         );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch,
+            0
+        );
+    }
+
+    #[test]
+    fn buflo_terminal_cancels_a_retained_chaff_boundary_with_a_subcell_tail() {
+        // initial limit 16 leaves the exact 624-byte tail observed in the
+        // canonical live regression (640 - 16). A second exhausted chaff
+        // stream retains the HTTP/3 `awaiting_data_frame` parser boundary
+        // which previously kept aggregate backlog true forever.
+        let mut controller = buflo_terminal_capacity_controller(640);
+        retain_post_cap_parser_boundary(
+            &mut controller,
+            QcsdEndpointId(1),
+            QcsdStreamId(8),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+        );
+        assert!(controller.parser_lease_ranges.is_empty());
+        assert!(controller.streams.has_any_pending_parser_boundary());
+        assert!(!controller.streams.has_pending_application_parser_boundary());
+
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+
+        assert!(controller.defense.is_complete());
+        assert_eq!(controller.streams.open_chaff_count(), 0);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::CancelChaff {
+                        reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SendPacket { .. }
+                | QcsdAction::IncreaseReceiveLimit { .. }
+                | QcsdAction::SlotMissed { .. }
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert!(diagnostics.buflo_terminal_subcell_latched);
+        assert_eq!(diagnostics.buflo_terminal_subcell_latched_at_us, 31);
+        assert_eq!(diagnostics.buflo_terminal_subcell_open_streams_at_latch, 2);
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_exact_capacity_bytes_cancelled,
+            624
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch,
+            1
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch,
+            0
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch,
+            0
+        );
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn buflo_rolling_prearm_commits_once_before_the_due_incoming_action() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        let preview_actions: Vec<_> = controller.drain_actions().collect();
+        let preview_slot = preview_actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::PrearmPacket { packet, slot, .. } => {
+                    assert_eq!(packet.timestamp(), Duration::from_micros(40));
+                    Some(*slot)
+                }
+                _ => None,
+            })
+            .expect("future outgoing preview");
+        assert!(controller.pending_slots().is_empty());
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .buflo_scheduled_outgoing_cells,
+            4
+        );
+
+        controller
+            .reconcile_due_rolling(Duration::from_micros(40))
+            .expect("reconcile due rolling preview");
+        let due_actions: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(
+            due_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::CommitPrearmedPacket { slot, .. } if *slot == preview_slot
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !due_actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::SendPacket { .. }))
+        );
+        let incoming_slot = due_actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .expect("due incoming action");
+        assert!(preview_slot < incoming_slot);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .buflo_scheduled_outgoing_cells,
+            5
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .buflo_scheduled_incoming_cells,
+            5
+        );
+
+        controller
+            .reconcile_due_rolling(Duration::from_micros(40))
+            .expect("repeat rolling reconciliation is inert");
+        assert!(!controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket { slot, .. } if slot == preview_slot
+        )));
+    }
+
+    #[test]
+    fn queued_buflo_miss_cancels_the_due_preview_without_materializing_the_next_cell() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        controller.drain_actions().for_each(drop);
+
+        controller
+            .reconcile_due_rolling(Duration::from_micros(40))
+            .expect("reconcile current rolling event");
+        let first_due: Vec<_> = controller.drain_actions().collect();
+        let (realized_slot, realized_packet) = first_due
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::CommitPrearmedPacket { packet, slot, .. }
+                    if packet.timestamp() == Duration::from_micros(40) =>
+                {
+                    Some((*slot, *packet))
+                }
+                _ => None,
+            })
+            .expect("current exact cell commit");
+        let (next_slot, next_packet) = first_due
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::PrearmPacket { packet, slot, .. }
+                    if packet.timestamp() == Duration::from_micros(50) =>
+                {
+                    Some((*slot, *packet))
+                }
+                _ => None,
+            })
+            .expect("following preview");
+
+        controller.observe(
+            QcsdObservation::SlotMissed {
+                endpoint: QcsdEndpointId(1),
+                slot: realized_slot,
+                packet: realized_packet,
+                reason: MissedSlotReason::DeadlineExpired,
+            },
+            Duration::from_micros(50),
+        );
+        controller
+            .reconcile_due_rolling(Duration::from_micros(50))
+            .expect("cancel following rolling preview");
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelPrearmedPacket {
+                slot,
+                packet,
+                reason: QcsdPrearmCancellationReason::DefenseTerminal,
+                ..
+            } if *slot == next_slot && *packet == next_packet
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket { slot, .. } if *slot == next_slot
+        )));
+        assert!(
+            !controller
+                .pending_slots()
+                .iter()
+                .any(|(slot, _)| *slot == next_slot)
+        );
+        assert!(controller.terminal_failure().is_some());
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .buflo_scheduled_outgoing_cells,
+            5,
+            "the failed 40us cell must not materialize the 50us cell"
+        );
+    }
+
+    #[test]
+    fn closed_endpoint_preview_rearms_without_becoming_an_event() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        ready(&mut controller, 2, "https://second.example.com");
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::from_micros(31));
+        let first = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("first endpoint preview");
+        let QcsdAction::PrearmPacket {
+            endpoint,
+            packet,
+            slot: first_slot,
+            ..
+        } = first
+        else {
+            unreachable!();
+        };
+        assert_eq!(endpoint, QcsdEndpointId(1));
+        assert_eq!(packet.timestamp(), Duration::from_micros(40));
+
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(32),
+        );
+        assert_eq!(
+            controller.rolling_outgoing_prearm_endpoint(),
+            Some(QcsdEndpointId(2))
+        );
+        controller.poll(Duration::from_micros(32));
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let replacement = actions
+            .iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    QcsdAction::PrearmPacket {
+                        endpoint: QcsdEndpointId(2),
+                        packet: observed,
+                        ..
+                    } if *observed == packet
+                )
+            })
+            .expect("preview rearmed on surviving endpoint");
+        let QcsdAction::PrearmPacket {
+            slot: replacement_slot,
+            ..
+        } = replacement
+        else {
+            unreachable!();
+        };
+        assert_ne!(*replacement_slot, first_slot);
+        assert_eq!(
+            controller.rolling_outgoing_prearm_endpoint(),
+            Some(QcsdEndpointId(2))
+        );
+        assert!(controller.pending_slots().is_empty());
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket { .. }
+                | QcsdAction::CancelPrearmedPacket { .. }
+                | QcsdAction::SlotMissed { .. }
+                | QcsdAction::SlotSatisfied { .. }
+        )));
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .buflo_scheduled_outgoing_cells,
+            4
+        );
+    }
+
+    fn divergent_abandoned_rolling_controller(
+        event: Option<Packet>,
+        include_survivor: bool,
+    ) -> (QcsdController, Packet) {
+        let expected = Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_200)
+            .expect("expected rolling packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 10,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(DivergentRollingDefense {
+                preview: expected,
+                event,
+            }),
+        )
+        .expect("divergent rolling controller");
+        ready(&mut controller, 1, "https://first.example.com");
+        if include_survivor {
+            ready(&mut controller, 2, "https://second.example.com");
+        }
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::from_micros(31));
+        let endpoint = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::PrearmPacket {
+                    endpoint, packet, ..
+                } if packet == expected => Some(endpoint),
+                _ => None,
+            })
+            .expect("initial divergent preview");
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(41),
+        );
+        controller.flush_defense_observations();
+        assert!(controller.has_due_rolling_reconciliation());
+        (controller, expected)
+    }
+
+    #[test]
+    fn divergent_late_rolling_events_fail_closed_without_erasing_the_due_marker() {
+        let wrong = Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_199)
+            .expect("wrong rolling packet");
+        for (event, expected_message) in [
+            (None, "returned no event"),
+            (Some(wrong), "for late abandoned rolling identity"),
+        ] {
+            let (mut controller, expected) = divergent_abandoned_rolling_controller(event, false);
+            let error = controller
+                .reconcile_due_rolling(Duration::from_micros(41))
+                .expect_err("divergent defense must fail closed");
+            assert!(matches!(
+                error,
+                crate::Error::ControllerInvariant(message)
+                    if message.contains(expected_message)
+            ));
+            assert_eq!(
+                controller.rolling_reconciliation_due_packet(),
+                Some(expected)
+            );
+            assert!(controller.pending_slots().is_empty());
+            assert!(matches!(
+                controller.reconcile_due_rolling(Duration::from_micros(41)),
+                Err(crate::Error::ControllerInvariant(_))
+            ));
+            assert_eq!(
+                controller.rolling_reconciliation_due_packet(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn divergent_ordinary_due_events_leave_the_live_preview_abort_cancelable() {
+        let expected = Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_200)
+            .expect("expected rolling packet");
+        let wrong = Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_199)
+            .expect("wrong rolling packet");
+        for event in [None, Some(wrong)] {
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    control_interval_us: 10,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(DivergentRollingDefense {
+                    preview: expected,
+                    event,
+                }),
+            )
+            .expect("divergent rolling controller");
+            ready(&mut controller, 1, "https://first.example.com");
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::from_micros(31));
+            controller.drain_actions().for_each(drop);
+
+            assert!(matches!(
+                controller.reconcile_due_rolling(Duration::from_micros(40)),
+                Err(crate::Error::ControllerInvariant(message))
+                    if message.contains("did not materialize due rolling identity")
+            ));
+            assert_eq!(controller.rolling_outgoing_prearm.unwrap().packet, expected);
+            assert!(matches!(
+                controller.take_rolling_prearm_for_abort(),
+                Some(QcsdAction::CancelPrearmedPacket {
+                    packet,
+                    reason: QcsdPrearmCancellationReason::RunAborted,
+                    ..
+                }) if packet == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn mismatched_live_replacement_fails_before_preview_or_action_is_consumed() {
+        let expected = Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_200)
+            .expect("expected rolling packet");
+        let (mut controller, _) = divergent_abandoned_rolling_controller(Some(expected), true);
+        let wrong = Packet::new(Duration::from_micros(41), Direction::Outgoing, 1_200)
+            .expect("wrong replacement packet");
+        controller
+            .rolling_outgoing_prearm
+            .as_mut()
+            .expect("replacement preview")
+            .packet = wrong;
+
+        assert!(matches!(
+            controller.reconcile_due_rolling(Duration::from_micros(41)),
+            Err(crate::Error::ControllerInvariant(message))
+                if message.contains("conflicts with live preview")
+        ));
+        assert_eq!(
+            controller.rolling_reconciliation_due_packet(),
+            Some(expected)
+        );
+        assert_eq!(
+            controller
+                .rolling_outgoing_prearm
+                .expect("mismatched preview retained")
+                .packet,
+            wrong
+        );
+        assert!(controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket { packet, .. } if *packet == expected
+        )));
+    }
+
+    #[test]
+    fn closed_endpoint_preview_transfers_and_commits_at_exact_release() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        ready(&mut controller, 2, "https://second.example.com");
+        controller.streams.open(
+            QcsdEndpointId(2),
+            QcsdStreamId(8),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_216,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::from_micros(31));
+        let first = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("first endpoint preview");
+        let QcsdAction::PrearmPacket {
+            endpoint,
+            packet,
+            slot: first_slot,
+            ..
+        } = first
+        else {
+            unreachable!();
+        };
+
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(40),
+        );
+        controller.flush_defense_observations();
+        controller
+            .reconcile_due_rolling(Duration::from_micros(40))
+            .expect("transfer due rolling preview");
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let (prearm_index, replacement_slot) = actions
+            .iter()
+            .enumerate()
+            .find_map(|(index, action)| match action {
+                QcsdAction::PrearmPacket {
+                    endpoint: QcsdEndpointId(2),
+                    packet: observed,
+                    slot,
+                    not_before_after_us: 0,
+                    deadline_after_us: 10,
+                    ..
+                } if *observed == packet => Some((index, *slot)),
+                _ => None,
+            })
+            .expect("due preview transferred to survivor");
+        let commit_index = actions
+            .iter()
+            .position(|action| {
+                matches!(
+                    action,
+                    QcsdAction::CommitPrearmedPacket {
+                        endpoint: QcsdEndpointId(2),
+                        packet: observed,
+                        slot,
+                    } if *observed == packet && *slot == replacement_slot
+                )
+            })
+            .expect("transferred preview committed in the same microstep");
+        assert!(prearm_index < commit_index);
+        assert_ne!(replacement_slot, first_slot);
+        assert!(
+            controller
+                .pending_slots()
+                .contains(&(replacement_slot, packet))
+        );
+    }
+
+    #[test]
+    fn closed_endpoint_preview_one_microsecond_late_is_a_typed_fidelity_failure() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        ready(&mut controller, 2, "https://second.example.com");
+        controller.streams.open(
+            QcsdEndpointId(2),
+            QcsdStreamId(8),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_216,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::from_micros(31));
+        let first = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("first endpoint preview");
+        let QcsdAction::PrearmPacket {
+            endpoint, packet, ..
+        } = first
+        else {
+            unreachable!();
+        };
+
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(41),
+        );
+        controller.flush_defense_observations();
+        controller
+            .reconcile_due_rolling(Duration::from_micros(41))
+            .expect("terminalize late rolling preview");
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let misses: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::SlotMissed {
+                    packet,
+                    reason: MissedSlotReason::TimerLate,
+                    ..
+                } if packet.timestamp() == Duration::from_micros(40) => Some(packet.direction()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(misses, [Direction::Outgoing, Direction::Incoming]);
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket {
+                packet: observed, ..
+            } if *observed == packet
+        )));
+        assert!(controller.terminal_failure().is_some());
+        controller
+            .reconcile_due_rolling(Duration::from_micros(41))
+            .expect("repeat late reconciliation is inert");
+        assert!(controller.drain_actions().next().is_none());
+    }
+
+    #[test]
+    fn later_observation_in_close_batch_precedes_due_preview_reconciliation() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        ready(&mut controller, 2, "https://second.example.com");
+        controller.streams.open(
+            QcsdEndpointId(2),
+            QcsdStreamId(8),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_216,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::from_micros(31));
+        let first = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("first endpoint preview");
+        let QcsdAction::PrearmPacket {
+            endpoint, packet, ..
+        } = first
+        else {
+            unreachable!();
+        };
+
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(40),
+        );
+        assert!(controller.has_due_rolling_reconciliation());
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint: QcsdEndpointId(2),
+                stream: QcsdStreamId(8),
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(40),
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(40),
+        );
+        controller.flush_defense_observations();
+        controller
+            .reconcile_due_rolling(Duration::from_micros(40))
+            .expect("reconcile after complete observation batch");
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(controller.defense.is_complete());
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket {
+                packet: observed, ..
+            } if *observed == packet
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket {
+                packet: observed, ..
+            } if *observed == packet
+        )));
+        assert!(
+            !controller
+                .pending_slots()
+                .iter()
+                .any(|(_, observed)| *observed == packet)
+        );
+    }
+
+    #[test]
+    fn expired_abandoned_preview_gets_immediate_typed_deadline_misses() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        let preview = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("preview");
+        let QcsdAction::PrearmPacket { endpoint, .. } = preview else {
+            unreachable!();
+        };
+
+        controller.observe(
+            QcsdObservation::EndpointClosed { endpoint },
+            Duration::from_micros(50),
+        );
+        assert!(controller.has_due_rolling_reconciliation());
+        assert!(!controller.has_rolling_outgoing_prearm());
+        controller.flush_defense_observations();
+        controller
+            .reconcile_due_rolling(Duration::from_micros(50))
+            .expect("terminalize expired rolling preview");
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let misses: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::SlotMissed {
+                    packet,
+                    reason: MissedSlotReason::DeadlineExpired,
+                    ..
+                } if packet.timestamp() == Duration::from_micros(40) => Some(packet.direction()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(misses, [Direction::Outgoing, Direction::Incoming]);
+        assert!(controller.terminal_failure().is_some());
+        assert!(!controller.has_due_rolling_reconciliation());
+    }
+
+    #[test]
+    fn buflo_terminal_snapshot_cancels_an_applied_preview_without_an_event_outcome() {
+        let defense = resolved_buflo_terminal_defense(true);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 10,
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.drain_actions().for_each(drop);
+
+        controller.poll(Duration::from_micros(31));
+        let prearm = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("preview staged while adapter backlog remained true");
+        let QcsdAction::PrearmPacket { slot, packet, .. } = prearm else {
+            unreachable!();
+        };
+        assert!(controller.pending_slots().is_empty());
+
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(32),
+        );
+        controller.poll(Duration::from_micros(32));
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelPrearmedPacket {
+                slot: observed_slot,
+                packet: observed_packet,
+                reason: QcsdPrearmCancellationReason::DefenseTerminal,
+                ..
+            } if *observed_slot == slot && *observed_packet == packet
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed { .. }
+                | QcsdAction::SlotSatisfied { .. }
+                | QcsdAction::CommitPrearmedPacket { .. }
+        )));
+        assert!(controller.pending_slots().is_empty());
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.buflo_scheduled_outgoing_cells, 4);
+        assert_eq!(diagnostics.buflo_missed_outgoing_cells, 0);
+        assert_eq!(diagnostics.buflo_outgoing_unresolved_cells, 0);
+    }
+
+    #[test]
+    fn rolling_prearm_abort_removes_an_unapplied_preview_and_returns_one_cancellation() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+
+        let preview = controller
+            .actions
+            .iter()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .cloned()
+            .expect("queued preview");
+        let QcsdAction::PrearmPacket {
+            endpoint,
+            packet,
+            slot,
+            ..
+        } = preview
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            controller.take_rolling_prearm_for_abort(),
+            Some(QcsdAction::CancelPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+                reason: QcsdPrearmCancellationReason::RunAborted,
+            })
+        );
+        assert!(!controller.has_rolling_outgoing_prearm());
+        assert!(!controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket { .. } | QcsdAction::CancelPrearmedPacket { .. }
+        )));
+        assert!(controller.take_rolling_prearm_for_abort().is_none());
+    }
+
+    #[test]
+    fn rolling_prearm_abort_returns_one_cancellation_after_adapter_handoff() {
+        let mut controller = buflo_terminal_capacity_controller(1_216);
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        let preview = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("adapter-bound preview");
+        let QcsdAction::PrearmPacket {
+            endpoint,
+            packet,
+            slot,
+            ..
+        } = preview
+        else {
+            unreachable!();
+        };
+
+        assert_eq!(
+            controller.take_rolling_prearm_for_abort(),
+            Some(QcsdAction::CancelPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+                reason: QcsdPrearmCancellationReason::RunAborted,
+            })
+        );
+        assert!(controller.take_rolling_prearm_for_abort().is_none());
+    }
+
+    #[test]
+    fn abort_normalizes_an_already_queued_terminal_preview_cancellation_once() {
+        let defense = resolved_buflo_terminal_defense(true);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 10,
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::from_micros(31));
+        let preview = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("adapter-bound preview");
+        let QcsdAction::PrearmPacket {
+            endpoint,
+            packet,
+            slot,
+            ..
+        } = preview
+        else {
+            unreachable!();
+        };
+
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(32),
+        );
+        controller.poll(Duration::from_micros(32));
+        assert_eq!(
+            controller
+                .actions
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::CancelPrearmedPacket { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            controller.take_rolling_prearm_for_abort(),
+            Some(QcsdAction::CancelPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+                reason: QcsdPrearmCancellationReason::RunAborted,
+            })
+        );
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::CancelPrearmedPacket { .. }))
+        );
+        assert!(controller.take_rolling_prearm_for_abort().is_none());
     }
 
     #[test]
@@ -14716,6 +16445,10 @@ mod tests {
             16,
             1_000,
             1_000,
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::ZERO,
         );
 
         controller.update_completion(Duration::ZERO);
@@ -14753,6 +16486,366 @@ mod tests {
         assert!(matches!(
             controller.next_action(),
             Some(QcsdAction::DefenseComplete)
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "This single scenario verifies the complete atomic local-termination handoff and its diagnostics."
+    )]
+    fn local_et_atomically_cancels_chaff_and_hands_application_traffic_to_neqo() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                tail_wait_us: 0,
+                automatic_receive_window: 65_535,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(CompleteLocalEtDefense),
+        )
+        .expect("controller");
+        let first_endpoint = QcsdEndpointId(1);
+        let second_endpoint = QcsdEndpointId(2);
+        let application = QcsdStreamId(4);
+        let chaff = QcsdStreamId(8);
+        ready(&mut controller, 1, "https://one.example");
+        ready(&mut controller, 2, "https://two.example");
+        controller.open_stream(
+            first_endpoint,
+            application,
+            QcsdRequestRole::Application,
+            Some(2_000),
+        );
+        controller
+            .streams
+            .header_progress(first_endpoint, application, 0, true);
+        let parser_release = controller
+            .streams
+            .release_stream(first_endpoint, application, 16)
+            .expect("transferable parser range");
+        controller
+            .streams
+            .get_mut(first_endpoint, application)
+            .expect("application state")
+            .receive
+            .advertised(parser_release.absolute_limit);
+        controller.parser_lease_ranges.insert(
+            (first_endpoint, application),
+            vec![ParserLeaseRange {
+                start: parser_release.absolute_limit - parser_release.increase,
+                end: parser_release.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: true,
+            }],
+        );
+        controller.streams.open(
+            first_endpoint,
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_000,
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(2_000_001),
+        );
+
+        controller.update_completion(Duration::from_micros(2_000_001));
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                QcsdAction::CancelChaff {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(8),
+                    reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
+                },
+                QcsdAction::ConfigureAutomaticReceive {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(4),
+                    window: 65_535,
+                },
+                QcsdAction::ReleaseApplicationSendShaping {
+                    endpoint: QcsdEndpointId(1),
+                },
+                QcsdAction::ReleaseApplicationSendShaping {
+                    endpoint: QcsdEndpointId(2),
+                },
+            ]
+        ));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        assert!(controller.parser_lease_ranges.is_empty());
+        let diagnostics = controller.defense_diagnostics();
+        assert!(diagnostics.cs_buflo_local_et_before_application_complete);
+        assert_eq!(
+            diagnostics.cs_buflo_local_et_application_receive_streams_handed_off,
+            1
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_local_et_application_parser_boundaries_handed_off,
+            1
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_local_et_application_parser_lease_bytes_handed_off,
+            16
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_local_et_application_send_endpoints_released,
+            2
+        );
+
+        let dependent = QcsdStreamId(12);
+        controller.open_stream(
+            second_endpoint,
+            dependent,
+            QcsdRequestRole::Application,
+            Some(500),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::ConfigureAutomaticReceive {
+                endpoint: QcsdEndpointId(2),
+                stream: QcsdStreamId(12),
+                window: 65_535,
+            })
+        ));
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::ConfigureManualReceive { .. }))
+        );
+
+        controller.observe(
+            QcsdObservation::EndpointClosed {
+                endpoint: second_endpoint,
+            },
+            Duration::from_micros(2_000_002),
+        );
+        ready(&mut controller, 2, "https://two.example");
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::ReleaseApplicationSendShaping {
+                endpoint: QcsdEndpointId(2),
+            })
+        ));
+    }
+
+    #[test]
+    fn pre_dispatch_local_et_latch_blocks_the_race_then_releases_backlogged_application() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                tail_wait_us: 0,
+                automatic_receive_window: 65_535,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::<BacklogLatchedLocalEtDefense>::default(),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let application = QcsdStreamId(4);
+        let chaff = QcsdStreamId(8);
+        ready(&mut controller, 1, "https://one.example");
+        assert!(controller.can_start_application_batch());
+
+        // This is the runner's pre-dispatch causal boundary: queuing the
+        // observation does not mutate the defense, but reducing it latches
+        // local ET and must close the dispatch gate before controller.poll().
+        controller.observe(
+            QcsdObservation::Datagram {
+                endpoint: QcsdEndpointId(1),
+                direction: Direction::Incoming,
+                length: 1_200,
+                timestamp_us: 2_000_001,
+            },
+            Duration::from_micros(2_000_001),
+        );
+        assert!(controller.can_start_application_batch());
+        controller.flush_defense_observations();
+        assert!(!controller.can_start_application_batch());
+        assert!(
+            controller
+                .defense_diagnostics()
+                .cs_buflo_local_et_before_application_complete
+        );
+
+        // Force the exact request that the gate prevents, proving that even a
+        // pre-existing/manual application backlog cannot deadlock the
+        // post-latch handoff.  ApplicationComplete is delivered only after the
+        // latch and therefore must not erase the historical ordering proof.
+        controller.open_stream(
+            endpoint,
+            application,
+            QcsdRequestRole::Application,
+            Some(2_000),
+        );
+        controller.streams.open(
+            endpoint,
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_000,
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: true },
+            Duration::from_micros(2_000_002),
+        );
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(2_000_003),
+        );
+        controller.flush_defense_observations();
+        controller.update_completion(Duration::from_micros(2_000_003));
+
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                QcsdAction::CancelChaff {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(8),
+                    reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
+                },
+                QcsdAction::ConfigureAutomaticReceive {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(4),
+                    window: 65_535,
+                },
+                QcsdAction::ReleaseApplicationSendShaping {
+                    endpoint: QcsdEndpointId(1),
+                },
+            ]
+        ));
+        assert!(controller.cs_buflo_application_passthrough);
+        assert!(controller.can_start_application_batch());
+        assert!(
+            controller
+                .defense_diagnostics()
+                .cs_buflo_local_et_before_application_complete
+        );
+    }
+
+    #[test]
+    fn application_complete_delivered_before_local_et_is_not_misreported_as_early() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::<BacklogLatchedLocalEtDefense>::default(),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://one.example");
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(2_000_001),
+        );
+        controller.observe(
+            QcsdObservation::Datagram {
+                endpoint: QcsdEndpointId(1),
+                direction: Direction::Incoming,
+                length: 1_200,
+                timestamp_us: 2_000_001,
+            },
+            Duration::from_micros(2_000_001),
+        );
+        controller.flush_defense_observations();
+        controller.update_completion(Duration::from_micros(2_000_001));
+
+        let diagnostics = controller.defense_diagnostics();
+        assert!(!diagnostics.cs_buflo_local_et_before_application_complete);
+        assert_eq!(
+            diagnostics.cs_buflo_local_et_application_send_endpoints_released,
+            0
+        );
+        assert!(!controller.cs_buflo_application_passthrough);
+        assert!(controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::ReleaseApplicationSendShaping {
+                endpoint: QcsdEndpointId(1)
+            }
+        )));
+    }
+
+    #[test]
+    fn equal_timestamp_local_et_before_application_complete_preserves_production_order() {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                tail_wait_us: 0,
+                automatic_receive_window: 65_535,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::<BacklogLatchedLocalEtDefense>::default(),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let application = QcsdStreamId(4);
+        ready(&mut controller, 1, "https://one.example");
+        controller.open_stream(
+            endpoint,
+            application,
+            QcsdRequestRole::Application,
+            Some(2_000),
+        );
+
+        let barrier = Duration::from_micros(2_000_001);
+        controller.observe(
+            QcsdObservation::Datagram {
+                endpoint,
+                direction: Direction::Incoming,
+                length: 1_200,
+                timestamp_us: 2_000_001,
+            },
+            barrier,
+        );
+        controller.observe(QcsdObservation::ApplicationComplete, barrier);
+        controller.flush_defense_observations();
+
+        assert!(!controller.can_start_application_batch());
+        assert!(
+            controller
+                .defense_diagnostics()
+                .cs_buflo_local_et_before_application_complete
+        );
+        controller.update_completion(barrier);
+        assert!(controller.cs_buflo_application_passthrough);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .cs_buflo_local_et_application_send_endpoints_released,
+            1
+        );
+        assert!(matches!(
+            controller.drain_actions().collect::<Vec<_>>().as_slice(),
+            [
+                QcsdAction::ConfigureAutomaticReceive {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(4),
+                    window: 65_535,
+                },
+                QcsdAction::ReleaseApplicationSendShaping {
+                    endpoint: QcsdEndpointId(1),
+                },
+            ]
         ));
     }
 

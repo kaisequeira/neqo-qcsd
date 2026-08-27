@@ -1277,8 +1277,9 @@ mod tests {
     #[cfg(feature = "qcsd")]
     use neqo_csdef::{
         Direction, Packet, QcsdAction, QcsdChaffRequestId, QcsdConfig, QcsdController,
-        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdRequestRole, QcsdSlotId,
-        QcsdStreamFinish, QcsdStreamId, Resource, StaticSchedule, Trace,
+        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdPrearmCancellationReason,
+        QcsdRequestRole, QcsdSlotId, QcsdStreamFinish, QcsdStreamId, Resource, StaticSchedule,
+        Trace,
     };
     use neqo_qpack as qpack;
     use neqo_transport::{
@@ -1356,6 +1357,83 @@ mod tests {
                 }
             })
             .sum()
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_drive_request_to_server(
+        client: &mut Http3Client,
+        server: &mut TestServer,
+        stream: StreamId,
+        at: std::time::Instant,
+    ) -> Vec<u8> {
+        let mut request = Vec::new();
+        for _ in 0..16 {
+            if let Some(datagram) = client.process_output(at).dgram() {
+                server.conn.process_input(datagram, at);
+            }
+
+            let mut chunk = [0_u8; 256];
+            if let Ok((amount, fin)) = server.conn.stream_recv(stream, &mut chunk) {
+                request.extend_from_slice(&chunk[..amount]);
+                if fin {
+                    return request;
+                }
+            }
+
+            if let Some(datagram) = server.conn.process_output(at).dgram() {
+                client.process_input(datagram, at);
+            }
+        }
+        panic!("application request did not reach the server without another QCSD target");
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_pump_connected_pair(
+        client: &mut Http3Client,
+        server: &mut TestServer,
+        at: std::time::Instant,
+    ) {
+        if let Some(datagram) = client.process_output(at).dgram() {
+            server.conn.process_input(datagram, at);
+        }
+        if let Some(datagram) = server.conn.process_output(at).dgram() {
+            client.process_input(datagram, at);
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_collect_response_body(
+        client: &mut Http3Client,
+        stream: StreamId,
+        at: std::time::Instant,
+        body: &mut Vec<u8>,
+        headers_seen: &mut bool,
+        finished: &mut bool,
+    ) {
+        while let Some(event) = client.next_event() {
+            match event {
+                Http3ClientEvent::HeaderReady {
+                    stream_id,
+                    headers,
+                    interim,
+                    fin,
+                } if stream_id == stream => {
+                    check_response_header_1(&headers);
+                    assert!(!interim);
+                    assert!(!fin);
+                    *headers_seen = true;
+                }
+                Http3ClientEvent::DataReadable { stream_id } if stream_id == stream => {
+                    let mut chunk = [0_u8; 256];
+                    let (amount, fin) = client
+                        .read_data(at, stream_id, &mut chunk)
+                        .expect("read application response body");
+                    body.extend_from_slice(&chunk[..amount]);
+                    *finished |= fin;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Create a http3 client with default configuration.
@@ -2665,6 +2743,220 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one connected HTTP/3 oracle covers both sides of the CS local-ET handoff"
+    )]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "the connected oracle verifies ordered request, response, handoff, and dependent-stream phases"
+    )]
+    fn qcsd_cs_local_et_resumes_existing_and_dependent_application_streams() {
+        fixture_init();
+        let at = now();
+        let mut client = Http3Client::new(
+            DEFAULT_SERVER_NAME,
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            DEFAULT_ADDR,
+            DEFAULT_ADDR,
+            Http3Parameters::default()
+                .connection_parameters(
+                    ConnectionParameters::default()
+                        .versions(Version::default(), vec![Version::default()])
+                        .max_stream_data(StreamType::BiDi, false, 16),
+                )
+                .max_table_size_encoder(100)
+                .max_table_size_decoder(100)
+                .max_blocked_streams(100)
+                .max_concurrent_push_streams(5),
+            at,
+        )
+        .expect("client with the controlled 16-byte receive prefix");
+        let mut server = TestServer::new();
+        connect_with(&mut client, &mut server);
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                true,
+                Duration::from_millis(100),
+            )
+            .expect("enable shaped QCSD transport");
+
+        let existing = make_request(&mut client, false, &[]);
+        client
+            .register_qcsd_stream(existing, QcsdRequestRole::Application, Some(7))
+            .expect("register existing application stream");
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint: QcsdEndpointId(7),
+                    stream: QcsdStreamId(existing.as_u64()),
+                    initial_limit: 16,
+                },
+            )
+            .expect("retain controlled receive on the existing stream");
+        client.stream_close_send(existing, at).unwrap();
+
+        // Before local termination, the application request cannot leave without
+        // a scheduled opportunity.
+        if let Some(datagram) = client.process_output(at).dgram() {
+            server.conn.process_input(datagram, at);
+        }
+        let mut blocked_probe = [0_u8; 64];
+        assert!(
+            server
+                .conn
+                .stream_recv(existing, &mut blocked_probe)
+                .is_err()
+        );
+        assert!(client.qcsd_has_pending_stream_send());
+
+        let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).unwrap();
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::SendPacket {
+                    endpoint: QcsdEndpointId(7),
+                    packet,
+                    slot: QcsdSlotId(70),
+                    not_before_after_us: 0,
+                    deadline_after_us: 5_000,
+                    allow_stream_data: true,
+                    send_policy: neqo_csdef::QcsdSendPolicy::Exact,
+                },
+            )
+            .expect("one pre-termination application opportunity");
+        assert_eq!(
+            qcsd_drive_request_to_server(&mut client, &mut server, existing, at),
+            EXPECTED_REQUEST_HEADER_FRAME
+        );
+        assert_eq!(client.qcsd_pending_packet_targets(), 0);
+
+        let initial_response_bytes = server.conn.stream_send(existing, HTTP_RESPONSE_1).unwrap();
+        assert_eq!(initial_response_bytes, 16);
+        let mut existing_body = Vec::new();
+        let mut existing_headers = false;
+        let mut existing_finished = false;
+        for _ in 0..4 {
+            qcsd_pump_connected_pair(&mut client, &mut server, at);
+            qcsd_collect_response_body(
+                &mut client,
+                existing,
+                at,
+                &mut existing_body,
+                &mut existing_headers,
+                &mut existing_finished,
+            );
+        }
+        assert!(existing_headers);
+        assert!(!existing_body.is_empty());
+        assert!(existing_body.len() < EXPECTED_RESPONSE_DATA_1.len());
+        assert!(!existing_finished);
+
+        // These are the public actions emitted by CS-BuFLO's client-local ET
+        // handoff. Automatic receive preserves the already-delivered prefix;
+        // application-only send release remains in force for later requests.
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::ConfigureAutomaticReceive {
+                    endpoint: QcsdEndpointId(7),
+                    stream: QcsdStreamId(existing.as_u64()),
+                    window: 65_535,
+                },
+            )
+            .expect("hand existing response back to automatic receive");
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::ReleaseApplicationSendShaping {
+                    endpoint: QcsdEndpointId(7),
+                },
+            )
+            .expect("release application sends at local ET");
+        qcsd_pump_connected_pair(&mut client, &mut server, at);
+        assert_eq!(
+            server
+                .conn
+                .stream_send(existing, &HTTP_RESPONSE_1[initial_response_bytes..])
+                .unwrap(),
+            HTTP_RESPONSE_1.len() - initial_response_bytes
+        );
+        server.conn.stream_close_send(existing).unwrap();
+        for _ in 0..16 {
+            qcsd_pump_connected_pair(&mut client, &mut server, at);
+            qcsd_collect_response_body(
+                &mut client,
+                existing,
+                at,
+                &mut existing_body,
+                &mut existing_headers,
+                &mut existing_finished,
+            );
+            if existing_finished {
+                break;
+            }
+        }
+        assert!(existing_finished);
+        assert_eq!(existing_body, EXPECTED_RESPONSE_DATA_1);
+
+        // A dependent request opened after the release receives the controller's
+        // automatic configuration and crosses the shaped transport without a
+        // catch-up or scheduled packet target.
+        let dependent = make_request(&mut client, false, &[]);
+        client
+            .register_qcsd_stream(dependent, QcsdRequestRole::Application, Some(7))
+            .expect("register dependent application stream");
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::ConfigureAutomaticReceive {
+                    endpoint: QcsdEndpointId(7),
+                    stream: QcsdStreamId(dependent.as_u64()),
+                    window: 65_535,
+                },
+            )
+            .expect("configure dependent stream for ordinary receive");
+        client.stream_close_send(dependent, at).unwrap();
+        assert_eq!(client.qcsd_pending_packet_targets(), 0);
+        assert_eq!(
+            qcsd_drive_request_to_server(&mut client, &mut server, dependent, at),
+            EXPECTED_REQUEST_HEADER_FRAME
+        );
+        assert_eq!(client.qcsd_pending_packet_targets(), 0);
+
+        assert_eq!(
+            server.conn.stream_send(dependent, HTTP_RESPONSE_1).unwrap(),
+            HTTP_RESPONSE_1.len()
+        );
+        server.conn.stream_close_send(dependent).unwrap();
+        let mut dependent_body = Vec::new();
+        let mut dependent_headers = false;
+        let mut dependent_finished = false;
+        for _ in 0..16 {
+            qcsd_pump_connected_pair(&mut client, &mut server, at);
+            qcsd_collect_response_body(
+                &mut client,
+                dependent,
+                at,
+                &mut dependent_body,
+                &mut dependent_headers,
+                &mut dependent_finished,
+            );
+            if dependent_finished {
+                break;
+            }
+        }
+        assert!(dependent_headers);
+        assert!(dependent_finished);
+        assert_eq!(dependent_body, EXPECTED_RESPONSE_DATA_1);
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_send_packet_bridge_preserves_future_release_and_deadline_order() {
         let (mut client, _server) = connect();
         enable_qcsd_observations(&mut client);
@@ -2717,6 +3009,126 @@ mod tests {
                             endpoint: QcsdEndpointId(7),
                             slot: QcsdSlotId(60),
                             observed_size: 900,
+                        }
+                    )
+                })
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_prearm_bridge_commits_exactly_once() {
+        let (mut client, _server) = connect();
+        enable_qcsd_observations(&mut client);
+        let base = now();
+        let packet = Packet::new(Duration::from_millis(10), Direction::Outgoing, 900).unwrap();
+        client
+            .apply_qcsd_action(
+                base,
+                QcsdAction::PrearmPacket {
+                    endpoint: QcsdEndpointId(7),
+                    packet,
+                    slot: QcsdSlotId(61),
+                    not_before_after_us: 10_000,
+                    deadline_after_us: 15_000,
+                    allow_stream_data: false,
+                },
+            )
+            .expect("prearm exact target");
+        assert_eq!(client.qcsd_pending_packet_targets(), 1);
+        _ = client.process_output(base);
+        assert!(
+            !drain_qcsd_observations(&mut client)
+                .iter()
+                .any(|observation| {
+                    matches!(
+                        observation,
+                        QcsdObservation::SlotSatisfied {
+                            slot: QcsdSlotId(61),
+                            ..
+                        } | QcsdObservation::SlotMissed {
+                            slot: QcsdSlotId(61),
+                            ..
+                        }
+                    )
+                })
+        );
+
+        client
+            .apply_qcsd_action(
+                base,
+                QcsdAction::CommitPrearmedPacket {
+                    endpoint: QcsdEndpointId(7),
+                    packet,
+                    slot: QcsdSlotId(61),
+                },
+            )
+            .expect("commit exact target");
+        let release = base + Duration::from_millis(10);
+        assert_eq!(client.process_output(release).dgram().unwrap().len(), 900);
+        let observations = drain_qcsd_observations(&mut client);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(
+                    observation,
+                    QcsdObservation::SlotSatisfied {
+                        endpoint: QcsdEndpointId(7),
+                        slot: QcsdSlotId(61),
+                        observed_size: 900,
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(client.qcsd_pending_packet_targets(), 0);
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_prearm_bridge_cancels_without_an_outcome() {
+        let (mut client, _server) = connect();
+        enable_qcsd_observations(&mut client);
+        let cancel_base = now();
+        let cancel_packet =
+            Packet::new(Duration::from_millis(30), Direction::Outgoing, 900).unwrap();
+        client
+            .apply_qcsd_action(
+                cancel_base,
+                QcsdAction::PrearmPacket {
+                    endpoint: QcsdEndpointId(7),
+                    packet: cancel_packet,
+                    slot: QcsdSlotId(62),
+                    not_before_after_us: 20_000,
+                    deadline_after_us: 25_000,
+                    allow_stream_data: false,
+                },
+            )
+            .expect("prearm cancellable target");
+        client
+            .apply_qcsd_action(
+                cancel_base,
+                QcsdAction::CancelPrearmedPacket {
+                    endpoint: QcsdEndpointId(7),
+                    packet: cancel_packet,
+                    slot: QcsdSlotId(62),
+                    reason: QcsdPrearmCancellationReason::DefenseTerminal,
+                },
+            )
+            .expect("cancel inert target");
+        assert_eq!(client.qcsd_pending_packet_targets(), 0);
+        assert!(
+            !drain_qcsd_observations(&mut client)
+                .iter()
+                .any(|observation| {
+                    matches!(
+                        observation,
+                        QcsdObservation::SlotSatisfied {
+                            slot: QcsdSlotId(62),
+                            ..
+                        } | QcsdObservation::SlotMissed {
+                            slot: QcsdSlotId(62),
+                            ..
                         }
                     )
                 })

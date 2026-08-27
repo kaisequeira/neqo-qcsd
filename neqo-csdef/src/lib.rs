@@ -42,10 +42,11 @@ pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
     MissedSlotReason, QcsdAction, QcsdChaffCancellationReason, QcsdChaffRequestId,
     QcsdCongestionReason, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
-    QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
-    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
-    QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission,
-    TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,
+    QcsdParserLeaseOwner, QcsdPrearmCancellationReason, QcsdReceiveActionIdentity,
+    QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole,
+    QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamFinish,
+    QcsdStreamId, QcsdStreamTransmission, TimestampedQcsdObservation, TrafficMorphingBypassReason,
+    TrafficMorphingOutcome,
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{

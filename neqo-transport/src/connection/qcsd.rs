@@ -164,10 +164,19 @@ pub(super) struct PacketTarget {
     pub deadline: Instant,
     pub allow_stream_data: bool,
     pub send_policy: QcsdSendPolicy,
+    /// Whether the controller has promoted this transport preview to a real
+    /// defense event whose terminal outcome may be published.
+    pub committed: bool,
     pub defense_control_bytes: u16,
     pub lateness_us: u64,
     /// UDP bytes present immediately before QUIC PADDING is applied.
     pub unpadded_udp_bytes: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketTargetRegistration {
+    Committed(QcsdSendPolicy),
+    Preview,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,11 +195,13 @@ pub(super) struct PendingReceiveAction {
 
 impl Connection {
     pub(super) fn qcsd_stream_priority_is_budgeted(&self, priority: TransmissionPriority) -> bool {
-        if self.qcsd_chaff_send_released
-            && priority == TransmissionPriority::Normal
-            && self.qcsd_active_target.is_none()
-        {
-            return false;
+        if self.qcsd_active_target.is_none() {
+            if self.qcsd_chaff_send_released && priority == TransmissionPriority::Normal {
+                return false;
+            }
+            if self.qcsd_application_send_released && priority == TransmissionPriority::Important {
+                return false;
+            }
         }
         self.qcsd_send_shaping
             || self
@@ -527,7 +538,7 @@ impl Connection {
             None,
             deadline,
             allow_stream_data,
-            QcsdSendPolicy::Exact,
+            PacketTargetRegistration::Committed(QcsdSendPolicy::Exact),
         )
     }
 
@@ -554,7 +565,7 @@ impl Connection {
             Some(not_before),
             deadline,
             allow_stream_data,
-            QcsdSendPolicy::Exact,
+            PacketTargetRegistration::Committed(QcsdSendPolicy::Exact),
         )
     }
 
@@ -580,8 +591,104 @@ impl Connection {
             Some(not_before),
             deadline,
             allow_stream_data,
-            send_policy,
+            PacketTargetRegistration::Committed(send_policy),
         )
+    }
+
+    /// Stage one future exact-size target without creating a defense event.
+    ///
+    /// An uncommitted preview is ineligible for packet construction and never
+    /// emits a slot outcome. It must be committed or canceled by exact identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as
+    /// [`Self::qcsd_queue_scheduled_packet_target_window`], but does not emit a
+    /// slot observation because the preview is not scheduled work.
+    pub fn qcsd_prearm_scheduled_packet_target_window(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: Packet,
+        not_before: Instant,
+        deadline: Instant,
+        allow_stream_data: bool,
+    ) -> Res<()> {
+        self.qcsd_validate_packet_target_window(Some(not_before), deadline)?;
+        self.qcsd_queue_scheduled_packet_target_inner(
+            slot,
+            packet,
+            Some(not_before),
+            deadline,
+            allow_stream_data,
+            PacketTargetRegistration::Preview,
+        )
+    }
+
+    /// Promote one exact uncommitted preview to scheduled transport work.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` unless exactly one inactive queued preview has
+    /// the supplied slot and packet identity.
+    pub fn qcsd_commit_scheduled_packet_target(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: Packet,
+    ) -> Res<()> {
+        if self
+            .qcsd_active_target
+            .is_some_and(|target| target.slot == slot)
+        {
+            return Err(Error::InvalidInput);
+        }
+        let matches: Vec<_> = self
+            .qcsd_packet_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| (target.slot == slot).then_some(index))
+            .collect();
+        let [index] = matches.as_slice() else {
+            return Err(Error::InvalidInput);
+        };
+        let target = &mut self.qcsd_packet_targets[*index];
+        if target.packet != packet || target.committed {
+            return Err(Error::InvalidInput);
+        }
+        target.committed = true;
+        Ok(())
+    }
+
+    /// Retract one future packet preview before it becomes a defense event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` unless exactly one queued, inactive, uncommitted
+    /// target has the supplied slot and packet identity.
+    pub fn qcsd_cancel_scheduled_packet_target(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: Packet,
+    ) -> Res<()> {
+        if self
+            .qcsd_active_target
+            .is_some_and(|target| target.slot == slot)
+        {
+            return Err(Error::InvalidInput);
+        }
+        let matches: Vec<_> = self
+            .qcsd_packet_targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| (target.slot == slot).then_some((index, target.packet)))
+            .collect();
+        let [(index, observed_packet)] = matches.as_slice() else {
+            return Err(Error::InvalidInput);
+        };
+        if *observed_packet != packet || self.qcsd_packet_targets[*index].committed {
+            return Err(Error::InvalidInput);
+        }
+        _ = self.qcsd_packet_targets.remove(*index);
+        Ok(())
     }
 
     fn qcsd_validate_packet_target_window(
@@ -606,12 +713,25 @@ impl Connection {
         not_before: Option<Instant>,
         deadline: Instant,
         allow_stream_data: bool,
-        send_policy: QcsdSendPolicy,
+        registration: PacketTargetRegistration,
     ) -> Res<()> {
+        let (send_policy, committed) = match registration {
+            PacketTargetRegistration::Committed(send_policy) => (send_policy, true),
+            PacketTargetRegistration::Preview => (QcsdSendPolicy::Exact, false),
+        };
+        // A single provisional tail preserves FIFO resolution: no later
+        // target can become eligible behind an uncommitted preview.
+        if self
+            .qcsd_packet_targets
+            .back()
+            .is_some_and(|target| !target.committed)
+        {
+            return Err(Error::InvalidInput);
+        }
         let endpoint = self.qcsd_endpoint;
         let udp_payload_size = packet.length();
         if !self.state.connected() {
-            if let Some(endpoint) = endpoint {
+            if committed && let Some(endpoint) = endpoint {
                 self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
                     endpoint,
                     slot,
@@ -627,7 +747,7 @@ impl Connection {
             .qcsd_udp_payload_ceiling
             .map_or(path_limit, |ceiling| path_limit.min(usize::from(ceiling)));
         if udp_payload_size < 64 || usize::from(udp_payload_size) > effective_limit {
-            if let Some(endpoint) = endpoint {
+            if committed && let Some(endpoint) = endpoint {
                 self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
                     endpoint,
                     slot,
@@ -647,6 +767,7 @@ impl Connection {
             deadline,
             allow_stream_data,
             send_policy,
+            committed,
             defense_control_bytes: 0,
             lateness_us: 0,
             unpadded_udp_bytes: None,
@@ -655,15 +776,17 @@ impl Connection {
     }
 
     pub(super) fn qcsd_packet_target_wakeup(&self, now: Instant) -> Option<Instant> {
-        self.qcsd_packet_targets.front().map(|target| {
-            if now >= target.deadline {
-                now
-            } else if let Some(not_before) = target.not_before.filter(|release| now < *release) {
-                not_before
-            } else {
-                target.deadline
-            }
-        })
+        let target = self.qcsd_packet_targets.front()?;
+        if !target.committed {
+            return target.not_before.filter(|release| now < *release);
+        }
+        if now >= target.deadline {
+            Some(now)
+        } else if let Some(not_before) = target.not_before.filter(|release| now < *release) {
+            Some(not_before)
+        } else {
+            Some(target.deadline)
+        }
     }
 
     pub(super) fn qcsd_eligible_packet_target(&self, now: Instant) -> Option<PacketTarget> {
@@ -672,7 +795,8 @@ impl Connection {
             .find(|target| now < target.deadline)
             .copied()
             .filter(|target| {
-                target.not_before.is_none_or(|not_before| now >= not_before)
+                target.committed
+                    && target.not_before.is_none_or(|not_before| now >= not_before)
                     && now < target.deadline
             })
     }
@@ -686,7 +810,7 @@ impl Connection {
         while self
             .qcsd_packet_targets
             .front()
-            .is_some_and(|target| now >= target.deadline)
+            .is_some_and(|target| target.committed && now >= target.deadline)
         {
             let mut target = self
                 .qcsd_packet_targets
@@ -729,6 +853,7 @@ impl Connection {
     }
 
     pub(super) fn qcsd_target_satisfied(&mut self, target: &PacketTarget) {
+        debug_assert!(target.committed);
         if let Some(endpoint) = target.endpoint {
             self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotSatisfied {
                 endpoint,
@@ -739,6 +864,7 @@ impl Connection {
     }
 
     pub(super) fn qcsd_target_resolved(&mut self, target: &PacketTarget, outcome: QcsdSlotOutcome) {
+        debug_assert!(target.committed);
         if let Some(endpoint) = target.endpoint {
             self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotResolved {
                 endpoint,
@@ -831,6 +957,7 @@ impl Connection {
     }
 
     pub(super) fn qcsd_target_missed(&mut self, target: &PacketTarget, reason: MissedSlotReason) {
+        debug_assert!(target.committed);
         if let Some(endpoint) = target.endpoint {
             self.qcsd_observe_at_endpoint(endpoint, |endpoint| QcsdObservation::SlotMissed {
                 endpoint,

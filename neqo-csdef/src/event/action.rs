@@ -46,6 +46,17 @@ pub enum QcsdChaffCancellationReason {
     BufloTerminalSubcellTail,
 }
 
+/// Why a future packet preview was retracted before becoming a defense event.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdPrearmCancellationReason {
+    /// A fresh terminal snapshot closed the defense before the preview's release.
+    #[default]
+    DefenseTerminal,
+    /// The enclosing run ended before the preview could become scheduled work.
+    RunAborted,
+}
+
 /// Result of checking or applying one QCSD receive-limit action.
 ///
 /// Lifecycle outcomes are non-fatal: a controller can cancel the stream's
@@ -234,9 +245,40 @@ pub enum QcsdAction {
         #[serde(default, skip_serializing_if = "is_exact_send_policy")]
         send_policy: QcsdSendPolicy,
     },
+    /// Stage one retractable future packet target without emitting a defense
+    /// event. It must be committed or canceled before transport is driven at
+    /// the target's release.
+    PrearmPacket {
+        endpoint: QcsdEndpointId,
+        packet: Packet,
+        slot: QcsdSlotId,
+        not_before_after_us: u64,
+        deadline_after_us: u64,
+        allow_stream_data: bool,
+    },
+    /// Promote a staged target to a real defense event. Transport already owns
+    /// the target; this action binds controller and trace accounting only.
+    CommitPrearmedPacket {
+        endpoint: QcsdEndpointId,
+        packet: Packet,
+        slot: QcsdSlotId,
+    },
+    /// Retract a staged target which never became a defense event.
+    CancelPrearmedPacket {
+        endpoint: QcsdEndpointId,
+        packet: Packet,
+        slot: QcsdSlotId,
+        reason: QcsdPrearmCancellationReason,
+    },
     /// Permit chaff request bytes to leave without scheduled capacity after
     /// the outgoing schedule ends, allowing an incoming-only tail to finish.
     ReleaseChaffSendShaping {
+        endpoint: QcsdEndpointId,
+    },
+    /// Restore ordinary application request transmission after CS-BuFLO's
+    /// client-local early-termination boundary. Chaff remains shaped and is
+    /// canceled separately; this is never a bilateral completion signal.
+    ReleaseApplicationSendShaping {
         endpoint: QcsdEndpointId,
     },
     RequestChaff {
@@ -314,8 +356,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        QcsdAction, QcsdChaffCancellationReason, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
-        QcsdSendPolicy,
+        QcsdAction, QcsdChaffCancellationReason, QcsdParserLeaseOwner,
+        QcsdPrearmCancellationReason, QcsdReceiveActionIdentity, QcsdSendPolicy,
     };
     use crate::{Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
 
@@ -399,6 +441,49 @@ mod tests {
     }
 
     #[test]
+    fn rolling_prearm_lifecycle_actions_round_trip_with_typed_cancellation() {
+        let endpoint = QcsdEndpointId(2);
+        let packet =
+            Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_200).expect("packet");
+        let slot = QcsdSlotId(19);
+        let actions = [
+            QcsdAction::PrearmPacket {
+                endpoint,
+                packet,
+                slot,
+                not_before_after_us: 9,
+                deadline_after_us: 5_009,
+                allow_stream_data: true,
+            },
+            QcsdAction::CommitPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+            },
+            QcsdAction::CancelPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+                reason: QcsdPrearmCancellationReason::RunAborted,
+            },
+        ];
+
+        for action in &actions {
+            let encoded = serde_json::to_value(action).expect("serialize prearm action");
+            assert_eq!(
+                serde_json::from_value::<QcsdAction>(encoded).expect("deserialize prearm action"),
+                action.clone()
+            );
+        }
+        let cancellation =
+            serde_json::to_value(actions[2].clone()).expect("serialize cancellation");
+        assert_eq!(
+            cancellation.get("reason").and_then(Value::as_str),
+            Some("run_aborted")
+        );
+    }
+
+    #[test]
     fn cancel_chaff_reason_is_typed_and_legacy_actions_default_to_cs_buflo() {
         let buflo = QcsdAction::CancelChaff {
             endpoint: QcsdEndpointId(1),
@@ -429,6 +514,22 @@ mod tests {
                 stream: QcsdStreamId(4),
                 reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
             }
+        );
+    }
+
+    #[test]
+    fn application_send_release_is_typed_and_round_trips() {
+        let action = QcsdAction::ReleaseApplicationSendShaping {
+            endpoint: QcsdEndpointId(7),
+        };
+        let encoded = serde_json::to_value(&action).expect("serialize application release");
+        assert_eq!(
+            encoded.get("type").and_then(Value::as_str),
+            Some("release_application_send_shaping")
+        );
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(encoded).expect("deserialize application release"),
+            action
         );
     }
 

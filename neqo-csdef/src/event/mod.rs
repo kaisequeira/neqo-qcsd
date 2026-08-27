@@ -10,8 +10,9 @@ mod ids;
 mod observation;
 
 pub use action::{
-    QcsdAction, QcsdChaffCancellationReason, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
-    QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdSendPolicy,
+    QcsdAction, QcsdChaffCancellationReason, QcsdParserLeaseOwner, QcsdPrearmCancellationReason,
+    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdSendPolicy,
 };
 pub use ids::{QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdSlotId, QcsdStreamId};
 pub use observation::{

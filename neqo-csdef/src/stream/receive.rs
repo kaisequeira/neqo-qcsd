@@ -132,6 +132,56 @@ impl ReceiveState {
         )
     }
 
+    /// Whether a controlled response can be transferred atomically to Neqo's
+    /// ordinary receive-window manager.
+    ///
+    /// Every controller-requested byte must already have been advertised.
+    /// A retained parser boundary is safe: automatic HTTP/3 parsing replaces
+    /// that candidate-only liveness mechanism at the same transition.
+    pub const fn can_handoff_to_automatic(&self) -> bool {
+        match self {
+            Self::Created { .. } | Self::Automatic { .. } => true,
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                ..
+            }
+            | Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                ..
+            } => *advertised_limit == *requested_limit,
+            Self::Closed { .. } => false,
+        }
+    }
+
+    /// Hand a response to ordinary Neqo receive-window growth while preserving
+    /// all application byte counters accumulated under defense control.
+    pub const fn handoff_to_automatic(&mut self) -> bool {
+        if !self.can_handoff_to_automatic() {
+            return false;
+        }
+        let (consumed, data_length) = match self {
+            Self::Created { .. } => (0, 0),
+            Self::ReceivingHeaders { consumed, .. } => (*consumed, 0),
+            Self::ReceivingData {
+                consumed,
+                data_length,
+                ..
+            }
+            | Self::Automatic {
+                consumed,
+                data_length,
+            } => (*consumed, *data_length),
+            Self::Closed { .. } => return false,
+        };
+        *self = Self::Automatic {
+            consumed,
+            data_length,
+        };
+        true
+    }
+
     pub const fn available(&self) -> u64 {
         match self {
             Self::ReceivingHeaders {
@@ -979,6 +1029,29 @@ mod tests {
         let mut automatic = ReceiveState::created(false, 16, 1_000, 0);
         automatic.open();
         assert!(matches!(automatic, ReceiveState::Automatic { .. }));
+    }
+
+    #[test]
+    fn automatic_handoff_preserves_counters_and_requires_an_advertised_suffix() {
+        let mut state = ReceiveState::controlled(16, 1_000, 4_000);
+        state.response_headers(7, Some(4_000));
+        state.data_frame(2, 31);
+        state.bytes_read(40);
+        let (limit, increase) = state.release(32).expect("controlled release");
+        assert!(!state.can_handoff_to_automatic());
+        assert!(!state.handoff_to_automatic());
+        state.advertised(limit);
+        state.header_progress(0, true);
+        assert!(state.can_handoff_to_automatic());
+        assert!(state.handoff_to_automatic());
+        assert_eq!(
+            state,
+            ReceiveState::Automatic {
+                consumed: 40,
+                data_length: 31
+            }
+        );
+        assert_eq!(increase, 32);
     }
 
     #[test]

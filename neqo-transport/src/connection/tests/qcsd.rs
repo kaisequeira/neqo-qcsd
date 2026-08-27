@@ -522,6 +522,54 @@ fn attributed_target_reports_exact_satisfaction() {
 }
 
 #[test]
+fn exact_target_reports_nonzero_lateness_in_packet_composition() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), false);
+
+    let release = now();
+    let attempted_at = release + Duration::from_micros(123);
+    let packet = Packet::new(Duration::ZERO, Direction::Outgoing, 1_000).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(12),
+            packet,
+            release,
+            release + Duration::from_secs(1),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        client.process_output(attempted_at).dgram().unwrap().len(),
+        1_000
+    );
+
+    let observations = drain_observations(&mut client);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::SlotSatisfied {
+            slot: QcsdSlotId(12),
+            observed_size: 1_000,
+            ..
+        }
+    )));
+    let composition = observations
+        .iter()
+        .find_map(|observation| match observation {
+            QcsdObservation::ClassifiedDatagram {
+                direction: Direction::Outgoing,
+                composition: Some(composition),
+                ..
+            } if composition.desired_udp_bytes == 1_000 => Some(*composition),
+            _ => None,
+        })
+        .expect("exact target packet composition");
+    assert_eq!(composition.observed_udp_bytes, 1_000);
+    assert_eq!(composition.lateness_us, 123);
+}
+
+#[test]
 fn congestion_sensitive_full_target_reports_complete_composition() {
     let mut client = default_client();
     let mut server = default_server();
@@ -1080,6 +1128,354 @@ fn future_packet_target_is_fully_inert_until_not_before() {
             }
         )
     }));
+}
+
+#[test]
+fn future_packet_preview_cancels_by_exact_identity_without_an_outcome() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+
+    let queued_at = now();
+    let release = queued_at + Duration::from_millis(20);
+    let deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::from_millis(20), Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(41), packet, release, deadline, true)
+        .unwrap();
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    assert_eq!(client.qcsd_packet_target_wakeup(queued_at), Some(release));
+
+    let mismatch = Packet::new(Duration::from_millis(20), Direction::Outgoing, 301).unwrap();
+    assert_eq!(
+        client.qcsd_cancel_scheduled_packet_target(QcsdSlotId(41), mismatch),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+
+    client
+        .qcsd_cancel_scheduled_packet_target(QcsdSlotId(41), packet)
+        .unwrap();
+    assert_eq!(client.qcsd_pending_packet_targets(), 0);
+    assert_eq!(client.qcsd_packet_target_wakeup(queued_at), None);
+    assert!(
+        !drain_observations(&mut client)
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                QcsdObservation::SlotSatisfied {
+                    slot: QcsdSlotId(41),
+                    ..
+                } | QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(41),
+                    ..
+                } | QcsdObservation::SlotResolved {
+                    slot: QcsdSlotId(41),
+                    ..
+                }
+            ))
+    );
+}
+
+#[test]
+fn canceling_a_preview_preserves_its_committed_predecessor_wakeup() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let queued_at = now();
+    let first_release = queued_at + Duration::from_millis(10);
+    let first_deadline = first_release + Duration::from_millis(5);
+    let second_release = first_deadline + Duration::from_millis(5);
+    let second_deadline = second_release + Duration::from_millis(5);
+    let first = Packet::new(Duration::from_millis(10), Direction::Outgoing, 300).unwrap();
+    let second = Packet::new(Duration::from_millis(20), Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_queue_scheduled_packet_target_window(
+            QcsdSlotId(46),
+            first,
+            first_release,
+            first_deadline,
+            true,
+        )
+        .unwrap();
+    client
+        .qcsd_prearm_scheduled_packet_target_window(
+            QcsdSlotId(47),
+            second,
+            second_release,
+            second_deadline,
+            true,
+        )
+        .unwrap();
+    client
+        .qcsd_cancel_scheduled_packet_target(QcsdSlotId(47), second)
+        .unwrap();
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    assert_eq!(
+        client.qcsd_packet_target_wakeup(queued_at),
+        Some(first_release)
+    );
+}
+
+#[test]
+fn future_packet_preview_is_inert_through_release_and_expiry() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+
+    let queued_at = now();
+    let release = queued_at + Duration::from_millis(20);
+    let deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::from_millis(20), Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(42), packet, release, deadline, true)
+        .unwrap();
+
+    _ = client.process_output(release);
+    _ = client.process_output(deadline + Duration::from_micros(1));
+    assert_eq!(client.qcsd_active_target, None);
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    assert!(!drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(42),
+                ..
+            } | QcsdObservation::SlotMissed {
+                slot: QcsdSlotId(42),
+                ..
+            } | QcsdObservation::SlotResolved {
+                slot: QcsdSlotId(42),
+                ..
+            }
+        )
+    }));
+    client
+        .qcsd_cancel_scheduled_packet_target(QcsdSlotId(42), packet)
+        .unwrap();
+}
+
+#[test]
+fn committed_preview_realizes_or_expires_with_one_terminal_outcome() {
+    let mut realized = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut realized, &mut server);
+    realized.qcsd_enable(QcsdEndpointId(7), true);
+    let release = now() + Duration::from_millis(10);
+    let deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::from_millis(10), Direction::Outgoing, 900).unwrap();
+    realized
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(54), packet, release, deadline, true)
+        .unwrap();
+    realized
+        .qcsd_commit_scheduled_packet_target(QcsdSlotId(54), packet)
+        .unwrap();
+    assert_eq!(realized.process_output(release).dgram().unwrap().len(), 900);
+    let outcomes = drain_observations(&mut realized);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|observation| matches!(
+                observation,
+                QcsdObservation::SlotSatisfied {
+                    slot: QcsdSlotId(54),
+                    observed_size: 900,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(realized.qcsd_pending_packet_targets(), 0);
+    _ = realized.process_output(release);
+    assert!(
+        !drain_observations(&mut realized).iter().any(|observation| {
+            matches!(
+                observation,
+                QcsdObservation::SlotSatisfied {
+                    slot: QcsdSlotId(54),
+                    ..
+                } | QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(54),
+                    ..
+                }
+            )
+        })
+    );
+
+    let mut expired = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut expired, &mut server);
+    expired.qcsd_enable(QcsdEndpointId(7), true);
+    let release = now() + Duration::from_millis(10);
+    let deadline = release + Duration::from_millis(5);
+    expired
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(55), packet, release, deadline, true)
+        .unwrap();
+    expired
+        .qcsd_commit_scheduled_packet_target(QcsdSlotId(55), packet)
+        .unwrap();
+    _ = expired.process_output(deadline);
+    let outcomes = drain_observations(&mut expired);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|observation| matches!(
+                observation,
+                QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(55),
+                    reason: MissedSlotReason::DeadlineExpired,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(expired.qcsd_pending_packet_targets(), 0);
+    _ = expired.process_output(deadline);
+    assert!(!drain_observations(&mut expired).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::SlotSatisfied {
+                slot: QcsdSlotId(55),
+                ..
+            } | QcsdObservation::SlotMissed {
+                slot: QcsdSlotId(55),
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn preview_commit_identity_and_single_provisional_tail_are_fail_closed() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let release = now() + Duration::from_millis(10);
+    let deadline = release + Duration::from_millis(5);
+    let packet = Packet::new(Duration::from_millis(10), Direction::Outgoing, 900).unwrap();
+    client
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(56), packet, release, deadline, true)
+        .unwrap();
+    assert_eq!(
+        client.qcsd_commit_scheduled_packet_target(QcsdSlotId(57), packet),
+        Err(Error::InvalidInput)
+    );
+    let mismatch = Packet::new(Duration::from_millis(10), Direction::Outgoing, 901).unwrap();
+    assert_eq!(
+        client.qcsd_commit_scheduled_packet_target(QcsdSlotId(56), mismatch),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        client.qcsd_prearm_scheduled_packet_target_window(
+            QcsdSlotId(57),
+            packet,
+            deadline + Duration::from_millis(1),
+            deadline + Duration::from_millis(2),
+            true,
+        ),
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(client.qcsd_pending_packet_targets(), 1);
+    client
+        .qcsd_cancel_scheduled_packet_target(QcsdSlotId(56), packet)
+        .unwrap();
+    assert_eq!(client.qcsd_pending_packet_targets(), 0);
+    assert!(drain_observations(&mut client).is_empty());
+}
+
+#[test]
+fn preview_close_is_inert_but_committed_close_has_one_outcome() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let release = now() + Duration::from_secs(1);
+    let deadline = release + Duration::from_secs(1);
+    let packet = Packet::new(Duration::from_secs(1), Direction::Outgoing, 300).unwrap();
+    client
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(43), packet, release, deadline, true)
+        .unwrap();
+    client.close(now(), 0, "close inert preview");
+    assert_eq!(client.qcsd_pending_packet_targets(), 0);
+    assert!(
+        !drain_observations(&mut client)
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(43),
+                    ..
+                }
+            ))
+    );
+
+    let mut committed = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut committed, &mut server);
+    committed.qcsd_enable(QcsdEndpointId(7), true);
+    let release = now() + Duration::from_secs(1);
+    let deadline = release + Duration::from_secs(1);
+    committed
+        .qcsd_prearm_scheduled_packet_target_window(QcsdSlotId(44), packet, release, deadline, true)
+        .unwrap();
+    committed
+        .qcsd_commit_scheduled_packet_target(QcsdSlotId(44), packet)
+        .unwrap();
+    assert_eq!(
+        committed.qcsd_cancel_scheduled_packet_target(QcsdSlotId(44), packet),
+        Err(Error::InvalidInput)
+    );
+    committed.close(now(), 0, "close committed preview");
+    let outcomes = drain_observations(&mut committed)
+        .into_iter()
+        .filter(|observation| {
+            matches!(
+                observation,
+                QcsdObservation::SlotMissed {
+                    slot: QcsdSlotId(44),
+                    reason: MissedSlotReason::EndpointClosed,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(outcomes, 1);
+}
+
+#[test]
+fn rejected_packet_preview_never_publishes_a_slot_outcome() {
+    let endpoint = QcsdEndpointId(7);
+    let slot = QcsdSlotId(45);
+    let packet = Packet::new(Duration::from_secs(1), Direction::Outgoing, 300).unwrap();
+    let release = now() + Duration::from_secs(1);
+    let deadline = release + Duration::from_secs(1);
+    let mut disconnected = default_client();
+    disconnected.qcsd_enable(endpoint, true);
+    assert_eq!(
+        disconnected
+            .qcsd_prearm_scheduled_packet_target_window(slot, packet, release, deadline, true,),
+        Err(Error::NotAvailable)
+    );
+    assert!(drain_observations(&mut disconnected).is_empty());
+
+    let mut connected = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut connected, &mut server);
+    connected.qcsd_enable(endpoint, true);
+    connected.qcsd_set_udp_payload_ceiling(1_200).unwrap();
+    let oversized = Packet::new(Duration::from_secs(1), Direction::Outgoing, 1_201).unwrap();
+    assert_eq!(
+        connected
+            .qcsd_prearm_scheduled_packet_target_window(slot, oversized, release, deadline, true,),
+        Err(Error::InvalidInput)
+    );
+    assert!(drain_observations(&mut connected).is_empty());
 }
 
 #[test]
@@ -2158,6 +2554,177 @@ fn chaff_can_finish_after_outgoing_shaping_is_released() {
     let (read, _) = server.stream_recv(chaff, &mut buffer).unwrap();
     assert_eq!(read, 400);
     assert!(buffer[..read].iter().all(|byte| *byte == 0xCC));
+}
+
+#[test]
+fn cs_local_et_releases_only_application_sends_and_reenable_resets_the_proof() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let application = client.stream_create(StreamType::BiDi).unwrap();
+    let chaff = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(application, &[0xAA; 400]).unwrap();
+    client.stream_send(chaff, &[0xCC; 400]).unwrap();
+    client
+        .qcsd_register_stream_role(application, QcsdRequestRole::Application)
+        .unwrap();
+    client
+        .qcsd_register_stream_role(
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 1,
+                request_id: None,
+            },
+        )
+        .unwrap();
+    assert!(client.process_output(now()).dgram().is_none());
+
+    client.qcsd_release_application_send_shaping();
+    let datagram = client.process_output(now()).dgram().unwrap();
+    server.process_input(datagram, now());
+    let mut buffer = [0; 512];
+    let (read, _) = server.stream_recv(application, &mut buffer).unwrap();
+    assert_eq!(read, 400);
+    assert!(buffer[..read].iter().all(|byte| *byte == 0xAA));
+    assert!(server.stream_recv(chaff, &mut buffer).is_err());
+
+    client.stream_send(application, &[0xBB; 100]).unwrap();
+    client.qcsd_enable_send_shaping(true);
+    assert!(client.process_output(now()).dgram().is_none());
+    queue_target(&mut client, 91, 120, false).expect("control-only target");
+    client.qcsd_release_application_send_shaping();
+    let datagram = client.process_output(now()).dgram().unwrap();
+    server.process_input(datagram, now());
+    let control_only_application = server.stream_recv(application, &mut buffer);
+    if let Ok((read, fin)) = control_only_application {
+        assert_eq!((read, fin), (0, false));
+    }
+    assert!(server.stream_recv(chaff, &mut buffer).is_err());
+
+    let datagram = client.process_output(now()).dgram().unwrap();
+    server.process_input(datagram, now());
+    let (read, _) = server.stream_recv(application, &mut buffer).unwrap();
+    assert_eq!(read, 100);
+    assert!(buffer[..read].iter().all(|byte| *byte == 0xBB));
+    assert!(server.stream_recv(chaff, &mut buffer).is_err());
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loss-recovery oracle verifies original mixed transmission, selective release, and peer ACK"
+)]
+fn cs_local_et_application_release_recovers_only_application_after_mixed_loss() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+
+    let application = client.stream_create(StreamType::BiDi).unwrap();
+    let chaff = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(application, &[0xAA; 800]).unwrap();
+    client.stream_close_send(application).unwrap();
+    client.stream_send(chaff, &[0xCC; 800]).unwrap();
+    client.stream_close_send(chaff).unwrap();
+    client
+        .qcsd_register_stream_role(application, QcsdRequestRole::Application)
+        .unwrap();
+    client
+        .qcsd_register_stream_role(
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 1,
+                request_id: None,
+            },
+        )
+        .unwrap();
+
+    let mut original_observations = Vec::new();
+    for slot in [92, 93] {
+        queue_target(&mut client, slot, 1_200, true).unwrap();
+        let dropped = client
+            .process_output(now())
+            .dgram()
+            .expect("shaped packet carrying original stream data");
+        assert_eq!(dropped.len(), 1_200);
+        original_observations.extend(drain_observations(&mut client));
+    }
+    let transmitted = |role: QcsdRequestRole| {
+        original_observations
+            .iter()
+            .filter_map(|observation| match observation {
+                QcsdObservation::StreamDataTransmitted {
+                    role: observed_role,
+                    bytes,
+                    ..
+                } if *observed_role == role => Some(*bytes),
+                _ => None,
+            })
+            .sum::<u64>()
+    };
+    assert_eq!(transmitted(QcsdRequestRole::Application), 800);
+    assert_eq!(
+        transmitted(QcsdRequestRole::Chaff {
+            resource_id: 1,
+            request_id: None,
+        }),
+        800
+    );
+
+    let recovery_at = now() + AT_LEAST_PTO;
+    drop(client.process_output(recovery_at));
+    let mut buffer = [0; 1_024];
+    assert!(server.stream_recv(application, &mut buffer).is_err());
+    assert!(server.stream_recv(chaff, &mut buffer).is_err());
+
+    client.qcsd_release_application_send_shaping();
+    let recovery = client
+        .process_output(recovery_at)
+        .dgram()
+        .expect("application retransmission becomes targetless after local ET");
+    server.process_input(recovery, recovery_at);
+    let (read, fin) = server.stream_recv(application, &mut buffer).unwrap();
+    assert_eq!(read, 800);
+    assert!(fin);
+    assert!(buffer[..read].iter().all(|byte| *byte == 0xAA));
+    if let Ok((read, fin)) = server.stream_recv(chaff, &mut buffer) {
+        assert_eq!((read, fin), (0, false));
+    }
+
+    let ack_at = recovery_at + DEFAULT_RTT;
+    let acknowledgment = server
+        .process_output(ack_at)
+        .dgram()
+        .expect("peer acknowledgment for recovered application data");
+    client.process_input(acknowledgment, ack_at);
+    let acknowledged = drain_observations(&mut client);
+    assert!(acknowledged.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::StreamDataAcknowledged {
+            stream,
+            role: QcsdRequestRole::Application,
+            offset: 0,
+            bytes: 800,
+            fin: true,
+            ..
+        } if stream.0 == application.as_u64()
+    )));
+    assert!(!acknowledged.iter().any(|observation| matches!(
+        observation,
+        QcsdObservation::StreamDataAcknowledged {
+            role: QcsdRequestRole::Chaff { .. },
+            ..
+        }
+    )));
+    drop(client.process_output(ack_at));
+    let post_acknowledgment = drain_observations(&mut client);
+    assert!(
+        !post_acknowledgment.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::StreamDataTransmitted { .. }
+        ))
+    );
 }
 
 #[test]

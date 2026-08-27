@@ -408,8 +408,13 @@ pub struct DefenseDiagnostics {
     pub buflo_terminal_subcell_open_streams_at_latch: u64,
     /// Parser-lease bytes still live at the terminal sub-cell latch (must be zero).
     pub buflo_terminal_subcell_parser_lease_bytes_at_latch: u64,
-    /// Pending parser boundaries at the terminal sub-cell latch (must be zero).
+    /// Pending parser boundaries across all roles at the terminal sub-cell latch.
+    /// Nonzero values are permitted only for reviewed chaff streams canceled
+    /// by the typed terminal-tail transition.
     pub buflo_terminal_subcell_pending_parser_boundaries_at_latch: u64,
+    /// Pending application parser boundaries at the terminal sub-cell latch
+    /// (must be zero; application parsing is never cancellable defense work).
+    pub buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: u64,
     /// Whether the configured minimum duration was reached.
     pub buflo_minimum_duration_reached: bool,
     /// Whether the QCSD-only `BuFLO` event guard stopped the schedule.
@@ -558,10 +563,27 @@ pub struct DefenseDiagnostics {
     pub cs_buflo_quiet_time_reached: bool,
     /// Whether CS-BuFLO irreversibly entered its client-local termination state.
     pub cs_buflo_local_termination_latched: bool,
+    /// Monotonic microsecond at which client-local termination irreversibly latched.
+    pub cs_buflo_local_et_latched_at_us: u64,
+    /// Real outgoing application bytes observed after local termination.
+    pub cs_buflo_post_local_et_natural_outgoing_bytes: u64,
+    /// Real incoming application bytes observed after local termination.
+    pub cs_buflo_post_local_et_natural_incoming_bytes: u64,
     /// Queued chaff requests discarded at the local termination boundary.
     pub cs_buflo_local_et_pending_request_cancellations: u64,
     /// Open chaff request streams explicitly canceled at the local termination boundary.
     pub cs_buflo_local_et_stream_cancellations: u64,
+    /// Whether local early termination latched before the client onLoad analogue.
+    pub cs_buflo_local_et_before_application_complete: bool,
+    /// Open application receive streams handed back to ordinary Neqo flow control.
+    pub cs_buflo_local_et_application_receive_streams_handed_off: u64,
+    /// Retained application parser boundaries transferred to ordinary Neqo flow control.
+    pub cs_buflo_local_et_application_parser_boundaries_handed_off: u64,
+    /// Remaining advertised unowned parser-lease bytes transferred at local termination.
+    pub cs_buflo_local_et_application_parser_lease_bytes_handed_off: u64,
+    /// Live endpoints whose application send shaping was released by a pre-onLoad handoff.
+    /// Post-onLoad retransmission cleanup is deliberately excluded.
+    pub cs_buflo_local_et_application_send_endpoints_released: u64,
     /// Whether the QCSD-only `CS-BuFLO` event guard stopped the schedule.
     pub cs_buflo_event_guard_triggered: bool,
 }
@@ -599,6 +621,15 @@ pub trait Defense: Debug {
     fn observe_application_bytes(&mut self, _at: Duration, _direction: Direction, _bytes: u64) {}
     /// Return the next event at or before `elapsed`.
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet>;
+    /// Pure preview of the next deterministic outgoing event which may be
+    /// staged before release and retracted before it is emitted.
+    ///
+    /// The preview must remain identical until either [`Self::next_event`]
+    /// returns it or the defense becomes terminal. Previewing must not advance
+    /// schedule state or diagnostics.
+    fn next_outgoing_prearm(&self) -> Option<Packet> {
+        None
+    }
     /// Snapshot a fixed schedule whose outgoing targets may be staged before release.
     ///
     /// Returning `None` preserves ordinary due-time generation. Implementations

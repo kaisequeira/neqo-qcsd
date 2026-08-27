@@ -230,6 +230,12 @@ impl Defense for Buflo {
     }
 
     fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
+        // Exact-cell failure is terminal. In particular, a transport outcome
+        // can be queued immediately before a later rolling release; never
+        // materialize that next cell while the failure is being reduced.
+        if self.realization_failed {
+            return None;
+        }
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         self.latest_elapsed_us = self.latest_elapsed_us.max(elapsed_us);
         if self.reject_overdue_cells(elapsed_us) {
@@ -251,8 +257,25 @@ impl Defense for Buflo {
         })
     }
 
+    fn next_outgoing_prearm(&self) -> Option<Packet> {
+        if self.schedule_closed()
+            || self.event_guard_triggered
+            || self.catch_up_failure_triggered
+            || self.realization_failed
+            || self.scheduled_outgoing >= self.parameters.max_events
+        {
+            return None;
+        }
+        Packet::new(
+            Duration::from_micros(self.next_outgoing_us),
+            Direction::Outgoing,
+            self.parameters.packet_size,
+        )
+        .ok()
+    }
+
     fn next_event_at(&self) -> Option<Duration> {
-        if self.is_complete() {
+        if self.is_complete() || self.realization_failed {
             return None;
         }
         (!self.schedule_closed())
@@ -352,6 +375,23 @@ mod tests {
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
         }
+    }
+
+    #[test]
+    fn outgoing_prearm_preview_is_pure_and_tracks_only_the_next_cursor() {
+        let mut defense = Buflo::from_parameters(parameters());
+        let preview = defense.next_outgoing_prearm().expect("t=0 preview");
+        assert_eq!(preview.timestamp(), Duration::ZERO);
+        assert_eq!(preview.direction(), Direction::Outgoing);
+        assert_eq!(defense.next_outgoing_prearm(), Some(preview));
+        assert_eq!(defense.diagnostics().buflo_scheduled_outgoing_cells, 0);
+
+        assert_eq!(defense.next_event(Duration::ZERO), Some(preview));
+        let incoming = defense.next_event(Duration::ZERO).expect("t=0 incoming");
+        assert_eq!(incoming.direction(), Direction::Incoming);
+        let next = defense.next_outgoing_prearm().expect("next preview");
+        assert_eq!(next.timestamp(), Duration::from_micros(10));
+        assert_eq!(defense.diagnostics().buflo_scheduled_outgoing_cells, 1);
     }
 
     #[test]

@@ -143,6 +143,8 @@ pub enum MissedSlotReason {
     /// Receive credit reached the wire, but the corresponding stream or
     /// endpoint ended before every scheduled offset was consumed.
     ReceiveCreditRetired,
+    /// The exact opportunity was first reconciled after its scheduled release.
+    TimerLate,
     DeadlineExpired,
     RunAborted,
 }

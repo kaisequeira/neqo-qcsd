@@ -575,6 +575,9 @@ impl Http3Client {
     /// or a request that cannot be created.
     pub fn apply_qcsd_action(&mut self, now: Instant, action: QcsdAction) -> Res<Option<StreamId>> {
         let own_endpoint = self.qcsd_endpoint.ok_or(Error::InvalidInput)?;
+        if self.apply_qcsd_packet_lifecycle_action(now, own_endpoint, &action)? {
+            return Ok(None);
+        }
         match action {
             QcsdAction::ConfigureManualReceive {
                 endpoint,
@@ -616,33 +619,11 @@ impl Http3Client {
                 self.conn
                     .qcsd_set_stream_receive_limit(StreamId::new(stream.0), absolute_limit)?;
             }
-            QcsdAction::SendPacket {
-                endpoint,
-                packet,
-                slot,
-                not_before_after_us,
-                deadline_after_us,
-                allow_stream_data,
-                send_policy,
-            } if endpoint == own_endpoint => {
-                let not_before = now
-                    .checked_add(Duration::from_micros(not_before_after_us))
-                    .ok_or(Error::InvalidInput)?;
-                let deadline = now
-                    .checked_add(Duration::from_micros(deadline_after_us))
-                    .ok_or(Error::InvalidInput)?;
-                self.conn
-                    .qcsd_queue_scheduled_packet_target_window_with_policy(
-                        slot,
-                        packet,
-                        not_before,
-                        deadline,
-                        allow_stream_data,
-                        send_policy,
-                    )?;
-            }
             QcsdAction::ReleaseChaffSendShaping { endpoint } if endpoint == own_endpoint => {
                 self.conn.qcsd_release_chaff_send_shaping();
+            }
+            QcsdAction::ReleaseApplicationSendShaping { endpoint } if endpoint == own_endpoint => {
+                self.conn.qcsd_release_application_send_shaping();
             }
             QcsdAction::RequestChaff {
                 endpoint,
@@ -676,6 +657,82 @@ impl Http3Client {
             _ => return Ok(None),
         }
         Ok(None)
+    }
+
+    fn apply_qcsd_packet_lifecycle_action(
+        &mut self,
+        now: Instant,
+        own_endpoint: QcsdEndpointId,
+        action: &QcsdAction,
+    ) -> Res<bool> {
+        match action {
+            QcsdAction::SendPacket {
+                endpoint,
+                packet,
+                slot,
+                not_before_after_us,
+                deadline_after_us,
+                allow_stream_data,
+                send_policy,
+            } if *endpoint == own_endpoint => {
+                let not_before = now
+                    .checked_add(Duration::from_micros(*not_before_after_us))
+                    .ok_or(Error::InvalidInput)?;
+                let deadline = now
+                    .checked_add(Duration::from_micros(*deadline_after_us))
+                    .ok_or(Error::InvalidInput)?;
+                self.conn
+                    .qcsd_queue_scheduled_packet_target_window_with_policy(
+                        *slot,
+                        *packet,
+                        not_before,
+                        deadline,
+                        *allow_stream_data,
+                        *send_policy,
+                    )?;
+            }
+            QcsdAction::PrearmPacket {
+                endpoint,
+                packet,
+                slot,
+                not_before_after_us,
+                deadline_after_us,
+                allow_stream_data,
+            } if *endpoint == own_endpoint => {
+                let not_before = now
+                    .checked_add(Duration::from_micros(*not_before_after_us))
+                    .ok_or(Error::InvalidInput)?;
+                let deadline = now
+                    .checked_add(Duration::from_micros(*deadline_after_us))
+                    .ok_or(Error::InvalidInput)?;
+                self.conn.qcsd_prearm_scheduled_packet_target_window(
+                    *slot,
+                    *packet,
+                    not_before,
+                    deadline,
+                    *allow_stream_data,
+                )?;
+            }
+            QcsdAction::CancelPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+                ..
+            } if *endpoint == own_endpoint => {
+                self.conn
+                    .qcsd_cancel_scheduled_packet_target(*slot, *packet)?;
+            }
+            QcsdAction::CommitPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+            } if *endpoint == own_endpoint => {
+                self.conn
+                    .qcsd_commit_scheduled_packet_target(*slot, *packet)?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     fn apply_qcsd_chaff_request(
