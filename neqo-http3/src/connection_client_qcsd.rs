@@ -54,29 +54,38 @@ impl Http3Client {
             || self.conn.qcsd_has_pending_stream_send_excluding(allowed)
     }
 
-    /// Whether request-causal STREAM output remains after the prefix target.
+    /// Whether required HTTP/3 or transport STREAM output remains pending.
     ///
-    /// Late chaff request streams are explicitly allowed by the qualification
-    /// specification.  Post-warmup QPACK decoder output is non-request-causal
-    /// and is excluded by its fixed critical stream role.  HTTP/3 control,
-    /// QPACK encoder, required request, and any unknown transport stream output
-    /// remain blocking.
-    pub fn qcsd_has_pending_required_prefix_stream_send(
-        &mut self,
-        allowed_late_requests: &[StreamId],
-    ) -> bool {
+    /// Request streams listed in `allowed_requests` are explicitly excluded.
+    /// QPACK decoder output is non-request-causal and is excluded by its exact
+    /// fixed critical-stream identity at both the HTTP/3 handler and transport
+    /// boundaries. HTTP/3 control, QPACK encoder, every other request, and any
+    /// unknown transport stream output remain blocking.
+    ///
+    /// This returns `true` conservatively until the QPACK decoder stream has an
+    /// exact transport identity; it never excludes a stream by inference.
+    pub fn qcsd_has_pending_required_stream_send(&mut self, allowed_requests: &[StreamId]) -> bool {
         let Some(decoder_stream) = self.base_handler.qcsd_qpack_decoder_stream_id() else {
             return true;
         };
-        let mut transport_exclusions = allowed_late_requests.to_vec();
+        let mut transport_exclusions = allowed_requests.to_vec();
         if !transport_exclusions.contains(&decoder_stream) {
             transport_exclusions.push(decoder_stream);
         }
         self.base_handler
-            .qcsd_has_pending_required_prefix_handler_send(allowed_late_requests)
+            .qcsd_has_pending_required_prefix_handler_send(allowed_requests)
             || self
                 .conn
                 .qcsd_has_pending_stream_send_excluding(&transport_exclusions)
+    }
+
+    /// Backward-compatible prefix-qualification name for
+    /// [`Self::qcsd_has_pending_required_stream_send`].
+    pub fn qcsd_has_pending_required_prefix_stream_send(
+        &mut self,
+        allowed_late_requests: &[StreamId],
+    ) -> bool {
+        self.qcsd_has_pending_required_stream_send(allowed_late_requests)
     }
 
     /// The exact client QPACK decoder stream whose post-warmup output is

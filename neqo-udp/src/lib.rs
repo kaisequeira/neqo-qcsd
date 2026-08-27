@@ -59,10 +59,36 @@ impl Default for RecvBuf {
     }
 }
 
-pub fn send_inner(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendErrorMode {
+    Standard,
+    QcsdStrict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendErrorAction {
+    IgnoreMessageTooLarge,
+    IgnoreNoBufferSpace,
+    Propagate,
+}
+
+fn send_error_action(mode: SendErrorMode, error: &io::Error) -> SendErrorAction {
+    if mode == SendErrorMode::QcsdStrict {
+        SendErrorAction::Propagate
+    } else if is_emsgsize(error) {
+        SendErrorAction::IgnoreMessageTooLarge
+    } else if is_enobufs(error) {
+        SendErrorAction::IgnoreNoBufferSpace
+    } else {
+        SendErrorAction::Propagate
+    }
+}
+
+fn send_inner_with_error_mode(
     state: &UdpSocketState,
     socket: quinn_udp::UdpSockRef<'_>,
     d: &datagram::Batch,
+    error_mode: SendErrorMode,
 ) -> io::Result<()> {
     let transmit = Transmit {
         destination: d.destination(),
@@ -74,25 +100,27 @@ pub fn send_inner(
 
     match state.try_send(socket, &transmit) {
         Ok(()) => {}
-        Err(e) if is_emsgsize(&e) => {
-            qdebug!(
-                "Failed to send datagram of size {} bytes, in {} segments, each {} bytes, from {} to {}. PMTUD probe? Ignoring error: {e}",
-                d.data().len(),
-                d.num_datagrams(),
-                d.datagram_size().get(),
-                d.source(),
-                d.destination()
-            );
-            return Ok(());
-        }
-        Err(e) if is_enobufs(&e) => {
-            // The send queue is momentarily full. Don't map to WouldBlock: the
-            // socket IS writable, so edge-triggered epoll/kqueue won't re-signal
-            // and the send loop would hang. Drop the packet; QUIC will retransmit.
-            qdebug!("Interface send queue full (ENOBUFS), dropping packet: {e}");
-            return Ok(());
-        }
-        e @ Err(_) => return e,
+        Err(error) => match send_error_action(error_mode, &error) {
+            SendErrorAction::IgnoreMessageTooLarge => {
+                qdebug!(
+                    "Failed to send datagram of size {} bytes, in {} segments, each {} bytes, from {} to {}. PMTUD probe? Ignoring error: {error}",
+                    d.data().len(),
+                    d.num_datagrams(),
+                    d.datagram_size().get(),
+                    d.source(),
+                    d.destination()
+                );
+                return Ok(());
+            }
+            SendErrorAction::IgnoreNoBufferSpace => {
+                // The send queue is momentarily full. Don't map to WouldBlock: the
+                // socket IS writable, so edge-triggered epoll/kqueue won't re-signal
+                // and the send loop would hang. Drop the packet; QUIC will retransmit.
+                qdebug!("Interface send queue full (ENOBUFS), dropping packet: {error}");
+                return Ok(());
+            }
+            SendErrorAction::Propagate => return Err(error),
+        },
     }
 
     qtrace!(
@@ -105,6 +133,29 @@ pub fn send_inner(
     );
 
     Ok(())
+}
+
+/// Send a [`datagram::Batch`], retaining the historical best-effort treatment
+/// of `EMSGSIZE` and `ENOBUFS` errors.
+pub fn send_inner(
+    state: &UdpSocketState,
+    socket: quinn_udp::UdpSockRef<'_>,
+    d: &datagram::Batch,
+) -> io::Result<()> {
+    send_inner_with_error_mode(state, socket, d, SendErrorMode::Standard)
+}
+
+/// Send a [`datagram::Batch`] for a QCSD fidelity-sensitive socket handoff.
+///
+/// Unlike [`send_inner`], this propagates `EMSGSIZE` and `ENOBUFS`. QCSD must
+/// observe those failures rather than treating a dropped defense packet as a
+/// successful handoff.
+pub fn send_inner_qcsd(
+    state: &UdpSocketState,
+    socket: quinn_udp::UdpSockRef<'_>,
+    d: &datagram::Batch,
+) -> io::Result<()> {
+    send_inner_with_error_mode(state, socket, d, SendErrorMode::QcsdStrict)
 }
 
 #[cfg(unix)]
@@ -445,6 +496,46 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(unix, windows))]
+    fn qcsd_send_error_mode_propagates_errors_ignored_by_standard_mode() {
+        #[cfg(unix)]
+        let emsgsize = io::Error::from_raw_os_error(libc::EMSGSIZE);
+        #[cfg(windows)]
+        let emsgsize = io::Error::from_raw_os_error(WinSock::WSAEMSGSIZE.0);
+        #[cfg(unix)]
+        let enobufs = io::Error::from_raw_os_error(libc::ENOBUFS);
+        #[cfg(windows)]
+        let enobufs = io::Error::from_raw_os_error(WinSock::WSAENOBUFS.0);
+
+        assert_eq!(
+            send_error_action(SendErrorMode::Standard, &emsgsize),
+            SendErrorAction::IgnoreMessageTooLarge
+        );
+        assert_eq!(
+            send_error_action(SendErrorMode::Standard, &enobufs),
+            SendErrorAction::IgnoreNoBufferSpace
+        );
+        assert_eq!(
+            send_error_action(SendErrorMode::QcsdStrict, &emsgsize),
+            SendErrorAction::Propagate
+        );
+        assert_eq!(
+            send_error_action(SendErrorMode::QcsdStrict, &enobufs),
+            SendErrorAction::Propagate
+        );
+
+        let unrelated = io::Error::other("unrelated send failure");
+        assert_eq!(
+            send_error_action(SendErrorMode::Standard, &unrelated),
+            SendErrorAction::Propagate
+        );
+        assert_eq!(
+            send_error_action(SendErrorMode::QcsdStrict, &unrelated),
+            SendErrorAction::Propagate
+        );
+    }
+
+    #[test]
     #[cfg(windows)]
     fn is_emsgsize_true_for_wsaemsgsize() {
         let err = io::Error::from_raw_os_error(WinSock::WSAEMSGSIZE.0);
@@ -642,6 +733,29 @@ mod tests {
         assert_eq!(
             received_datagram.next().unwrap().as_ref(),
             normal_datagram.data()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn send_qcsd_propagates_emsgsize() -> Result<(), io::Error> {
+        let sender = socket()?;
+        let receiver = socket()?;
+        let segment_size = usize::from(u16::MAX) + 1;
+        let oversized_batch = datagram::Batch::new(
+            sender.inner.local_addr()?,
+            receiver.inner.local_addr()?,
+            Tos::from((Dscp::Le, Ecn::Ect1)),
+            NonZeroUsize::new(segment_size).unwrap(),
+            vec![0; segment_size * 2],
+        );
+
+        let error = send_inner_qcsd(&sender.state, (&sender.inner).into(), &oversized_batch)
+            .expect_err("QCSD send must propagate an oversized-datagram error");
+        assert!(
+            is_emsgsize(&error),
+            "expected EMSGSIZE-compatible error, got {error:?}"
         );
 
         Ok(())

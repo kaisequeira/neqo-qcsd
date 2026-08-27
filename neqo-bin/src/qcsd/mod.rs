@@ -25,7 +25,7 @@ use futures::{
     future::{select, select_all},
 };
 use http::Uri;
-use neqo_common::{Header, event::Provider as _};
+use neqo_common::{Header, datagram, event::Provider as _};
 use neqo_csdef::{
     ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics, DefenseKind,
     DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
@@ -160,6 +160,44 @@ enum ChaffRequestHeaderModeArg {
 enum ResponseQualificationMode {
     Legacy,
     SustainedIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketHandoffPolicy {
+    /// Preserve Neqo's historical best-effort handling of local interface
+    /// buffer exhaustion and oversized datagrams.
+    HistoricalBestEffort,
+    /// Candidate fidelity runs must fail closed if the OS did not accept the
+    /// defense datagram; otherwise the slot could be falsely receipted.
+    CandidateFidelityStrict,
+}
+
+impl SocketHandoffPolicy {
+    const fn for_defense(defense: &DefenseConfig) -> Self {
+        if is_candidate_defense(defense) {
+            Self::CandidateFidelityStrict
+        } else {
+            Self::HistoricalBestEffort
+        }
+    }
+
+    const fn for_response_qualification(mode: ResponseQualificationMode) -> Self {
+        match mode {
+            ResponseQualificationMode::Legacy => Self::HistoricalBestEffort,
+            ResponseQualificationMode::SustainedIdentity => Self::CandidateFidelityStrict,
+        }
+    }
+
+    fn send(self, socket: &Socket, batch: &datagram::Batch) -> io::Result<()> {
+        match self {
+            Self::HistoricalBestEffort => socket.send(batch),
+            Self::CandidateFidelityStrict => socket.send_qcsd(batch),
+        }
+    }
+}
+
+const fn is_candidate_defense(defense: &DefenseConfig) -> bool {
+    matches!(defense, DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_))
 }
 
 impl From<StaticModeArg> for StaticMode {
@@ -1653,6 +1691,12 @@ struct ApplicationRequest {
 struct ScheduledOutgoing {
     slot: QcsdSlotId,
     packet: Packet,
+    /// Exact absolute adapter release for a committed rolling target. Fixed
+    /// schedule targets store their action instant here and never consult it.
+    /// A rolling target owns the output microstep at its nominal defense
+    /// timestamp, but transport must not be driven until this (possibly
+    /// sub-microsecond-later) release instant.
+    not_before: Instant,
     /// Absolute adapter deadline derived from the same action timestamp and
     /// relative window passed to transport. A target is not accepted unless
     /// the committed UDP datagram reaches the OS socket before this instant.
@@ -1666,6 +1710,7 @@ struct ScheduledOutgoing {
 struct PrearmedOutgoing {
     slot: QcsdSlotId,
     packet: Packet,
+    not_before: Instant,
     deadline: Instant,
 }
 
@@ -1704,6 +1749,7 @@ struct Endpoint {
     retired_applications: Vec<(u32, ResourceRunState)>,
     scheduled_outgoing: VecDeque<ScheduledOutgoing>,
     prearmed_outgoing: VecDeque<PrearmedOutgoing>,
+    socket_handoff_policy: SocketHandoffPolicy,
     traffic_morphing_activation: TrafficMorphingActivation,
     /// Unit-test seam that makes an observation visible during exactly one
     /// output step, exercising the production post-output causal barrier.
@@ -1713,6 +1759,9 @@ struct Endpoint {
     test_output_observations: Vec<TimestampedQcsdObservation>,
     #[cfg(test)]
     test_force_socket_handoff_success: bool,
+    /// Inject one strict-path OS error without depending on host buffer state.
+    #[cfg(test)]
+    test_strict_socket_handoff_error: Option<i32>,
 }
 
 #[expect(
@@ -2158,6 +2207,7 @@ async fn qualify_chaff_response(
     timeout_seconds: u64,
 ) -> Result<(), Error> {
     let mode = response_qualification_mode(parallel_requests, total_requests, request_header_mode)?;
+    let socket_handoff_policy = SocketHandoffPolicy::for_response_qualification(mode);
     if packet_size != 1_200 || max_response_bytes == 0 {
         return Err(Error::Argument(
             "response qualification requires packet_size=1200 and positive max_response_bytes"
@@ -2402,7 +2452,7 @@ async fn qualify_chaff_response(
                     }
                     qualification_network_output_seen |= opened;
                     loop {
-                        match socket.send(&batch) {
+                        match socket_handoff_policy.send(&socket, &batch) {
                             Ok(()) => break,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 socket.writable().await?;
@@ -3439,7 +3489,7 @@ async fn qualify_chaff_prefix(
                         next_packet_sequence = next_packet_sequence.saturating_add(1);
                     }
                     loop {
-                        match socket.send(&batch) {
+                        match SocketHandoffPolicy::HistoricalBestEffort.send(&socket, &batch) {
                             Ok(()) => break,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 socket.writable().await?;
@@ -4700,14 +4750,10 @@ async fn execute_run_inner(
                     &mut traces,
                     defense_elapsed,
                 )?;
-                let candidate_defense = matches!(
-                    spec.config.defense,
-                    DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
-                );
-                let egress_backlog_pending = endpoints.iter_mut().any(|endpoint| {
-                    endpoint.client.qcsd_has_pending_stream_send()
-                        || (candidate_defense && endpoint.client.qcsd_has_pending_defense_control())
-                });
+                let candidate_defense = is_candidate_defense(&spec.config.defense);
+                let egress_backlog_pending = endpoints
+                    .iter_mut()
+                    .any(|endpoint| endpoint_egress_backlog_pending(endpoint, candidate_defense));
                 if last_egress_backlog != Some(egress_backlog_pending) {
                     last_egress_backlog = Some(egress_backlog_pending);
                     let record = observation_clock.record(QcsdObservation::EgressBacklog {
@@ -4788,12 +4834,10 @@ async fn execute_run_inner(
                         && endpoint.scheduled_outgoing.is_empty()
                         && endpoint.prearmed_outgoing.is_empty()
                         && endpoint.client.qcsd_pending_packet_targets() == 0
-                        && (!matches!(
-                            spec.config.defense,
-                            DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
-                        ) || (!endpoint.client.qcsd_has_pending_stream_send()
-                            && !endpoint.client.qcsd_has_pending_defense_control()
-                            && application_send_halves_peer_confirmed(endpoint)))
+                        && endpoint_send_terminal(
+                            endpoint,
+                            is_candidate_defense(&spec.config.defense),
+                        )
                 })
             {
                 traces.ensure_no_pending_slots()?;
@@ -5086,6 +5130,7 @@ fn create_endpoints(
                 retired_applications: Vec::new(),
                 scheduled_outgoing: VecDeque::new(),
                 prearmed_outgoing: VecDeque::new(),
+                socket_handoff_policy: SocketHandoffPolicy::for_defense(&spec.config.defense),
                 traffic_morphing_activation: if matches!(
                     &spec.config.defense,
                     DefenseConfig::TrafficMorphing(_)
@@ -5100,6 +5145,8 @@ fn create_endpoints(
                 test_output_observations: Vec::new(),
                 #[cfg(test)]
                 test_force_socket_handoff_success: false,
+                #[cfg(test)]
+                test_strict_socket_handoff_error: None,
             })
         })
         .collect()
@@ -5244,6 +5291,25 @@ fn application_send_halves_peer_confirmed(endpoint: &Endpoint) -> bool {
             .client
             .qcsd_application_send_stream_peer_confirmed(stream)
     })
+}
+
+/// Backlog semantics shared by both the controller's quiet-timer observation
+/// and the runner's terminal predicate. Candidate defenses exclude only the
+/// non-request-causal QPACK decoder stream; historical modes retain their
+/// established all-STREAM observation.
+fn endpoint_egress_backlog_pending(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
+    if candidate_defense {
+        endpoint.client.qcsd_has_pending_required_stream_send(&[])
+            || endpoint.client.qcsd_has_pending_defense_control()
+    } else {
+        endpoint.client.qcsd_has_pending_stream_send()
+    }
+}
+
+fn endpoint_send_terminal(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
+    !candidate_defense
+        || (!endpoint_egress_backlog_pending(endpoint, true)
+            && application_send_halves_peer_confirmed(endpoint))
 }
 
 fn tracked_application_send_halves_peer_confirmed(
@@ -7134,6 +7200,10 @@ fn apply_action(
         } => Some(ScheduledOutgoing {
             slot: *slot,
             packet: *packet,
+            // Fixed/legacy targets never use the rolling adapter-release
+            // selector. Avoid introducing a new overflow failure path for
+            // their previously ignored `not_before_after_us` value.
+            not_before: now,
             deadline: now
                 .checked_add(Duration::from_micros(*deadline_after_us))
                 .ok_or_else(|| {
@@ -7158,6 +7228,7 @@ fn apply_action(
             Some(ScheduledOutgoing {
                 slot: *slot,
                 packet: *packet,
+                not_before: prearm.not_before,
                 deadline: prearm.deadline,
                 rolling_prearmed: true,
             })
@@ -7222,10 +7293,19 @@ fn apply_action(
             if let QcsdAction::PrearmPacket {
                 packet,
                 slot,
+                not_before_after_us,
                 deadline_after_us,
                 ..
             } = &trace_action
             {
+                let not_before = now
+                    .checked_add(Duration::from_micros(*not_before_after_us))
+                    .ok_or_else(|| {
+                        Error::SlotInvariant(format!(
+                            "prearmed slot {} lacked a representable adapter release",
+                            slot.0
+                        ))
+                    })?;
                 let deadline = now
                     .checked_add(Duration::from_micros(*deadline_after_us))
                     .ok_or_else(|| {
@@ -7237,6 +7317,7 @@ fn apply_action(
                 endpoint.prearmed_outgoing.push_back(PrearmedOutgoing {
                     slot: *slot,
                     packet: *packet,
+                    not_before,
                     deadline,
                 });
             }
@@ -7581,10 +7662,18 @@ fn attempt_socket_handoff(
     send: impl FnOnce() -> io::Result<()>,
     mut clock: impl FnMut() -> Instant,
 ) -> Result<SocketHandoff, Error> {
-    // An otherwise-unshaped batch must not slip across a rolling release while
-    // the syscall is in progress or while retrying after `WouldBlock`.  Check
-    // before every attempt and again after a successful handoff.  Target-bearing
-    // batches retain their stricter adapter-deadline/backpressure contract below.
+    // No batch may enter the socket syscall after its active half-open fidelity
+    // window. Check before every attempt and again after a successful handoff:
+    // the latter preserves evidence when scheduler preemption crosses a
+    // boundary while the syscall is in progress.
+    if let Some(deadline) = target_deadlines.iter().copied().min() {
+        let attempted_at = clock();
+        if attempted_at >= deadline {
+            return Err(Error::SlotInvariant(format!(
+                "target-bearing UDP datagram reached or crossed its adapter deadline before socket handoff ({attempted_at:?} >= {deadline:?})"
+            )));
+        }
+    }
     let unshaped_interrupt = target_deadlines
         .is_empty()
         .then_some(rolling_interrupt)
@@ -7603,7 +7692,8 @@ fn attempt_socket_handoff(
             if let Some(deadline) = target_deadlines
                 .iter()
                 .copied()
-                .find(|deadline| sent_at >= *deadline)
+                .filter(|deadline| sent_at >= *deadline)
+                .min()
             {
                 return Ok(SocketHandoff::SentLate {
                     sent_at,
@@ -7860,8 +7950,9 @@ async fn drive_endpoint_output_with_clock(
                     drive_elapsed,
                 )?;
             }
+            let mut rolling_adapter_release = None;
             if rolling_output_lifecycle_active(controller, endpoints) {
-                if let Some(priority) = due_rolling_output_endpoint(
+                if let Some((priority, not_before)) = due_rolling_output_target(
                     endpoints.iter().enumerate().flat_map(|(index, endpoint)| {
                         endpoint
                             .scheduled_outgoing
@@ -7875,6 +7966,7 @@ async fn drive_endpoint_output_with_clock(
                     // also prevents the newly staged next-tick preview from
                     // stealing priority from the event just committed above.
                     output_endpoint_index = priority;
+                    rolling_adapter_release = Some(not_before);
                 }
                 due_rolling_slots_before_output = endpoints
                     .iter()
@@ -7884,6 +7976,19 @@ async fn drive_endpoint_output_with_clock(
                     })
                     .map(|scheduled| scheduled.slot)
                     .collect();
+            }
+            if let Some(not_before) = rolling_adapter_release {
+                // `PrearmPacket` represents the absolute release as a relative
+                // whole-microsecond delay, rounded upward so transport can never
+                // send early.  The nominal defense tick can therefore precede
+                // the adapter release by 1--999 ns. Refresh the runner clock
+                // after reconciliation/action dispatch and wait for the exact
+                // adapter instant instead of allowing same-tick receiver-credit
+                // control to escape as an unshaped datagram.
+                drive_now = monotonic_clock();
+                if drive_now < not_before {
+                    return Ok(Some(not_before));
+                }
             }
         }
 
@@ -7955,17 +8060,17 @@ fn rolling_output_lifecycle_active(controller: &QcsdController, endpoints: &[End
         })
 }
 
-fn due_rolling_output_endpoint<'a>(
+fn due_rolling_output_target<'a>(
     scheduled: impl IntoIterator<Item = (usize, &'a ScheduledOutgoing)>,
     drive_elapsed: Duration,
-) -> Option<usize> {
+) -> Option<(usize, Instant)> {
     scheduled
         .into_iter()
         .filter(|(_, scheduled)| {
             scheduled.rolling_prearmed && scheduled.packet.timestamp() <= drive_elapsed
         })
         .min_by_key(|(_, scheduled)| (scheduled.packet.timestamp(), scheduled.slot))
-        .map(|(index, _)| index)
+        .map(|(index, scheduled)| (index, scheduled.not_before))
 }
 
 #[expect(
@@ -8048,6 +8153,9 @@ async fn process_output_once_with_clock(
     let (sent_at, late_handoff) = loop {
         #[cfg(test)]
         let force_socket_handoff_success = endpoint.test_force_socket_handoff_success;
+        #[cfg(test)]
+        let strict_socket_handoff_error = endpoint.test_strict_socket_handoff_error.take();
+        let socket_handoff_policy = endpoint.socket_handoff_policy;
         match attempt_socket_handoff(
             &target_deadlines,
             rolling_interrupt,
@@ -8056,7 +8164,13 @@ async fn process_output_once_with_clock(
                 if force_socket_handoff_success {
                     return Ok(());
                 }
-                endpoint.socket.send(&batch)
+                #[cfg(test)]
+                if socket_handoff_policy == SocketHandoffPolicy::CandidateFidelityStrict
+                    && let Some(raw_os_error) = strict_socket_handoff_error
+                {
+                    return Err(io::Error::from_raw_os_error(raw_os_error));
+                }
+                socket_handoff_policy.send(&endpoint.socket, &batch)
             },
             &mut *monotonic_clock,
         )? {
@@ -8403,19 +8517,20 @@ mod tests {
         QualificationAcknowledgement, QualifierStream, RequestPolicyArg, ResourceRunState,
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
         RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
-        SocketHandoffBoundary, StaticModeArg, StreamActivationStage, StreamRecord, StreamType,
-        SustainedResponseQualificationRequest, TrafficMorphingActivation, absolute_wakeup,
-        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
-        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
-        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
+        SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
+        StreamRecord, StreamType, SustainedResponseQualificationRequest, TrafficMorphingActivation,
+        absolute_wakeup, action_failure_reason, activate_traffic_morphing,
+        application_send_halves_peer_confirmed, apply_action_batch, apply_queued_actions,
+        attempt_socket_handoff, await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
         bounded_qualification_wait, buflo_run_summary, cancel_uncommitted_prearms_on_abort,
         create_endpoints, cs_buflo_run_summary, datagram_observation, deadline_error,
         defense_parameter_provenance, dispatch_ready_requests, drain_qualifier_stream_data,
-        drive_endpoint_output, drive_endpoint_output_with_clock, due_rolling_output_endpoint,
-        ensure_defense_realizable, expected_application_response_length, finish_application_record,
-        finish_chaff_record, finish_stream, forward_qcsd_observation, handle_all_qcsd_observations,
-        handle_http_events, has_in_flight_application_stream, normalize_rolling_prearm_window, now,
-        pending_receive_identity_is_reconciled, prefix_receipts_pass,
+        drive_endpoint_output, drive_endpoint_output_with_clock, due_rolling_output_target,
+        endpoint_egress_backlog_pending, endpoint_send_terminal, ensure_defense_realizable,
+        expected_application_response_length, finish_application_record, finish_chaff_record,
+        finish_stream, forward_qcsd_observation, handle_all_qcsd_observations, handle_http_events,
+        has_in_flight_application_stream, is_candidate_defense, normalize_rolling_prearm_window,
+        now, pending_receive_identity_is_reconciled, prefix_receipts_pass,
         prefix_targetless_stream_bytes, preflight_receive_actions_with, prepare_chaff_cancellation,
         projected_ael, projected_identity_chaff_headers, qcsd_connection_parameters,
         qualification_content_encoding, ready_request_batch, record_adapter_action_error,
@@ -8854,6 +8969,11 @@ mod tests {
             .expect("retire chaff record");
         assert!(endpoint.streams.is_empty());
         assert!(endpoint.client.qcsd_has_pending_defense_control());
+        assert!(endpoint_egress_backlog_pending(&mut endpoint, true));
+        assert!(
+            !endpoint_send_terminal(&mut endpoint, true),
+            "candidate completion is blocked while local-ET control remains"
+        );
 
         test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
         assert_eq!(endpoint.client.state(), neqo_http3::Http3State::Connected);
@@ -8873,8 +8993,25 @@ mod tests {
         );
         assert!(!qpack_decoder_handler_pending);
         assert!(qpack_decoder_transport_pending);
+        assert!(
+            !endpoint.client.qcsd_has_pending_required_stream_send(&[]),
+            "decoder-only transport backlog is non-request-causal and must not hold candidate completion open"
+        );
         assert!(!endpoint.client.qcsd_has_pending_defense_control());
         assert!(application_send_halves_peer_confirmed(&endpoint));
+        assert!(
+            !endpoint_egress_backlog_pending(&mut endpoint, true),
+            "candidate quiet state excludes only decoder-only transport backlog"
+        );
+        assert!(
+            endpoint_egress_backlog_pending(&mut endpoint, false),
+            "legacy observation retains its established all-STREAM semantics"
+        );
+        assert!(
+            endpoint_send_terminal(&mut endpoint, false),
+            "legacy completion retains its established transport-independent predicate"
+        );
+        assert!(endpoint_send_terminal(&mut endpoint, true));
 
         drop(traces);
         let events = fs::read_to_string(output.join("events.csv")).expect("events trace");
@@ -12422,32 +12559,37 @@ mod tests {
 
     #[test]
     fn due_rolling_output_selection_ignores_legacy_and_future_targets() {
+        let adapter_release = now();
         let scheduled = [
             vec![ScheduledOutgoing {
                 slot: QcsdSlotId(1),
                 packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).expect("packet"),
-                deadline: now(),
+                not_before: adapter_release,
+                deadline: adapter_release,
                 rolling_prearmed: false,
             }],
             vec![ScheduledOutgoing {
                 slot: QcsdSlotId(2),
                 packet: Packet::new(Duration::from_micros(20), Direction::Outgoing, 1_200)
                     .expect("packet"),
-                deadline: now(),
+                not_before: adapter_release + Duration::from_nanos(2),
+                deadline: adapter_release,
                 rolling_prearmed: true,
             }],
             vec![ScheduledOutgoing {
                 slot: QcsdSlotId(4),
                 packet: Packet::new(Duration::from_micros(10), Direction::Outgoing, 1_200)
                     .expect("packet"),
-                deadline: now(),
+                not_before: adapter_release + Duration::from_nanos(4),
+                deadline: adapter_release,
                 rolling_prearmed: true,
             }],
             vec![ScheduledOutgoing {
                 slot: QcsdSlotId(3),
                 packet: Packet::new(Duration::from_micros(10), Direction::Outgoing, 1_200)
                     .expect("packet"),
-                deadline: now(),
+                not_before: adapter_release + Duration::from_nanos(3),
+                deadline: adapter_release,
                 rolling_prearmed: true,
             }],
         ];
@@ -12458,17 +12600,327 @@ mod tests {
         };
 
         assert_eq!(
-            due_rolling_output_endpoint(candidates(), Duration::from_micros(9)),
+            due_rolling_output_target(candidates(), Duration::from_micros(9)),
             None
         );
         assert_eq!(
-            due_rolling_output_endpoint(candidates(), Duration::from_micros(10)),
-            Some(3)
+            due_rolling_output_target(candidates(), Duration::from_micros(10)),
+            Some((3, adapter_release + Duration::from_nanos(3)))
         );
         assert_eq!(
-            due_rolling_output_endpoint(candidates(), Duration::from_micros(20)),
-            Some(3)
+            due_rolling_output_target(candidates(), Duration::from_micros(20)),
+            Some((3, adapter_release + Duration::from_nanos(3)))
         );
+    }
+
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::future_not_send,
+        clippy::too_many_lines,
+        reason = "one connected runner oracle preserves the exact prearm, paired-credit, handoff, and trace lifecycle"
+    )]
+    async fn assert_fractional_adapter_release_redrive(adapter_skew_ns: u64) {
+        assert!((1..=999).contains(&adapter_skew_ns));
+        let output = trace_output_dir(&format!(
+            "fractional-adapter-release-redrive-{adapter_skew_ns}"
+        ));
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let outgoing =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let incoming =
+            Packet::new(Duration::from_millis(20), Direction::Incoming, 1_200).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([outgoing, incoming]),
+            }),
+        )
+        .expect("same-tick outgoing/incoming controller");
+
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        // Leave a real response stream open, but drain every request/critical
+        // STREAM byte before the defense starts. The only non-target output
+        // staged at the nominal tick below is therefore the scheduled
+        // MAX_STREAM_DATA control for the simultaneous incoming opportunity.
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let request_url = http::Uri::from_static("https://127.0.0.1:4433/controlled");
+        let stream = endpoint
+            .client
+            .fetch(
+                started,
+                "GET",
+                &request_url,
+                &[],
+                neqo_http3::Priority::default(),
+            )
+            .expect("create controlled application request");
+        endpoint
+            .client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(10_000))
+            .expect("register controlled application response");
+        let request_stream_bytes = endpoint
+            .client
+            .qcsd_request_stream_bytes(stream)
+            .expect("measure controlled request stream");
+        endpoint
+            .client
+            .stream_close_send(stream, started)
+            .expect("close controlled request send side");
+        endpoint.application_send_streams.insert(stream);
+        let mut stream_record = application(None, false);
+        stream_record.url = request_url.to_string();
+        stream_record.request_stream_bytes = request_stream_bytes;
+        endpoint.streams.insert(stream, stream_record);
+        let mut server = server;
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert!(
+            !endpoint.client.qcsd_has_pending_stream_send(),
+            "request and HTTP/3 critical STREAM output are preflushed"
+        );
+        endpoint.client.qcsd_enable_send_shaping(true);
+        drop(endpoint.client.qcsd_timestamped_observations());
+
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoint.id,
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: endpoint.id,
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        let mut endpoints = vec![endpoint];
+        endpoints[0].test_force_socket_handoff_success = true;
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+
+        let release_at = started + outgoing.timestamp();
+        let remaining_before_tick_ns = 1_000 - adapter_skew_ns;
+        let dispatch_at = release_at
+            .checked_sub(Duration::from_nanos(remaining_before_tick_ns))
+            .expect("release has the fractional dispatch predecessor");
+        let dispatch_elapsed = dispatch_at.saturating_duration_since(started);
+        controller.poll(dispatch_elapsed);
+        let preview_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(preview_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::ConfigureManualReceive {
+                stream: configured,
+                ..
+            } if configured.0 == stream.as_u64()
+        )));
+        assert!(preview_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket { packet, .. } if *packet == outgoing
+        )));
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            dispatch_at,
+            dispatch_elapsed,
+            preview_actions,
+        )
+        .expect("apply fractionally delayed rolling preview");
+        let adapter_release = release_at + Duration::from_nanos(adapter_skew_ns);
+        assert_eq!(
+            endpoints[0].prearmed_outgoing[0].not_before,
+            adapter_release
+        );
+
+        // This deterministic output seam would be consumed immediately if the
+        // runner drove transport with the stale nominal tick. It must remain
+        // untouched while the committed target waits for its exact adapter
+        // release.
+        endpoints[0].test_observation_on_next_output =
+            Some(observation_clock.record(QcsdObservation::EgressBacklog { pending: true }));
+        let mut nominal_clock = || release_at;
+        let wakeup = drive_endpoint_output_with_clock(
+            0,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(started),
+            &mut nominal_clock,
+        )
+        .await
+        .expect("nominal tick commits without driving transport");
+        assert_eq!(wakeup, Some(adapter_release));
+        assert!(endpoints[0].test_observation_on_next_output.is_some());
+        assert!(endpoints[0].test_output_observations.is_empty());
+        assert!(endpoints[0].prearmed_outgoing.is_empty());
+        assert_eq!(endpoints[0].scheduled_outgoing.len(), 1);
+        let outgoing_slot = endpoints[0].scheduled_outgoing[0].slot;
+        assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 1);
+        let pending_receive = endpoints[0].client.qcsd_pending_receive_action_identities();
+        assert_eq!(pending_receive.len(), 1);
+        let incoming_slot = match pending_receive[0] {
+            QcsdReceiveActionIdentity::Scheduled {
+                endpoint,
+                stream: observed_stream,
+                slot,
+                ..
+            } => {
+                assert_eq!(endpoint, endpoints[0].id);
+                assert_eq!(observed_stream.0, stream.as_u64());
+                slot
+            }
+            other @ QcsdReceiveActionIdentity::ParserLease { .. } => {
+                panic!("expected scheduled same-tick receive control, got {other:?}")
+            }
+        };
+        assert!(
+            controller
+                .pending_slots()
+                .contains(&(incoming_slot, incoming))
+        );
+        assert_eq!(controller.pending_slots().len(), 2);
+
+        let just_before_adapter = adapter_release
+            .checked_sub(Duration::from_nanos(1))
+            .expect("adapter release has a predecessor");
+        let mut pre_adapter_clock = || just_before_adapter;
+        let wakeup = drive_endpoint_output_with_clock(
+            0,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(started),
+            &mut pre_adapter_clock,
+        )
+        .await
+        .expect("runner remains idle immediately before adapter release");
+        assert_eq!(wakeup, Some(adapter_release));
+        assert!(endpoints[0].test_observation_on_next_output.is_some());
+        assert!(endpoints[0].test_output_observations.is_empty());
+        assert_eq!(
+            endpoints[0].client.qcsd_pending_receive_action_identities(),
+            pending_receive
+        );
+
+        endpoints[0].test_observation_on_next_output = None;
+        let mut adapter_clock = || adapter_release;
+        let _wakeup = drive_endpoint_output_with_clock(
+            0,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(started),
+            &mut adapter_clock,
+        )
+        .await
+        .expect("exact adapter release realizes the committed target");
+        assert!(endpoints[0].scheduled_outgoing.is_empty());
+        assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 0);
+        assert!(
+            endpoints[0]
+                .client
+                .qcsd_pending_receive_action_identities()
+                .is_empty(),
+            "same-tick receive control is encoded only inside the exact target"
+        );
+        assert_eq!(controller.pending_slots(), [(incoming_slot, incoming)]);
+
+        drop(traces);
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule trace");
+        let mut schedule_lines = schedule.lines();
+        let schedule_header: Vec<_> = schedule_lines
+            .next()
+            .expect("schedule header")
+            .split(',')
+            .collect();
+        let schedule_rows: Vec<_> = schedule_lines.collect();
+        assert_eq!(
+            schedule_rows.len(),
+            1,
+            "one terminal row for the exact cell"
+        );
+        let schedule_fields: Vec<_> = schedule_rows[0].split(',').collect();
+        assert_eq!(
+            schedule_fields.len(),
+            schedule_header.len(),
+            "complete typed schedule row"
+        );
+        let schedule_field = |name: &str| {
+            let index = schedule_header
+                .iter()
+                .position(|column| *column == name)
+                .unwrap_or_else(|| panic!("missing schedule column {name}"));
+            schedule_fields[index]
+        };
+        assert_eq!(schedule_field("direction"), "outgoing");
+        assert_eq!(schedule_field("size"), "1200");
+        assert_eq!(schedule_field("satisfaction"), "satisfied");
+        assert_eq!(schedule_field("miss_reason"), "");
+        assert_eq!(
+            schedule_field("slot_id"),
+            outgoing_slot.0.to_string(),
+            "the committed outgoing identity terminates exactly once"
+        );
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        let mut lines = packets.lines();
+        let header: Vec<_> = lines.next().expect("packet header").split(',').collect();
+        let packet_rows: Vec<_> = lines.collect();
+        assert_eq!(packet_rows.len(), 1, "no early or catch-up datagram");
+        let fields: Vec<_> = packet_rows[0].split(',').collect();
+        assert_eq!(fields.len(), header.len(), "complete typed packet row");
+        let field = |name: &str| {
+            let index = header
+                .iter()
+                .position(|column| *column == name)
+                .unwrap_or_else(|| panic!("missing packet column {name}"));
+            fields[index]
+        };
+        assert_eq!(field("observed_udp_length"), "1200");
+        assert_eq!(field("scheduled_target"), "1200");
+        assert_eq!(field("satisfaction"), "satisfied");
+        assert_eq!(field("send_policy"), "exact");
+        assert!(
+            field("defense_control_bytes")
+                .parse::<u16>()
+                .expect("defense-control composition bytes")
+                > 0,
+            "the exact cell carries the simultaneous receive-limit control"
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    async fn fractional_rolling_release_waits_for_the_exact_adapter_boundary() {
+        for adapter_skew_ns in [1, 500, 999] {
+            assert_fractional_adapter_release_redrive(adapter_skew_ns).await;
+        }
     }
 
     #[test]
@@ -13747,6 +14199,52 @@ mod tests {
     }
 
     #[test]
+    fn strict_socket_handoff_is_isolated_to_candidate_evidence_paths() {
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Static {
+                schedule: "schedule.csv".into(),
+                padding_only: false,
+            },
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::TrafficMorphing(TrafficMorphingConfig::default()),
+            DefenseConfig::WtfPad(WtfPadConfig::default()),
+            DefenseConfig::WalkieTalkie(WalkieTalkieConfig::default()),
+        ] {
+            assert!(!is_candidate_defense(&defense));
+            assert_eq!(
+                SocketHandoffPolicy::for_defense(&defense),
+                SocketHandoffPolicy::HistoricalBestEffort
+            );
+        }
+        for defense in [
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "buflo.json".into(),
+            }),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "cs-buflo.json".into(),
+            }),
+        ] {
+            assert!(is_candidate_defense(&defense));
+            assert_eq!(
+                SocketHandoffPolicy::for_defense(&defense),
+                SocketHandoffPolicy::CandidateFidelityStrict
+            );
+        }
+        assert_eq!(
+            SocketHandoffPolicy::for_response_qualification(ResponseQualificationMode::Legacy),
+            SocketHandoffPolicy::HistoricalBestEffort
+        );
+        assert_eq!(
+            SocketHandoffPolicy::for_response_qualification(
+                ResponseQualificationMode::SustainedIdentity
+            ),
+            SocketHandoffPolicy::CandidateFidelityStrict
+        );
+    }
+
+    #[test]
     fn old_presets_remain_profile_aliases() {
         let front = resolve_run_config(
             None,
@@ -14287,10 +14785,35 @@ mod tests {
             SocketHandoff::Sent(before_deadline)
         );
 
+        for attempted_at in [deadline, deadline + Duration::from_nanos(1)] {
+            let mut sends = 0;
+            let error = attempt_socket_handoff(
+                &[deadline],
+                None,
+                || {
+                    sends += 1;
+                    Ok(())
+                },
+                || attempted_at,
+            )
+            .expect_err("an expired target window must fail before the syscall");
+            assert_eq!(sends, 0);
+            assert!(matches!(
+                error,
+                Error::SlotInvariant(message) if message.contains("before socket handoff")
+            ));
+        }
+
         for sent_at in [deadline, deadline + Duration::from_nanos(1)] {
+            let mut handoff_clock = [before_deadline, sent_at].into_iter();
             assert_eq!(
-                attempt_socket_handoff(&[deadline], None, || Ok(()), || sent_at)
-                    .expect("the successful handoff must retain its late wire receipt"),
+                attempt_socket_handoff(
+                    &[deadline],
+                    None,
+                    || Ok(()),
+                    || { handoff_clock.next().expect("pre/post target handoff clock") }
+                )
+                .expect("the successful handoff must retain its late wire receipt"),
                 SocketHandoff::SentLate {
                     sent_at,
                     deadline,
@@ -14333,7 +14856,16 @@ mod tests {
 
         let release_at = started + packet.timestamp();
         let adapter_deadline = release_at + Duration::from_micros(5_000);
-        let mut times = VecDeque::from([release_at, release_at, adapter_deadline]);
+        let before_deadline = adapter_deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("adapter deadline has a predecessor");
+        let mut times = VecDeque::from([
+            release_at,
+            release_at,
+            release_at,
+            before_deadline,
+            adapter_deadline,
+        ]);
         let mut monotonic_clock = || times.pop_front().unwrap_or(adapter_deadline);
         let error = drive_endpoint_output_with_clock(
             0,
@@ -14367,6 +14899,129 @@ mod tests {
         let events = fs::read_to_string(output.join("events.csv")).expect("event trace");
         assert!(events.contains("slot_satisfied"));
         assert!(events.contains("\"\"type\"\":\"\"datagram\"\""));
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one strict-failure oracle spans transport commit, OS error, abort cleanup, and immutable trace evidence"
+    )]
+    async fn candidate_runner_propagates_strict_os_handoff_errors() {
+        let output = trace_output_dir("candidate-strict-socket-error");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let mut controller = rolling_abort_controller(packet);
+        let preview = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("rolling preview");
+        let preview_slot = match &preview {
+            QcsdAction::PrearmPacket { slot, .. } => *slot,
+            _ => unreachable!("selected rolling preview"),
+        };
+        let mut endpoints = vec![connected_runner_endpoint(
+            &output,
+            started,
+            &observation_clock,
+        )];
+        endpoints[0].socket_handoff_policy = SocketHandoffPolicy::CandidateFidelityStrict;
+        endpoints[0].test_strict_socket_handoff_error = Some(libc::EMSGSIZE);
+        drop(endpoints[0].client.qcsd_timestamped_observations());
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            vec![preview],
+        )
+        .expect("apply rolling preview");
+
+        let release_at = started + packet.timestamp();
+        let mut release_clock = || release_at;
+        let error = drive_endpoint_output_with_clock(
+            0,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(started),
+            &mut release_clock,
+        )
+        .await
+        .expect_err("candidate runner must propagate a failed OS handoff");
+        assert!(matches!(
+            error,
+            Error::Io(source) if source.raw_os_error() == Some(libc::EMSGSIZE)
+        ));
+        assert_eq!(
+            endpoints[0].test_strict_socket_handoff_error, None,
+            "the injected OS error reaches exactly one strict send attempt"
+        );
+        assert_eq!(controller.pending_slots(), [(preview_slot, packet)]);
+        assert_eq!(traces.pending_slots().len(), 1);
+        assert!(!traces.is_slot_terminal(preview_slot));
+
+        cancel_uncommitted_prearms_on_abort(
+            &mut endpoints,
+            &mut controller,
+            &mut traces,
+            release_at,
+        )
+        .expect("strict handoff abort cleanup");
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            release_at,
+            packet.timestamp(),
+            MissedSlotReason::RunAborted,
+        )
+        .expect("terminalize strict handoff failure");
+        // The production cleanup path is idempotent if error unwinding reaches
+        // it again; no second terminal receipt may be written.
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            release_at,
+            packet.timestamp(),
+            MissedSlotReason::RunAborted,
+        )
+        .expect("repeat terminal cleanup remains idempotent");
+        traces
+            .ensure_no_pending_slots()
+            .expect("strict failure leaves no unresolved trace slot");
+
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(
+            packets.lines().count(),
+            1,
+            "failed OS handoff cannot write a successful packet row"
+        );
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule trace");
+        let mut lines = schedule.lines();
+        let header: Vec<_> = lines.next().expect("schedule header").split(',').collect();
+        let rows: Vec<_> = lines.collect();
+        assert_eq!(rows.len(), 1, "strict failure has one terminal receipt");
+        let fields: Vec<_> = rows[0].split(',').collect();
+        assert_eq!(fields.len(), header.len());
+        let field = |name: &str| {
+            let index = header
+                .iter()
+                .position(|column| *column == name)
+                .unwrap_or_else(|| panic!("missing schedule column {name}"));
+            fields[index]
+        };
+        assert_eq!(field("satisfaction"), "missed");
+        assert_eq!(field("miss_reason"), "RunAborted");
+        assert_eq!(field("slot_id"), preview_slot.0.to_string());
         drop(endpoints);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }

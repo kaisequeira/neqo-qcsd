@@ -3618,7 +3618,12 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
-    fn qcsd_required_prefix_predicate_excludes_only_qpack_decoder_output() {
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "one stateful HTTP/3 fixture proves every stream class stays conservatively partitioned"
+    )]
+    fn qcsd_required_stream_predicate_excludes_only_qpack_decoder_output() {
         let (mut client, mut server) = connect();
         client
             .enable_qcsd(
@@ -3644,28 +3649,55 @@ mod tests {
             Some(StreamId::new(10))
         );
 
-        // A shaped application request blocks unless it is explicitly in the
-        // late-request set.
+        // A shaped application request blocks unless it is explicitly allowed.
         let request = make_request(&mut client, false, &[]);
+        client
+            .register_qcsd_stream(request, QcsdRequestRole::Application, None)
+            .unwrap();
+        assert!(client.qcsd_has_pending_required_stream_send(&[]));
         assert!(client.qcsd_has_pending_required_prefix_stream_send(&[]));
+        assert!(!client.qcsd_has_pending_required_stream_send(&[request]));
         assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[request]));
 
+        // A chaff request is also required when no request exception names it.
+        // Allowing the application request alone must not hide chaff backlog.
+        let chaff = client
+            .qcsd_fetch_nonblocking(now(), &Uri::from_static("https://something.com/chaff"), &[])
+            .unwrap();
+        client
+            .register_qcsd_stream(
+                chaff,
+                QcsdRequestRole::Chaff {
+                    resource_id: 91,
+                    request_id: Some(QcsdChaffRequestId(92)),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(client.qcsd_has_pending_required_stream_send(&[request]));
+        assert!(!client.qcsd_has_pending_required_stream_send(&[request, chaff]));
+
         // A queued control-stream PRIORITY_UPDATE remains request-causal even
-        // when the request itself is explicitly late.
+        // when both request streams are explicitly allowed.
         assert!(
             client
                 .priority_update(request, Priority::new(6, false))
                 .unwrap()
         );
-        assert!(client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+        assert!(client.qcsd_has_pending_required_stream_send(&[request, chaff]));
 
-        // Flush the request and control update before inducing peer-response
-        // decoder feedback.
+        // Flush both requests and the control update before inducing
+        // peer-response decoder feedback.
         client.qcsd_enable_send_shaping(false);
-        let output = client.process_output(now());
-        let output = server.conn.process(output.dgram(), now());
-        drop(client.process(output.dgram(), now()));
-        assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+        for _ in 0..8 {
+            if !client.qcsd_has_pending_required_stream_send(&[request, chaff]) {
+                break;
+            }
+            let output = client.process_output(now());
+            let output = server.conn.process(output.dgram(), now());
+            drop(client.process(output.dgram(), now()));
+        }
+        assert!(!client.qcsd_has_pending_required_stream_send(&[request, chaff]));
         client.qcsd_enable_send_shaping(true);
 
         // Server dynamic-table response headers generate client QPACK decoder
@@ -3701,7 +3733,44 @@ mod tests {
             client.qcsd_qpack_decoder_handler_pending()
                 || client.qcsd_qpack_decoder_transport_pending()
         );
-        assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[request]));
+        assert!(!client.qcsd_has_pending_required_stream_send(&[]));
+        assert!(!client.qcsd_has_pending_required_prefix_stream_send(&[]));
+
+        // The similarly critical QPACK encoder is not excluded. A pending
+        // capacity update must continue to block required-stream completion.
+        client
+            .base_handler
+            .qpack_encoder()
+            .borrow_mut()
+            .set_max_capacity(0)
+            .unwrap();
+        assert!(
+            client
+                .base_handler
+                .qpack_encoder()
+                .borrow()
+                .has_pending_send()
+        );
+        assert!(client.qcsd_has_pending_required_stream_send(&[]));
+
+        // Once encoder output is handed to transport and flushed, an unknown
+        // transport stream remains blocking; it is never inferred to be the
+        // decoder stream merely because it is unidirectional.
+        client.qcsd_enable_send_shaping(false);
+        for _ in 0..8 {
+            if !client.qcsd_has_pending_required_stream_send(&[]) {
+                break;
+            }
+            let output = client.process_output(now());
+            let output = server.conn.process(output.dgram(), now());
+            drop(client.process(output.dgram(), now()));
+        }
+        assert!(!client.qcsd_has_pending_required_stream_send(&[]));
+        client.qcsd_enable_send_shaping(true);
+        let unknown = client.conn.stream_create(StreamType::UniDi).unwrap();
+        assert_eq!(client.conn.stream_send(unknown, b"unknown").unwrap(), 7);
+        assert!(client.qcsd_has_pending_required_stream_send(&[]));
+        assert!(client.qcsd_has_pending_required_prefix_stream_send(&[]));
     }
 
     #[cfg(feature = "qcsd")]

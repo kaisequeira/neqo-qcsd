@@ -110,6 +110,18 @@ impl Socket {
         })
     }
 
+    /// Send a fidelity-sensitive QCSD [`datagram::Batch`].
+    ///
+    /// Unlike [`Self::send`], this preserves interface-buffer exhaustion and
+    /// message-too-large errors so a dropped defense datagram can never be
+    /// receipted as a successful socket handoff.
+    #[cfg(feature = "qcsd")]
+    pub fn send_qcsd(&self, d: &datagram::Batch) -> io::Result<()> {
+        self.inner.try_io(tokio::io::Interest::WRITABLE, || {
+            neqo_udp::send_inner_qcsd(&self.state, (&self.inner).into(), d)
+        })
+    }
+
     /// Receive a batch of [`neqo_common::Datagram`]s on the given [`Socket`], each set with
     /// the provided local address.
     pub fn recv<'a>(
