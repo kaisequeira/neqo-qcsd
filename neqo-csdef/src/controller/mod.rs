@@ -2794,9 +2794,19 @@ impl QcsdController {
         self.release_chaff_send_shaping_if_needed();
 
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        let boundary_us = ControlLoop::boundary_us(elapsed_us, self.config.control_interval_us);
-        if self.control.should_process_incoming(boundary_us) {
-            self.process_incoming(boundary_us, elapsed);
+        if self.defense.incoming_slot_must_resolve_in_window() {
+            // Exact-window opportunities can occur anywhere inside the
+            // controller's legacy control interval (CS-BuFLO deliberately
+            // jitters them).  Handle each due event at the current instant;
+            // rounding it to the next interval can move the first allocation
+            // attempt beyond its exclusive deadline.  Exact-window failures
+            // are terminal, so this cannot create a retry or catch-up loop.
+            self.process_incoming(elapsed_us, elapsed);
+        } else {
+            let boundary_us = ControlLoop::boundary_us(elapsed_us, self.config.control_interval_us);
+            if self.control.should_process_incoming(boundary_us) {
+                self.process_incoming(boundary_us, elapsed);
+            }
         }
         self.retry_pending_parser_leases();
 
@@ -17123,6 +17133,63 @@ mod tests {
             action,
             QcsdAction::SlotMissed { .. } | QcsdAction::SlotSatisfied { .. }
         )));
+    }
+
+    #[test]
+    fn exact_incoming_inside_processed_bucket_is_allocated_at_due_instant() {
+        // Include every within-bucket offset observed in the failed live
+        // cohort, plus one event close to the next legacy boundary.
+        for due_us in [50, 76, 202, 384, 597, 836, 4_900] {
+            let due = Duration::from_micros(due_us);
+            let packet = Packet::new(due, Direction::Incoming, 100).expect("packet");
+            let (defense, _) = ExactIncomingOneShot::new(packet);
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    control_interval_us: 5_000,
+                    max_stream_data_excess: 1_000,
+                    drop_unsatisfied_events: false,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(defense),
+            )
+            .expect("controller");
+            ready(&mut controller, 1, "https://example.com");
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(0),
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(1_000),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+
+            // Mark the containing legacy bucket as processed before the
+            // jittered event becomes due. Exact-window defenses must not
+            // inherit that bucket's gate when the event appears later in the
+            // same interval.
+            controller.poll(Duration::from_micros(due_us - 1));
+            assert_eq!(controller.next_deadline(), Some(due));
+            assert!(controller.control.incoming.is_empty());
+
+            controller.poll(due);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                QcsdAction::IncreaseReceiveLimit {
+                    packet: observed,
+                    ..
+                } if *observed == packet
+            )));
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, QcsdAction::SlotMissed { .. }))
+            );
+            assert!(controller.control.incoming.is_empty());
+        }
     }
 
     #[test]
