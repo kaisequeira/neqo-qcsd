@@ -3797,13 +3797,14 @@ mod tests {
         duration_as_floor_micros,
     };
     use crate::{
-        Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction,
-        EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdConfig,
-        QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner,
-        QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSendPolicy, QcsdSlotId, QcsdStreamFinish,
-        QcsdStreamId, Resource, ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace,
-        TrafficMorphing, TrafficMorphingConfig, WalkieTalkie, WalkieTalkieConfig, WtfPad,
-        WtfPadConfig,
+        Buflo, BufloParameters, CsBuflo, CsBufloEarlyTermination, CsBufloPaddingMode,
+        CsBufloParameters, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal,
+        Direction, EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdConfig,
+        QcsdDatagramClass, QcsdEndpointId, QcsdImplementationScope, QcsdObservation,
+        QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSendPolicy,
+        QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, Resource,
+        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphing,
+        TrafficMorphingConfig, WalkieTalkie, WalkieTalkieConfig, WtfPad, WtfPadConfig,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9344,6 +9345,352 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the two-endpoint oracle settles both send and receive slot identities"
+    )]
+    fn exercise_candidate_across_two_endpoints(
+        defense: Box<dyn Defense>,
+        packet_size: u16,
+        expected_send_policy: QcsdSendPolicy,
+    ) -> (
+        QcsdController,
+        Vec<QcsdEndpointId>,
+        Vec<(QcsdEndpointId, QcsdStreamId)>,
+    ) {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                control_interval_us: 5_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            defense,
+        )
+        .expect("candidate controller");
+        let endpoints = [
+            (QcsdEndpointId(1), QcsdStreamId(0), "https://one.example"),
+            (QcsdEndpointId(2), QcsdStreamId(4), "https://two.example"),
+        ];
+        for (endpoint, stream, origin) in endpoints {
+            ready(&mut controller, endpoint.0, origin);
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(10_000),
+                },
+                Duration::ZERO,
+            );
+        }
+        let configured: Vec<_> = controller
+            .drain_actions()
+            .map(|action| match action {
+                QcsdAction::ConfigureManualReceive {
+                    endpoint, stream, ..
+                } => (endpoint, stream),
+                _ => panic!("unexpected endpoint setup action: {action:?}"),
+            })
+            .collect();
+        assert_eq!(
+            configured,
+            [
+                (QcsdEndpointId(1), QcsdStreamId(0)),
+                (QcsdEndpointId(2), QcsdStreamId(4)),
+            ]
+        );
+        for (endpoint, _, origin) in endpoints {
+            assert_eq!(
+                controller
+                    .endpoint_origins
+                    .get(&endpoint)
+                    .map(String::as_str),
+                Some(origin)
+            );
+            assert!(
+                controller.streams.capacity(endpoint).application_incoming
+                    >= u64::from(packet_size) * 2
+            );
+        }
+
+        let mut at = Duration::ZERO;
+        let mut outgoing_endpoints = Vec::new();
+        let mut incoming_streams = Vec::new();
+        let mut scheduled_slots = BTreeSet::new();
+        for _ in 0..64 {
+            let deadline = controller
+                .next_deadline()
+                .expect("candidate retains a next opportunity");
+            at = at.max(deadline);
+            controller.poll(at);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            let mut terminal_observations = Vec::new();
+            let mut incoming_slots = Vec::new();
+            for action in actions {
+                match action {
+                    QcsdAction::SendPacket {
+                        endpoint,
+                        packet,
+                        slot,
+                        allow_stream_data,
+                        send_policy,
+                        ..
+                    } => {
+                        assert!(endpoints.iter().any(|candidate| candidate.0 == endpoint));
+                        assert_eq!(packet.direction(), Direction::Outgoing);
+                        assert_eq!(packet.length(), packet_size);
+                        assert!(allow_stream_data);
+                        assert_eq!(send_policy, expected_send_policy);
+                        assert!(scheduled_slots.insert(slot), "slot identity was reused");
+                        outgoing_endpoints.push(endpoint);
+                        terminal_observations.push(match send_policy {
+                            QcsdSendPolicy::Exact => QcsdObservation::SlotSatisfied {
+                                endpoint,
+                                slot,
+                                observed_size: packet.length(),
+                            },
+                            QcsdSendPolicy::CongestionSensitive => QcsdObservation::SlotResolved {
+                                endpoint,
+                                slot,
+                                packet,
+                                outcome: QcsdSlotOutcome::Full {
+                                    composition: QcsdSlotComposition {
+                                        desired_udp_bytes: packet.length(),
+                                        observed_udp_bytes: packet.length(),
+                                        defense_control_bytes: 1,
+                                        quic_padding_bytes: packet.length() - 1,
+                                        ..QcsdSlotComposition::default()
+                                    },
+                                },
+                            },
+                        });
+                    }
+                    QcsdAction::IncreaseReceiveLimit {
+                        endpoint,
+                        stream,
+                        absolute_limit,
+                        packet,
+                        slot,
+                    } => {
+                        assert!(
+                            endpoints.iter().any(|candidate| {
+                                candidate.0 == endpoint && candidate.1 == stream
+                            })
+                        );
+                        assert_eq!(packet.direction(), Direction::Incoming);
+                        assert_eq!(packet.length(), packet_size);
+                        assert!(scheduled_slots.insert(slot), "slot identity was reused");
+                        incoming_streams.push((endpoint, stream));
+                        incoming_slots.push((slot, endpoint, packet));
+                        terminal_observations.push(QcsdObservation::ReceiveLimitAdvertised {
+                            endpoint,
+                            stream,
+                            absolute_limit,
+                            slot: Some(slot),
+                        });
+                        let consumed = controller
+                            .streams
+                            .consumed(endpoint, stream)
+                            .expect("registered application stream");
+                        let bytes = absolute_limit.saturating_sub(consumed);
+                        assert!(bytes >= u64::from(packet.length()));
+                        terminal_observations.push(QcsdObservation::BytesRead {
+                            endpoint,
+                            stream,
+                            bytes,
+                        });
+                    }
+                    QcsdAction::SlotMissed { reason, .. } => {
+                        panic!("candidate opportunity was missed: {reason:?}");
+                    }
+                    _ => panic!("unexpected candidate action: {action:?}"),
+                }
+            }
+            for observation in terminal_observations {
+                controller.observe(observation, at);
+            }
+            controller.drain_observations();
+            let terminal_actions: Vec<_> = controller.drain_actions().collect();
+            assert_eq!(terminal_actions.len(), incoming_slots.len());
+            for action in terminal_actions {
+                let QcsdAction::SlotSatisfied {
+                    endpoint: Some(endpoint),
+                    packet,
+                    slot,
+                } = action
+                else {
+                    panic!("unexpected incoming terminal action: {action:?}");
+                };
+                assert_eq!(packet.direction(), Direction::Incoming);
+                assert!(incoming_slots.iter().any(|candidate| {
+                    candidate.0 == slot && candidate.1 == endpoint && candidate.2 == packet
+                }));
+            }
+            if outgoing_endpoints.len() >= 2 && incoming_streams.len() >= 2 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            outgoing_endpoints.get(..2),
+            Some(&[QcsdEndpointId(1), QcsdEndpointId(2)][..])
+        );
+        assert_eq!(
+            incoming_streams.get(..2),
+            Some(
+                &[
+                    (QcsdEndpointId(1), QcsdStreamId(0)),
+                    (QcsdEndpointId(2), QcsdStreamId(4)),
+                ][..]
+            )
+        );
+        assert_eq!(
+            scheduled_slots.len(),
+            outgoing_endpoints.len() + incoming_streams.len()
+        );
+        assert!(controller.pending_slots().is_empty());
+        assert!(controller.control.outgoing.is_empty());
+        assert!(controller.control.incoming.is_empty());
+        assert!(controller.control.credit.is_empty());
+        assert!(controller.control.claims.is_empty());
+        assert!(controller.incoming_credit_ledger.is_empty());
+        assert_eq!(controller.terminal_failure(), None);
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            diagnostics.scheduled_incoming_requested_bytes,
+            u64::try_from(incoming_streams.len()).expect("incoming count") * u64::from(packet_size)
+        );
+        assert_eq!(
+            diagnostics.scheduled_incoming_advertised_bytes,
+            diagnostics.scheduled_incoming_requested_bytes
+        );
+        assert_eq!(
+            diagnostics.scheduled_incoming_consumed_bytes,
+            diagnostics.scheduled_incoming_requested_bytes
+        );
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        (controller, outgoing_endpoints, incoming_streams)
+    }
+
+    #[test]
+    fn buflo_settles_exact_cells_across_two_endpoint_origins() {
+        let defense = Buflo::from_parameters(BufloParameters {
+            schema_version: 1,
+            interval_us: 5_000,
+            minimum_duration_us: 20_000,
+            packet_size: 1_200,
+            max_events: 100,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        });
+        let (controller, outgoing, incoming) = exercise_candidate_across_two_endpoints(
+            Box::new(defense),
+            1_200,
+            QcsdSendPolicy::Exact,
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert!(diagnostics.buflo_client_only);
+        assert!(!diagnostics.buflo_paper_equivalent);
+        assert_eq!(
+            diagnostics.buflo_scheduled_outgoing_cells,
+            outgoing.len() as u64
+        );
+        assert_eq!(
+            diagnostics.buflo_scheduled_incoming_cells,
+            incoming.len() as u64
+        );
+        assert_eq!(diagnostics.buflo_full_outgoing_cells, outgoing.len() as u64);
+        assert_eq!(diagnostics.buflo_partial_outgoing_cells, 0);
+        assert_eq!(diagnostics.buflo_suppressed_outgoing_cells, 0);
+        assert_eq!(diagnostics.buflo_missed_outgoing_cells, 0);
+        assert_eq!(diagnostics.buflo_missed_incoming_cells, 0);
+        assert_eq!(diagnostics.buflo_catch_up_outgoing_cells, 0);
+        assert_eq!(diagnostics.buflo_catch_up_incoming_cells, 0);
+        assert_eq!(diagnostics.buflo_outgoing_unresolved_cells, 0);
+        assert_eq!(diagnostics.buflo_incoming_unresolved_cells, 0);
+    }
+
+    #[test]
+    fn cs_buflo_settles_one_shot_opportunities_across_two_endpoint_origins() {
+        let defense = CsBuflo::from_parameters(
+            CsBufloParameters {
+                schema_version: 1,
+                packet_size: 600,
+                initial_interval_us: 8_192,
+                minimum_interval_us: 4_096,
+                maximum_interval_us: 32_768,
+                initial_adaptation_boundary_bytes: 16_384,
+                quiet_time_us: 2_000_000,
+                outgoing_padding_mode: CsBufloPaddingMode::Total,
+                incoming_padding_mode: CsBufloPaddingMode::Payload,
+                timing_sample_limit: 1_000,
+                jitter_denominator: 100,
+                jitter_max_numerator: 200,
+                early_termination: CsBufloEarlyTermination::Local,
+                max_events: 1_000,
+                implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+                paper_equivalent: false,
+            },
+            42,
+        );
+        let (controller, outgoing, incoming) = exercise_candidate_across_two_endpoints(
+            Box::new(defense),
+            600,
+            QcsdSendPolicy::CongestionSensitive,
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert!(diagnostics.cs_buflo_client_only);
+        assert!(!diagnostics.cs_buflo_paper_equivalent);
+        assert_eq!(
+            diagnostics.cs_buflo_scheduled_outgoing_cells,
+            outgoing.len() as u64
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_scheduled_incoming_cells,
+            incoming.len() as u64
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_full_outgoing_cells,
+            outgoing.len() as u64
+        );
+        assert_eq!(diagnostics.cs_buflo_partial_outgoing_cells, 0);
+        assert_eq!(diagnostics.cs_buflo_suppressed_outgoing_cells, 0);
+        assert_eq!(diagnostics.cs_buflo_missed_outgoing_cells, 0);
+        assert_eq!(diagnostics.cs_buflo_missed_incoming_cells, 0);
+        assert_eq!(
+            diagnostics.cs_buflo_desired_udp_bytes,
+            outgoing.len() as u64 * 600
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_realized_udp_bytes,
+            diagnostics.cs_buflo_desired_udp_bytes
+        );
+        assert_eq!(diagnostics.cs_buflo_application_stream_bytes, 0);
+        assert_eq!(diagnostics.cs_buflo_retransmission_stream_bytes, 0);
+        assert_eq!(diagnostics.cs_buflo_chaff_stream_bytes, 0);
+        assert_eq!(
+            diagnostics.cs_buflo_defense_control_bytes,
+            outgoing.len() as u64
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_quic_padding_bytes,
+            outgoing.len() as u64 * 599
+        );
+        assert_eq!(diagnostics.cs_buflo_other_quic_bytes, 0);
+        assert_eq!(diagnostics.cs_buflo_lateness_us_total, 0);
+        assert_eq!(diagnostics.cs_buflo_lateness_us_max, 0);
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_local_realized_cells,
+            incoming.len() as u64
+        );
+        assert_eq!(diagnostics.cs_buflo_outgoing_unresolved_cells, 0);
+        assert_eq!(diagnostics.cs_buflo_incoming_unresolved_cells, 0);
     }
 
     #[test]
