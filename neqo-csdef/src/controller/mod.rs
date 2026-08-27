@@ -2838,8 +2838,24 @@ impl QcsdController {
     /// Endpoint owning the currently staged rolling preview, if any.
     #[must_use]
     pub const fn rolling_outgoing_prearm_endpoint(&self) -> Option<QcsdEndpointId> {
+        match self.rolling_outgoing_prearm_identity() {
+            Some((endpoint, _, _)) => Some(endpoint),
+            None => None,
+        }
+    }
+
+    /// Exact identity of the currently staged rolling preview, if any.
+    ///
+    /// The runner uses the complete identity at a fidelity-sensitive release
+    /// boundary.  Endpoint-only matching is insufficient because a stale
+    /// adapter preview could otherwise be confused with a later slot owned by
+    /// the same connection.
+    #[must_use]
+    pub const fn rolling_outgoing_prearm_identity(
+        &self,
+    ) -> Option<(QcsdEndpointId, crate::Packet, QcsdSlotId)> {
         match self.rolling_outgoing_prearm {
-            Some(prearm) => Some(prearm.endpoint),
+            Some(prearm) => Some((prearm.endpoint, prearm.packet, prearm.slot)),
             None => None,
         }
     }
@@ -15771,6 +15787,10 @@ mod tests {
         };
         assert_eq!(endpoint, QcsdEndpointId(1));
         assert_eq!(packet.timestamp(), Duration::from_micros(40));
+        assert_eq!(
+            controller.rolling_outgoing_prearm_identity(),
+            Some((endpoint, packet, first_slot))
+        );
 
         controller.observe(
             QcsdObservation::EndpointClosed { endpoint },
@@ -15806,6 +15826,10 @@ mod tests {
         assert_eq!(
             controller.rolling_outgoing_prearm_endpoint(),
             Some(QcsdEndpointId(2))
+        );
+        assert_eq!(
+            controller.rolling_outgoing_prearm_identity(),
+            Some((QcsdEndpointId(2), packet, *replacement_slot))
         );
         assert!(controller.pending_slots().is_empty());
         assert!(!actions.iter().any(|action| matches!(

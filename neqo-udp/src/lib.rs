@@ -16,6 +16,7 @@ use std::{
     iter,
     net::SocketAddr,
     slice::{self, ChunksMut},
+    time::Instant,
 };
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use std::{os::fd::AsRawFd as _, ptr};
@@ -89,7 +90,8 @@ fn send_inner_with_error_mode(
     socket: quinn_udp::UdpSockRef<'_>,
     d: &datagram::Batch,
     error_mode: SendErrorMode,
-) -> io::Result<()> {
+    timestamp: impl FnOnce() -> Option<Instant>,
+) -> io::Result<Option<Instant>> {
     let transmit = Transmit {
         destination: d.destination(),
         ecn: EcnCodepoint::from_bits(Into::<u8>::into(d.tos())),
@@ -110,18 +112,25 @@ fn send_inner_with_error_mode(
                     d.source(),
                     d.destination()
                 );
-                return Ok(());
+                return Ok(None);
             }
             SendErrorAction::IgnoreNoBufferSpace => {
                 // The send queue is momentarily full. Don't map to WouldBlock: the
                 // socket IS writable, so edge-triggered epoll/kqueue won't re-signal
                 // and the send loop would hang. Drop the packet; QUIC will retransmit.
                 qdebug!("Interface send queue full (ENOBUFS), dropping packet: {error}");
-                return Ok(());
+                return Ok(None);
             }
             SendErrorAction::Propagate => return Err(error),
         },
     }
+
+    // Sample at the lowest portable boundary immediately after quinn-udp's
+    // successful nonblocking send call. This is a conservative post-call
+    // upper bound on socket handoff, never a kernel-transmit, NIC, or capture
+    // timestamp. A caller-side clock read can be delayed after the syscall has
+    // already handed the datagram to the OS and is therefore not valid here.
+    let handed_off_at = timestamp();
 
     qtrace!(
         "sent {} bytes, in {} segments, each {} bytes, from {} to {} ",
@@ -132,7 +141,7 @@ fn send_inner_with_error_mode(
         d.destination(),
     );
 
-    Ok(())
+    Ok(handed_off_at)
 }
 
 /// Send a [`datagram::Batch`], retaining the historical best-effort treatment
@@ -142,7 +151,7 @@ pub fn send_inner(
     socket: quinn_udp::UdpSockRef<'_>,
     d: &datagram::Batch,
 ) -> io::Result<()> {
-    send_inner_with_error_mode(state, socket, d, SendErrorMode::Standard)
+    send_inner_with_error_mode(state, socket, d, SendErrorMode::Standard, || None).map(drop)
 }
 
 /// Send a [`datagram::Batch`] for a QCSD fidelity-sensitive socket handoff.
@@ -155,7 +164,25 @@ pub fn send_inner_qcsd(
     socket: quinn_udp::UdpSockRef<'_>,
     d: &datagram::Batch,
 ) -> io::Result<()> {
-    send_inner_with_error_mode(state, socket, d, SendErrorMode::QcsdStrict)
+    send_inner_with_error_mode(state, socket, d, SendErrorMode::QcsdStrict, || None).map(drop)
+}
+
+/// Send a fidelity-sensitive QCSD batch and return the immediate monotonic
+/// timestamp sampled at the low-level successful socket handoff boundary.
+pub fn send_inner_qcsd_timestamped<F: FnOnce() -> Instant>(
+    state: &UdpSocketState,
+    socket: quinn_udp::UdpSockRef<'_>,
+    d: &datagram::Batch,
+    clock: F,
+) -> io::Result<Instant> {
+    send_inner_with_error_mode(
+        state,
+        socket,
+        d,
+        SendErrorMode::QcsdStrict,
+        || Some(clock()),
+    )?
+    .ok_or_else(|| io::Error::other("strict QCSD send omitted its socket timestamp"))
 }
 
 #[cfg(unix)]
@@ -413,6 +440,14 @@ mod tests {
         // Reverse non-blocking flag set by `UdpSocketState` to make the test non-racy.
         socket.inner.set_nonblocking(false)?;
         Ok(socket)
+    }
+
+    fn now() -> Instant {
+        #![expect(
+            clippy::disallowed_methods,
+            reason = "the timestamp boundary test needs a monotonic clock"
+        )]
+        Instant::now()
     }
 
     #[test]
@@ -758,6 +793,33 @@ mod tests {
             "expected EMSGSIZE-compatible error, got {error:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn timestamped_qcsd_send_samples_the_low_level_success_boundary() -> Result<(), io::Error> {
+        let sender = socket()?;
+        let receiver = socket()?;
+        let batch: datagram::Batch = Datagram::new(
+            sender.inner.local_addr()?,
+            receiver.inner.local_addr()?,
+            Tos::from((Dscp::Le, Ecn::Ect0)),
+            b"timestamped-qcsd-send".to_vec(),
+        )
+        .into();
+        let before = now();
+        let handed_off_at =
+            send_inner_qcsd_timestamped(&sender.state, (&sender.inner).into(), &batch, now)?;
+        let after = now();
+        assert!(handed_off_at >= before);
+        assert!(handed_off_at <= after);
+
+        let mut recv_buf = RecvBuf::default();
+        let received_datagram = receiver
+            .recv("127.0.0.1:0".parse().unwrap(), &mut recv_buf)?
+            .next()
+            .expect("timestamped datagram reaches receiver");
+        assert_eq!(received_datagram.as_ref(), batch.data());
         Ok(())
     }
 

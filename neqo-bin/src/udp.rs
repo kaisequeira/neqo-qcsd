@@ -6,6 +6,8 @@
 
 #![expect(clippy::missing_errors_doc, reason = "Passing up tokio errors.")]
 
+#[cfg(feature = "qcsd")]
+use std::time::Instant;
 use std::{io, net::SocketAddr};
 
 use neqo_common::{datagram, qdebug};
@@ -119,6 +121,19 @@ impl Socket {
     pub fn send_qcsd(&self, d: &datagram::Batch) -> io::Result<()> {
         self.inner.try_io(tokio::io::Interest::WRITABLE, || {
             neqo_udp::send_inner_qcsd(&self.state, (&self.inner).into(), d)
+        })
+    }
+
+    /// Send a fidelity-sensitive QCSD batch and retain the low-level socket
+    /// handoff timestamp sampled immediately after the nonblocking send.
+    #[cfg(feature = "qcsd")]
+    pub fn send_qcsd_timestamped<F: FnOnce() -> Instant>(
+        &self,
+        d: &datagram::Batch,
+        clock: F,
+    ) -> io::Result<Instant> {
+        self.inner.try_io(tokio::io::Interest::WRITABLE, || {
+            neqo_udp::send_inner_qcsd_timestamped(&self.state, (&self.inner).into(), d, clock)
         })
     }
 
