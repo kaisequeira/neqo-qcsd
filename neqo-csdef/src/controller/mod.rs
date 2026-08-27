@@ -15,10 +15,10 @@ use control_loop::{ControlLoop, PendingClaim, PendingCredit, PendingIncoming, Pe
 use crate::{
     Buflo, Capacity, CapacityAdjustment, CsBuflo, Defense, DefenseConfig, DefenseDiagnostics,
     DefenseMode, DefenseSignal, Direction, EventOutcome, Front, MissedSlotReason, QcsdAction,
-    QcsdConfig, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
-    QcsdRequestRole, QcsdSlotId, QcsdStreamId, ResourceManifest, Result, RoundRobinScheduler,
-    SignalKind, StaticSchedule, Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad,
-    chaff_manager::ChaffManager, stream::StreamRegistry,
+    QcsdChaffCancellationReason, QcsdConfig, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner,
+    QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId, QcsdStreamId, ResourceManifest, Result,
+    RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw, TrafficMorphing, WalkieTalkie,
+    WtfPad, chaff_manager::ChaffManager, stream::StreamRegistry,
 };
 
 /// Exact controller bookkeeping canceled after a typed receive-lifecycle rejection.
@@ -355,6 +355,13 @@ pub struct QcsdController {
     application_complete: bool,
     adapter_egress_backlog_pending: bool,
     last_effective_egress_backlog_pending: Option<bool>,
+    buflo_terminal_subcell_pending_request_cancellations: u64,
+    buflo_terminal_subcell_stream_cancellations: u64,
+    buflo_terminal_subcell_exact_capacity_bytes_cancelled: u64,
+    buflo_terminal_subcell_latched_at_us: Option<u64>,
+    buflo_terminal_subcell_open_streams_at_latch: u64,
+    buflo_terminal_subcell_parser_lease_bytes_at_latch: u64,
+    buflo_terminal_subcell_pending_parser_boundaries_at_latch: u64,
     cs_buflo_local_et_pending_request_cancellations: u64,
     cs_buflo_local_et_stream_cancellations: u64,
     completion_emitted: bool,
@@ -503,6 +510,13 @@ impl QcsdController {
             application_complete: false,
             adapter_egress_backlog_pending: true,
             last_effective_egress_backlog_pending: None,
+            buflo_terminal_subcell_pending_request_cancellations: 0,
+            buflo_terminal_subcell_stream_cancellations: 0,
+            buflo_terminal_subcell_exact_capacity_bytes_cancelled: 0,
+            buflo_terminal_subcell_latched_at_us: None,
+            buflo_terminal_subcell_open_streams_at_latch: 0,
+            buflo_terminal_subcell_parser_lease_bytes_at_latch: 0,
+            buflo_terminal_subcell_pending_parser_boundaries_at_latch: 0,
             cs_buflo_local_et_pending_request_cancellations: 0,
             cs_buflo_local_et_stream_cancellations: 0,
             completion_emitted: false,
@@ -554,6 +568,23 @@ impl QcsdController {
         diagnostics.scheduled_incoming_consumed_bytes = self.scheduled_incoming_consumed_bytes;
         diagnostics.scheduled_incoming_retired_bytes = self.scheduled_incoming_retired_bytes;
         diagnostics.scheduled_incoming_unresolved_bytes = unresolved;
+        diagnostics.buflo_terminal_subcell_pending_request_cancellations =
+            self.buflo_terminal_subcell_pending_request_cancellations;
+        diagnostics.buflo_terminal_subcell_stream_cancellations =
+            self.buflo_terminal_subcell_stream_cancellations;
+        diagnostics.buflo_terminal_subcell_exact_capacity_bytes_cancelled =
+            self.buflo_terminal_subcell_exact_capacity_bytes_cancelled;
+        diagnostics.buflo_terminal_subcell_latched =
+            self.buflo_terminal_subcell_latched_at_us.is_some();
+        diagnostics.buflo_terminal_subcell_latched_at_us = self
+            .buflo_terminal_subcell_latched_at_us
+            .unwrap_or_default();
+        diagnostics.buflo_terminal_subcell_open_streams_at_latch =
+            self.buflo_terminal_subcell_open_streams_at_latch;
+        diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch =
+            self.buflo_terminal_subcell_parser_lease_bytes_at_latch;
+        diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch =
+            self.buflo_terminal_subcell_pending_parser_boundaries_at_latch;
         diagnostics.cs_buflo_local_et_pending_request_cancellations =
             self.cs_buflo_local_et_pending_request_cancellations;
         diagnostics.cs_buflo_local_et_stream_cancellations =
@@ -3600,6 +3631,20 @@ impl QcsdController {
     }
 
     fn candidate_defense_control_backlog_pending(&self) -> bool {
+        let terminal_parser_backlog = self.defense.terminal_chaff_backlog_cell_bytes().is_some()
+            && (!self.parser_lease_ranges.is_empty()
+                || self.streams.has_any_pending_parser_boundary());
+        let open_chaff_schedule_backlog = self.streams.open_chaff_count() > 0
+            && self
+                .defense
+                .terminal_chaff_backlog_cell_bytes()
+                .map_or_else(
+                    || self.defense.terminal_chaff_cancellation_reason().is_none(),
+                    |required| {
+                        self.defense.accepts_new_chaff_requests()
+                            || self.streams.aggregate_capacity().chaff_incoming >= required
+                    },
+                );
         !self.pending_slots.is_empty()
             || !self.control.incoming.is_empty()
             || !self.control.outgoing.is_empty()
@@ -3607,8 +3652,8 @@ impl QcsdController {
             || !self.control.claims.is_empty()
             || !self.control.receiver_continuations.is_empty()
             || !self.incoming_credit_ledger.is_empty()
-            || (!self.defense.cancel_open_chaff_on_completion()
-                && self.streams.open_chaff_count() > 0)
+            || terminal_parser_backlog
+            || open_chaff_schedule_backlog
             || self
                 .chaff
                 .as_ref()
@@ -3631,15 +3676,46 @@ impl QcsdController {
         }
         let pending =
             self.adapter_egress_backlog_pending || self.candidate_defense_control_backlog_pending();
-        if self.last_effective_egress_backlog_pending != Some(pending) {
+        // Candidate termination is irreversible. BuFLO terminal-tail closure
+        // and CS-BuFLO pre-onLoad quiet termination therefore consume a fresh
+        // aggregate `false` snapshot, never a value retained across later
+        // observations. Re-emit it while either candidate remains open even
+        // when the effective boolean did not change.
+        let fresh_candidate_terminal_snapshot = !pending
+            && !self.defense.is_complete()
+            && (self.defense.terminal_chaff_backlog_cell_bytes().is_some()
+                || self.defense.terminal_chaff_cancellation_reason().is_some());
+        if self.last_effective_egress_backlog_pending != Some(pending)
+            || fresh_candidate_terminal_snapshot
+        {
             self.last_effective_egress_backlog_pending = Some(pending);
             self.push_signal(at, SignalKind::EgressBacklog { pending });
         }
     }
 
-    fn terminalize_local_et_chaff(&mut self, at: Duration) {
-        if !self.defense.cancel_open_chaff_on_completion() || !self.defense.is_complete() {
+    fn terminalize_local_chaff(&mut self, at: Duration) {
+        if !self.defense.is_complete() || self.defense.terminal_failure().is_some() {
             return;
+        }
+        let Some(reason) = self.defense.terminal_chaff_cancellation_reason() else {
+            return;
+        };
+        if reason == QcsdChaffCancellationReason::BufloTerminalSubcellTail
+            && self.buflo_terminal_subcell_latched_at_us.is_none()
+        {
+            self.buflo_terminal_subcell_latched_at_us =
+                Some(u64::try_from(at.as_micros()).unwrap_or(u64::MAX));
+            self.buflo_terminal_subcell_open_streams_at_latch =
+                u64::try_from(self.streams.open_chaff_count()).unwrap_or(u64::MAX);
+            self.buflo_terminal_subcell_exact_capacity_bytes_cancelled =
+                self.streams.aggregate_capacity().chaff_incoming;
+            self.buflo_terminal_subcell_parser_lease_bytes_at_latch = self
+                .parser_lease_ranges
+                .values()
+                .flatten()
+                .fold(0_u64, |total, range| total.saturating_add(range.bytes()));
+            self.buflo_terminal_subcell_pending_parser_boundaries_at_latch =
+                u64::try_from(self.streams.pending_parser_boundaries().len()).unwrap_or(u64::MAX);
         }
 
         let queued = std::mem::take(&mut self.actions);
@@ -3653,26 +3729,47 @@ impl QcsdController {
                 if let Some(chaff) = &mut self.chaff {
                     chaff.request_failed(resource.id, Some(request_id));
                 }
-                self.cs_buflo_local_et_pending_request_cancellations = self
-                    .cs_buflo_local_et_pending_request_cancellations
-                    .saturating_add(1);
+                match reason {
+                    QcsdChaffCancellationReason::BufloTerminalSubcellTail => {
+                        self.buflo_terminal_subcell_pending_request_cancellations = self
+                            .buflo_terminal_subcell_pending_request_cancellations
+                            .saturating_add(1);
+                    }
+                    QcsdChaffCancellationReason::CsBufloLocalEarlyTermination => {
+                        self.cs_buflo_local_et_pending_request_cancellations = self
+                            .cs_buflo_local_et_pending_request_cancellations
+                            .saturating_add(1);
+                    }
+                }
             } else {
                 self.actions.push_back(action);
             }
         }
 
         for (endpoint, stream) in self.streams.open_chaff_streams() {
-            self.actions
-                .push_back(QcsdAction::CancelChaff { endpoint, stream });
+            self.actions.push_back(QcsdAction::CancelChaff {
+                endpoint,
+                stream,
+                reason,
+            });
             self.close_stream(endpoint, stream, crate::QcsdStreamFinish::LocalError, at);
-            self.cs_buflo_local_et_stream_cancellations = self
-                .cs_buflo_local_et_stream_cancellations
-                .saturating_add(1);
+            match reason {
+                QcsdChaffCancellationReason::BufloTerminalSubcellTail => {
+                    self.buflo_terminal_subcell_stream_cancellations = self
+                        .buflo_terminal_subcell_stream_cancellations
+                        .saturating_add(1);
+                }
+                QcsdChaffCancellationReason::CsBufloLocalEarlyTermination => {
+                    self.cs_buflo_local_et_stream_cancellations = self
+                        .cs_buflo_local_et_stream_cancellations
+                        .saturating_add(1);
+                }
+            }
         }
     }
 
     fn update_completion(&mut self, elapsed: Duration) {
-        self.terminalize_local_et_chaff(elapsed);
+        self.terminalize_local_chaff(elapsed);
         let has_backlog = self.control.incoming_backlog() > 0
             || self.control.claim_backlog() > 0
             || !self.control.receiver_continuations.is_empty()
@@ -3692,9 +3789,9 @@ impl QcsdController {
                     .chaff
                     .as_ref()
                     .is_some_and(|chaff| chaff.pending_count() > 0)
-                    || (!self.defense.cancel_open_chaff_on_completion()
+                    || (self.defense.terminal_chaff_cancellation_reason().is_none()
                         && self.streams.open_chaff_count() > 0)));
-        if self.defense.is_complete() && !has_backlog {
+        if self.defense.is_complete() && self.defense.terminal_failure().is_none() && !has_backlog {
             let due = *self.completion_due.get_or_insert_with(|| {
                 elapsed.saturating_add(Duration::from_micros(self.config.tail_wait_us))
             });
@@ -3882,12 +3979,13 @@ mod tests {
     use crate::{
         Buflo, BufloParameters, CsBuflo, CsBufloEarlyTermination, CsBufloPaddingMode,
         CsBufloParameters, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal,
-        Direction, EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction, QcsdConfig,
-        QcsdDatagramClass, QcsdEndpointId, QcsdImplementationScope, QcsdObservation,
-        QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSendPolicy,
-        QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, Resource,
-        ResourceManifest, SignalKind, StaticSchedule, TamarawConfig, Trace, TrafficMorphing,
-        TrafficMorphingConfig, WalkieTalkie, WalkieTalkieConfig, WtfPad, WtfPadConfig,
+        Direction, EventOutcome, FrontConfig, MissedSlotReason, Packet, QcsdAction,
+        QcsdChaffCancellationReason, QcsdConfig, QcsdDatagramClass, QcsdEndpointId,
+        QcsdImplementationScope, QcsdObservation, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
+        QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome,
+        QcsdStreamFinish, QcsdStreamId, Resource, ResourceManifest, SignalKind, StaticSchedule,
+        TamarawConfig, Trace, TrafficMorphing, TrafficMorphingConfig, WalkieTalkie,
+        WalkieTalkieConfig, WtfPad, WtfPadConfig,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4055,14 +4153,15 @@ mod tests {
             true
         }
 
-        fn cancel_open_chaff_on_completion(&self) -> bool {
-            true
+        fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
+            Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
         }
     }
 
     #[derive(Debug)]
     struct BacklogProbeDefense {
         states: Rc<RefCell<Vec<bool>>>,
+        terminal_reason: Option<QcsdChaffCancellationReason>,
     }
 
     impl Defense for BacklogProbeDefense {
@@ -4094,6 +4193,10 @@ mod tests {
 
         fn requires_terminal_chaff_drain(&self) -> bool {
             true
+        }
+
+        fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
+            self.terminal_reason
         }
     }
 
@@ -14061,6 +14164,532 @@ mod tests {
         );
     }
 
+    fn resolved_buflo_terminal_defense(application_complete: bool) -> Buflo {
+        let mut defense = Buflo::from_parameters(BufloParameters {
+            schema_version: 1,
+            interval_us: 10,
+            minimum_duration_us: 30,
+            packet_size: 1_200,
+            max_events: 100,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        });
+        if application_complete {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(5),
+                kind: SignalKind::ApplicationComplete,
+            });
+        }
+        let mut scheduled = Vec::new();
+        for at in [0, 10, 20, 30] {
+            while let Some(packet) = defense.next_event(Duration::from_micros(at)) {
+                scheduled.push(packet);
+            }
+        }
+        for packet in scheduled {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(30),
+                kind: SignalKind::Resolved {
+                    packet,
+                    outcome: EventOutcome::Satisfied { observed: 1_200 },
+                },
+            });
+        }
+        assert_eq!(defense.accepts_new_chaff_requests(), !application_complete);
+        assert!(!defense.is_complete());
+        defense
+    }
+
+    fn buflo_terminal_capacity_controller(expected_raw_bytes: u64) -> QcsdController {
+        let defense = resolved_buflo_terminal_defense(true);
+
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 10,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        ready(&mut controller, endpoint.0, "https://example.com");
+        controller.drain_actions().for_each(drop);
+        controller.streams.open(
+            endpoint,
+            QcsdStreamId(4),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            expected_raw_bytes,
+        );
+        controller
+    }
+
+    fn open_additional_terminal_chaff(
+        controller: &mut QcsdController,
+        stream: u64,
+        expected_raw_bytes: u64,
+    ) {
+        controller.streams.open(
+            QcsdEndpointId(1),
+            QcsdStreamId(stream),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            expected_raw_bytes,
+        );
+    }
+
+    #[test]
+    fn buflo_terminal_capacity_is_aggregated_across_open_streams() {
+        let mut subcell = buflo_terminal_capacity_controller(616);
+        open_additional_terminal_chaff(&mut subcell, 8, 615);
+        subcell.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        subcell.poll(Duration::from_micros(31));
+        assert!(subcell.defense.is_complete());
+        assert_eq!(subcell.streams.open_chaff_count(), 0);
+        assert_eq!(
+            subcell
+                .actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::CancelChaff {
+                        reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        let diagnostics = subcell.defense_diagnostics();
+        assert_eq!(diagnostics.buflo_terminal_subcell_open_streams_at_latch, 2);
+        assert_eq!(diagnostics.buflo_terminal_subcell_stream_cancellations, 2);
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_exact_capacity_bytes_cancelled,
+            1_199
+        );
+
+        let mut whole = buflo_terminal_capacity_controller(616);
+        open_additional_terminal_chaff(&mut whole, 8, 616);
+        whole.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        whole.poll(Duration::from_micros(31));
+        assert!(!whole.defense.is_complete());
+        assert_eq!(
+            whole.defense.next_event_at(),
+            Some(Duration::from_micros(40))
+        );
+        assert!(
+            !whole
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::CancelChaff { .. }))
+        );
+        whole.poll(Duration::from_micros(40));
+        let next_pair: Vec<_> = whole.drain_actions().collect();
+        assert_eq!(
+            next_pair
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::SendPacket { .. }))
+                .count(),
+            1
+        );
+        let advertised: Vec<_> = next_pair
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { absolute_limit, .. } => Some(*absolute_limit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(advertised, [616, 616]);
+        assert_eq!(
+            advertised.iter().map(|limit| limit - 16).sum::<u64>(),
+            1_200
+        );
+    }
+
+    #[test]
+    fn buflo_terminal_failure_never_receipts_a_subcell_cancellation() {
+        let parameters = BufloParameters {
+            schema_version: 1,
+            interval_us: 10,
+            minimum_duration_us: 30,
+            packet_size: 1_200,
+            max_events: 1,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        };
+        let mut defense = Buflo::from_parameters(parameters);
+        while defense.next_event(Duration::ZERO).is_some() {}
+        assert_eq!(defense.next_event(Duration::from_micros(10)), None);
+        assert!(defense.terminal_failure().is_some());
+        let mut controller =
+            QcsdController::with_defense(QcsdConfig::default(), None, Box::new(defense))
+                .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.drain_actions().for_each(drop);
+        open_additional_terminal_chaff(&mut controller, 4, 1_215);
+
+        controller.terminalize_local_chaff(Duration::from_micros(31));
+
+        assert_eq!(controller.streams.open_chaff_count(), 1);
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::CancelChaff { .. }))
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert!(!diagnostics.buflo_terminal_subcell_latched);
+        assert_eq!(diagnostics.buflo_terminal_subcell_stream_cancellations, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "both sides of the exact 1,200-byte terminal boundary share one proof"
+    )]
+    fn buflo_terminal_open_chaff_backlog_requires_a_whole_cell() {
+        // known_limit - requested_limit = 1,199: no exact cell exists.
+        let mut subcell = buflo_terminal_capacity_controller(1_215);
+        subcell.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        subcell.poll(Duration::from_micros(31));
+        assert!(subcell.defense.is_complete());
+        assert_eq!(subcell.defense.next_event_at(), None);
+        assert_eq!(subcell.streams.open_chaff_count(), 0);
+        let first_actions: Vec<_> = subcell.drain_actions().collect();
+        assert_eq!(
+            first_actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::CancelChaff {
+                        reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !first_actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        assert!(!first_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SendPacket { .. }
+                | QcsdAction::IncreaseReceiveLimit { .. }
+                | QcsdAction::SlotMissed { .. }
+        )));
+        let diagnostics = subcell.defense_diagnostics();
+        assert_eq!(diagnostics.buflo_terminal_subcell_stream_cancellations, 1);
+        assert!(diagnostics.buflo_terminal_subcell_latched);
+        assert_eq!(diagnostics.buflo_terminal_subcell_latched_at_us, 31);
+        assert_eq!(diagnostics.buflo_terminal_subcell_open_streams_at_latch, 1);
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch,
+            0
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch,
+            0
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_exact_capacity_bytes_cancelled,
+            1_199
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_request_cancellations,
+            0
+        );
+        assert_eq!(diagnostics.cs_buflo_local_et_stream_cancellations, 0);
+        assert_eq!(
+            diagnostics.cs_buflo_local_et_pending_request_cancellations,
+            0
+        );
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+
+        subcell.poll(Duration::from_micros(40));
+        assert!(
+            subcell
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+
+        // Exactly one full 1,200-byte opportunity remains: it is backlog and
+        // must produce the next pair instead of being terminalized.
+        let mut whole = buflo_terminal_capacity_controller(1_216);
+        whole.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        whole.poll(Duration::from_micros(31));
+        assert!(!whole.defense.is_complete());
+        assert_eq!(
+            whole.defense.next_event_at(),
+            Some(Duration::from_micros(40))
+        );
+        whole.poll(Duration::from_micros(40));
+        let next_pair: Vec<_> = whole.drain_actions().collect();
+        assert_eq!(
+            next_pair
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::SendPacket { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            next_pair
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+                .count(),
+            1,
+            "actions: {next_pair:?}"
+        );
+        assert!(!next_pair.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff { .. } | QcsdAction::SlotMissed { .. }
+        )));
+    }
+
+    #[test]
+    fn buflo_terminal_cancellation_backlog_cannot_reopen_schedule() {
+        let mut controller = buflo_terminal_capacity_controller(1_215);
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        assert!(controller.defense.is_complete());
+        assert!(controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff {
+                reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                ..
+            }
+        )));
+
+        // The queued STOP_SENDING/RESET work makes effective backlog true on
+        // this poll. The first eligible terminal boundary remains irreversible.
+        controller.poll(Duration::from_micros(32));
+        assert!(controller.defense.is_complete());
+        assert_eq!(controller.defense.next_event_at(), None);
+        controller.poll(Duration::from_micros(40));
+        assert!(!controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SendPacket { .. }
+                | QcsdAction::IncreaseReceiveLimit { .. }
+                | QcsdAction::SlotMissed { .. }
+        )));
+    }
+
+    #[test]
+    fn buflo_terminal_waits_for_an_in_flight_parser_lease() {
+        let mut controller = buflo_terminal_capacity_controller(1_215);
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                start: 16,
+                end: 17,
+                owner: None,
+                unowned: true,
+                advertised: true,
+            }],
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        assert!(!controller.defense.is_complete());
+        assert!(!controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff { .. } | QcsdAction::DefenseComplete
+        )));
+
+        controller.parser_lease_ranges.remove(&(endpoint, stream));
+        controller.poll(Duration::from_micros(32));
+        assert!(controller.defense.is_complete());
+        assert!(controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff {
+                reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                ..
+            }
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.buflo_terminal_subcell_latched_at_us, 32);
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch,
+            0
+        );
+    }
+
+    #[test]
+    fn buflo_terminal_rechecks_backlog_after_stale_false_before_onload() {
+        let defense = resolved_buflo_terminal_defense(false);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 10,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        ready(&mut controller, endpoint.0, "https://example.com");
+        controller.drain_actions().for_each(drop);
+
+        // Establish the exact stale state involved in the race: the previous
+        // controller snapshot was false while onLoad was not yet eligible.
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(30),
+        );
+        controller.poll(Duration::from_micros(30));
+        assert_eq!(
+            controller.last_effective_egress_backlog_pending,
+            Some(false)
+        );
+        assert!(!controller.defense.is_complete());
+
+        // Parser work appears between polls, before ApplicationComplete is
+        // reduced. A stale false must not irreversibly latch and cancel it.
+        controller.streams.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_215,
+        );
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                start: 16,
+                end: 17,
+                owner: None,
+                unowned: true,
+                advertised: true,
+            }],
+        );
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        assert!(!controller.defense.is_complete());
+        assert!(
+            controller
+                .parser_lease_ranges
+                .contains_key(&(endpoint, stream))
+        );
+        assert!(!controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff {
+                reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                ..
+            }
+        )));
+
+        controller.parser_lease_ranges.remove(&(endpoint, stream));
+        controller.poll(Duration::from_micros(32));
+        assert!(controller.defense.is_complete());
+        assert!(controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff {
+                reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                ..
+            }
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.buflo_terminal_subcell_latched_at_us, 32);
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch,
+            0
+        );
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch,
+            0
+        );
+    }
+
+    #[test]
+    fn buflo_terminal_waits_for_a_retained_parser_boundary_without_a_live_lease() {
+        let mut controller = buflo_terminal_capacity_controller(1_215);
+        retain_post_cap_parser_boundary(
+            &mut controller,
+            QcsdEndpointId(1),
+            QcsdStreamId(8),
+            QcsdRequestRole::Application,
+        );
+        assert!(controller.parser_lease_ranges.is_empty());
+        assert!(controller.streams.has_any_pending_parser_boundary());
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(31),
+        );
+        controller.poll(Duration::from_micros(31));
+        assert!(!controller.defense.is_complete());
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::CancelChaff { .. }))
+        );
+
+        controller.streams.clear_parser_boundaries();
+        controller.poll(Duration::from_micros(32));
+        assert!(controller.defense.is_complete());
+        assert!(controller.actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CancelChaff {
+                reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                ..
+            }
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_pending_parser_boundaries_at_latch,
+            0
+        );
+    }
+
     #[test]
     fn local_et_cancels_an_open_chaff_stream_before_defense_complete() {
         let mut controller = QcsdController::with_defense(
@@ -14099,6 +14728,7 @@ mod tests {
                     QcsdAction::CancelChaff {
                         endpoint: observed_endpoint,
                         stream: observed_stream,
+                        reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
                     } if *observed_endpoint == endpoint && *observed_stream == stream
                 ))
                 .count(),
@@ -14150,6 +14780,7 @@ mod tests {
             Some(manifest),
             Box::new(BacklogProbeDefense {
                 states: Rc::clone(&states),
+                terminal_reason: None,
             }),
         )
         .expect("controller");
@@ -14179,6 +14810,29 @@ mod tests {
         );
         controller.poll(Duration::from_micros(1));
         assert_eq!(&*states.borrow(), &[true, false]);
+    }
+
+    #[test]
+    fn candidate_quiet_termination_receives_repeated_fresh_false_snapshots() {
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(BacklogProbeDefense {
+                states: Rc::clone(&states),
+                terminal_reason: Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination),
+            }),
+        )
+        .expect("controller");
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::ZERO,
+        );
+
+        controller.poll(Duration::ZERO);
+        assert_eq!(&*states.borrow(), &[false, false]);
+        controller.poll(Duration::from_micros(1));
+        assert_eq!(&*states.borrow(), &[false, false, false, false]);
     }
 
     #[test]

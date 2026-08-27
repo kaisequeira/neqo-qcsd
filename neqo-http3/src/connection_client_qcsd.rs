@@ -652,12 +652,14 @@ impl Http3Client {
                 let stream_id = self.apply_qcsd_chaff_request(now, resource, request_id)?;
                 return Ok(Some(stream_id));
             }
-            QcsdAction::CancelChaff { endpoint, stream } if endpoint == own_endpoint => {
+            QcsdAction::CancelChaff {
+                endpoint, stream, ..
+            } if endpoint == own_endpoint => {
                 let stream_id = StreamId::new(stream.0);
                 let error = Error::HttpRequestCancelled.code();
                 self.cancel_fetch(stream_id, error)?;
                 // The runner closes a request's H3 send handler immediately
-                // after encoding its request/FIN. At local ET, `cancel_fetch`
+                // after encoding its request/FIN. At client-local termination, `cancel_fetch`
                 // therefore usually sees only the receive handler and queues
                 // STOP_SENDING. Reset the still-live QUIC send half directly
                 // so an unacknowledged request/FIN cannot be lost and revive
@@ -666,7 +668,7 @@ impl Http3Client {
                     Ok(()) | Err(neqo_transport::Error::InvalidStreamId) => {}
                     Err(error) => return Err(error.into()),
                 }
-                self.conn.qcsd_mark_local_et_chaff_cancellation(stream_id);
+                self.conn.qcsd_mark_chaff_cancellation(stream_id);
             }
             QcsdAction::SlotMissed { .. }
             | QcsdAction::SlotSatisfied { .. }

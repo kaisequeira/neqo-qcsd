@@ -274,8 +274,8 @@ impl Connection {
     }
 
     /// Mark each transport cancellation control actually queued by a
-    /// successful CS-BuFLO local-ET request cancellation as defense-owned.
-    pub fn qcsd_mark_local_et_chaff_cancellation(&mut self, stream: StreamId) {
+    /// successful typed candidate-defense chaff cancellation as defense-owned.
+    pub fn qcsd_mark_chaff_cancellation(&mut self, stream: StreamId) {
         // STOP_SENDING supersedes receive-window advertisement for this
         // abandoned response. The transport will not regenerate an unacked
         // MAX_STREAM_DATA after the receive side enters AbortReading.

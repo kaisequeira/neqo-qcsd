@@ -775,7 +775,7 @@ fn local_et_waits_for_split_stop_ack_and_lost_reset_recovery() {
     // shaping remains enabled with no slot: the exact local-ET identity must
     // use the maintenance path rather than releasing arbitrary stream bytes.
     client.stream_reset_send(stream, 0).unwrap();
-    client.qcsd_mark_local_et_chaff_cancellation(stream);
+    client.qcsd_mark_chaff_cancellation(stream);
     assert!(client.qcsd_unacked_local_et_resets.contains(&stream));
     let reset_frames_before = client.stats().frame_tx.reset_stream;
     let reset_at = established_at + DEFAULT_RTT;
@@ -796,7 +796,7 @@ fn local_et_waits_for_split_stop_ack_and_lost_reset_recovery() {
     // cancellation controls into separate packets. The STOP acknowledgment
     // must not erase the independently lost reset obligation.
     client.stream_stop_sending(stream, 0).unwrap();
-    client.qcsd_mark_local_et_chaff_cancellation(stream);
+    client.qcsd_mark_chaff_cancellation(stream);
     assert!(client.qcsd_unacked_local_et_resets.contains(&stream));
     let reset_frames_before_stop = client.stats().frame_tx.reset_stream;
     let stop_frames_before = client.stats().frame_tx.stop_sending;
@@ -868,7 +868,7 @@ fn local_et_stop_ack_waits_for_peer_reset_when_final_size_is_unknown() {
     client.stream_send(stream, b"request").unwrap();
     client.stream_close_send(stream).unwrap();
     client.stream_stop_sending(stream, 0).unwrap();
-    client.qcsd_mark_local_et_chaff_cancellation(stream);
+    client.qcsd_mark_chaff_cancellation(stream);
     assert!(client.qcsd_unacked_local_et_stop_sending.contains(&stream));
     assert!(client.qcsd_unacked_local_et_resets.is_empty());
 

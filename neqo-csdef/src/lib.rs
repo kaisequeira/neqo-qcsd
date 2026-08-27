@@ -40,9 +40,9 @@ pub use defense::{
 pub use dependency_tracker::{DependencyTracker, ResourceRunState};
 pub use distribution::{Histogram, MorphingMatrix};
 pub use event::{
-    MissedSlotReason, QcsdAction, QcsdChaffRequestId, QcsdCongestionReason, QcsdDatagramClass,
-    QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner,
-    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    MissedSlotReason, QcsdAction, QcsdChaffCancellationReason, QcsdChaffRequestId,
+    QcsdCongestionReason, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
+    QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
     QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
     QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission,
     TimestampedQcsdObservation, TrafficMorphingBypassReason, TrafficMorphingOutcome,

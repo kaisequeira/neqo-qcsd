@@ -2991,7 +2991,7 @@ mod tests {
 
     #[cfg(feature = "qcsd")]
     #[test]
-    fn qcsd_local_et_resets_transport_send_half_after_h3_send_close() {
+    fn qcsd_buflo_tail_resets_transport_send_half_after_h3_send_close() {
         let (mut client, mut server) = connect();
         client
             .enable_qcsd(
@@ -3037,9 +3037,10 @@ mod tests {
                 QcsdAction::CancelChaff {
                     endpoint: QcsdEndpointId(7),
                     stream: QcsdStreamId(stream.as_u64()),
+                    reason: neqo_csdef::QcsdChaffCancellationReason::BufloTerminalSubcellTail,
                 },
             )
-            .expect("local-ET cancellation");
+            .expect("BuFLO terminal-tail cancellation");
         assert!(client.qcsd_has_pending_defense_control());
 
         let cancellation = client
@@ -3058,7 +3059,7 @@ mod tests {
                 } if composition.defense_control_bytes > 0 => Some(composition),
                 _ => None,
             })
-            .expect("local-ET packet-build composition");
+            .expect("BuFLO terminal-tail packet-build composition");
         assert_eq!(
             usize::from(composition.observed_udp_bytes),
             cancellation.len()

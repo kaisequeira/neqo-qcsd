@@ -29,13 +29,13 @@ use neqo_common::{Header, event::Provider as _};
 use neqo_csdef::{
     ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics, DefenseKind,
     DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
-    QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation,
-    QcsdObservationClock, QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
-    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy,
-    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamTransmission, Resource,
-    ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
-    ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4, StaticMode,
-    TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
+    QcsdChaffCancellationReason, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId,
+    QcsdObservation, QcsdObservationClock, QcsdProfile, QcsdReceiveActionIdentity,
+    QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole,
+    QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamTransmission,
+    Resource, ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest,
+    ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
+    StaticMode, TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
     WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
@@ -6641,42 +6641,64 @@ fn apply_queued_actions(
     }
 }
 
-fn validate_local_et_chaff_target(
+fn validate_chaff_cancellation_target(
     streams: &HashMap<StreamId, StreamRecord>,
     stream: neqo_csdef::QcsdStreamId,
 ) -> Result<StreamId, Error> {
     let stream_id = StreamId::new(stream.0);
     let Some(record) = streams.get(&stream_id) else {
         return Err(Error::SlotInvariant(format!(
-            "local CS-BuFLO termination targeted unknown chaff stream {}",
+            "client-local defense termination targeted unknown chaff stream {}",
             stream.0
         )));
     };
     if !matches!(record.role, QcsdRequestRole::Chaff { .. }) {
         return Err(Error::SlotInvariant(format!(
-            "local CS-BuFLO termination targeted application stream {}",
+            "client-local defense termination targeted application stream {}",
             stream.0
         )));
     }
     Ok(stream_id)
 }
 
-/// Validate a local-ET cancellation before touching HTTP/3, then atomically
+const fn chaff_cancellation_rollback_label(reason: QcsdChaffCancellationReason) -> &'static str {
+    match reason {
+        QcsdChaffCancellationReason::BufloTerminalSubcellTail => {
+            "buflo_terminal_subcell_unencoded_rollback"
+        }
+        QcsdChaffCancellationReason::CsBufloLocalEarlyTermination => {
+            "cs_buflo_local_et_unencoded_rollback"
+        }
+    }
+}
+
+const fn chaff_cancellation_receipt_outcome(reason: QcsdChaffCancellationReason) -> &'static str {
+    match reason {
+        QcsdChaffCancellationReason::BufloTerminalSubcellTail => {
+            "buflo_terminal_subcell_tail_cancelled"
+        }
+        QcsdChaffCancellationReason::CsBufloLocalEarlyTermination => {
+            "local_early_termination_cancelled"
+        }
+    }
+}
+
+/// Validate a typed client-local cancellation before touching HTTP/3, then atomically
 /// roll back any receive-limit action that transport accepted but has not yet
 /// encoded. The controller has already closed this chaff stream and removed
 /// the matching unadvertised suffix before it emits `CancelChaff`; leaving the
 /// adapter suffix alive would strand terminal defense-control backlog once
 /// `STOP_SENDING` moves the transport receive state out of `Recv`.
-fn prepare_local_et_chaff_cancellation(
+fn prepare_chaff_cancellation(
     endpoint: &mut Endpoint,
     traces: &mut TraceFiles,
     now: Instant,
     action: &QcsdAction,
-) -> Result<Option<StreamId>, Error> {
-    let QcsdAction::CancelChaff { stream, .. } = action else {
+) -> Result<Option<(StreamId, QcsdChaffCancellationReason)>, Error> {
+    let QcsdAction::CancelChaff { stream, reason, .. } = action else {
         return Ok(None);
     };
-    let stream_id = validate_local_et_chaff_target(&endpoint.streams, *stream)?;
+    let stream_id = validate_chaff_cancellation_target(&endpoint.streams, *stream)?;
 
     let identities: Vec<QcsdReceiveActionIdentity> = endpoint
         .client
@@ -6700,7 +6722,7 @@ fn prepare_local_et_chaff_cancellation(
             now,
             Some(endpoint.id),
             "receive_cancellation",
-            "local_et_unencoded_rollback",
+            chaff_cancellation_rollback_label(*reason),
             &json!({
                 "stream": stream.0,
                 "identities": identities
@@ -6717,7 +6739,7 @@ fn prepare_local_et_chaff_cancellation(
             }),
         )?;
     }
-    Ok(Some(stream_id))
+    Ok(Some((stream_id, *reason)))
 }
 
 #[expect(
@@ -6809,8 +6831,7 @@ fn apply_action(
     };
     // This is deliberately before `apply_qcsd_action`: a stale or invalid
     // CancelChaff identity must never mutate an application or unknown stream.
-    let local_et_stream =
-        prepare_local_et_chaff_cancellation(endpoint, traces, now, &trace_action)?;
+    let canceled_chaff = prepare_chaff_cancellation(endpoint, traces, now, &trace_action)?;
     let scheduled_packet = match &trace_action {
         QcsdAction::SendPacket {
             packet,
@@ -6974,20 +6995,20 @@ fn apply_action(
                 // request is eligible for its first transport output.
                 handle_qcsd_observations(endpoint, controller, traces, defense_elapsed)?;
             }
-            if let Some(stream_id) = local_et_stream {
+            if let Some((stream_id, cancellation_reason)) = canceled_chaff {
                 let Some(record) = endpoint.streams.get_mut(&stream_id) else {
                     return Err(Error::SlotInvariant(format!(
-                        "local CS-BuFLO termination targeted unknown chaff stream {}",
+                        "client-local defense termination targeted unknown chaff stream {}",
                         stream_id.as_u64()
                     )));
                 };
                 if !matches!(record.role, QcsdRequestRole::Chaff { .. }) {
                     return Err(Error::SlotInvariant(format!(
-                        "local CS-BuFLO termination targeted application stream {}",
+                        "client-local defense termination targeted application stream {}",
                         stream_id.as_u64()
                     )));
                 }
-                record.outcome = "local_early_termination_cancelled";
+                record.outcome = chaff_cancellation_receipt_outcome(cancellation_reason);
                 finish_stream(endpoint, stream_id)?;
             }
             traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
@@ -7439,11 +7460,13 @@ fn buflo_run_summary(
     };
     diagnostics.map(|diagnostics| {
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "buflo",
             "implementation_scope": "client_only_quic",
             "paper_equivalent": false,
             "incoming_opportunity_semantics": "client_receive_credit_and_response_qualified_chaff_attempt",
+            "terminal_subcell_policy": "drain_whole_cells_then_client_local_http3_cancel_unallocatable_reviewed_chaff_tail",
+            "terminal_subcell_observer_effect": "typed_stop_sending_and_reset_stream_defense_control_may_follow_the_last_exact_cell",
             "unavailable_peer_properties": [
                 "scheduled_server_datagram_timing",
                 "scheduled_server_datagram_size",
@@ -7604,16 +7627,17 @@ mod tests {
         ChaffManifest, ChaffQualification, Defense, DefenseConfig, DefenseDiagnostics, DefenseMode,
         DefenseSignal, DependencyTracker, Direction, ExpectedChaffResponse, FrontConfig,
         IdentityChaffRequestHeaderPrimitive, MissedSlotReason, Packet, QcsdAction,
-        QcsdChaffRequestId, QcsdConfig, QcsdCongestionReason, QcsdController, QcsdDatagramClass,
-        QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner,
-        QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
-        QcsdReceiveLimitOutcome, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome,
-        QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission, QualifiedChaffResource, Resource,
-        ResourceManifest, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
-        ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
-        ResponseOnlyQualifiedChaffResource, ResponseOnlyQualifiedChaffResourceV4, SignalKind,
-        StaticSchedule, TamarawConfig, Trace, TrafficMorphingConfig, WalkieTalkieConfig,
-        WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig, sanitize_chaff_headers,
+        QcsdChaffCancellationReason, QcsdChaffRequestId, QcsdConfig, QcsdCongestionReason,
+        QcsdController, QcsdDatagramClass, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
+        QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
+        QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdSendPolicy, QcsdSlotComposition,
+        QcsdSlotId, QcsdSlotOutcome, QcsdStreamFinish, QcsdStreamId, QcsdStreamTransmission,
+        QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
+        ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
+        ResponseOnlyChaffQualificationV4, ResponseOnlyQualifiedChaffResource,
+        ResponseOnlyQualifiedChaffResourceV4, SignalKind, StaticSchedule, TamarawConfig, Trace,
+        TrafficMorphingConfig, WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad,
+        WtfPadConfig, sanitize_chaff_headers,
     };
     use neqo_udp::RecvBuf;
     use serde_json::json;
@@ -7635,7 +7659,7 @@ mod tests {
         finish_chaff_record, finish_stream, forward_qcsd_observation, handle_http_events,
         has_in_flight_application_stream, now, pending_receive_identity_is_reconciled,
         prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
-        prepare_local_et_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
+        prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
         record_adapter_action_error, record_receive_limit_error, record_terminal_action,
         register_action_batch, remaining_wakeup_delay, resolve_run_config,
@@ -7644,8 +7668,8 @@ mod tests {
         sustained_qualification_content_encoding, sustained_representation_failure,
         sustained_requests_are_classifiable, terminalize_pending_slots,
         trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles},
-        traffic_morphing_endpoint_seed, validate_chaff_manifest_defense,
-        validate_local_et_chaff_target, validate_prefix_capacity_plan,
+        traffic_morphing_endpoint_seed, validate_chaff_cancellation_target,
+        validate_chaff_manifest_defense, validate_prefix_capacity_plan,
         validate_qualified_chaff_binding, validate_walkie_talkie_chaff_precondition,
         wait_for_activity_until, walkie_talkie_qualification_binding_matches, write_run_json,
     };
@@ -7713,7 +7737,7 @@ mod tests {
     }
 
     #[test]
-    fn local_et_chaff_target_is_validated_before_adapter_mutation() {
+    fn chaff_cancellation_target_is_validated_before_adapter_mutation() {
         let application_stream = neqo_transport::StreamId::new(0);
         let chaff_stream = neqo_transport::StreamId::new(4);
         let streams = HashMap::from([
@@ -7722,18 +7746,46 @@ mod tests {
         ]);
 
         assert!(matches!(
-            validate_local_et_chaff_target(&streams, QcsdStreamId(8)),
+            validate_chaff_cancellation_target(&streams, QcsdStreamId(8)),
             Err(Error::SlotInvariant(message)) if message.contains("unknown chaff stream 8")
         ));
         assert!(matches!(
-            validate_local_et_chaff_target(&streams, QcsdStreamId(0)),
+            validate_chaff_cancellation_target(&streams, QcsdStreamId(0)),
             Err(Error::SlotInvariant(message)) if message.contains("application stream 0")
         ));
         assert_eq!(
-            validate_local_et_chaff_target(&streams, QcsdStreamId(4)).expect("known chaff"),
+            validate_chaff_cancellation_target(&streams, QcsdStreamId(4)).expect("known chaff"),
             chaff_stream
         );
         assert_eq!(streams.len(), 2, "validation is side-effect free");
+    }
+
+    #[test]
+    fn chaff_cancellation_reason_selects_distinct_rollback_and_receipt_labels() {
+        assert_eq!(
+            super::chaff_cancellation_rollback_label(
+                QcsdChaffCancellationReason::BufloTerminalSubcellTail
+            ),
+            "buflo_terminal_subcell_unencoded_rollback"
+        );
+        assert_eq!(
+            super::chaff_cancellation_receipt_outcome(
+                QcsdChaffCancellationReason::BufloTerminalSubcellTail
+            ),
+            "buflo_terminal_subcell_tail_cancelled"
+        );
+        assert_eq!(
+            super::chaff_cancellation_rollback_label(
+                QcsdChaffCancellationReason::CsBufloLocalEarlyTermination
+            ),
+            "cs_buflo_local_et_unencoded_rollback"
+        );
+        assert_eq!(
+            super::chaff_cancellation_receipt_outcome(
+                QcsdChaffCancellationReason::CsBufloLocalEarlyTermination
+            ),
+            "local_early_termination_cancelled"
+        );
     }
 
     #[tokio::test]
@@ -7894,12 +7946,16 @@ mod tests {
         let cancel = QcsdAction::CancelChaff {
             endpoint: endpoint.id,
             stream,
+            reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
         };
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         assert_eq!(
-            prepare_local_et_chaff_cancellation(&mut endpoint, &mut traces, started, &cancel,)
+            prepare_chaff_cancellation(&mut endpoint, &mut traces, started, &cancel,)
                 .expect("prepare exact local-ET rollback"),
-            Some(neqo_transport::StreamId::new(stream.0))
+            Some((
+                neqo_transport::StreamId::new(stream.0),
+                QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
+            ))
         );
         assert!(
             endpoint
@@ -7961,7 +8017,7 @@ mod tests {
 
         drop(traces);
         let events = fs::read_to_string(output.join("events.csv")).expect("events trace");
-        assert!(events.contains("local_et_unencoded_rollback"));
+        assert!(events.contains("cs_buflo_local_et_unencoded_rollback"));
         drop(endpoint);
         drop(server);
         fs::remove_dir_all(output).expect("remove trace test directory");
@@ -8835,13 +8891,21 @@ mod tests {
         });
 
         let buflo_summary = buflo_run_summary(&buflo, Some(&diagnostics)).expect("BuFLO summary");
-        assert_eq!(buflo_summary["schema_version"], 1);
+        assert_eq!(buflo_summary["schema_version"], 2);
         assert_eq!(buflo_summary["kind"], "buflo");
         assert_eq!(buflo_summary["implementation_scope"], "client_only_quic");
         assert_eq!(buflo_summary["paper_equivalent"], false);
         assert_eq!(
             buflo_summary["incoming_opportunity_semantics"],
             "client_receive_credit_and_response_qualified_chaff_attempt"
+        );
+        assert_eq!(
+            buflo_summary["terminal_subcell_policy"],
+            "drain_whole_cells_then_client_local_http3_cancel_unallocatable_reviewed_chaff_tail"
+        );
+        assert_eq!(
+            buflo_summary["terminal_subcell_observer_effect"],
+            "typed_stop_sending_and_reset_stream_defense_control_may_follow_the_last_exact_cell"
         );
         assert_eq!(
             buflo_summary["unavailable_peer_properties"],

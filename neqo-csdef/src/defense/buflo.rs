@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use super::{Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, SignalKind};
-use crate::{BufloConfig, BufloParameters, Direction, Packet, Result};
+use crate::{BufloConfig, BufloParameters, Direction, Packet, QcsdChaffCancellationReason, Result};
 
 /// Clean-room, client-only `BuFLO` schedule adaptation.
 ///
@@ -39,6 +39,7 @@ pub struct Buflo {
     event_guard_triggered: bool,
     catch_up_failure_triggered: bool,
     realization_failed: bool,
+    terminal_latched: bool,
 }
 
 impl Buflo {
@@ -77,6 +78,7 @@ impl Buflo {
             event_guard_triggered: false,
             catch_up_failure_triggered: false,
             realization_failed: false,
+            terminal_latched: false,
         }
     }
 
@@ -85,12 +87,25 @@ impl Buflo {
             && self.next_outgoing_us > self.parameters.minimum_duration_us
     }
 
-    const fn schedule_closed(&self) -> bool {
+    const fn terminal_conditions_met(&self) -> bool {
         self.application_complete
+            && !self.event_guard_triggered
+            && !self.catch_up_failure_triggered
+            && !self.realization_failed
             && self.minimum_schedule_emitted()
             && !self.egress_backlog_pending
             && self.terminal_incoming == self.scheduled_incoming
             && self.terminal_outgoing == self.scheduled_outgoing
+    }
+
+    const fn schedule_closed(&self) -> bool {
+        self.terminal_latched
+    }
+
+    const fn latch_terminal_if_ready(&mut self) {
+        if self.terminal_conditions_met() {
+            self.terminal_latched = true;
+        }
     }
 
     const fn normally_complete(&self) -> bool {
@@ -196,11 +211,21 @@ impl Defense for Buflo {
         self.latest_elapsed_us = self
             .latest_elapsed_us
             .max(u64::try_from(signal.at.as_micros()).unwrap_or(u64::MAX));
+        let fresh_terminal_backlog_snapshot =
+            matches!(signal.kind, SignalKind::EgressBacklog { pending: false });
         match signal.kind {
             SignalKind::ApplicationComplete => self.application_complete = true,
             SignalKind::EgressBacklog { pending } => self.egress_backlog_pending = pending,
             SignalKind::Resolved { packet, outcome } => self.record_outcome(packet, outcome),
             _ => {}
+        }
+        // Terminal closure is irreversible.  Reduce all prerequisite signals
+        // first, then latch only from a controller-generated snapshot of the
+        // aggregate application/control/parser backlog.  In particular, a
+        // previously observed `false` must not be reused by a later onLoad or
+        // event-resolution observation after new parser work has appeared.
+        if fresh_terminal_backlog_snapshot {
+            self.latch_terminal_if_ready();
         }
     }
 
@@ -268,6 +293,15 @@ impl Defense for Buflo {
 
     fn accepts_new_chaff_requests(&self) -> bool {
         !(self.application_complete && self.minimum_schedule_emitted())
+    }
+
+    fn terminal_chaff_backlog_cell_bytes(&self) -> Option<u64> {
+        Some(u64::from(self.parameters.packet_size))
+    }
+
+    fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
+        self.terminal_latched
+            .then_some(QcsdChaffCancellationReason::BufloTerminalSubcellTail)
     }
 
     fn diagnostics(&self) -> DefenseDiagnostics {
@@ -360,6 +394,10 @@ mod tests {
                 },
             });
         }
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(30),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
         assert!(defense.is_complete());
     }
 
@@ -409,6 +447,10 @@ mod tests {
                 },
             });
         }
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(50),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
         assert!(defense.is_complete());
     }
 
@@ -435,6 +477,49 @@ mod tests {
     }
 
     #[test]
+    fn terminal_boundary_is_irreversible_after_the_parser_tail_starts() {
+        let mut defense = Buflo::from_parameters(parameters());
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(5),
+            kind: SignalKind::ApplicationComplete,
+        });
+        let mut scheduled = Vec::new();
+        for at in [0, 10, 20, 30] {
+            while let Some(packet) = defense.next_event(Duration::from_micros(at)) {
+                scheduled.push(packet);
+            }
+        }
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(31),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        for packet in scheduled {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(31),
+                kind: SignalKind::Resolved {
+                    packet,
+                    outcome: crate::EventOutcome::Satisfied { observed: 1_200 },
+                },
+            });
+        }
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(31),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert!(defense.is_complete());
+
+        // A parser-only tail is controller backlog, but it cannot reopen a
+        // schedule that stopped at the first eligible post-tau boundary.
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(32),
+            kind: SignalKind::EgressBacklog { pending: true },
+        });
+        assert!(defense.is_complete());
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.next_event(Duration::from_micros(40)), None);
+    }
+
+    #[test]
     fn event_guard_is_typed_terminal_failure() {
         let mut parameters = parameters();
         parameters.max_events = 2;
@@ -445,6 +530,7 @@ mod tests {
         assert!(defense.is_complete());
         assert!(defense.terminal_failure().is_some());
         assert!(defense.diagnostics().buflo_event_guard_triggered);
+        assert_eq!(defense.terminal_chaff_cancellation_reason(), None);
     }
 
     #[test]
@@ -461,6 +547,7 @@ mod tests {
             defense.terminal_failure(),
             Some("BuFLO scheduler fell behind a constant-rate cell boundary")
         );
+        assert_eq!(defense.terminal_chaff_cancellation_reason(), None);
     }
 
     #[test]
@@ -502,7 +589,7 @@ mod tests {
                         kind: SignalKind::ApplicationComplete,
                     });
                 }
-                if tick == backlog_clear_tick {
+                if tick >= backlog_clear_tick {
                     defense.observe(DefenseSignal {
                         at,
                         kind: SignalKind::EgressBacklog { pending: false },
@@ -518,6 +605,12 @@ mod tests {
                                 observed: packet.length(),
                             },
                         },
+                    });
+                }
+                if tick >= backlog_clear_tick {
+                    defense.observe(DefenseSignal {
+                        at,
+                        kind: SignalKind::EgressBacklog { pending: false },
                     });
                 }
             }

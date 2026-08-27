@@ -13,8 +13,9 @@ use super::{
     EventOutcome, SignalKind,
 };
 use crate::{
-    CsBufloConfig, CsBufloPaddingMode, CsBufloParameters, Direction, Packet, QcsdSendPolicy,
-    QcsdSlotComposition, QcsdSlotId, Result, SplitMix64, derive,
+    CsBufloConfig, CsBufloPaddingMode, CsBufloParameters, Direction, Packet,
+    QcsdChaffCancellationReason, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, Result,
+    SplitMix64, derive,
 };
 
 const OUTGOING: usize = 0;
@@ -126,6 +127,7 @@ pub struct CsBuflo {
     local_termination_latched: bool,
     latest_elapsed_us: u64,
     egress_backlog_pending: bool,
+    quiet_backlog_snapshot_fresh: bool,
     full_outgoing: u64,
     partial_outgoing: u64,
     suppressed_outgoing: u64,
@@ -198,6 +200,7 @@ impl CsBuflo {
             local_termination_latched: false,
             latest_elapsed_us: 0,
             egress_backlog_pending: true,
+            quiet_backlog_snapshot_fresh: false,
             full_outgoing: 0,
             partial_outgoing: 0,
             suppressed_outgoing: 0,
@@ -270,7 +273,7 @@ impl CsBuflo {
         // Pending application or defense-control egress can later create both
         // outgoing bytes and peer responses.  A quiet timer must not freeze an
         // irreversible pre-backlog target for either direction.
-        if self.egress_backlog_pending {
+        if self.egress_backlog_pending || !self.quiet_backlog_snapshot_fresh {
             return;
         }
         for direction in [Direction::Outgoing, Direction::Incoming] {
@@ -321,8 +324,8 @@ impl CsBuflo {
         }
         let index = direction_index(direction);
         if direction == Direction::Outgoing
-            && self.egress_backlog_pending
             && !self.application_complete()
+            && (self.egress_backlog_pending || !self.quiet_backlog_snapshot_fresh)
         {
             return false;
         }
@@ -667,9 +670,26 @@ impl Defense for CsBuflo {
     fn observe(&mut self, signal: DefenseSignal) {
         let at_us = u64::try_from(signal.at.as_micros()).unwrap_or(u64::MAX);
         self.latest_elapsed_us = self.latest_elapsed_us.max(at_us);
+        if !matches!(
+            signal.kind,
+            SignalKind::ApplicationComplete | SignalKind::EgressBacklog { .. }
+        ) {
+            // A quiet-time decision may consume only the aggregate controller
+            // snapshot produced after every observation already queued for
+            // this poll. Any intervening wire/outcome/control signal makes a
+            // remembered `false` stale. ApplicationComplete is the explicit
+            // client onLoad analogue and intentionally bypasses quiet gating.
+            self.quiet_backlog_snapshot_fresh = false;
+        }
         match signal.kind {
             SignalKind::ApplicationComplete => self.freeze_padding_targets(at_us),
-            SignalKind::EgressBacklog { pending } => self.egress_backlog_pending = pending,
+            SignalKind::EgressBacklog { pending } => {
+                self.egress_backlog_pending = pending;
+                self.quiet_backlog_snapshot_fresh = !pending;
+                if !pending {
+                    self.freeze_strict_quiet_targets();
+                }
+            }
             SignalKind::PayloadBytes {
                 direction,
                 bytes,
@@ -700,6 +720,7 @@ impl Defense for CsBuflo {
     fn observe_application_bytes(&mut self, at: Duration, direction: Direction, bytes: u64) {
         let at_us = u64::try_from(at.as_micros()).unwrap_or(u64::MAX);
         self.latest_elapsed_us = self.latest_elapsed_us.max(at_us);
+        self.quiet_backlog_snapshot_fresh = false;
         let index = direction_index(direction);
         self.natural[index] = self.natural[index].saturating_add(bytes);
         self.last_natural_us[index] = Some(at_us);
@@ -800,8 +821,8 @@ impl Defense for CsBuflo {
         true
     }
 
-    fn cancel_open_chaff_on_completion(&self) -> bool {
-        true
+    fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
+        Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
     }
 
     fn deduplicate_chaff_payload_offsets(&self) -> bool {
@@ -1216,6 +1237,54 @@ mod tests {
     }
 
     #[test]
+    fn quiet_fallback_rejects_a_stale_false_backlog_snapshot() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 91);
+        defense.next_us = [u64::MAX; 2];
+        defense.natural = [1_000, 1_000];
+        defense.cover_payload = [0, 24];
+        defense.realized_total = [1_100, 1_124];
+        defense.padding_targets = [Some(1_024), Some(1_024)];
+        defense.padding_basis_natural = [Some(1_000), Some(1_000)];
+        defense.padding_basis_cover = [Some(0), Some(24)];
+        defense.padding_basis_total = [Some(1_100), Some(1_124)];
+        defense.scheduled = [1, 1];
+        defense.terminal = [1, 1];
+        defense.last_natural_us = [Some(0), Some(0)];
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_secs(2),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert!(!defense.is_complete());
+
+        // This wire observation crosses the strict quiet boundary after new
+        // controller work has appeared but before its fresh `pending: true`
+        // snapshot is delivered. It must invalidate the remembered false.
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::Wire {
+                direction: Direction::Outgoing,
+                length: 1,
+            },
+        });
+        assert!(!defense.is_complete());
+        assert!(!defense.local_termination_latched);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::EgressBacklog { pending: true },
+        });
+        assert!(!defense.is_complete());
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_002),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert!(defense.is_complete());
+        assert!(defense.local_termination_latched);
+    }
+
+    #[test]
     fn zero_application_completion_freezes_zero_targets_and_terminates_without_cells() {
         let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 10);
         defense.egress_backlog_pending = false;
@@ -1466,11 +1535,14 @@ mod tests {
         defense.scheduled = [1, 1];
         defense.terminal = [1, 1];
         defense.last_natural_us = [Some(0), Some(0)];
-        defense.egress_backlog_pending = false;
         defense.latest_elapsed_us = 2_000_000;
         assert!(!defense.is_complete());
         assert_eq!(defense.padding_targets, [None, None]);
 
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
         assert_eq!(defense.next_event(Duration::from_micros(2_000_001)), None);
         assert!(!defense.application_complete());
         assert_eq!(defense.padding_targets, [Some(2_048), Some(2_048)]);
@@ -1917,6 +1989,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the independent randomized oracle checks padding, crossing, quiet, and completion together"
+    )]
     fn randomized_padding_crossing_idle_and_termination_match_independent_oracle() {
         let mut state = 0x3c6e_f372_fe94_f82b_u64;
         let mut draw = || {
@@ -2017,6 +2093,7 @@ mod tests {
             quiet.latest_elapsed_us =
                 last + quiet.parameters.quiet_time_us + u64::from(after_quiet);
             quiet.egress_backlog_pending = case & 4 != 0;
+            quiet.quiet_backlog_snapshot_fresh = !quiet.egress_backlog_pending;
             quiet.in_flight = [true, true];
             assert_eq!(quiet.channel_idle(Direction::Outgoing), after_quiet);
             assert_eq!(quiet.channel_idle(Direction::Incoming), after_quiet);

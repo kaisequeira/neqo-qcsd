@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::Capacity;
 use crate::{
-    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdDatagramClass, QcsdSendPolicy,
-    QcsdSlotComposition, QcsdSlotId, TrafficMorphingOutcome,
+    Direction, MissedSlotReason, Packet, QcsdChaffCancellationReason, QcsdCongestionReason,
+    QcsdDatagramClass, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, TrafficMorphingOutcome,
 };
 
 /// Whether a defense adds cover traffic or regulates the whole application.
@@ -394,6 +394,22 @@ pub struct DefenseDiagnostics {
     pub buflo_egress_backlog_pending: bool,
     /// Whether the application-complete signal was observed.
     pub buflo_application_complete: bool,
+    /// Pending reviewed-chaff requests discarded at an ineligible terminal sub-cell tail.
+    pub buflo_terminal_subcell_pending_request_cancellations: u64,
+    /// Open reviewed-chaff streams canceled at an ineligible terminal sub-cell tail.
+    pub buflo_terminal_subcell_stream_cancellations: u64,
+    /// Exact raw receive capacity left across the canceled sub-cell tail streams.
+    pub buflo_terminal_subcell_exact_capacity_bytes_cancelled: u64,
+    /// Whether the first eligible post-tau sub-cell terminal boundary latched.
+    pub buflo_terminal_subcell_latched: bool,
+    /// Controller elapsed time at the terminal sub-cell latch.
+    pub buflo_terminal_subcell_latched_at_us: u64,
+    /// Open reviewed-chaff streams present at the terminal sub-cell latch.
+    pub buflo_terminal_subcell_open_streams_at_latch: u64,
+    /// Parser-lease bytes still live at the terminal sub-cell latch (must be zero).
+    pub buflo_terminal_subcell_parser_lease_bytes_at_latch: u64,
+    /// Pending parser boundaries at the terminal sub-cell latch (must be zero).
+    pub buflo_terminal_subcell_pending_parser_boundaries_at_latch: u64,
     /// Whether the configured minimum duration was reached.
     pub buflo_minimum_duration_reached: bool,
     /// Whether the QCSD-only `BuFLO` event guard stopped the schedule.
@@ -729,15 +745,21 @@ pub trait Defense: Debug {
     fn accepts_new_chaff_requests(&self) -> bool {
         true
     }
-    /// Whether locally complete candidate semantics explicitly cancel any
-    /// remaining reviewed-chaff request streams instead of continuing to
-    /// allocate receive credit until their peer responses finish.
+    /// Exact chaff receive capacity required for one more terminal-drain
+    /// schedule event.
     ///
-    /// CS-BuFLO uses this for its client-side early-termination adaptation.
-    /// `BuFLO` deliberately retains the default and drains data through its
-    /// post-tau cadence.
-    fn cancel_open_chaff_on_completion(&self) -> bool {
-        false
+    /// When replenishment has closed, an open reviewed-chaff stream is useful
+    /// to the defense schedule only while it can carry another whole incoming
+    /// event. Returning a byte floor lets the controller stop at that first
+    /// ineligible boundary. The defense must then expose a typed terminal
+    /// cancellation reason or otherwise keep the stream open as a completion
+    /// barrier. `None` retains the historical open-stream backlog rule.
+    fn terminal_chaff_backlog_cell_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Typed local reason attached to any terminal reviewed-chaff cleanup.
+    fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
+        None
     }
     /// Whether outgoing reviewed-chaff STREAM payload is counted once per
     /// unique stream offset instead of once per wire transmission.

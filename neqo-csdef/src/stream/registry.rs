@@ -696,6 +696,12 @@ impl StreamRegistry {
         pending
     }
 
+    pub fn has_any_pending_parser_boundary(&self) -> bool {
+        self.streams.values().any(|state| {
+            state.receive_actions_available && state.receive.has_pending_parser_boundary()
+        })
+    }
+
     pub fn clear_parser_boundaries(&mut self) {
         #[expect(
             clippy::iter_over_hash_type,

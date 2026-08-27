@@ -35,6 +35,17 @@ pub enum QcsdSendPolicy {
     CongestionSensitive,
 }
 
+/// Client-local reason for terminating an unfinished reviewed-chaff request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QcsdChaffCancellationReason {
+    /// CS-BuFLO's local early-termination adaptation reached its stop state.
+    #[default]
+    CsBufloLocalEarlyTermination,
+    /// `BuFLO` drained every whole cell and only an ineligible sub-cell tail remained.
+    BufloTerminalSubcellTail,
+}
+
 /// Result of checking or applying one QCSD receive-limit action.
 ///
 /// Lifecycle outcomes are non-fatal: a controller can cancel the stream's
@@ -233,12 +244,16 @@ pub enum QcsdAction {
         resource: Resource,
         request_id: QcsdChaffRequestId,
     },
-    /// Cancel one still-open reviewed-chaff request at CS-BuFLO's local
-    /// early-termination boundary. This is a client-local HTTP/3 cancellation,
-    /// not the bilateral padding-complete signal used by the source study.
+    /// Cancel one still-open reviewed-chaff request at a typed client-local
+    /// terminal boundary. This is standard HTTP/3 cancellation, never a
+    /// bilateral padding-complete signal.
     CancelChaff {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
+        /// Auditable candidate-defense reason. Older schema-two actions
+        /// without this field deserialize as CS-BuFLO local termination.
+        #[serde(default)]
+        reason: QcsdChaffCancellationReason,
     },
     SlotMissed {
         endpoint: Option<QcsdEndpointId>,
@@ -298,7 +313,10 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{QcsdAction, QcsdParserLeaseOwner, QcsdReceiveActionIdentity, QcsdSendPolicy};
+    use super::{
+        QcsdAction, QcsdChaffCancellationReason, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
+        QcsdSendPolicy,
+    };
     use crate::{Direction, Packet, QcsdEndpointId, QcsdSlotId, QcsdStreamId};
 
     #[test]
@@ -377,6 +395,40 @@ mod tests {
             serde_json::from_value::<QcsdAction>(staged_json)
                 .expect("deserialize staged send action"),
             staged
+        );
+    }
+
+    #[test]
+    fn cancel_chaff_reason_is_typed_and_legacy_actions_default_to_cs_buflo() {
+        let buflo = QcsdAction::CancelChaff {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(4),
+            reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+        };
+        let buflo_json = serde_json::to_value(&buflo).expect("serialize typed cancellation");
+        assert_eq!(
+            buflo_json.get("reason").and_then(Value::as_str),
+            Some("buflo_terminal_subcell_tail")
+        );
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(buflo_json)
+                .expect("deserialize typed cancellation"),
+            buflo
+        );
+
+        let legacy_json = serde_json::json!({
+            "type": "cancel_chaff",
+            "endpoint": 1,
+            "stream": 4,
+        });
+        assert_eq!(
+            serde_json::from_value::<QcsdAction>(legacy_json)
+                .expect("deserialize legacy cancellation"),
+            QcsdAction::CancelChaff {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(4),
+                reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
+            }
         );
     }
 
