@@ -3812,7 +3812,9 @@ impl QcsdController {
         // a newly opened chaff request.  Enqueuing one here could place
         // RequestChaff immediately before DefenseComplete and leave a gated
         // request stream permanently open.
-        if self.defense.requires_terminal_chaff_drain() && self.defense.is_complete() {
+        if !self.defense.accepts_new_chaff_requests()
+            || self.defense.requires_terminal_chaff_drain() && self.defense.is_complete()
+        {
             return;
         }
         let Some(chaff) = &mut self.chaff else {
@@ -13994,6 +13996,69 @@ mod tests {
             controller.next_action(),
             Some(QcsdAction::DefenseComplete)
         ));
+    }
+
+    #[test]
+    fn buflo_terminal_drain_does_not_open_replacement_chaff() {
+        let mut defense = Buflo::from_parameters(BufloParameters {
+            schema_version: 1,
+            interval_us: 10,
+            minimum_duration_us: 30,
+            packet_size: 1_200,
+            max_events: 100,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        });
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(5),
+            kind: SignalKind::ApplicationComplete,
+        });
+        for at in [0, 10, 20, 30] {
+            while defense.next_event(Duration::from_micros(at)).is_some() {}
+        }
+        assert!(!defense.accepts_new_chaff_requests());
+        assert!(!defense.is_complete());
+
+        let manifest = ResourceManifest {
+            resources: vec![Resource {
+                id: 7,
+                url: "https://example.com/chaff".into(),
+                kind: "Other".into(),
+                content_length: Some(10_000),
+                data_length: 10_000,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            }],
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                low_watermark: 1_000,
+                max_chaff_streams: 1,
+                ..QcsdConfig::default()
+            },
+            Some(manifest),
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.drain_actions().for_each(drop);
+
+        controller.request_chaff_if_needed(true);
+
+        assert!(
+            !controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::RequestChaff { .. }))
+        );
+        assert_eq!(
+            controller
+                .chaff
+                .as_ref()
+                .map_or(0, super::ChaffManager::pending_count),
+            0
+        );
     }
 
     #[test]

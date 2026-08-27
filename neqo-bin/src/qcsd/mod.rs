@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
     io::{self, Write as _},
+    mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -1089,6 +1090,179 @@ struct RunCompletion<'a> {
     application_completion_monotonic_ns: Option<u64>,
     defense_diagnostics: Option<DefenseDiagnostics>,
     runner_wakeup_metrics: Option<RunnerWakeupMetrics>,
+}
+
+const QCSD_CLIENT_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-cpu10-v1";
+
+fn requested_scheduler_contract() -> Result<Option<String>, Error> {
+    match std::env::var("QCSD_CAPTURE_SCHEDULER_CONTRACT") {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::RunAborted(
+            "client scheduler contract is not valid UTF-8".into(),
+        )),
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RealtimePriorityLimit {
+    soft: u64,
+    hard: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProcessSchedulerEvidence {
+    schema_version: u32,
+    source: &'static str,
+    policy: String,
+    priority: i32,
+    affinity_cpus: Vec<usize>,
+    rlimit_rtprio: RealtimePriorityLimit,
+    no_new_privileges: Option<bool>,
+    effective_capabilities_hex: Option<String>,
+    cgroup_effective_cpuset: Option<String>,
+    affinity_scope: &'static str,
+    contract: Option<String>,
+    contract_valid: bool,
+}
+
+fn scheduler_contract_matches(evidence: &ProcessSchedulerEvidence) -> bool {
+    evidence.contract.as_deref().is_none_or(|value| {
+        value == QCSD_CLIENT_SCHEDULER_CONTRACT
+            && evidence.source == "linux-sched-and-procfs-v1"
+            && evidence.policy == "SCHED_RR"
+            && evidence.priority == 1
+            && evidence.affinity_cpus == [10]
+            && evidence.rlimit_rtprio.soft == 1
+            && evidence.rlimit_rtprio.hard == 1
+            && evidence.no_new_privileges == Some(true)
+            && evidence.effective_capabilities_hex.as_deref() == Some("0000000000000000")
+            && evidence.cgroup_effective_cpuset.as_deref() == Some("10-11")
+            && evidence.affinity_scope
+                == "qcsd_container_affinity_partition_not_physical_cpu_isolation"
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
+    let policy = {
+        // SAFETY: Querying the current process does not dereference pointers.
+        let value = unsafe { libc::sched_getscheduler(0) };
+        if value < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        value
+    };
+    let mut parameters = libc::sched_param { sched_priority: 0 };
+    // SAFETY: `parameters` is a valid writable sched_param for this process.
+    if unsafe { libc::sched_getparam(0, &raw mut parameters) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: A zeroed cpu_set_t is a valid destination for sched_getaffinity.
+    let mut affinity: libc::cpu_set_t = unsafe { mem::zeroed() };
+    // SAFETY: `affinity` and its exact size describe a valid writable buffer.
+    if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut affinity) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let affinity_cpus = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| {
+            // SAFETY: `cpu` is bounded by CPU_SETSIZE and `affinity` is initialized.
+            unsafe { libc::CPU_ISSET(*cpu, &affinity) }
+        })
+        .collect::<Vec<_>>();
+    // SAFETY: A zeroed rlimit is a valid destination for getrlimit.
+    let mut rtprio: libc::rlimit = unsafe { mem::zeroed() };
+    // SAFETY: `rtprio` is a valid writable rlimit for the RLIMIT_RTPRIO query.
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &raw mut rtprio) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: PR_GET_NO_NEW_PRIVS takes no pointer arguments for this query.
+    let no_new_privileges_raw = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    if no_new_privileges_raw < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let no_new_privileges = no_new_privileges_raw == 1;
+    let policy = match policy {
+        libc::SCHED_OTHER => "SCHED_OTHER",
+        libc::SCHED_FIFO => "SCHED_FIFO",
+        libc::SCHED_RR => "SCHED_RR",
+        libc::SCHED_BATCH => "SCHED_BATCH",
+        libc::SCHED_IDLE => "SCHED_IDLE",
+        _ => "SCHED_UNKNOWN",
+    }
+    .to_string();
+    let effective_capabilities_hex =
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CapEff:\t"))
+                    .map(str::trim)
+                    .map(str::to_string)
+            });
+    let cgroup_effective_cpuset = fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let contract = requested_scheduler_contract()?;
+    let mut evidence = ProcessSchedulerEvidence {
+        schema_version: 1,
+        source: "linux-sched-and-procfs-v1",
+        policy,
+        priority: parameters.sched_priority,
+        affinity_cpus,
+        rlimit_rtprio: RealtimePriorityLimit {
+            soft: rtprio.rlim_cur,
+            hard: rtprio.rlim_max,
+        },
+        no_new_privileges: Some(no_new_privileges),
+        effective_capabilities_hex,
+        cgroup_effective_cpuset,
+        affinity_scope: "qcsd_container_affinity_partition_not_physical_cpu_isolation",
+        contract,
+        contract_valid: false,
+    };
+    evidence.contract_valid = scheduler_contract_matches(&evidence);
+    if !evidence.contract_valid {
+        return Err(Error::RunAborted(format!(
+            "client scheduler contract failed: contract={:?} policy={} priority={} affinity={:?} rtprio={}/{} no_new_privileges={:?} effective_capabilities={:?} cgroup_effective_cpuset={:?}",
+            evidence.contract,
+            evidence.policy,
+            evidence.priority,
+            evidence.affinity_cpus,
+            evidence.rlimit_rtprio.soft,
+            evidence.rlimit_rtprio.hard,
+            evidence.no_new_privileges,
+            evidence.effective_capabilities_hex,
+            evidence.cgroup_effective_cpuset,
+        )));
+    }
+    Ok(evidence)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
+    let contract = requested_scheduler_contract()?;
+    if contract.is_some() {
+        return Err(Error::RunAborted(
+            "client scheduler contract is supported only on Linux".into(),
+        ));
+    }
+    Ok(ProcessSchedulerEvidence {
+        schema_version: 1,
+        source: "unsupported-platform-v1",
+        policy: "unavailable".into(),
+        priority: 0,
+        affinity_cpus: Vec::new(),
+        rlimit_rtprio: RealtimePriorityLimit { soft: 0, hard: 0 },
+        no_new_privileges: None,
+        effective_capabilities_hex: None,
+        cgroup_effective_cpuset: None,
+        affinity_scope: "unavailable",
+        contract,
+        contract_valid: true,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -3896,6 +4070,9 @@ fn sha256(bytes: &[u8]) -> Result<String, Error> {
     reason = "the current-thread runner keeps the connection and controller lifecycle in one event loop"
 )]
 async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
+    // Capture campaigns bind a least-privilege scheduling contract. Direct
+    // developer invocations still serialize their unconstrained observation.
+    _ = process_scheduler_evidence()?;
     spec.workload.validate()?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
@@ -5350,7 +5527,7 @@ fn sanitize_chaff_action_headers(action: &mut QcsdAction) {
     if let QcsdAction::RequestChaff { resource, .. } = action {
         // Sanitize before cloning the action so the adapter, action event, and
         // response receipt all describe the same frozen request headers.
-        resource.headers = sanitize_chaff_headers(std::mem::take(&mut resource.headers));
+        resource.headers = sanitize_chaff_headers(mem::take(&mut resource.headers));
     }
 }
 
@@ -6894,12 +7071,29 @@ async fn wait_for_activity_until<'a>(
     sockets: impl IntoIterator<Item = &'a Socket>,
     wakeup: Instant,
 ) -> Result<ActivityWake, Error> {
-    // Recompute immediately before sleeping: callback durations are never
-    // allowed to accumulate against a stale transport-drive timestamp.  An
-    // already-due callback still awaits once so Tokio's current-thread reactor
-    // can publish socket readiness before the runner retries its work loop.
-    let delay = remaining_wakeup_delay(wakeup, now()).unwrap_or_else(|| Duration::from_micros(1));
-    wait_for_activity(sockets, delay).await
+    // A future callback retains its absolute monotonic deadline instead of
+    // converting it to a relative sleep after every loop turn. An already-due
+    // callback still yields once so Tokio's current-thread reactor can publish
+    // socket readiness before the runner retries its work loop.
+    if remaining_wakeup_delay(wakeup, now()).is_none() {
+        return wait_for_activity(sockets, Duration::from_micros(1)).await;
+    }
+    let readiness: Vec<_> = sockets
+        .into_iter()
+        .map(|socket| Box::pin(socket.readable()))
+        .collect();
+    let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wakeup));
+    if readiness.is_empty() {
+        timer.await;
+        return Ok(ActivityWake::Timer);
+    }
+    let sockets_ready =
+        select_all(readiness).map(|(result, _, _)| result.map(|()| ActivityWake::SocketReady));
+    let timeout_ready = Box::pin(timer.map(|()| Ok(ActivityWake::Timer)));
+    select(sockets_ready, timeout_ready)
+        .map(|either| either.factor_first().0)
+        .await
+        .map_err(Error::from)
 }
 
 fn absolute_wakeup(base: Instant, delay: Duration) -> Option<Instant> {
@@ -7293,6 +7487,7 @@ fn write_run_json(
     started_unix_ns: u128,
     completion: &RunCompletion<'_>,
 ) -> Result<(), Error> {
+    let process_scheduler = process_scheduler_evidence()?;
     let chaff_responses = collect_chaff_responses(endpoints)?;
     let buflo_summary = buflo_run_summary(
         &spec.config.defense,
@@ -7341,6 +7536,7 @@ fn write_run_json(
         "application_completion_monotonic_ns": completion.application_completion_monotonic_ns,
         "defense_diagnostics": completion.defense_diagnostics,
         "runner_wakeup_metrics": completion.runner_wakeup_metrics,
+        "process_scheduler": process_scheduler,
         "buflo_summary": buflo_summary,
         "cs_buflo_summary": cs_buflo_summary,
         "completion_status": completion.status,
@@ -7451,8 +7647,7 @@ mod tests {
         traffic_morphing_endpoint_seed, validate_chaff_manifest_defense,
         validate_local_et_chaff_target, validate_prefix_capacity_plan,
         validate_qualified_chaff_binding, validate_walkie_talkie_chaff_precondition,
-        wait_for_activity, wait_for_activity_until, walkie_talkie_qualification_binding_matches,
-        write_run_json,
+        wait_for_activity_until, walkie_talkie_qualification_binding_matches, write_run_json,
     };
 
     fn trace_output_dir(label: &str) -> PathBuf {
@@ -8502,6 +8697,58 @@ mod tests {
     }
 
     #[test]
+    fn measured_scheduler_contract_rejects_every_receipted_mismatch() {
+        fn assert_rejected(
+            exact: &super::ProcessSchedulerEvidence,
+            mutate: impl FnOnce(&mut super::ProcessSchedulerEvidence),
+        ) {
+            let mut value = exact.clone();
+            mutate(&mut value);
+            assert!(!super::scheduler_contract_matches(&value));
+        }
+
+        let exact = super::ProcessSchedulerEvidence {
+            schema_version: 1,
+            source: "linux-sched-and-procfs-v1",
+            policy: "SCHED_RR".into(),
+            priority: 1,
+            affinity_cpus: vec![10],
+            rlimit_rtprio: super::RealtimePriorityLimit { soft: 1, hard: 1 },
+            no_new_privileges: Some(true),
+            effective_capabilities_hex: Some("0000000000000000".into()),
+            cgroup_effective_cpuset: Some("10-11".into()),
+            affinity_scope: "qcsd_container_affinity_partition_not_physical_cpu_isolation",
+            contract: Some("qcsd-client-rr1-cpu10-v1".into()),
+            contract_valid: false,
+        };
+        assert!(super::scheduler_contract_matches(&exact));
+
+        assert_rejected(&exact, |value| value.source = "wrong-source");
+        assert_rejected(&exact, |value| value.policy = "SCHED_OTHER".into());
+        assert_rejected(&exact, |value| value.priority = 2);
+        assert_rejected(&exact, |value| value.affinity_cpus = vec![10, 11]);
+        assert_rejected(&exact, |value| value.rlimit_rtprio.soft = 0);
+        assert_rejected(&exact, |value| value.rlimit_rtprio.hard = 2);
+        assert_rejected(&exact, |value| value.no_new_privileges = Some(false));
+        assert_rejected(&exact, |value| {
+            value.effective_capabilities_hex = Some("0000000000002000".into());
+        });
+        assert_rejected(&exact, |value| {
+            value.cgroup_effective_cpuset = Some("0-11".into());
+        });
+        assert_rejected(&exact, |value| value.affinity_scope = "physical-dedication");
+        assert_rejected(&exact, |value| value.contract = Some("unknown".into()));
+
+        let mut unconstrained = exact;
+        unconstrained.contract = None;
+        unconstrained.policy = "SCHED_OTHER".into();
+        assert!(
+            super::scheduler_contract_matches(&unconstrained),
+            "direct developer runs have no requested scheduler contract"
+        );
+    }
+
+    #[test]
     fn run_receipt_keeps_evidence_without_duplicate_workload_fields() {
         let output = trace_output_dir("minimal-run-receipt");
         let spec = RunSpec {
@@ -8554,6 +8801,14 @@ mod tests {
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
         assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 1);
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
+        assert_eq!(receipt["process_scheduler"]["schema_version"], 1);
+        assert!(receipt["process_scheduler"]["policy"].is_string());
+        assert!(receipt["process_scheduler"]["affinity_cpus"].is_array());
+        assert_eq!(
+            receipt["process_scheduler"]["contract"],
+            serde_json::Value::Null
+        );
+        assert_eq!(receipt["process_scheduler"]["contract_valid"], true);
         for retained in [
             "resolved_configuration",
             "responses",
@@ -9347,8 +9602,9 @@ mod tests {
             .observation(Some(endpoint), &observation)
             .expect("event row");
         traces.flush_events().expect("events");
-        drop(traces);
 
+        // Explicit finalization, rather than Drop, must make all three buffered
+        // trace streams visible before run.json is written.
         let packets = fs::read_to_string(output.join("packets.csv")).expect("packets");
         let events = fs::read_to_string(output.join("events.csv")).expect("events");
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
@@ -9388,6 +9644,7 @@ mod tests {
                 .expect("schedule row")
                 .ends_with(expected_suffix)
         );
+        drop(traces);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -11579,7 +11836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socket_readiness_preempts_the_runner_timer() {
+    async fn socket_readiness_preempts_the_absolute_runner_timer() {
         let socket = Socket::bind("127.0.0.1:0").expect("receiver socket");
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender socket");
         sender
@@ -11588,7 +11845,7 @@ mod tests {
 
         let wake = tokio::time::timeout(
             Duration::from_secs(1),
-            wait_for_activity([&socket], Duration::from_secs(60)),
+            wait_for_activity_until([&socket], now() + Duration::from_secs(60)),
         )
         .await
         .expect("readiness should beat the timeout")
@@ -11597,11 +11854,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_socket_wait_reports_an_actual_timer_return() {
-        let wake = wait_for_activity(std::iter::empty(), Duration::from_micros(1))
+    async fn empty_socket_wait_reaches_the_absolute_runner_deadline() {
+        let deadline = now() + Duration::from_millis(1);
+        let wake = wait_for_activity_until(std::iter::empty(), deadline)
             .await
             .expect("timer wait");
         assert_eq!(wake, ActivityWake::Timer);
+        assert!(now() >= deadline);
     }
 
     #[test]

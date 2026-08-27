@@ -266,6 +266,10 @@ impl Defense for Buflo {
         true
     }
 
+    fn accepts_new_chaff_requests(&self) -> bool {
+        !(self.application_complete && self.minimum_schedule_emitted())
+    }
+
     fn diagnostics(&self) -> DefenseDiagnostics {
         DefenseDiagnostics {
             buflo_paper_equivalent: false,
@@ -406,6 +410,28 @@ mod tests {
             });
         }
         assert!(defense.is_complete());
+    }
+
+    #[test]
+    fn inclusive_tau_and_onload_close_only_new_chaff_replenishment() {
+        let mut defense = Buflo::from_parameters(parameters());
+        assert!(defense.accepts_new_chaff_requests());
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(5),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert!(defense.accepts_new_chaff_requests());
+
+        for at in [0, 10, 20, 30] {
+            while defense.next_event(Duration::from_micros(at)).is_some() {}
+        }
+
+        assert!(defense.minimum_schedule_emitted());
+        assert!(!defense.accepts_new_chaff_requests());
+        assert!(
+            !defense.is_complete(),
+            "already-open chaff and scheduled cells must still drain naturally"
+        );
     }
 
     #[test]

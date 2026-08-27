@@ -721,6 +721,14 @@ pub trait Defense: Debug {
     fn requires_terminal_chaff_drain(&self) -> bool {
         false
     }
+    /// Whether the controller may open another reviewed-chaff request.
+    ///
+    /// Existing defenses retain the low-watermark replenisher. A defense that
+    /// enters a natural terminal drain can close replenishment while keeping
+    /// already-open and pending chaff in its backlog until those streams end.
+    fn accepts_new_chaff_requests(&self) -> bool {
+        true
+    }
     /// Whether locally complete candidate semantics explicitly cancel any
     /// remaining reviewed-chaff request streams instead of continuing to
     /// allocate receive credit until their peer responses finish.

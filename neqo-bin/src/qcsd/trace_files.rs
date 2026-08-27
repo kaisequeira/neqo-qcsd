@@ -11,7 +11,13 @@
     reason = "the parent runner constructs these private-module trace records directly"
 )]
 
-use std::{collections::HashMap, fs::File, io::Write as _, path::Path, time::Instant};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufWriter, Write as _},
+    path::Path,
+    time::Instant,
+};
 
 use neqo_csdef::{
     Direction, Packet, QcsdCongestionReason, QcsdEndpointId, QcsdObservation, QcsdSendPolicy,
@@ -257,9 +263,9 @@ struct EventTraceRow {
 }
 
 pub(super) struct TraceFiles {
-    packets: File,
-    events: File,
-    schedule: File,
+    packets: BufWriter<File>,
+    events: BufWriter<File>,
+    schedule: BufWriter<File>,
     start: Instant,
     event_rows: Vec<EventTraceRow>,
     next_event_sequence: u64,
@@ -271,17 +277,29 @@ pub(super) struct TraceFiles {
 
 impl TraceFiles {
     pub(super) fn new(output_dir: &Path, start: Instant) -> Result<Self, Error> {
-        let mut packets = File::create(output_dir.join("packets.csv"))?;
+        // Keep sustained 120-second constant-rate traces off the filesystem
+        // hot path; candidate evidence is flushed explicitly before run.json.
+        const TRACE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+        let mut packets = BufWriter::with_capacity(
+            TRACE_BUFFER_BYTES,
+            File::create(output_dir.join("packets.csv"))?,
+        );
         writeln!(
             packets,
             "direction,monotonic_us,connection,observed_udp_length,scheduled_target,satisfaction,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
         )?;
-        let mut events = File::create(output_dir.join("events.csv"))?;
+        let mut events = BufWriter::with_capacity(
+            TRACE_BUFFER_BYTES,
+            File::create(output_dir.join("events.csv"))?,
+        );
         writeln!(
             events,
             "monotonic_us,connection,event,outcome,details,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
         )?;
-        let mut schedule = File::create(output_dir.join("schedule.csv"))?;
+        let mut schedule = BufWriter::with_capacity(
+            TRACE_BUFFER_BYTES,
+            File::create(output_dir.join("schedule.csv"))?,
+        );
         writeln!(
             schedule,
             "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
@@ -583,6 +601,8 @@ impl TraceFiles {
             )?;
         }
         self.events.flush()?;
+        self.packets.flush()?;
+        self.schedule.flush()?;
         self.events_flushed = true;
         Ok(())
     }
