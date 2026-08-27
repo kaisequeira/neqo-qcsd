@@ -235,7 +235,10 @@ pub struct CsBufloRateTransitionDiagnostics {
 pub struct DefenseDiagnostics {
     /// Incoming schedule bytes handed to the shared receive-credit adapter.
     pub scheduled_incoming_requested_bytes: u64,
-    /// Scheduled receive-credit offsets confirmed encoded on the local wire.
+    /// Scheduled receive-credit bytes currently or terminally attributed to
+    /// locally encoded offsets. Retried parser ownership is de-attributed
+    /// before replacement credit is encoded, so this is not a cumulative wire
+    /// byte counter.
     pub scheduled_incoming_advertised_bytes: u64,
     /// Scheduled receive-credit offsets actually consumed as response bytes.
     pub scheduled_incoming_consumed_bytes: u64,

@@ -343,6 +343,9 @@ pub struct QcsdController {
     parser_lease_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<ParserLeaseRange>>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
     scheduled_incoming_requested_bytes: u64,
+    /// Scheduled ownership currently backed by physically advertised receive
+    /// capacity. Unconsumed parser ownership is removed again if its stream
+    /// closes and the same slot must be retried elsewhere.
     scheduled_incoming_advertised_bytes: u64,
     scheduled_incoming_consumed_bytes: u64,
     scheduled_incoming_retired_bytes: u64,
@@ -535,6 +538,16 @@ impl QcsdController {
         debug_assert!(
             self.scheduled_incoming_advertised_bytes <= self.scheduled_incoming_requested_bytes,
             "advertised scheduled incoming credit cannot exceed requested credit"
+        );
+        debug_assert!(
+            self.scheduled_incoming_consumed_bytes <= self.scheduled_incoming_advertised_bytes,
+            "consumed scheduled incoming credit must have been locally advertised"
+        );
+        debug_assert!(
+            self.incoming_credit_ledger
+                .values()
+                .all(|ledger| ledger.consumed <= ledger.advertised),
+            "each live incoming slot must advertise scheduled credit before consuming it"
         );
         diagnostics.scheduled_incoming_requested_bytes = self.scheduled_incoming_requested_bytes;
         diagnostics.scheduled_incoming_advertised_bytes = self.scheduled_incoming_advertised_bytes;
@@ -1459,9 +1472,15 @@ impl QcsdController {
         if let Some(state) = self.streams.get_mut(endpoint, stream) {
             state.receive.advertised(absolute_limit);
         }
+        let mut advertised_parser_owners = BTreeMap::new();
         if let Some(ranges) = self.parser_lease_ranges.get_mut(&(endpoint, stream)) {
             for range in ranges {
-                range.advertised |= range.end <= absolute_limit;
+                let newly_advertised = !range.advertised && range.end <= absolute_limit;
+                range.advertised |= newly_advertised;
+                if newly_advertised && let Some(owner) = range.owner {
+                    let total = advertised_parser_owners.entry(owner.slot).or_insert(0_u64);
+                    *total = total.saturating_add(range.bytes());
+                }
             }
         }
         let mut advertised_ranges = Vec::new();
@@ -1490,33 +1509,15 @@ impl QcsdController {
             ranges.append(&mut advertised_ranges);
             ranges.sort_unstable_by_key(|range| (range.start, range.end, range.slot));
         }
-        let mut completed = Vec::new();
-        let mut invalid = Vec::new();
         for (slot, advertised) in advertised_by_slot {
-            let Some(ledger) = self.incoming_credit_ledger.get_mut(&slot) else {
-                continue;
-            };
-            let remaining = ledger.requested().saturating_sub(ledger.advertised);
-            if advertised > remaining {
-                invalid.push(slot);
-                continue;
-            }
-            ledger.advertised = ledger.advertised.saturating_add(advertised);
-            self.scheduled_incoming_advertised_bytes = self
-                .scheduled_incoming_advertised_bytes
-                .saturating_add(advertised);
-            if ledger.advertised == ledger.requested() && !ledger.local_realization_emitted {
-                ledger.local_realization_emitted = true;
-                completed.push((slot, ledger.packet));
-            }
+            self.record_advertised_credit(slot, advertised, at);
         }
-        for slot in invalid {
-            self.fail_incoming_slot(slot, MissedSlotReason::RunAborted, at, true);
-        }
-        if self.defense.split_incoming_credit_lifecycle() {
-            for (slot, packet) in completed {
-                self.push_signal(at, SignalKind::IncomingCreditAdvertised { slot, packet });
-            }
+        // A post-cap parser lease is physically slotless, but can already
+        // carry explicit scheduling ownership. Count that ownership only once
+        // the transport proves the lease was advertised; consuming it remains
+        // the separate terminal transition below.
+        for (slot, advertised) in advertised_parser_owners {
+            self.record_advertised_credit(slot, advertised, at);
         }
         // A pristine typed parser boundary may have first exposed exact
         // scheduled capacity.  That release had to be encoded before a
@@ -1524,6 +1525,69 @@ impl QcsdController {
         // now that requested and advertised limits can agree.
         self.try_pre_header_bootstrap(endpoint, stream);
         self.try_parser_lease(endpoint, stream, true);
+    }
+
+    /// Attribute physically advertised receive capacity to one scheduled
+    /// incoming slot. Ordinary exact releases arrive here directly. Parser
+    /// leases arrive either with an explicit owner at advertisement time or
+    /// when consumed bytes acquire ownership from an older live claim.
+    fn record_advertised_credit(&mut self, slot: QcsdSlotId, bytes: u64, at: Duration) {
+        let (invalid, completed) = {
+            let Some(ledger) = self.incoming_credit_ledger.get_mut(&slot) else {
+                return;
+            };
+            let remaining = ledger.requested().saturating_sub(ledger.advertised);
+            if bytes > remaining {
+                (true, None)
+            } else {
+                ledger.advertised = ledger.advertised.saturating_add(bytes);
+                self.scheduled_incoming_advertised_bytes = self
+                    .scheduled_incoming_advertised_bytes
+                    .saturating_add(bytes);
+                let completed = (ledger.advertised == ledger.requested()
+                    && !ledger.local_realization_emitted)
+                    .then(|| {
+                        ledger.local_realization_emitted = true;
+                        ledger.packet
+                    });
+                (false, completed)
+            }
+        };
+        if invalid {
+            self.fail_incoming_slot(slot, MissedSlotReason::RunAborted, at, true);
+        } else if let Some(packet) = completed
+            && self.defense.split_incoming_credit_lifecycle()
+        {
+            self.push_signal(at, SignalKind::IncomingCreditAdvertised { slot, packet });
+        }
+    }
+
+    /// Remove unconsumed advertised parser capacity before its provisional
+    /// owner is returned to the allocator. The original local realization is
+    /// retained: retrying bytes from the same slot must not emit a second
+    /// opportunity, but its replacement credit must be able to restore the
+    /// byte ledger without being mistaken for over-advertisement.
+    fn return_advertised_credit(&mut self, slot: QcsdSlotId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let Some(ledger) = self.incoming_credit_ledger.get_mut(&slot) else {
+            return;
+        };
+        let remaining = ledger
+            .advertised
+            .checked_sub(bytes)
+            .expect("returned parser ownership exceeds its scheduled advertisement");
+        assert!(
+            remaining >= ledger.consumed,
+            "returned parser ownership must be unconsumed scheduled advertisement"
+        );
+        assert!(
+            self.scheduled_incoming_advertised_bytes >= bytes,
+            "returned parser ownership exceeds the global scheduled advertisement"
+        );
+        ledger.advertised = remaining;
+        self.scheduled_incoming_advertised_bytes -= bytes;
     }
 
     fn try_pre_header_bootstrap(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
@@ -1802,6 +1866,7 @@ impl QcsdController {
         // oldest same-stream claims and recycle exactly that overlap; any
         // remainder stays permanently charged to the lifetime unowned cap.
         let mut reclassified = 0_u64;
+        let mut reclassified_by_slot = BTreeMap::new();
         if unowned_overlap > 0 {
             let mut indices: Vec<_> = self
                 .control
@@ -1825,6 +1890,8 @@ impl QcsdController {
                 if consumed > 0 {
                     let total = owned_by_slot.entry(claim.slot).or_insert(0_u64);
                     *total = total.saturating_add(consumed);
+                    let advertised = reclassified_by_slot.entry(claim.slot).or_insert(0_u64);
+                    *advertised = advertised.saturating_add(consumed);
                 }
             }
         }
@@ -1835,6 +1902,15 @@ impl QcsdController {
                     .schedule_parser_lease_bytes(endpoint, stream, reclassified, true,),
                 reclassified
             );
+        }
+        // These bytes came from a parser lease that the transport had already
+        // advertised without an owner. Consumption converts the oldest live
+        // same-stream claim into scheduled ownership, so the same physical
+        // bytes must enter both the scheduled-advertised and scheduled-consumed
+        // ledgers. Counting only consumption leaves split cells permanently
+        // short by the parser bytes displaced at stream hand-off.
+        for (slot, advertised) in reclassified_by_slot {
+            self.record_advertised_credit(slot, advertised, at);
         }
         for (slot, consumed) in owned_by_slot {
             self.record_consumed_credit(slot, consumed, at);
@@ -1855,6 +1931,10 @@ impl QcsdController {
         if consumed == 0 {
             return;
         }
+        debug_assert!(
+            ledger.consumed.saturating_add(consumed) <= ledger.advertised,
+            "scheduled credit must be advertised before it is consumed"
+        );
         ledger.consumed = ledger.consumed.saturating_add(consumed);
         self.scheduled_incoming_consumed_bytes = self
             .scheduled_incoming_consumed_bytes
@@ -2129,6 +2209,7 @@ impl QcsdController {
             if remaining == 0 || !self.incoming_credit_ledger.contains_key(&owner.slot) {
                 continue;
             }
+            self.return_advertised_credit(owner.slot, remaining);
             self.streams.restore_claim(endpoint, stream, remaining);
             self.return_claim(&PendingClaim {
                 slot: owner.slot,
@@ -10442,6 +10523,143 @@ mod tests {
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "split advertisement, consumption, and terminal ordering form one lifecycle oracle"
+    )]
+    fn reclassified_parser_credit_realizes_split_lifecycle_once_before_terminal() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 4).expect("packet");
+        let slot = QcsdSlotId(604);
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let (mut defense, calls) = RecordingDefense::new([], DefenseMode::ChaffAndShape);
+        defense.split_incoming_credit_lifecycle = true;
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .bytes_read(1);
+        assert_eq!(controller.streams.claim_stream(endpoint, stream, 4), 4);
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 4;
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 4,
+        });
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                start: 1,
+                end: 5,
+                owner: None,
+                unowned: true,
+                advertised: true,
+            }],
+        );
+
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 4,
+            },
+            Duration::from_micros(7),
+        );
+        controller.drain_observations();
+
+        let calls = calls.borrow();
+        let advertised: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| {
+                matches!(
+                    call,
+                    RecordedCall::Signal(DefenseSignal {
+                        kind: SignalKind::IncomingCreditAdvertised {
+                            slot: observed,
+                            packet: observed_packet,
+                        },
+                        ..
+                    }) if *observed == slot && *observed_packet == packet
+                )
+                .then_some(index)
+            })
+            .collect();
+        let consumed: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| {
+                matches!(
+                    call,
+                    RecordedCall::Signal(DefenseSignal {
+                        kind: SignalKind::ReceiveCreditConsumed { bytes: 4 },
+                        ..
+                    })
+                )
+                .then_some(index)
+            })
+            .collect();
+        let resolved: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, call)| {
+                matches!(
+                    call,
+                    RecordedCall::Signal(DefenseSignal {
+                        kind: SignalKind::IncomingCreditResolved {
+                            slot: observed,
+                            packet: observed_packet,
+                            outcome: EventOutcome::Satisfied { observed: 4 },
+                        },
+                        ..
+                    }) if *observed == slot && *observed_packet == packet
+                )
+                .then_some(index)
+            })
+            .collect();
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(resolved.len(), 1);
+        assert!(advertised[0] < consumed[0] && consumed[0] < resolved[0]);
+        drop(calls);
+
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
     fn advertised_tail_controller(
         mode: DefenseMode,
         excess: u64,
@@ -11244,6 +11462,13 @@ mod tests {
             },
             Duration::from_micros(2),
         );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            0,
+            "an unowned parser lease is not scheduled merely by advertisement"
+        );
 
         // Encoding the lease did not realize scheduled work. Reading its
         // two-byte prefix does: those raw bytes spend two bytes of the
@@ -11257,12 +11482,9 @@ mod tests {
             Duration::from_micros(3),
         );
         assert_eq!(controller.control.claims[0].remaining, 2);
-        assert_eq!(
-            controller
-                .defense_diagnostics()
-                .scheduled_incoming_consumed_bytes,
-            2
-        );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 2);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 2);
         controller.observe(
             QcsdObservation::DataFrame {
                 endpoint,
@@ -11324,14 +11546,24 @@ mod tests {
         ));
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 4);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 4);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 4);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "advertise, stream return, retry, and consumption form one ownership oracle"
+    )]
     fn unused_scheduled_parser_ownership_returns_on_stream_lifecycle() {
-        for finish in [QcsdStreamFinish::Fin, QcsdStreamFinish::Reset] {
+        for (finish, consumed_before_close) in [QcsdStreamFinish::Fin, QcsdStreamFinish::Reset]
+            .into_iter()
+            .flat_map(|finish| [(finish, 0_u64), (finish, 4_u64)])
+        {
+            let (mut defense, calls) = RecordingDefense::new([], DefenseMode::ChaffAndShape);
+            defense.split_incoming_credit_lifecycle = true;
             let mut controller = QcsdController::with_defense(
                 QcsdConfig {
                     initial_max_stream_data: 1,
@@ -11339,11 +11571,12 @@ mod tests {
                     ..QcsdConfig::default()
                 },
                 None,
-                Box::new(StaticSchedule::new(Trace::default(), false)),
+                Box::new(defense),
             )
             .expect("controller");
             let endpoint = QcsdEndpointId(1);
             let stream = QcsdStreamId(4);
+            let retry_stream = QcsdStreamId(8);
             let slot = QcsdSlotId(5);
             let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
             ready(&mut controller, 1, "https://example.com");
@@ -11370,9 +11603,52 @@ mod tests {
                     end: 11,
                     owner: Some(QcsdParserLeaseOwner { packet, slot }),
                     unowned: false,
-                    advertised: true,
+                    advertised: false,
                 }],
             );
+            controller.credit_advertised(endpoint, stream, 11, None, Duration::ZERO);
+            controller.drain_observations();
+            let local_realizations = || {
+                calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| {
+                        matches!(
+                            call,
+                            RecordedCall::Signal(DefenseSignal {
+                                kind: SignalKind::IncomingCreditAdvertised {
+                                    slot: observed,
+                                    packet: observed_packet,
+                                },
+                                ..
+                            }) if *observed == slot && *observed_packet == packet
+                        )
+                    })
+                    .count()
+            };
+            assert_eq!(local_realizations(), 1);
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 10);
+            assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+
+            if consumed_before_close > 0 {
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream,
+                        bytes: 1 + consumed_before_close,
+                    },
+                    Duration::from_micros(1),
+                );
+                assert!(controller.next_action().is_none());
+                let diagnostics = controller.defense_diagnostics();
+                assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
+                assert_eq!(
+                    diagnostics.scheduled_incoming_consumed_bytes,
+                    consumed_before_close
+                );
+            }
 
             controller.observe(
                 QcsdObservation::StreamFinished {
@@ -11386,14 +11662,95 @@ mod tests {
             assert!(controller.control.claims.is_empty());
             assert_eq!(controller.control.incoming.len(), 1);
             assert_eq!(controller.control.incoming[0].slot, slot);
-            assert_eq!(controller.control.incoming[0].remaining, 10);
+            assert_eq!(
+                controller.control.incoming[0].remaining,
+                10 - consumed_before_close
+            );
             assert_eq!(controller.control.incoming[0].endpoint, None);
             assert_eq!(controller.pending_slots(), [(slot, packet)]);
             let diagnostics = controller.defense_diagnostics();
             assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 10);
-            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+            assert_eq!(
+                diagnostics.scheduled_incoming_advertised_bytes,
+                consumed_before_close
+            );
+            assert_eq!(
+                diagnostics.scheduled_incoming_consumed_bytes,
+                consumed_before_close
+            );
             assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
-            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 10);
+            assert_eq!(
+                diagnostics.scheduled_incoming_unresolved_bytes,
+                10 - consumed_before_close
+            );
+
+            // The same slot can move to another stream without its replacement
+            // advertisement being counted as an overflow or producing a
+            // duplicate local realization.
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream: retry_stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(11),
+                },
+                Duration::from_micros(2),
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::from_millis(5));
+            let QcsdAction::IncreaseReceiveLimit {
+                stream: observed_stream,
+                absolute_limit,
+                slot: observed_slot,
+                ..
+            } = controller
+                .drain_actions()
+                .find(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+                .expect("replacement receive credit")
+            else {
+                panic!("expected replacement receive credit");
+            };
+            assert_eq!(observed_stream, retry_stream);
+            assert_eq!(observed_slot, slot);
+            assert_eq!(absolute_limit, 11 - consumed_before_close);
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream: retry_stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_millis(5),
+            );
+            controller.drain_observations();
+            assert_eq!(local_realizations(), 1);
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
+            assert_eq!(
+                diagnostics.scheduled_incoming_consumed_bytes,
+                consumed_before_close
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: retry_stream,
+                    bytes: 11 - consumed_before_close,
+                },
+                Duration::from_millis(6),
+            );
+            assert!(controller.drain_actions().any(|action| matches!(
+                action,
+                QcsdAction::SlotSatisfied {
+                    slot: observed,
+                    ..
+                } if observed == slot
+            )));
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 10);
+            assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 10);
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
         }
     }
 
@@ -11501,7 +11858,7 @@ mod tests {
                         slot: advertised_slot,
                     }),
                     unowned: false,
-                    advertised: true,
+                    advertised: false,
                 },
                 ParserLeaseRange {
                     start: 26,
@@ -11511,6 +11868,13 @@ mod tests {
                     advertised: false,
                 },
             ],
+        );
+        controller.credit_advertised(endpoint, stream, 16, None, Duration::ZERO);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            3
         );
         let actions = [
             QcsdAction::IncreaseReceiveLimit {
@@ -12638,6 +13002,7 @@ mod tests {
         assert!(controller.parser_lease_ranges.is_empty());
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 8);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 8);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 8);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
@@ -12808,6 +13173,27 @@ mod tests {
             Duration::from_micros(1),
         );
         assert!(controller.next_action().is_none());
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 10);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 10);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: lease.2,
+                slot: None,
+            },
+            Duration::from_micros(1),
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            10,
+            "a duplicate slotless advertisement cannot double-count its owner"
+        );
         controller.observe(
             QcsdObservation::BytesRead {
                 endpoint,
@@ -12824,6 +13210,7 @@ mod tests {
         ));
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 10);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 10);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
@@ -14899,6 +15286,7 @@ mod tests {
         );
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 100);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 84);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 16);
@@ -14920,6 +15308,7 @@ mod tests {
             }) if satisfied == slot
         ));
         let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 100);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
