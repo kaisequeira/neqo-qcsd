@@ -485,6 +485,10 @@ pub struct DefenseDiagnostics {
     pub cs_buflo_incoming_padding_basis_total_bytes: u64,
     /// Live early-termination mapping identifier.
     pub cs_buflo_early_termination_semantics: &'static str,
+    /// Version of the client-only stop-then-drain early-termination translation.
+    pub cs_buflo_early_termination_translation_version: u32,
+    /// Client-only policy used to stop new opportunities and drain advertised credit.
+    pub cs_buflo_termination_stop_policy: &'static str,
     /// Source-study socket write size retained only as comparison metadata.
     pub cs_buflo_reference_tcp_write_size_bytes: u64,
     /// Source-study nominal IPv4/TCP packet size retained only as metadata.
@@ -503,6 +507,50 @@ pub struct DefenseDiagnostics {
     pub cs_buflo_outgoing_power_of_two_crossed: bool,
     /// Whether the latest ingress-credit increment crossed a power-of-two boundary.
     pub cs_buflo_incoming_power_of_two_crossed: bool,
+    /// Whether outgoing opportunities have entered the terminal drain phase.
+    pub cs_buflo_outgoing_termination_stop_latched: bool,
+    /// Whether incoming opportunities have entered the terminal drain phase.
+    pub cs_buflo_incoming_termination_stop_latched: bool,
+    /// Outgoing reason which initiated terminal drain, or empty before a latch.
+    pub cs_buflo_outgoing_termination_stop_reason: &'static str,
+    /// Incoming reason which initiated terminal drain, or empty before a latch.
+    pub cs_buflo_incoming_termination_stop_reason: &'static str,
+    /// Outgoing phase in which terminal drain began, or empty before a latch.
+    pub cs_buflo_outgoing_termination_stop_phase: &'static str,
+    /// Incoming phase in which terminal drain began, or empty before a latch.
+    pub cs_buflo_incoming_termination_stop_phase: &'static str,
+    /// Outgoing controller elapsed time at the terminal-drain latch.
+    pub cs_buflo_outgoing_termination_stop_latched_at_us: u64,
+    /// Incoming controller elapsed time at the terminal-drain latch.
+    pub cs_buflo_incoming_termination_stop_latched_at_us: u64,
+    /// Outgoing opportunities scheduled when terminal drain began.
+    pub cs_buflo_outgoing_termination_stop_scheduled_cells_at_stop: u64,
+    /// Incoming opportunities scheduled when terminal drain began.
+    pub cs_buflo_incoming_termination_stop_scheduled_cells_at_stop: u64,
+    /// Outgoing opportunities terminal when terminal drain began.
+    pub cs_buflo_outgoing_termination_stop_terminal_cells_at_stop: u64,
+    /// Incoming opportunities terminal when terminal drain began.
+    pub cs_buflo_incoming_termination_stop_terminal_cells_at_stop: u64,
+    /// Outgoing padding-policy progress at the terminal-drain latch.
+    pub cs_buflo_outgoing_termination_stop_progress_bytes_at_stop: u64,
+    /// Incoming padding-policy progress at the terminal-drain latch.
+    pub cs_buflo_incoming_termination_stop_progress_bytes_at_stop: u64,
+    /// Outgoing frozen padding target at the terminal-drain latch.
+    pub cs_buflo_outgoing_termination_stop_padding_target_bytes_at_stop: u64,
+    /// Incoming frozen padding target at the terminal-drain latch.
+    pub cs_buflo_incoming_termination_stop_padding_target_bytes_at_stop: u64,
+    /// Outgoing accounted-byte total at the crossing that initiated terminal drain.
+    pub cs_buflo_outgoing_termination_stop_crossing_total_bytes: u64,
+    /// Incoming accounted-byte total at the crossing that initiated terminal drain.
+    pub cs_buflo_incoming_termination_stop_crossing_total_bytes: u64,
+    /// Outgoing observed increment that crossed the terminal-drain boundary.
+    pub cs_buflo_outgoing_termination_stop_crossing_increment_bytes: u64,
+    /// Incoming observed increment that crossed the terminal-drain boundary.
+    pub cs_buflo_incoming_termination_stop_crossing_increment_bytes: u64,
+    /// Number of outgoing provisional stop receipts invalidated before final termination.
+    pub cs_buflo_outgoing_termination_stop_provisional_invalidation_count: u64,
+    /// Number of incoming provisional stop receipts invalidated before final termination.
+    pub cs_buflo_incoming_termination_stop_provisional_invalidation_count: u64,
     /// Fresh outgoing application STREAM bytes used by the adaptive boundary.
     pub cs_buflo_real_bearing_outgoing_bytes: u64,
     /// Client-only incoming real-bearing byte approximation.

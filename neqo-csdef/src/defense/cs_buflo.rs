@@ -22,7 +22,10 @@ const OUTGOING: usize = 0;
 const INCOMING: usize = 1;
 const REFERENCE_TCP_WRITE_SIZE_BYTES: u64 = 548;
 const REFERENCE_NOMINAL_TCP_PACKET_SIZE_BYTES: u64 = 600;
-const EARLY_TERMINATION_SEMANTICS: &str = "udp_client_only_observed_udp_power_of_two_crossing";
+const EARLY_TERMINATION_SEMANTICS: &str =
+    "client_only_outgoing_observed_udp_and_incoming_consumed_credit_power_of_two_crossing";
+const EARLY_TERMINATION_TRANSLATION_VERSION: u32 = 2;
+const TERMINATION_STOP_POLICY: &str = "stop_new_opportunities_at_first_eligible_padding_target_or_power_of_two_crossing_then_drain_advertised_credit_exactly_once";
 const RATE_BOUNDARY_COUNTER_SEMANTICS: &str = "client_only_quic_fresh_application_stream_bytes_outgoing_retransmission_excluded_and_consumed_application_offsets_incoming";
 const AUTHOR_RATE_BOUNDARY_COUNTER_SEMANTICS: &str =
     "per_direction_actually_transmitted_real_plus_junk_bytes";
@@ -84,6 +87,36 @@ struct PendingIncomingOpportunity {
     locally_realized: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminationStopReason {
+    PaddingTargetReached,
+    PowerOfTwoCrossing,
+}
+
+impl TerminationStopReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PaddingTargetReached => "padding_target_reached",
+            Self::PowerOfTwoCrossing => "power_of_two_crossing",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminationStopPhase {
+    ApplicationComplete,
+    StrictQuiet,
+}
+
+impl TerminationStopPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplicationComplete => "application_complete",
+            Self::StrictQuiet => "strict_quiet",
+        }
+    }
+}
+
 /// Clean-room, client-only `CS-BuFLO` adaptation.
 ///
 /// Client egress uses one-shot congestion-sensitive transport attempts.
@@ -115,6 +148,17 @@ pub struct CsBuflo {
     real_bearing_bytes: [u64; 2],
     termination_accounted_bytes: [u64; 2],
     last_termination_increment_bytes: [u64; 2],
+    termination_stop_latched: [bool; 2],
+    termination_stop_reason: [Option<TerminationStopReason>; 2],
+    termination_stop_phase: [Option<TerminationStopPhase>; 2],
+    termination_stop_latched_at_us: [Option<u64>; 2],
+    termination_stop_scheduled_cells_at_stop: [u64; 2],
+    termination_stop_terminal_cells_at_stop: [u64; 2],
+    termination_stop_progress_bytes_at_stop: [u64; 2],
+    termination_stop_padding_target_bytes_at_stop: [u64; 2],
+    termination_stop_crossing_total_bytes: [u64; 2],
+    termination_stop_crossing_increment_bytes: [u64; 2],
+    termination_stop_provisional_invalidation_count: [u64; 2],
     last_natural_us: [Option<u64>; 2],
     estimator_last_us: [Option<u64>; 2],
     estimator_direction: Option<Direction>,
@@ -190,6 +234,17 @@ impl CsBuflo {
             real_bearing_bytes: [0; 2],
             termination_accounted_bytes: [0; 2],
             last_termination_increment_bytes: [0; 2],
+            termination_stop_latched: [false; 2],
+            termination_stop_reason: [None; 2],
+            termination_stop_phase: [None; 2],
+            termination_stop_latched_at_us: [None; 2],
+            termination_stop_scheduled_cells_at_stop: [0; 2],
+            termination_stop_terminal_cells_at_stop: [0; 2],
+            termination_stop_progress_bytes_at_stop: [0; 2],
+            termination_stop_padding_target_bytes_at_stop: [0; 2],
+            termination_stop_crossing_total_bytes: [0; 2],
+            termination_stop_crossing_increment_bytes: [0; 2],
+            termination_stop_provisional_invalidation_count: [0; 2],
             last_natural_us: [None; 2],
             estimator_last_us: [None; 2],
             estimator_direction: None,
@@ -250,27 +305,27 @@ impl CsBuflo {
         }
     }
 
-    fn freeze_padding_target(&mut self, direction: Direction) {
+    fn freeze_padding_target(&mut self, at_us: u64, direction: Direction) {
         let index = direction_index(direction);
-        if self.padding_targets[index].is_some() {
-            return;
+        if self.padding_targets[index].is_none() {
+            self.padding_basis_natural[index] = Some(self.natural[index]);
+            self.padding_basis_cover[index] = Some(self.cover_payload[index]);
+            self.padding_basis_total[index] = Some(self.realized_total[index]);
+            self.padding_targets[index] = Some(match self.padding_mode(direction) {
+                CsBufloPaddingMode::Total => ceiling_power_of_two(self.realized_total[index]),
+                CsBufloPaddingMode::Payload => {
+                    payload_padding_target(self.natural[index], self.cover_payload[index])
+                }
+            });
         }
-        self.padding_basis_natural[index] = Some(self.natural[index]);
-        self.padding_basis_cover[index] = Some(self.cover_payload[index]);
-        self.padding_basis_total[index] = Some(self.realized_total[index]);
-        self.padding_targets[index] = Some(match self.padding_mode(direction) {
-            CsBufloPaddingMode::Total => ceiling_power_of_two(self.realized_total[index]),
-            CsBufloPaddingMode::Payload => {
-                payload_padding_target(self.natural[index], self.cover_payload[index])
-            }
-        });
+        self.maybe_latch_termination_stop(at_us, direction, None);
     }
 
     fn freeze_padding_targets(&mut self, at_us: u64) {
+        self.completion_at_us.get_or_insert(at_us);
         for direction in [Direction::Outgoing, Direction::Incoming] {
-            self.freeze_padding_target(direction);
+            self.freeze_padding_target(at_us, direction);
         }
-        self.completion_at_us = Some(at_us);
     }
 
     /// A strict-quiet target is provisional until both directions jointly
@@ -279,22 +334,55 @@ impl CsBuflo {
     /// quiet/onLoad boundary freeze a target that includes the resumed
     /// activity. Joint local termination remains irreversible and is handled
     /// separately by `post_local_termination_natural`.
-    fn invalidate_provisional_padding_target(&mut self, direction: Direction) {
+    const fn reset_termination_stop_evidence(&mut self, index: usize) {
+        self.termination_stop_latched[index] = false;
+        self.termination_stop_reason[index] = None;
+        self.termination_stop_phase[index] = None;
+        self.termination_stop_latched_at_us[index] = None;
+        self.termination_stop_scheduled_cells_at_stop[index] = 0;
+        self.termination_stop_terminal_cells_at_stop[index] = 0;
+        self.termination_stop_progress_bytes_at_stop[index] = 0;
+        self.termination_stop_padding_target_bytes_at_stop[index] = 0;
+        self.termination_stop_crossing_total_bytes[index] = 0;
+        self.termination_stop_crossing_increment_bytes[index] = 0;
+    }
+
+    fn invalidate_provisional_padding_target(&mut self, at_us: u64, direction: Direction) {
         let index = direction_index(direction);
-        if self.local_termination_latched || self.padding_targets[index].is_none() {
+        if self.local_termination_latched {
             return;
         }
+        let had_provisional_state = self.padding_targets[index].is_some()
+            || self.padding_basis_natural[index].is_some()
+            || self.padding_basis_cover[index].is_some()
+            || self.padding_basis_total[index].is_some()
+            || self.termination_stop_latched[index];
+        if !had_provisional_state {
+            return;
+        }
+        self.termination_stop_provisional_invalidation_count[index] =
+            self.termination_stop_provisional_invalidation_count[index].saturating_add(1);
         self.padding_basis_natural[index] = None;
         self.padding_basis_cover[index] = None;
         self.padding_basis_total[index] = None;
         self.padding_targets[index] = None;
+        self.reset_termination_stop_evidence(index);
 
         // onLoad is itself a permanent idle boundary. Re-freeze immediately
         // for the rare case where a causally later fresh-byte observation is
         // reduced before joint termination; strict-quiet targets instead wait
         // for another fresh aggregate-idle proof.
         if self.application_complete() {
-            self.freeze_padding_target(direction);
+            self.freeze_padding_target(at_us, direction);
+        }
+    }
+
+    fn invalidate_all_pre_onload_provisional_stops(&mut self, at_us: u64) {
+        if self.application_complete() || self.local_termination_latched {
+            return;
+        }
+        for direction in [Direction::Outgoing, Direction::Incoming] {
+            self.invalidate_provisional_padding_target(at_us, direction);
         }
     }
 
@@ -307,7 +395,7 @@ impl CsBuflo {
         }
         for direction in [Direction::Outgoing, Direction::Incoming] {
             if self.channel_idle(direction) {
-                self.freeze_padding_target(direction);
+                self.freeze_padding_target(self.latest_elapsed_us, direction);
             }
         }
     }
@@ -347,25 +435,94 @@ impl CsBuflo {
         })
     }
 
+    fn termination_phase_eligible(&self, direction: Direction) -> bool {
+        let index = direction_index(direction);
+        let outgoing_quiet_eligible = direction != Direction::Outgoing
+            || self.application_complete()
+            || (!self.egress_backlog_pending && self.quiet_backlog_snapshot_fresh);
+        self.padding_targets[index].is_some()
+            && self.channel_idle(direction)
+            && outgoing_quiet_eligible
+    }
+
+    /// A realized outgoing outcome deliberately makes the aggregate backlog
+    /// snapshot stale before its replacement snapshot is delivered. Preserve
+    /// a crossing which occurred in an already-frozen idle phase across that
+    /// short handoff, but do not activate completion until
+    /// `termination_phase_eligible` sees the fresh aggregate proof.
+    fn termination_crossing_phase_eligible(&self, direction: Direction) -> bool {
+        let index = direction_index(direction);
+        let outgoing_quiet_eligible = direction != Direction::Outgoing
+            || self.application_complete()
+            || !self.egress_backlog_pending;
+        self.padding_targets[index].is_some()
+            && self.channel_idle(direction)
+            && outgoing_quiet_eligible
+    }
+
+    fn termination_stop_active(&self, direction: Direction) -> bool {
+        self.termination_stop_latched[direction_index(direction)]
+            && self.termination_phase_eligible(direction)
+    }
+
+    const fn termination_stop_blocks_new_opportunities(&self, direction: Direction) -> bool {
+        self.termination_stop_latched[direction_index(direction)]
+    }
+
+    fn maybe_latch_termination_stop(
+        &mut self,
+        at_us: u64,
+        direction: Direction,
+        crossing: Option<(u64, u64)>,
+    ) {
+        let index = direction_index(direction);
+        if self.local_termination_latched || self.termination_stop_latched[index] {
+            return;
+        }
+        // Requiring a frozen target makes this an eligible terminal-phase
+        // crossing. In particular, the initial 0 -> one-cell crossing cannot
+        // remain sticky from connection start and terminate immediately at
+        // onLoad.
+        let target_reached = self.termination_phase_eligible(direction)
+            && self.padding_targets[index].is_some_and(|target| self.progress(direction) >= target);
+        let crossing = crossing.filter(|(total, increment)| {
+            total > increment && self.termination_crossing_phase_eligible(direction)
+        });
+        // Prefer the direct padding-target proof when one observation also
+        // crosses an accounted-byte boundary; crossing evidence is reserved
+        // for stops which actually depend on that translated predicate.
+        let (reason, crossing) = if target_reached {
+            (TerminationStopReason::PaddingTargetReached, None)
+        } else if let Some(crossing) = crossing {
+            (TerminationStopReason::PowerOfTwoCrossing, Some(crossing))
+        } else {
+            return;
+        };
+        let target = self.padding_targets[index].unwrap_or_default();
+        self.termination_stop_latched[index] = true;
+        self.termination_stop_reason[index] = Some(reason);
+        self.termination_stop_phase[index] = Some(if self.application_complete() {
+            TerminationStopPhase::ApplicationComplete
+        } else {
+            TerminationStopPhase::StrictQuiet
+        });
+        self.termination_stop_latched_at_us[index] = Some(at_us);
+        self.termination_stop_scheduled_cells_at_stop[index] = self.scheduled[index];
+        self.termination_stop_terminal_cells_at_stop[index] = self.terminal[index];
+        self.termination_stop_progress_bytes_at_stop[index] = self.progress(direction);
+        self.termination_stop_padding_target_bytes_at_stop[index] = target;
+        if let Some((total, increment)) = crossing {
+            self.termination_stop_crossing_total_bytes[index] = total;
+            self.termination_stop_crossing_increment_bytes[index] = increment;
+        }
+    }
+
     fn direction_complete(&self, direction: Direction) -> bool {
         if self.local_termination_latched {
             return true;
         }
         let index = direction_index(direction);
-        if direction == Direction::Outgoing
-            && !self.application_complete()
-            && (self.egress_backlog_pending || !self.quiet_backlog_snapshot_fresh)
-        {
-            return false;
-        }
-        self.channel_idle(direction)
-            && self.terminal[index] == self.scheduled[index]
-            && (self.padding_targets[index]
-                .is_some_and(|target| self.progress(direction) >= target)
-                || crossed_power_of_two(
-                    self.termination_accounted_bytes[index],
-                    self.last_termination_increment_bytes[index],
-                ))
+        self.termination_stop_active(direction) && self.terminal[index] == self.scheduled[index]
     }
 
     fn maybe_latch_local_termination(&mut self) {
@@ -384,13 +541,24 @@ impl CsBuflo {
         self.scheduled[OUTGOING].saturating_add(self.scheduled[INCOMING])
     }
 
-    const fn record_termination_increment(&mut self, index: usize, increment: u64) {
+    const fn record_termination_increment(
+        &mut self,
+        index: usize,
+        increment: u64,
+    ) -> Option<(u64, u64)> {
         if increment == 0 {
-            return;
+            return None;
         }
+        let previous = self.termination_accounted_bytes[index];
         self.termination_accounted_bytes[index] =
             self.termination_accounted_bytes[index].saturating_add(increment);
         self.last_termination_increment_bytes[index] = increment;
+        if previous > 0 && crossed_power_of_two(self.termination_accounted_bytes[index], increment)
+        {
+            Some((self.termination_accounted_bytes[index], increment))
+        } else {
+            None
+        }
     }
 
     fn record_estimator_sample(&mut self, at_us: u64, direction: Direction) {
@@ -466,7 +634,8 @@ impl CsBuflo {
     }
 
     fn record_composition(&mut self, at_us: u64, composition: QcsdSlotComposition) {
-        self.record_termination_increment(OUTGOING, outgoing_termination_increment(composition));
+        let crossing = self
+            .record_termination_increment(OUTGOING, outgoing_termination_increment(composition));
         self.realized_total[OUTGOING] =
             self.realized_total[OUTGOING].saturating_add(u64::from(composition.observed_udp_bytes));
         if composition.application_stream_bytes > 0 {
@@ -474,7 +643,7 @@ impl CsBuflo {
             // outcome. If onLoad froze a CTSP target between those two ordered
             // observations, refresh once more after the UDP total is known so
             // the immutable basis cannot retain the pre-composition total.
-            self.invalidate_provisional_padding_target(Direction::Outgoing);
+            self.invalidate_provisional_padding_target(at_us, Direction::Outgoing);
         }
         self.application_stream_bytes = self
             .application_stream_bytes
@@ -510,9 +679,11 @@ impl CsBuflo {
                 .saturating_add(u64::from(composition.application_stream_bytes));
             self.adapt_rate_if_due(at_us, Direction::Outgoing);
         }
+        self.maybe_latch_termination_stop(at_us, Direction::Outgoing, crossing);
     }
 
     fn record_outcome(&mut self, at_us: u64, packet: Packet, outcome: EventOutcome) {
+        self.latest_elapsed_us = self.latest_elapsed_us.max(at_us);
         debug_assert_eq!(packet.direction(), Direction::Outgoing);
         let at_minimum_interval = self.in_flight_at_minimum_interval[OUTGOING];
         self.terminal[OUTGOING] = self.terminal[OUTGOING].saturating_add(1);
@@ -545,9 +716,10 @@ impl CsBuflo {
             }
             EventOutcome::Satisfied { observed } => {
                 self.full_outgoing = self.full_outgoing.saturating_add(1);
-                self.record_termination_increment(OUTGOING, u64::from(observed));
+                let crossing = self.record_termination_increment(OUTGOING, u64::from(observed));
                 self.realized_total[OUTGOING] =
                     self.realized_total[OUTGOING].saturating_add(u64::from(observed));
+                self.maybe_latch_termination_stop(at_us, Direction::Outgoing, crossing);
             }
             EventOutcome::Missed(_) => {
                 self.missed_outgoing = self.missed_outgoing.saturating_add(1);
@@ -610,7 +782,14 @@ impl CsBuflo {
         self.maybe_latch_local_termination();
     }
 
-    fn record_incoming_outcome(&mut self, slot: QcsdSlotId, packet: Packet, outcome: EventOutcome) {
+    fn record_incoming_outcome(
+        &mut self,
+        at_us: u64,
+        slot: QcsdSlotId,
+        packet: Packet,
+        outcome: EventOutcome,
+    ) {
+        self.latest_elapsed_us = self.latest_elapsed_us.max(at_us);
         let pending = self.pending_incoming.remove(&slot);
         let pending_matches = pending.is_some_and(|pending| pending.packet == packet);
         let locally_realized = pending.is_some_and(|pending| pending.locally_realized);
@@ -635,20 +814,22 @@ impl CsBuflo {
                 if !locally_realized {
                     self.realization_failed = true;
                 }
-                self.record_termination_increment(INCOMING, u64::from(observed));
+                let crossing = self.record_termination_increment(INCOMING, u64::from(observed));
                 self.realized_total[INCOMING] =
                     self.realized_total[INCOMING].saturating_add(u64::from(observed));
+                self.maybe_latch_termination_stop(at_us, Direction::Incoming, crossing);
             }
             EventOutcome::FullySatisfied { composition } => {
                 if !locally_realized {
                     self.realization_failed = true;
                 }
-                self.record_termination_increment(
+                let crossing = self.record_termination_increment(
                     INCOMING,
                     u64::from(composition.observed_udp_bytes),
                 );
                 self.realized_total[INCOMING] = self.realized_total[INCOMING]
                     .saturating_add(u64::from(composition.observed_udp_bytes));
+                self.maybe_latch_termination_stop(at_us, Direction::Incoming, crossing);
             }
             EventOutcome::Missed(_)
             | EventOutcome::PartiallySatisfied { .. }
@@ -665,9 +846,10 @@ impl CsBuflo {
     }
 
     fn pop_direction(&mut self, elapsed_us: u64, direction: Direction) -> Option<Packet> {
+        self.maybe_latch_termination_stop(elapsed_us, direction, None);
         let index = direction_index(direction);
         if self.in_flight[index]
-            || self.direction_complete(direction)
+            || self.termination_stop_blocks_new_opportunities(direction)
             || self.event_guard_triggered
             || self.realization_failed
         {
@@ -723,7 +905,9 @@ impl Defense for CsBuflo {
             SignalKind::EgressBacklog { pending } => {
                 self.egress_backlog_pending = pending;
                 self.quiet_backlog_snapshot_fresh = !pending;
-                if !pending {
+                if pending {
+                    self.invalidate_all_pre_onload_provisional_stops(at_us);
+                } else {
                     self.freeze_strict_quiet_targets();
                 }
             }
@@ -734,6 +918,7 @@ impl Defense for CsBuflo {
             } => {
                 let index = direction_index(direction);
                 self.cover_payload[index] = self.cover_payload[index].saturating_add(bytes);
+                self.maybe_latch_termination_stop(at_us, direction, None);
             }
             SignalKind::Resolved { packet, outcome } => {
                 self.record_outcome(at_us, packet, outcome);
@@ -748,7 +933,7 @@ impl Defense for CsBuflo {
                 slot,
                 packet,
                 outcome,
-            } => self.record_incoming_outcome(slot, packet, outcome),
+            } => self.record_incoming_outcome(at_us, slot, packet, outcome),
             _ => {}
         }
         self.maybe_latch_local_termination();
@@ -764,7 +949,7 @@ impl Defense for CsBuflo {
                 self.post_local_termination_natural[index].saturating_add(bytes);
             return;
         }
-        self.invalidate_provisional_padding_target(direction);
+        self.invalidate_provisional_padding_target(at_us, direction);
         self.quiet_backlog_snapshot_fresh = false;
         self.last_natural_us[index] = Some(at_us);
         if direction == Direction::Incoming {
@@ -810,8 +995,10 @@ impl Defense for CsBuflo {
         }
         let mut candidates = Vec::with_capacity(4);
         for direction in [Direction::Outgoing, Direction::Incoming] {
-            if !self.direction_complete(direction) {
-                let index = direction_index(direction);
+            let index = direction_index(direction);
+            if !self.direction_complete(direction)
+                && !self.termination_stop_blocks_new_opportunities(direction)
+            {
                 if !self.in_flight[index] {
                     candidates.push(self.next_us[index]);
                 }
@@ -885,6 +1072,12 @@ impl Defense for CsBuflo {
         let basis_natural = self.padding_basis_natural.map(|value| value.unwrap_or(0));
         let basis_cover = self.padding_basis_cover.map(|value| value.unwrap_or(0));
         let basis_total = self.padding_basis_total.map(|value| value.unwrap_or(0));
+        let stop_reason = self
+            .termination_stop_reason
+            .map(|value| value.map_or("", TerminationStopReason::as_str));
+        let stop_phase = self
+            .termination_stop_phase
+            .map(|value| value.map_or("", TerminationStopPhase::as_str));
         DefenseDiagnostics {
             cs_buflo_paper_equivalent: false,
             cs_buflo_client_only: true,
@@ -923,6 +1116,8 @@ impl Defense for CsBuflo {
             cs_buflo_outgoing_padding_basis_total_bytes: basis_total[OUTGOING],
             cs_buflo_incoming_padding_basis_total_bytes: basis_total[INCOMING],
             cs_buflo_early_termination_semantics: EARLY_TERMINATION_SEMANTICS,
+            cs_buflo_early_termination_translation_version: EARLY_TERMINATION_TRANSLATION_VERSION,
+            cs_buflo_termination_stop_policy: TERMINATION_STOP_POLICY,
             cs_buflo_reference_tcp_write_size_bytes: REFERENCE_TCP_WRITE_SIZE_BYTES,
             cs_buflo_reference_nominal_tcp_packet_size_bytes:
                 REFERENCE_NOMINAL_TCP_PACKET_SIZE_BYTES,
@@ -943,6 +1138,46 @@ impl Defense for CsBuflo {
                 self.termination_accounted_bytes[INCOMING],
                 self.last_termination_increment_bytes[INCOMING],
             ),
+            cs_buflo_outgoing_termination_stop_latched: self.termination_stop_latched[OUTGOING],
+            cs_buflo_incoming_termination_stop_latched: self.termination_stop_latched[INCOMING],
+            cs_buflo_outgoing_termination_stop_reason: stop_reason[OUTGOING],
+            cs_buflo_incoming_termination_stop_reason: stop_reason[INCOMING],
+            cs_buflo_outgoing_termination_stop_phase: stop_phase[OUTGOING],
+            cs_buflo_incoming_termination_stop_phase: stop_phase[INCOMING],
+            cs_buflo_outgoing_termination_stop_latched_at_us: self.termination_stop_latched_at_us
+                [OUTGOING]
+                .unwrap_or_default(),
+            cs_buflo_incoming_termination_stop_latched_at_us: self.termination_stop_latched_at_us
+                [INCOMING]
+                .unwrap_or_default(),
+            cs_buflo_outgoing_termination_stop_scheduled_cells_at_stop: self
+                .termination_stop_scheduled_cells_at_stop[OUTGOING],
+            cs_buflo_incoming_termination_stop_scheduled_cells_at_stop: self
+                .termination_stop_scheduled_cells_at_stop[INCOMING],
+            cs_buflo_outgoing_termination_stop_terminal_cells_at_stop: self
+                .termination_stop_terminal_cells_at_stop[OUTGOING],
+            cs_buflo_incoming_termination_stop_terminal_cells_at_stop: self
+                .termination_stop_terminal_cells_at_stop[INCOMING],
+            cs_buflo_outgoing_termination_stop_progress_bytes_at_stop: self
+                .termination_stop_progress_bytes_at_stop[OUTGOING],
+            cs_buflo_incoming_termination_stop_progress_bytes_at_stop: self
+                .termination_stop_progress_bytes_at_stop[INCOMING],
+            cs_buflo_outgoing_termination_stop_padding_target_bytes_at_stop: self
+                .termination_stop_padding_target_bytes_at_stop[OUTGOING],
+            cs_buflo_incoming_termination_stop_padding_target_bytes_at_stop: self
+                .termination_stop_padding_target_bytes_at_stop[INCOMING],
+            cs_buflo_outgoing_termination_stop_crossing_total_bytes: self
+                .termination_stop_crossing_total_bytes[OUTGOING],
+            cs_buflo_incoming_termination_stop_crossing_total_bytes: self
+                .termination_stop_crossing_total_bytes[INCOMING],
+            cs_buflo_outgoing_termination_stop_crossing_increment_bytes: self
+                .termination_stop_crossing_increment_bytes[OUTGOING],
+            cs_buflo_incoming_termination_stop_crossing_increment_bytes: self
+                .termination_stop_crossing_increment_bytes[INCOMING],
+            cs_buflo_outgoing_termination_stop_provisional_invalidation_count: self
+                .termination_stop_provisional_invalidation_count[OUTGOING],
+            cs_buflo_incoming_termination_stop_provisional_invalidation_count: self
+                .termination_stop_provisional_invalidation_count[INCOMING],
             cs_buflo_real_bearing_outgoing_bytes: self.real_bearing_bytes[OUTGOING],
             cs_buflo_real_bearing_incoming_bytes: self.real_bearing_bytes[INCOMING],
             cs_buflo_outgoing_padding_target_bytes: targets[OUTGOING],
@@ -1002,7 +1237,8 @@ mod tests {
     use std::{collections::VecDeque, time::Duration};
 
     use super::{
-        CsBuflo, INCOMING, OUTGOING, crossed_power_of_two, floor_power_of_two,
+        CsBuflo, INCOMING, OUTGOING, TERMINATION_STOP_POLICY, TerminationStopPhase,
+        TerminationStopReason, crossed_power_of_two, floor_power_of_two,
         outgoing_termination_increment, payload_padding_target,
     };
     use crate::{
@@ -1030,6 +1266,17 @@ mod tests {
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
         }
+    }
+
+    fn advertise_incoming(defense: &mut CsBuflo, at_us: u64, slot: QcsdSlotId) -> Packet {
+        defense.next_us[OUTGOING] = u64::MAX;
+        defense.next_us[INCOMING] = at_us;
+        let packet = defense
+            .pop_direction(at_us, Direction::Incoming)
+            .expect("incoming opportunity");
+        defense.record_incoming_scheduled(slot, packet);
+        defense.record_incoming_advertised(at_us, slot, packet);
+        packet
     }
 
     fn oracle_direction_index(direction: Direction) -> usize {
@@ -1394,7 +1641,7 @@ mod tests {
         defense.next_us = [u64::MAX; 2];
         defense.natural = [1_000, 1_000];
         defense.cover_payload = [0, 24];
-        defense.realized_total = [1_100, 1_124];
+        defense.realized_total = [1_024, 1_124];
         defense.padding_targets = [Some(1_024), Some(1_024)];
         defense.padding_basis_natural = [Some(1_000), Some(1_000)];
         defense.padding_basis_cover = [Some(0), Some(24)];
@@ -1596,7 +1843,7 @@ mod tests {
         assert!(diagnostics.cs_buflo_outgoing_power_of_two_crossed);
         assert_eq!(
             diagnostics.cs_buflo_early_termination_semantics,
-            "udp_client_only_observed_udp_power_of_two_crossing"
+            "client_only_outgoing_observed_udp_and_incoming_consumed_credit_power_of_two_crossing"
         );
         assert_eq!(diagnostics.cs_buflo_reference_tcp_write_size_bytes, 548);
         assert_eq!(
@@ -1612,6 +1859,8 @@ mod tests {
         defense.natural = [1_000, 1_000];
         defense.cover_payload = [100, 100];
         defense.realized_total = [1_100, 1_100];
+        defense.termination_accounted_bytes = [600, 600];
+        defense.last_termination_increment_bytes = [600, 600];
         defense.scheduled = [1, 1];
         defense.in_flight = [true, true];
         defense.egress_backlog_pending = false;
@@ -1680,8 +1929,8 @@ mod tests {
     fn strict_quiet_fallback_freezes_directional_targets_and_completes_without_onload() {
         let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 14);
         defense.natural = [1_000, 1_000];
-        defense.cover_payload = [100, 100];
-        defense.realized_total = [1_100, 1_100];
+        defense.cover_payload = [1_048, 1_048];
+        defense.realized_total = [2_048, 2_048];
         defense.termination_accounted_bytes = [1_200, 1_200];
         defense.last_termination_increment_bytes = [600, 600];
         defense.scheduled = [1, 1];
@@ -1845,6 +2094,619 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the 12-credit RTT pipeline regression audits the complete immutable stop receipt"
+    )]
+    fn eligible_incoming_crossing_stops_new_opportunities_then_drains_advertised_credit() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1501);
+        defense.natural[INCOMING] = 1_000;
+
+        let warmup_slot = QcsdSlotId(301);
+        let warmup = advertise_incoming(&mut defense, 0, warmup_slot);
+        defense.record_incoming_outcome(
+            0,
+            warmup_slot,
+            warmup,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(!defense.termination_stop_latched[INCOMING]);
+
+        let advertised: Vec<_> = (0_u64..12)
+            .map(|offset| {
+                let slot = QcsdSlotId(302 + offset);
+                let packet = advertise_incoming(&mut defense, offset + 1, slot);
+                (slot, packet)
+            })
+            .collect();
+        assert_eq!(defense.scheduled[INCOMING], 13);
+        assert_eq!(defense.terminal[INCOMING], 1);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(20),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert_eq!(defense.padding_targets[INCOMING], Some(1_024));
+        assert!(!defense.termination_stop_latched[INCOMING]);
+
+        let (crossing_slot, crossing) = advertised[0];
+        defense.record_incoming_outcome(
+            21,
+            crossing_slot,
+            crossing,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert_eq!(defense.termination_accounted_bytes[INCOMING], 1_200);
+        assert!(defense.termination_stop_latched[INCOMING]);
+        assert_eq!(
+            defense.termination_stop_crossing_total_bytes[INCOMING],
+            1_200
+        );
+        assert_eq!(
+            defense.termination_stop_crossing_increment_bytes[INCOMING],
+            600
+        );
+        assert!(!defense.direction_complete(Direction::Incoming));
+        assert_eq!(
+            defense.termination_stop_reason[INCOMING],
+            Some(TerminationStopReason::PowerOfTwoCrossing)
+        );
+        assert_eq!(
+            defense.termination_stop_phase[INCOMING],
+            Some(TerminationStopPhase::ApplicationComplete)
+        );
+        assert_eq!(defense.termination_stop_latched_at_us[INCOMING], Some(21));
+        assert_eq!(
+            defense.termination_stop_scheduled_cells_at_stop[INCOMING],
+            13
+        );
+        assert_eq!(defense.termination_stop_terminal_cells_at_stop[INCOMING], 2);
+        assert_eq!(
+            defense.termination_stop_progress_bytes_at_stop[INCOMING],
+            1_000
+        );
+        assert_eq!(
+            defense.termination_stop_padding_target_bytes_at_stop[INCOMING],
+            1_024
+        );
+
+        let scheduled_at_stop = defense.scheduled;
+        assert_eq!(defense.next_event(Duration::from_micros(21)), None);
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.scheduled, scheduled_at_stop);
+
+        for (offset, (slot, packet)) in advertised.into_iter().skip(1).enumerate() {
+            defense.record_incoming_outcome(
+                22 + u64::try_from(offset).expect("bounded test offset"),
+                slot,
+                packet,
+                EventOutcome::Satisfied { observed: 600 },
+            );
+        }
+        assert_eq!(defense.termination_accounted_bytes[INCOMING], 7_800);
+        assert!(!crossed_power_of_two(7_800, 600));
+        assert!(defense.termination_stop_latched[INCOMING]);
+        assert!(defense.direction_complete(Direction::Incoming));
+        assert!(defense.is_complete());
+        assert_eq!(defense.scheduled, scheduled_at_stop);
+        assert_eq!(defense.terminal[INCOMING], 13);
+
+        let diagnostics = defense.diagnostics();
+        assert!(!diagnostics.cs_buflo_incoming_power_of_two_crossed);
+        assert!(diagnostics.cs_buflo_incoming_termination_stop_latched);
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_crossing_total_bytes,
+            1_200
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_crossing_increment_bytes,
+            600
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_reason,
+            "power_of_two_crossing"
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_phase,
+            "application_complete"
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_latched_at_us,
+            21
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_scheduled_cells_at_stop,
+            diagnostics.cs_buflo_scheduled_incoming_cells
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_terminal_cells_at_stop,
+            2
+        );
+        assert_eq!(diagnostics.cs_buflo_incoming_unresolved_cells, 0);
+        assert_eq!(diagnostics.cs_buflo_local_et_latched_at_us, 32);
+        assert!(
+            diagnostics.cs_buflo_incoming_termination_stop_latched_at_us
+                <= diagnostics.cs_buflo_local_et_latched_at_us
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_early_termination_translation_version,
+            2
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_termination_stop_policy,
+            TERMINATION_STOP_POLICY
+        );
+    }
+
+    #[test]
+    fn reached_padding_target_stops_new_incoming_opportunities_before_credit_drain() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1502);
+        defense.natural[INCOMING] = 1_000;
+        defense.observe(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert_eq!(defense.padding_targets[INCOMING], Some(1_024));
+
+        let first_slot = QcsdSlotId(311);
+        let first = advertise_incoming(&mut defense, 1, first_slot);
+        let second_slot = QcsdSlotId(312);
+        let second = advertise_incoming(&mut defense, 2, second_slot);
+        assert_eq!(defense.scheduled[INCOMING], 2);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(3),
+            kind: SignalKind::PayloadBytes {
+                direction: Direction::Incoming,
+                bytes: 24,
+                cover: true,
+            },
+        });
+        assert!(defense.termination_stop_latched[INCOMING]);
+        assert!(!defense.direction_complete(Direction::Incoming));
+        assert_eq!(defense.next_event(Duration::from_micros(3)), None);
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.scheduled[INCOMING], 2);
+        assert_eq!(
+            defense.termination_stop_reason[INCOMING],
+            Some(TerminationStopReason::PaddingTargetReached)
+        );
+        assert_eq!(
+            defense.termination_stop_phase[INCOMING],
+            Some(TerminationStopPhase::ApplicationComplete)
+        );
+        assert_eq!(defense.termination_stop_latched_at_us[INCOMING], Some(3));
+        assert_eq!(
+            defense.termination_stop_scheduled_cells_at_stop[INCOMING],
+            2
+        );
+        assert_eq!(defense.termination_stop_terminal_cells_at_stop[INCOMING], 0);
+        assert_eq!(
+            defense.termination_stop_progress_bytes_at_stop[INCOMING],
+            1_024
+        );
+        assert_eq!(
+            defense.termination_stop_padding_target_bytes_at_stop[INCOMING],
+            1_024
+        );
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(3),
+            kind: SignalKind::EgressBacklog { pending: true },
+        });
+        assert!(defense.termination_stop_latched[INCOMING]);
+        assert_eq!(
+            defense.termination_stop_provisional_invalidation_count[INCOMING], 0,
+            "ApplicationComplete makes the stop irreversible"
+        );
+
+        defense.record_incoming_outcome(
+            4,
+            first_slot,
+            first,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(!defense.direction_complete(Direction::Incoming));
+        defense.record_incoming_outcome(
+            5,
+            second_slot,
+            second,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(defense.direction_complete(Direction::Incoming));
+        assert!(defense.is_complete());
+        assert_eq!(
+            defense.termination_stop_crossing_total_bytes[INCOMING], 0,
+            "a target-initiated stop must not invent crossing evidence"
+        );
+        let diagnostics = defense.diagnostics();
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_reason,
+            "padding_target_reached"
+        );
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_phase,
+            "application_complete"
+        );
+        assert_eq!(diagnostics.cs_buflo_local_et_latched_at_us, 5);
+        assert!(
+            diagnostics.cs_buflo_incoming_termination_stop_latched_at_us
+                <= diagnostics.cs_buflo_local_et_latched_at_us
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_payload_stop_precedes_later_produced_credit_resolution() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1509);
+        defense.natural[INCOMING] = 1_000;
+        defense.observe(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::ApplicationComplete,
+        });
+        let slot = QcsdSlotId(315);
+        let packet = advertise_incoming(&mut defense, 1, slot);
+
+        // The controller's stable equal-time production order for BytesRead is
+        // PayloadBytes, ReceiveCreditConsumed, then IncomingCreditResolved.
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(3),
+            kind: SignalKind::PayloadBytes {
+                direction: Direction::Incoming,
+                bytes: 24,
+                cover: true,
+            },
+        });
+        defense.record_incoming_outcome(3, slot, packet, EventOutcome::Satisfied { observed: 600 });
+
+        let diagnostics = defense.diagnostics();
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_terminal_cells_at_stop,
+            0
+        );
+        assert_eq!(diagnostics.cs_buflo_incoming_unresolved_cells, 0);
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_latched_at_us,
+            3
+        );
+        assert_eq!(diagnostics.cs_buflo_local_et_latched_at_us, 3);
+    }
+
+    #[test]
+    fn crossing_before_target_freeze_is_not_reused_at_onload() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1503);
+        defense.natural[INCOMING] = 1_000;
+        let slot = QcsdSlotId(321);
+        let packet = advertise_incoming(&mut defense, 0, slot);
+        defense.record_incoming_outcome(0, slot, packet, EventOutcome::Satisfied { observed: 600 });
+        assert!(crossed_power_of_two(
+            defense.termination_accounted_bytes[INCOMING],
+            defense.last_termination_increment_bytes[INCOMING]
+        ));
+        assert!(!defense.termination_stop_latched[INCOMING]);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(1),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert_eq!(defense.padding_targets[INCOMING], Some(1_024));
+        assert!(defense.diagnostics().cs_buflo_incoming_power_of_two_crossed);
+        assert!(!defense.termination_stop_latched[INCOMING]);
+
+        defense.next_us[INCOMING] = 1;
+        let next = defense
+            .next_event(Duration::from_micros(1))
+            .expect("pre-freeze crossing must not stop the post-onLoad schedule");
+        assert_eq!(next.direction(), Direction::Incoming);
+    }
+
+    #[test]
+    fn initial_zero_to_one_cell_crossing_cannot_initiate_a_frozen_target_stop() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1507);
+        defense.natural[INCOMING] = 1_000;
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(10),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert_eq!(defense.padding_targets[INCOMING], Some(1_024));
+
+        let slot = QcsdSlotId(325);
+        let packet = advertise_incoming(&mut defense, 11, slot);
+        defense.record_incoming_outcome(
+            12,
+            slot,
+            packet,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        let diagnostics = defense.diagnostics();
+        assert!(
+            diagnostics.cs_buflo_incoming_power_of_two_crossed,
+            "the generic final-edge diagnostic remains source-compatible"
+        );
+        assert_eq!(diagnostics.cs_buflo_incoming_termination_stop_reason, "");
+        assert_eq!(diagnostics.cs_buflo_incoming_termination_stop_phase, "");
+        assert_eq!(
+            diagnostics.cs_buflo_incoming_termination_stop_latched_at_us,
+            0
+        );
+        assert!(!defense.termination_stop_latched[INCOMING]);
+        assert_eq!(defense.termination_stop_reason[INCOMING], None);
+        assert_eq!(defense.termination_stop_latched_at_us[INCOMING], None);
+        assert_eq!(
+            defense.termination_stop_crossing_total_bytes[INCOMING], 0,
+            "0 -> one cell is not an eligible stop-initiating crossing"
+        );
+
+        defense.next_us[INCOMING] = 13;
+        let next = defense
+            .next_event(Duration::from_micros(13))
+            .expect("the forbidden initial crossing must not stop incoming credit");
+        assert_eq!(next.direction(), Direction::Incoming);
+    }
+
+    #[test]
+    fn resumed_natural_traffic_resets_provisional_crossing_stop() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1504);
+        defense.natural[INCOMING] = 1_000;
+        defense.last_natural_us = [Some(0), Some(0)];
+
+        let warmup_slot = QcsdSlotId(331);
+        let warmup = advertise_incoming(&mut defense, 0, warmup_slot);
+        defense.record_incoming_outcome(
+            0,
+            warmup_slot,
+            warmup,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        let crossing_slot = QcsdSlotId(332);
+        let crossing = advertise_incoming(&mut defense, 1, crossing_slot);
+        let drain_slot = QcsdSlotId(333);
+        let drain = advertise_incoming(&mut defense, 2, drain_slot);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert_eq!(defense.padding_targets[INCOMING], Some(1_024));
+        defense.record_incoming_outcome(
+            2_000_002,
+            crossing_slot,
+            crossing,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(defense.termination_stop_latched[INCOMING]);
+
+        defense.observe_application_bytes(Duration::from_micros(2_000_003), Direction::Incoming, 1);
+        assert_eq!(defense.padding_targets[INCOMING], None);
+        assert!(!defense.termination_stop_latched[INCOMING]);
+        assert_eq!(defense.termination_stop_crossing_total_bytes[INCOMING], 0);
+        assert_eq!(
+            defense.termination_stop_crossing_increment_bytes[INCOMING],
+            0
+        );
+        assert_eq!(defense.termination_stop_reason[INCOMING], None);
+        assert_eq!(defense.termination_stop_phase[INCOMING], None);
+        assert_eq!(defense.termination_stop_latched_at_us[INCOMING], None);
+        assert_eq!(
+            defense.termination_stop_scheduled_cells_at_stop[INCOMING],
+            0
+        );
+        assert_eq!(defense.termination_stop_terminal_cells_at_stop[INCOMING], 0);
+        assert_eq!(
+            defense.termination_stop_provisional_invalidation_count[INCOMING],
+            1
+        );
+
+        let next_crossing_slot = QcsdSlotId(334);
+        let next_crossing = advertise_incoming(&mut defense, 2_000_004, next_crossing_slot);
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(4_000_004),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert_eq!(defense.padding_targets[INCOMING], Some(1_024));
+        defense.record_incoming_outcome(
+            4_000_005,
+            drain_slot,
+            drain,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(!defense.termination_stop_latched[INCOMING]);
+        defense.record_incoming_outcome(
+            4_000_006,
+            next_crossing_slot,
+            next_crossing,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(defense.termination_stop_latched[INCOMING]);
+        assert_eq!(
+            defense.termination_stop_crossing_total_bytes[INCOMING],
+            2_400
+        );
+        assert_eq!(
+            defense.termination_stop_crossing_increment_bytes[INCOMING],
+            600
+        );
+        assert_eq!(
+            defense.termination_stop_provisional_invalidation_count[INCOMING],
+            1
+        );
+    }
+
+    #[test]
+    fn strict_quiet_outgoing_crossing_survives_the_aggregate_snapshot_refresh() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1505);
+        defense.natural[OUTGOING] = 3_000;
+        defense.last_natural_us = [Some(0), Some(0)];
+        defense.next_us[INCOMING] = u64::MAX;
+
+        for at_us in 0..3 {
+            defense.next_us[OUTGOING] = at_us;
+            let packet = defense
+                .pop_direction(at_us, Direction::Outgoing)
+                .expect("pre-freeze outgoing opportunity");
+            defense.record_outcome(at_us, packet, EventOutcome::Satisfied { observed: 600 });
+        }
+        assert_eq!(defense.termination_accounted_bytes[OUTGOING], 1_800);
+        assert!(!defense.termination_stop_latched[OUTGOING]);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert_eq!(defense.padding_targets[OUTGOING], Some(4_096));
+
+        defense.next_us[OUTGOING] = 2_000_002;
+        let crossing = defense
+            .pop_direction(2_000_002, Direction::Outgoing)
+            .expect("post-freeze crossing opportunity");
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_002),
+            kind: SignalKind::Resolved {
+                packet: crossing,
+                outcome: EventOutcome::Satisfied { observed: 600 },
+            },
+        });
+        assert!(!defense.quiet_backlog_snapshot_fresh);
+        assert!(defense.termination_stop_latched[OUTGOING]);
+        assert!(!defense.termination_stop_active(Direction::Outgoing));
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(
+            defense.termination_stop_crossing_total_bytes[OUTGOING],
+            2_400
+        );
+        assert_eq!(
+            defense.termination_stop_reason[OUTGOING],
+            Some(TerminationStopReason::PowerOfTwoCrossing)
+        );
+        assert_eq!(
+            defense.termination_stop_phase[OUTGOING],
+            Some(TerminationStopPhase::StrictQuiet)
+        );
+        assert_eq!(
+            defense.termination_stop_latched_at_us[OUTGOING],
+            Some(2_000_002)
+        );
+        assert_eq!(
+            defense.termination_stop_scheduled_cells_at_stop[OUTGOING],
+            4
+        );
+        assert_eq!(defense.termination_stop_terminal_cells_at_stop[OUTGOING], 4);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_002),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert!(defense.termination_stop_active(Direction::Outgoing));
+        assert!(defense.is_complete());
+    }
+
+    #[test]
+    fn pre_onload_outgoing_backlog_can_resume_a_provisional_stop_without_spinning() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1506);
+        defense.padding_targets[OUTGOING] = Some(2_048);
+        defense.padding_basis_natural[OUTGOING] = Some(1_000);
+        defense.padding_basis_cover[OUTGOING] = Some(0);
+        defense.padding_basis_total[OUTGOING] = Some(1_000);
+        defense.last_natural_us[OUTGOING] = Some(0);
+        defense.latest_elapsed_us = 2_000_001;
+        defense.egress_backlog_pending = false;
+        defense.quiet_backlog_snapshot_fresh = true;
+        defense.termination_stop_latched[OUTGOING] = true;
+        defense.scheduled[INCOMING] = 1;
+        defense.in_flight[INCOMING] = true;
+        defense.next_us = [2_000_001, u64::MAX];
+
+        assert!(defense.termination_stop_blocks_new_opportunities(Direction::Outgoing));
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.next_event(Duration::from_micros(2_000_001)), None);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_002),
+            kind: SignalKind::EgressBacklog { pending: true },
+        });
+        assert!(!defense.termination_stop_blocks_new_opportunities(Direction::Outgoing));
+        let resumed = defense
+            .next_event(Duration::from_micros(2_000_002))
+            .expect("new outgoing backlog must be able to resume shaping");
+        assert_eq!(resumed.direction(), Direction::Outgoing);
+
+        defense.observe_application_bytes(Duration::from_micros(2_000_002), Direction::Outgoing, 1);
+        assert!(!defense.termination_stop_latched[OUTGOING]);
+        assert_eq!(defense.padding_targets[OUTGOING], None);
+    }
+
+    #[test]
+    fn pre_onload_pending_backlog_invalidates_both_stops_and_resumes_incoming_credit() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Payload), 0x1508);
+        defense.natural = [1_000, 1_000];
+        defense.last_natural_us = [Some(0), Some(0)];
+
+        let pending: Vec<_> = (0_u64..12)
+            .map(|offset| {
+                let slot = QcsdSlotId(401 + offset);
+                let packet = advertise_incoming(&mut defense, offset + 1, slot);
+                (slot, packet)
+            })
+            .collect();
+        assert_eq!(pending.len(), 12);
+        assert_eq!(defense.pending_incoming.len(), 12);
+        assert_eq!(defense.scheduled[INCOMING], 12);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_001),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert_eq!(defense.padding_targets, [Some(1_024), Some(1_024)]);
+        defense.termination_accounted_bytes = [1_200, 1_200];
+        defense.last_termination_increment_bytes = [600, 600];
+        for direction in [Direction::Outgoing, Direction::Incoming] {
+            defense.maybe_latch_termination_stop(2_000_002, direction, Some((1_200, 600)));
+        }
+        assert_eq!(defense.termination_stop_latched, [true, true]);
+        assert_eq!(
+            defense.termination_stop_reason,
+            [
+                Some(TerminationStopReason::PowerOfTwoCrossing),
+                Some(TerminationStopReason::PowerOfTwoCrossing),
+            ]
+        );
+        assert_eq!(defense.next_event_at(), None);
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2_000_003),
+            kind: SignalKind::EgressBacklog { pending: true },
+        });
+        assert_eq!(defense.padding_targets, [None, None]);
+        assert_eq!(defense.padding_basis_natural, [None, None]);
+        assert_eq!(defense.padding_basis_cover, [None, None]);
+        assert_eq!(defense.padding_basis_total, [None, None]);
+        assert_eq!(defense.termination_stop_latched, [false, false]);
+        assert_eq!(defense.termination_stop_reason, [None, None]);
+        assert_eq!(defense.termination_stop_phase, [None, None]);
+        assert_eq!(defense.termination_stop_latched_at_us, [None, None]);
+        assert_eq!(defense.termination_stop_scheduled_cells_at_stop, [0, 0]);
+        assert_eq!(defense.termination_stop_terminal_cells_at_stop, [0, 0]);
+        assert_eq!(defense.termination_stop_progress_bytes_at_stop, [0, 0]);
+        assert_eq!(
+            defense.termination_stop_padding_target_bytes_at_stop,
+            [0, 0]
+        );
+        assert_eq!(defense.termination_stop_crossing_total_bytes, [0, 0]);
+        assert_eq!(defense.termination_stop_crossing_increment_bytes, [0, 0]);
+        assert_eq!(
+            defense.termination_stop_provisional_invalidation_count,
+            [1, 1]
+        );
+
+        defense.next_us = [u64::MAX, 2_000_003];
+        let resumed = defense
+            .next_event(Duration::from_micros(2_000_003))
+            .expect("pending egress must resume incoming credit despite the 12-credit pipeline");
+        assert_eq!(resumed.direction(), Direction::Incoming);
+        assert_eq!(defense.scheduled[INCOMING], 13);
+        assert_eq!(defense.pending_incoming.len(), 12);
+    }
+
+    #[test]
     fn overlapping_incoming_outcomes_keep_slot_exact_minimum_classification() {
         let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0x16);
         defense.current_interval_us[INCOMING] = 4_096;
@@ -1868,6 +2730,7 @@ mod tests {
         assert_eq!(defense.pending_incoming.len(), 2);
 
         defense.record_incoming_outcome(
+            40,
             ordinary_slot,
             ordinary,
             EventOutcome::Satisfied { observed: 600 },
@@ -1876,6 +2739,7 @@ mod tests {
         assert_eq!(defense.minimum_interval_full[INCOMING], 0);
 
         defense.record_incoming_outcome(
+            50,
             minimum_slot,
             minimum,
             EventOutcome::Satisfied { observed: 600 },
@@ -2256,15 +3120,22 @@ mod tests {
                         defense.natural[index] + defense.cover_payload[index]
                     }
                 };
-                let expected = (direction == Direction::Incoming
-                    || defense.application_complete()
-                    || !defense.egress_backlog_pending)
-                    && defense.terminal[index] == defense.scheduled[index]
-                    && (progress >= expected_targets[index]
-                        || oracle_crossed(
-                            defense.termination_accounted_bytes[index],
-                            defense.last_termination_increment_bytes[index],
-                        ));
+                let crossing = oracle_crossed(
+                    defense.termination_accounted_bytes[index],
+                    defense.last_termination_increment_bytes[index],
+                )
+                .then_some((
+                    defense.termination_accounted_bytes[index],
+                    defense.last_termination_increment_bytes[index],
+                ))
+                .filter(|(total, increment)| total > increment);
+                defense.maybe_latch_termination_stop(case, direction, crossing);
+                let expected = defense.termination_stop_latched[index]
+                    && defense.terminal[index] == defense.scheduled[index];
+                assert_eq!(
+                    defense.termination_stop_latched[index],
+                    progress >= expected_targets[index] || crossing.is_some()
+                );
                 assert_eq!(defense.direction_complete(direction), expected);
             }
 
