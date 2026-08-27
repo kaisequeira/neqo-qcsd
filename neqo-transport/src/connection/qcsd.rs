@@ -284,6 +284,21 @@ impl Connection {
                 })
     }
 
+    /// Whether an accepted scheduled receive-credit action still needs its
+    /// first physical `MAX_STREAM_DATA` encoding.
+    ///
+    /// This deliberately excludes generic pending receive actions and
+    /// already-encoded/in-flight defense control.  The `BuFLO` runner uses the
+    /// predicate only for the causal follow-up drive after an exact outgoing
+    /// handoff; widening it would let unrelated retransmission work select an
+    /// endpoint at that fidelity-sensitive boundary.
+    #[must_use]
+    pub fn qcsd_has_unadvertised_scheduled_receive_credit(&self) -> bool {
+        self.qcsd_pending_receive_actions
+            .iter()
+            .any(|pending| pending.identity.slot().is_some())
+    }
+
     /// Mark each transport cancellation control actually queued by a
     /// successful typed candidate-defense chaff cancellation as defense-owned.
     pub fn qcsd_mark_chaff_cancellation(&mut self, stream: StreamId) {

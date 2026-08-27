@@ -14,9 +14,10 @@ use std::{
 
 use neqo_csdef::{
     Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdDatagramClass, QcsdEndpointId,
-    QcsdObservation, QcsdObservationClock, QcsdReceiveActionIdentity, QcsdReceiveLimitFatal,
-    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotId, QcsdSlotOutcome,
-    QcsdStreamId, TrafficMorphingConfig, TrafficMorphingEgress, TrafficMorphingOutcome,
+    QcsdObservation, QcsdObservationClock, QcsdParserLeaseOwner, QcsdReceiveActionIdentity,
+    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotId,
+    QcsdSlotOutcome, QcsdStreamId, TrafficMorphingConfig, TrafficMorphingEgress,
+    TrafficMorphingOutcome,
 };
 use test_fixture::{DEFAULT_ADDR, DEFAULT_ADDR_V4, fixture_init, now};
 
@@ -655,13 +656,16 @@ fn scheduled_receive_credit_is_counted_as_defense_control() {
     client.qcsd_enable(QcsdEndpointId(7), false);
     let stream = client.stream_create(StreamType::BiDi).unwrap();
     let limit = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap() + 100;
+    assert!(!client.qcsd_has_unadvertised_scheduled_receive_credit());
     client
         .qcsd_set_stream_receive_limit_for_slot(stream, limit, QcsdSlotId(199))
         .unwrap();
+    assert!(client.qcsd_has_unadvertised_scheduled_receive_credit());
     let queued_at = now();
     queue_congestion_sensitive_target(&mut client, 120, 300, false, queued_at).unwrap();
 
     assert_eq!(client.process_output(queued_at).dgram().unwrap().len(), 300);
+    assert!(!client.qcsd_has_unadvertised_scheduled_receive_credit());
     let composition = drain_observations(&mut client)
         .into_iter()
         .find_map(|observation| match observation {
@@ -704,6 +708,68 @@ fn scheduled_receive_credit_is_counted_as_defense_control() {
         .expect("peer acknowledges retransmitted receive control");
     client.process_input(acknowledgment, ack_at);
     assert!(!client.qcsd_has_pending_defense_control());
+}
+
+#[test]
+fn only_slot_owned_pending_receive_actions_select_the_causal_credit_drive() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    let endpoint = QcsdEndpointId(7);
+    client.qcsd_enable(endpoint, false);
+    let stream = client.stream_create(StreamType::BiDi).unwrap();
+    let initial = u64::try_from(INITIAL_LOCAL_MAX_STREAM_DATA).unwrap();
+    client
+        .qcsd_set_stream_receive_limit(stream, initial)
+        .expect("manual receive");
+
+    let unowned = QcsdReceiveActionIdentity::ParserLease {
+        endpoint,
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 10,
+        increase: 10,
+        owner: None,
+    };
+    client
+        .qcsd_apply_stream_receive_limit_action(
+            stream,
+            initial + 10,
+            Some(unowned),
+            Some(initial),
+            true,
+        )
+        .expect("apply unowned parser lease");
+    assert!(!client.qcsd_has_unadvertised_scheduled_receive_credit());
+    client
+        .qcsd_commit_receive_action_cancellation(&[unowned])
+        .expect("cancel unowned parser lease");
+
+    let owner = QcsdParserLeaseOwner {
+        packet: Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet"),
+        slot: QcsdSlotId(200),
+    };
+    let owned_identity = QcsdReceiveActionIdentity::ParserLease {
+        endpoint,
+        stream: QcsdStreamId(stream.as_u64()),
+        absolute_limit: initial + 10,
+        increase: 10,
+        owner: Some(owner),
+    };
+    client
+        .qcsd_apply_stream_receive_limit_action(
+            stream,
+            initial + 10,
+            Some(owned_identity),
+            Some(initial),
+            true,
+        )
+        .expect("apply slot-owned parser lease");
+    assert!(client.qcsd_has_unadvertised_scheduled_receive_credit());
+    _ = client
+        .process_output(now())
+        .dgram()
+        .expect("encode parser lease");
+    assert!(!client.qcsd_has_unadvertised_scheduled_receive_credit());
 }
 
 #[test]

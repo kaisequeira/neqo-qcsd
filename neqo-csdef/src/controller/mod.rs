@@ -268,6 +268,30 @@ impl UnadvertisedReceiveRange {
     const fn slot(self) -> Option<QcsdSlotId> {
         self.identity().slot()
     }
+
+    fn matches_physical_advertisement(
+        self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        observed_slot: Option<QcsdSlotId>,
+    ) -> bool {
+        if self.endpoint() != endpoint
+            || self.stream() != stream
+            || self.absolute_limit() > absolute_limit
+        {
+            return false;
+        }
+        match self {
+            // Transport emits one observation per covered scheduled slot. Keep
+            // those tombstones disambiguated when such a slot is present.
+            Self::Scheduled(credit) => observed_slot.is_none_or(|observed| credit.slot == observed),
+            // Parser leases are physically slotless. A frame that also covers
+            // scheduled credit produces only slot-attributed observations, so
+            // endpoint/stream/limit coverage is their complete identity here.
+            Self::Parser { .. } => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,6 +378,12 @@ pub struct QcsdController {
     /// a lease never satisfies scheduled work.
     parser_lease_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<ParserLeaseRange>>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
+    /// Scheduled receive releases that crossed their exclusive realization
+    /// deadline after the adapter accepted them but before transport encoded
+    /// them.  They are terminal scheduling tombstones, not live ownership:
+    /// a later physical advertisement remains auditable, but can never create
+    /// a consumable range or reverse the slot's `DeadlineExpired` outcome.
+    terminal_unadvertised_incoming_credit: Vec<UnadvertisedReceiveRange>,
     scheduled_incoming_requested_bytes: u64,
     /// Scheduled ownership currently backed by physically advertised receive
     /// capacity. Unconsumed parser ownership is removed again if its stream
@@ -536,6 +566,7 @@ impl QcsdController {
             advertised_incoming_credit: HashMap::new(),
             parser_lease_ranges: HashMap::new(),
             incoming_credit_ledger: HashMap::new(),
+            terminal_unadvertised_incoming_credit: Vec::new(),
             scheduled_incoming_requested_bytes: 0,
             scheduled_incoming_advertised_bytes: 0,
             scheduled_incoming_consumed_bytes: 0,
@@ -1584,6 +1615,11 @@ impl QcsdController {
         slot: Option<QcsdSlotId>,
         at: Duration,
     ) {
+        // The realization window is half-open. An observation stamped at the
+        // exclusive deadline is physical late evidence, never a successful
+        // scheduling transition. Expire all older accepted releases first so
+        // this observation cannot remove their live deadline ownership.
+        self.expire_unadvertised_exact_incoming(at);
         if let Some(state) = self.streams.get_mut(endpoint, stream) {
             state.receive.advertised(absolute_limit);
         }
@@ -1598,6 +1634,19 @@ impl QcsdController {
                 }
             }
         }
+        let mut terminal_advertised = 0_u64;
+        self.terminal_unadvertised_incoming_credit.retain(|range| {
+            let same_release =
+                range.matches_physical_advertisement(endpoint, stream, absolute_limit, slot);
+            if same_release {
+                terminal_advertised = terminal_advertised
+                    .saturating_add(range.absolute_limit().saturating_sub(range.start()));
+            }
+            !same_release
+        });
+        self.scheduled_incoming_advertised_bytes = self
+            .scheduled_incoming_advertised_bytes
+            .saturating_add(terminal_advertised);
         let mut advertised_ranges = Vec::new();
         let mut advertised_by_slot = BTreeMap::new();
         self.control.credit.retain(|credit| {
@@ -2710,6 +2759,24 @@ impl QcsdController {
         }
 
         let affected = self.dependent_unadvertised_slots(roots);
+        if reason == MissedSlotReason::DeadlineExpired
+            && self.defense.incoming_slot_must_resolve_in_window()
+        {
+            for range in self
+                .unadvertised_receive_ranges()
+                .into_iter()
+                .filter(|range| range.slot().is_some_and(|slot| affected.contains(&slot)))
+            {
+                let identity = range.identity();
+                if !self
+                    .terminal_unadvertised_incoming_credit
+                    .iter()
+                    .any(|candidate| candidate.identity() == identity)
+                {
+                    self.terminal_unadvertised_incoming_credit.push(range);
+                }
+            }
+        }
         let canceled_actions = self.rollback_failed_receive_ranges(&affected);
 
         let claims: Vec<_> = self
@@ -2762,6 +2829,41 @@ impl QcsdController {
         (affected, canceled_actions)
     }
 
+    /// Terminalize every exact-window incoming release whose first physical
+    /// advertisement did not occur inside its half-open realization window.
+    ///
+    /// Consumption is intentionally not part of this deadline: a timely
+    /// client-side `MAX_STREAM_DATA` advertisement may be consumed after an
+    /// arbitrary network RTT. A live ledger whose local-realization edge has
+    /// not fired can span direct scheduled credit, an owned parser lease, or
+    /// partial multi-stream fan-out; all share this one deadline.
+    fn expire_unadvertised_exact_incoming(&mut self, at: Duration) {
+        if !self.defense.incoming_slot_must_resolve_in_window() {
+            return;
+        }
+        let roots: HashSet<_> = self
+            .incoming_credit_ledger
+            .iter()
+            .filter_map(|(slot, ledger)| {
+                let deadline = ledger
+                    .packet
+                    .timestamp()
+                    .saturating_add(self.config.control_interval());
+                (!ledger.local_realization_emitted && at >= deadline).then_some(*slot)
+            })
+            .collect();
+        if !roots.is_empty() {
+            let (_, accepted_but_unencoded) =
+                self.fail_incoming_slots(&roots, MissedSlotReason::DeadlineExpired, at, true);
+            // These identities may already have crossed into an endpoint
+            // adapter, so the controller cannot safely pretend to revoke
+            // them here. The typed Missed outcome immediately makes BuFLO or
+            // CS-BuFLO fail closed; terminal tombstones above preserve any
+            // later physical advertisement without a satisfaction path.
+            drop(accepted_but_unencoded);
+        }
+    }
+
     /// Advance the published control loop to `elapsed` and queue due actions.
     pub fn poll(&mut self, elapsed: Duration) {
         if self.fixed_schedule.is_some() {
@@ -2771,6 +2873,7 @@ impl QcsdController {
             return;
         }
 
+        self.expire_unadvertised_exact_incoming(elapsed);
         self.drain_observations();
         let candidate_terminal_drain = self.defense.requires_terminal_chaff_drain();
         if !candidate_terminal_drain {
@@ -3258,6 +3361,7 @@ impl QcsdController {
             return;
         }
 
+        self.expire_unadvertised_exact_incoming(elapsed);
         self.drain_observations();
         self.request_chaff_if_needed(true);
         self.refresh_receiver_continuation_reserves();
@@ -4589,6 +4693,21 @@ impl QcsdController {
                 .map_or(next, |last| last.saturating_add(interval));
             candidates.push(Duration::from_micros(next_unprocessed));
         }
+        if self.defense.incoming_slot_must_resolve_in_window()
+            && let Some(deadline) = self
+                .incoming_credit_ledger
+                .values()
+                .filter(|ledger| !ledger.local_realization_emitted)
+                .map(|ledger| {
+                    ledger
+                        .packet
+                        .timestamp()
+                        .saturating_add(self.config.control_interval())
+                })
+                .min()
+        {
+            candidates.push(deadline);
+        }
         if let Some(due) = self.completion_due.filter(|_| !self.completion_emitted) {
             candidates.push(due);
         }
@@ -4695,8 +4814,8 @@ mod tests {
 
     use super::{
         AdvertisedIncomingCredit, IncomingCreditLedger, ParserLeaseRange, PendingClaim,
-        PendingCredit, PendingIncoming, QcsdController, duration_as_ceil_micros,
-        duration_as_floor_micros,
+        PendingCredit, PendingIncoming, QcsdController, UnadvertisedReceiveRange,
+        duration_as_ceil_micros, duration_as_floor_micros,
     };
     use crate::{
         Buflo, BufloParameters, CsBuflo, CsBufloEarlyTermination, CsBufloPaddingMode,
@@ -17133,6 +17252,391 @@ mod tests {
             action,
             QcsdAction::SlotMissed { .. } | QcsdAction::SlotSatisfied { .. }
         )));
+    }
+
+    #[test]
+    fn exact_incoming_unadvertised_deadline_is_a_wakeup_and_is_irreversible() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let (defense, outcomes) = ExactIncomingOneShot::new(packet);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                max_stream_data_excess: 1_000,
+                drop_unsatisfied_events: false,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        ready(&mut controller, endpoint.0, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1_000),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+
+        controller.poll(Duration::ZERO);
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit,
+            slot,
+            ..
+        } = controller.next_action().expect("whole credit action")
+        else {
+            panic!("expected receive credit");
+        };
+        controller.drain_actions().for_each(drop);
+        controller.flush_defense_observations();
+        assert_eq!(controller.next_deadline(), Some(Duration::from_millis(5)));
+
+        controller.poll(Duration::from_millis(5));
+        let terminal: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(
+            terminal
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::SlotMissed {
+                        slot: observed,
+                        reason: MissedSlotReason::DeadlineExpired,
+                        ..
+                    } if *observed == slot
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes.borrow().as_slice(),
+            [EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+
+        // Accepted adapter control may still be encoded after its logical
+        // deadline. Preserve that physical evidence once, but never recreate
+        // scheduled consumption ownership or a satisfied terminal outcome.
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::from_micros(5_001),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: absolute_limit,
+            },
+            Duration::from_millis(50),
+        );
+        controller.poll(Duration::from_millis(50));
+        assert_eq!(
+            outcomes.borrow().as_slice(),
+            [EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+        assert!(!controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the inclusive boundary pair shares one complete lifecycle oracle"
+    )]
+    fn exact_incoming_advertisement_uses_the_half_open_4999_5000_boundary() {
+        for advertised_at_us in [4_999_u64, 5_000] {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+            let (defense, outcomes) = ExactIncomingOneShot::new(packet);
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    control_interval_us: 5_000,
+                    max_stream_data_excess: 1_000,
+                    drop_unsatisfied_events: false,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(defense),
+            )
+            .expect("controller");
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(0);
+            ready(&mut controller, endpoint.0, "https://example.com");
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(1_000),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::ZERO);
+            let QcsdAction::IncreaseReceiveLimit {
+                absolute_limit,
+                slot,
+                ..
+            } = controller.next_action().expect("whole credit action")
+            else {
+                panic!("expected receive credit");
+            };
+            controller.drain_actions().for_each(drop);
+
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(advertised_at_us),
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: absolute_limit,
+                },
+                Duration::from_millis(50),
+            );
+            controller.poll(Duration::from_millis(50));
+            let actions: Vec<_> = controller.drain_actions().collect();
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 100);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+
+            if advertised_at_us == 4_999 {
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    [EventOutcome::Satisfied { observed: 100 }]
+                );
+                assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 100);
+                assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|action| matches!(
+                            action,
+                            QcsdAction::SlotSatisfied { slot: observed, .. } if *observed == slot
+                        ))
+                        .count(),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    [EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+                );
+                assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+                assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|action| matches!(
+                            action,
+                            QcsdAction::SlotMissed {
+                                slot: observed,
+                                reason: MissedSlotReason::DeadlineExpired,
+                                ..
+                            } if *observed == slot
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(!actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::SlotSatisfied { slot: observed, .. } if *observed == slot
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_late_frame_accounts_slotless_parser_and_matching_scheduled_tombstones() {
+        let (defense, _) = RecordingDefense::new([], DefenseMode::ChaffAndShape);
+        let mut controller =
+            QcsdController::with_defense(QcsdConfig::default(), None, Box::new(defense))
+                .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let scheduled_slot = QcsdSlotId(90);
+        let parser_slot = QcsdSlotId(91);
+        let later_slot = QcsdSlotId(92);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 20).expect("packet");
+        let parser_packet =
+            Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("parser packet");
+        controller.terminal_unadvertised_incoming_credit.extend([
+            UnadvertisedReceiveRange::Parser {
+                endpoint,
+                stream,
+                range: ParserLeaseRange {
+                    start: 90,
+                    end: 100,
+                    owner: Some(QcsdParserLeaseOwner {
+                        packet: parser_packet,
+                        slot: parser_slot,
+                    }),
+                    unowned: false,
+                    advertised: false,
+                },
+            },
+            UnadvertisedReceiveRange::Scheduled(PendingCredit {
+                slot: scheduled_slot,
+                packet,
+                endpoint,
+                stream,
+                absolute_limit: 120,
+                increase: 20,
+            }),
+            UnadvertisedReceiveRange::Scheduled(PendingCredit {
+                slot: later_slot,
+                packet,
+                endpoint,
+                stream,
+                absolute_limit: 140,
+                increase: 20,
+            }),
+        ]);
+
+        // Transport emits only the covered scheduled slot when one physical
+        // MAX_STREAM_DATA frame also covers a preceding parser lease.
+        controller.credit_advertised(
+            endpoint,
+            stream,
+            120,
+            Some(scheduled_slot),
+            Duration::from_millis(10),
+        );
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 30);
+        assert_eq!(controller.terminal_unadvertised_incoming_credit.len(), 1);
+        assert_eq!(
+            controller.terminal_unadvertised_incoming_credit[0].slot(),
+            Some(later_slot)
+        );
+
+        // Repeated per-slot observations for the same frame are idempotent.
+        controller.credit_advertised(
+            endpoint,
+            stream,
+            120,
+            Some(scheduled_slot),
+            Duration::from_millis(10),
+        );
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 30);
+        assert_eq!(controller.terminal_unadvertised_incoming_credit.len(), 1);
+    }
+
+    #[test]
+    fn exact_owned_parser_lease_uses_the_same_local_realization_deadline() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
+        let (mut defense, outcomes) = ExactIncomingOneShot::new(packet);
+        assert_eq!(defense.next_event(Duration::ZERO), Some(packet));
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 32,
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let slot = QcsdSlotId(90);
+        ready(&mut controller, endpoint.0, "https://example.com");
+        retain_post_cap_parser_boundary(
+            &mut controller,
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 10;
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 10,
+        });
+        controller.try_parser_lease(endpoint, stream, true);
+        let QcsdAction::LeaseParserReceive {
+            absolute_limit,
+            owner: Some(owner),
+            ..
+        } = controller.next_action().expect("owned parser lease")
+        else {
+            panic!("expected slot-owned parser lease");
+        };
+        assert_eq!(owner, QcsdParserLeaseOwner { packet, slot });
+        controller.drain_actions().for_each(drop);
+        controller.flush_defense_observations();
+        assert_eq!(controller.next_deadline(), Some(Duration::from_millis(5)));
+
+        // An advertisement stamped exactly at the exclusive boundary is
+        // retained as late physical evidence, not local realization.
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: None,
+            },
+            Duration::from_millis(5),
+        );
+        controller.poll(Duration::from_millis(5));
+        assert!(controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed {
+                slot: observed,
+                reason: MissedSlotReason::DeadlineExpired,
+                ..
+            } if observed == slot
+        )));
+        assert_eq!(
+            outcomes.borrow().as_slice(),
+            [EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: absolute_limit,
+            },
+            Duration::from_millis(50),
+        );
+        controller.poll(Duration::from_millis(50));
+        assert_eq!(
+            outcomes.borrow().as_slice(),
+            [EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 10);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 10);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]

@@ -46,6 +46,13 @@ impl Http3Client {
         self.conn.qcsd_has_pending_defense_control()
     }
 
+    /// Whether transport accepted scheduled receive credit that has not yet
+    /// been physically advertised in a QUIC packet.
+    #[must_use]
+    pub fn qcsd_has_unadvertised_scheduled_receive_credit(&self) -> bool {
+        self.conn.qcsd_has_unadvertised_scheduled_receive_credit()
+    }
+
     /// Whether HTTP/3/QPACK or transport retains pending STREAM output other
     /// than the explicitly allowed request streams.
     pub fn qcsd_has_pending_stream_send_excluding(&mut self, allowed: &[StreamId]) -> bool {

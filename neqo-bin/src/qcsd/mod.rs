@@ -1325,8 +1325,8 @@ struct RunnerWakeupMetrics {
 impl RunnerWakeupMetrics {
     const fn new() -> Self {
         Self {
-            schema_version: 2,
-            semantics: "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=250; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_output_is_interrupted_at_guard",
+            schema_version: 3,
+            semantics: "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_output_is_interrupted_at_guard",
             wait_returns: 0,
             socket_readiness_wakeups: 0,
             timer_wakeups: 0,
@@ -7710,7 +7710,7 @@ enum BufloExactReleaseWaitStep {
     Dispatch,
 }
 
-const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL: Duration = Duration::from_micros(250);
+const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BufloExactReleaseCandidate {
@@ -7929,8 +7929,95 @@ fn buflo_guard_identity_matches_runner(
     }
 }
 
+fn buflo_unadvertised_scheduled_receive_credit_endpoints(endpoints: &[Endpoint]) -> Vec<usize> {
+    endpoints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, endpoint)| {
+            endpoint
+                .client
+                .qcsd_has_unadvertised_scheduled_receive_credit()
+                .then_some(index)
+        })
+        .collect()
+}
+
 #[expect(
     clippy::future_not_send,
+    reason = "the current-thread runner owns the post-handoff receive-credit causality boundary"
+)]
+async fn drive_buflo_unadvertised_scheduled_receive_credit(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Instant,
+) -> Result<(), Error> {
+    let selected = buflo_unadvertised_scheduled_receive_credit_endpoints(endpoints);
+    for endpoint_index in selected.iter().copied() {
+        if now() >= guard.deadline {
+            break;
+        }
+        // The ordered reducer materialized the paired incoming opportunity
+        // after the outgoing action. Once that outgoing action reaches its
+        // exact socket handoff, give only adapters retaining slot-owned,
+        // not-yet-encoded receive control one immediate packet-build turn.
+        // Same-endpoint control already composed into the outgoing cell has
+        // left this predicate and is therefore never driven twice here.
+        _ = drive_endpoint_output_until(
+            endpoint_index,
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            observation_clock,
+            Some(defense_start),
+            Some(guard.deadline),
+        )
+        .await?;
+    }
+
+    let checked_at = now();
+    let unresolved = selected.iter().copied().any(|endpoint_index| {
+        endpoints[endpoint_index]
+            .client
+            .qcsd_has_unadvertised_scheduled_receive_credit()
+    });
+    if unresolved && checked_at >= guard.deadline {
+        // Reduce the controller's exclusive local-realization timer before
+        // surfacing the runner error. This guarantees a typed, exactly-once
+        // `DeadlineExpired` receipt even when transport returned Callback or
+        // None without ever encoding the accepted receive action.
+        handle_all_qcsd_observations(
+            endpoints,
+            controller,
+            traces,
+            checked_at.saturating_duration_since(defense_start),
+        )?;
+        let elapsed = checked_at.saturating_duration_since(defense_start);
+        controller.poll(elapsed);
+        controller.flush_defense_observations();
+        apply_queued_actions(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            checked_at,
+            elapsed,
+        )?;
+        return Err(Error::RunAborted(format!(
+            "BuFLO incoming credit paired with outgoing slot {} remained unadvertised at its exact realization deadline",
+            guard.slot.0
+        )));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_lines,
     reason = "the binary deliberately uses Tokio's current-thread runtime"
 )]
 async fn dispatch_buflo_exact_release(
@@ -8042,6 +8129,16 @@ async fn dispatch_buflo_exact_release(
             guard.slot.0
         )));
     }
+    drive_buflo_unadvertised_scheduled_receive_credit(
+        guard,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        started,
+    )
+    .await?;
     Ok(())
 }
 
@@ -8072,10 +8169,10 @@ async fn dispatch_due_buflo_exact_release(
 
     // Tokio's current-thread timer and ordinary socket/HTTP work can otherwise
     // consume the complete half-open realization window before a due BuFLO
-    // target reaches transport. Reserve exactly that candidate's own window,
-    // sleep through most of it, and remain runnable only for the short
-    // receipted tail. Callers invoke this boundary between every bounded unit
-    // of ordinary work as well as at the loop head.
+    // target reaches transport. Reserve exactly that candidate's own window
+    // and remain runnable for the full five-millisecond realization interval.
+    // Callers invoke this boundary between every bounded unit of ordinary work
+    // as well as at the loop head.
     debug_assert!(guard.release < guard.deadline);
     let (entered_at, active_wait_started_at, dispatch_at) = wait_for_buflo_exact_release(&guard);
     runner_wakeup_metrics.record_buflo_exact_release_guard(
@@ -9211,9 +9308,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ActivityWake, ApplicationBatchLifecycle, Args, BufloExactReleaseCandidate,
-        BufloExactReleasePhase, BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg, DefenseArg,
-        Error, ExpectedChaffIdentity, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
+        ActivityWake, ApplicationBatchLifecycle, Args, BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        BufloExactReleaseCandidate, BufloExactReleaseGuard, BufloExactReleasePhase,
+        BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg, DefenseArg, Error,
+        ExpectedChaffIdentity, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
         PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg, QcsdRequestRole,
         QualificationAcknowledgement, QualifierStream, RequestPolicyArg, ResourceRunState,
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
@@ -9225,9 +9323,11 @@ mod tests {
         attempt_socket_handoff, attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
         bind_qualified_chaff_stream_limits, bounded_qualification_wait,
         buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
-        buflo_run_summary, cancel_uncommitted_prearms_on_abort, create_endpoints,
-        cs_buflo_run_summary, datagram_observation, deadline_error, defense_parameter_provenance,
-        dispatch_ready_requests, drain_qualifier_stream_data, drive_endpoint_output,
+        buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
+        cancel_uncommitted_prearms_on_abort, create_endpoints, cs_buflo_run_summary,
+        datagram_observation, deadline_error, defense_parameter_provenance,
+        dispatch_ready_requests, drain_qualifier_stream_data,
+        drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_with_clock, drive_endpoint_output_with_clock_until,
         due_rolling_output_target, endpoint_egress_backlog_pending, endpoint_send_terminal,
         ensure_defense_realizable, expected_application_response_length, finish_application_record,
@@ -10538,8 +10638,8 @@ mod tests {
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
                 runner_wakeup_metrics: Some(RunnerWakeupMetrics {
-                    schema_version: 2,
-                    semantics: "test-select-return-semantics",
+                    schema_version: 3,
+                    semantics: "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_output_is_interrupted_at_guard",
                     wait_returns: 3,
                     socket_readiness_wakeups: 1,
                     timer_wakeups: 2,
@@ -10561,7 +10661,7 @@ mod tests {
         assert!(receipt.get("resolved_workload").is_none());
         assert!(receipt.get("urls").is_none());
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 2);
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 3);
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
         assert_eq!(
             receipt["runner_wakeup_metrics"]["buflo_exact_release_guard_entries"],
@@ -13754,6 +13854,10 @@ mod tests {
                 .is_empty(),
             "same-tick receive control is encoded only inside the exact target"
         );
+        assert!(
+            buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints).is_empty(),
+            "same-endpoint credit composed into the exact cell is never selected for a duplicate follow-up drive"
+        );
         assert_eq!(controller.pending_slots(), [(incoming_slot, incoming)]);
 
         drop(traces);
@@ -13827,6 +13931,171 @@ mod tests {
         for adapter_skew_ns in [1, 500, 999] {
             assert_fractional_adapter_release_redrive(adapter_skew_ns).await;
         }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the connected two-endpoint oracle proves selective post-handoff credit output"
+    )]
+    async fn exact_handoff_drives_only_the_cross_endpoint_with_unadvertised_credit() {
+        let output = trace_output_dir("cross-endpoint-post-handoff-credit");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut credit_endpoint, mut credit_server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        let (outgoing_endpoint, outgoing_server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(1),
+            4_434,
+            5_000,
+        );
+
+        credit_endpoint.client.qcsd_enable_send_shaping(false);
+        let request_url = http::Uri::from_static("https://127.0.0.1:4433/controlled");
+        let stream = credit_endpoint
+            .client
+            .fetch(
+                started,
+                "GET",
+                &request_url,
+                &[],
+                neqo_http3::Priority::default(),
+            )
+            .expect("create controlled request stream");
+        credit_endpoint
+            .client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(10_000))
+            .expect("register controlled response stream");
+        credit_endpoint
+            .client
+            .stream_close_send(stream, started)
+            .expect("close request send side");
+        test_fixture::exchange_packets(
+            &mut credit_endpoint.client,
+            &mut credit_server,
+            false,
+            None,
+        );
+        assert!(!credit_endpoint.client.qcsd_has_pending_stream_send());
+        credit_endpoint.client.qcsd_enable_send_shaping(true);
+        drop(credit_endpoint.client.qcsd_timestamped_observations());
+
+        let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("incoming");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([incoming]),
+            }),
+        )
+        .expect("incoming controller");
+        for endpoint in [QcsdEndpointId(0), QcsdEndpointId(1)] {
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: format!("https://127.0.0.1:{}", 4_433_u64 + endpoint.0),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint: QcsdEndpointId(0),
+                ..
+            }
+        )));
+
+        let mut endpoints = vec![credit_endpoint, outgoing_endpoint];
+        endpoints[0].test_force_socket_handoff_success = true;
+        endpoints[1].test_observation_on_next_output =
+            Some(observation_clock.record(QcsdObservation::EgressBacklog { pending: true }));
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("apply cross-endpoint credit");
+        assert_eq!(
+            buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints),
+            [0]
+        );
+
+        let release = now();
+        let outgoing =
+            Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).expect("outgoing guard");
+        let guard = BufloExactReleaseGuard {
+            endpoint_index: 1,
+            endpoint: QcsdEndpointId(1),
+            slot: QcsdSlotId(999),
+            packet: outgoing,
+            phase: BufloExactReleasePhase::Committed,
+            guard_at: release,
+            active_wait_at: release,
+            release,
+            deadline: release + Duration::from_secs(1),
+        };
+        drive_buflo_unadvertised_scheduled_receive_credit(
+            &guard,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            started,
+        )
+        .await
+        .expect("cross-endpoint receive control drive");
+        assert!(buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints).is_empty());
+        assert!(
+            endpoints[1].test_observation_on_next_output.is_some(),
+            "an unrelated endpoint receives no speculative output turn"
+        );
+
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            now(),
+            now().saturating_duration_since(started),
+            MissedSlotReason::RunAborted,
+        )
+        .expect("terminalize unconsumed credit");
+        drop(traces);
+        drop(endpoints);
+        drop(credit_server);
+        drop(outgoing_server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[test]
@@ -16178,9 +16447,7 @@ mod tests {
         let entered_at = release
             .checked_sub(Duration::from_millis(5))
             .expect("release has a guard predecessor");
-        let active_wait_started_at = release
-            .checked_sub(Duration::from_micros(250))
-            .expect("release has an active-wait predecessor");
+        let active_wait_started_at = entered_at;
         metrics.record_buflo_exact_release_guard(
             entered_at,
             active_wait_started_at,
@@ -16188,7 +16455,7 @@ mod tests {
             release,
             release + Duration::from_nanos(7),
         );
-        assert_eq!(metrics.schema_version, 2);
+        assert_eq!(metrics.schema_version, 3);
         assert_eq!(metrics.wait_returns, 3);
         assert_eq!(metrics.socket_readiness_wakeups, 1);
         assert_eq!(metrics.timer_wakeups, 2);
@@ -16199,7 +16466,10 @@ mod tests {
             metrics.buflo_exact_release_guard_wait_nanoseconds,
             5_000_007
         );
-        assert_eq!(metrics.buflo_exact_release_active_wait_nanoseconds, 250_007);
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_nanoseconds,
+            5_000_007
+        );
         assert_eq!(
             metrics.buflo_exact_release_max_passive_wake_lateness_nanoseconds,
             0
@@ -16215,7 +16485,7 @@ mod tests {
         assert!(
             metrics
                 .semantics
-                .contains("scheduled_cells_are_not_wakeups")
+                .contains("buflo_exact_release_active_wait_tail_us=5000")
         );
     }
 
@@ -16252,7 +16522,7 @@ mod tests {
                     deadline,
                 },
             ],
-            Duration::from_micros(250),
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
         )
         .expect("valid candidate inventory")
         .expect("BuFLO exact candidate has a release guard");
@@ -16261,12 +16531,7 @@ mod tests {
         assert_eq!(guard.slot, QcsdSlotId(1));
         assert_eq!(guard.packet, packet);
         assert_eq!(guard.guard_at, base + Duration::from_millis(15));
-        assert_eq!(
-            guard.active_wait_at,
-            release
-                .checked_sub(Duration::from_micros(250))
-                .expect("release has an active-wait predecessor")
-        );
+        assert_eq!(guard.active_wait_at, guard.guard_at);
         assert_eq!(guard.release, release);
         assert_eq!(guard.deadline, deadline);
         assert!(
@@ -16281,7 +16546,7 @@ mod tests {
                     release,
                     deadline,
                 }],
-                Duration::from_micros(250),
+                BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
             )
             .expect("disabled selector is valid")
             .is_none(),
@@ -16310,7 +16575,7 @@ mod tests {
                     deadline: later_release + window,
                 },
             ],
-            Duration::from_micros(250),
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
         )
         .expect_err("slot ids are globally unique across endpoint runners");
         assert!(matches!(duplicate, Error::SlotInvariant(_)));
@@ -16334,17 +16599,13 @@ mod tests {
                 release,
                 deadline: release + window,
             }],
-            Duration::from_micros(250),
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
         )
         .expect("valid exact-release inventory")
         .expect("exact release guard");
         assert_eq!(
             buflo_exact_release_wait_step(&guard, guard.guard_at),
-            BufloExactReleaseWaitStep::Passive(
-                window
-                    .checked_sub(Duration::from_micros(250))
-                    .expect("window exceeds the active-wait tail")
-            )
+            BufloExactReleaseWaitStep::Active
         );
         assert_eq!(
             buflo_exact_release_wait_step(&guard, guard.active_wait_at),
@@ -16367,6 +16628,43 @@ mod tests {
             buflo_exact_release_wait_step(&guard, guard.deadline),
             BufloExactReleaseWaitStep::Dispatch,
             "an expired guard reaches the existing hard deadline failure path without catch-up"
+        );
+    }
+
+    #[test]
+    fn exact_release_guard_helper_retains_generic_short_tail_branch() {
+        let base = now();
+        let window = Duration::from_millis(5);
+        let tail = Duration::from_micros(250);
+        let release = base + Duration::from_millis(20);
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let guard = buflo_exact_release_guard_from_candidates(
+            true,
+            [BufloExactReleaseCandidate {
+                endpoint_index: 0,
+                endpoint: QcsdEndpointId(0),
+                slot: QcsdSlotId(1),
+                packet,
+                phase: BufloExactReleasePhase::Prearmed,
+                release,
+                deadline: release + window,
+            }],
+            tail,
+        )
+        .expect("valid generic release inventory")
+        .expect("generic release guard");
+        assert_eq!(
+            buflo_exact_release_wait_step(&guard, guard.guard_at),
+            BufloExactReleaseWaitStep::Passive(
+                window
+                    .checked_sub(tail)
+                    .expect("generic window exceeds its short active tail")
+            )
+        );
+        assert_eq!(
+            buflo_exact_release_wait_step(&guard, guard.active_wait_at),
+            BufloExactReleaseWaitStep::Active
         );
     }
 
