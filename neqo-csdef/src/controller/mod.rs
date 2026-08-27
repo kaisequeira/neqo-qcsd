@@ -14364,6 +14364,7 @@ mod tests {
 
     #[test]
     #[expect(
+        clippy::cognitive_complexity,
         clippy::too_many_lines,
         reason = "both sides of the exact 1,200-byte terminal boundary share one proof"
     )]
