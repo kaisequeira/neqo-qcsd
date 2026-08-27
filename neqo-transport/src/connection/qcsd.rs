@@ -294,9 +294,11 @@ impl Connection {
     /// endpoint at that fidelity-sensitive boundary.
     #[must_use]
     pub fn qcsd_has_unadvertised_scheduled_receive_credit(&self) -> bool {
-        self.qcsd_pending_receive_actions
-            .iter()
-            .any(|pending| pending.identity.slot().is_some())
+        !self.qcsd_pending_receive_credit.is_empty()
+            || self
+                .qcsd_pending_receive_actions
+                .iter()
+                .any(|pending| pending.identity.slot().is_some())
     }
 
     /// Mark each transport cancellation control actually queued by a
