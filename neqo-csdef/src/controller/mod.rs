@@ -9347,19 +9347,32 @@ mod tests {
         )));
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the two-endpoint oracle settles both send and receive slot identities"
-    )]
-    fn exercise_candidate_across_two_endpoints(
+    type CandidateEndpoint = (QcsdEndpointId, QcsdStreamId, &'static str);
+
+    #[derive(Default)]
+    struct CandidateExerciseState {
+        scheduled_slots: BTreeSet<QcsdSlotId>,
+        outgoing_endpoints: Vec<QcsdEndpointId>,
+        incoming_streams: Vec<(QcsdEndpointId, QcsdStreamId)>,
+    }
+
+    #[derive(Default)]
+    struct CandidateTick {
+        terminal_observations: Vec<QcsdObservation>,
+        incoming_slots: Vec<(QcsdSlotId, QcsdEndpointId, Packet)>,
+    }
+
+    fn candidate_endpoints() -> [CandidateEndpoint; 2] {
+        [
+            (QcsdEndpointId(1), QcsdStreamId(0), "https://one.example"),
+            (QcsdEndpointId(2), QcsdStreamId(4), "https://two.example"),
+        ]
+    }
+
+    fn prepare_candidate_across_two_endpoints(
         defense: Box<dyn Defense>,
         packet_size: u16,
-        expected_send_policy: QcsdSendPolicy,
-    ) -> (
-        QcsdController,
-        Vec<QcsdEndpointId>,
-        Vec<(QcsdEndpointId, QcsdStreamId)>,
-    ) {
+    ) -> (QcsdController, [CandidateEndpoint; 2]) {
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
                 initial_max_stream_data: 16,
@@ -9372,10 +9385,7 @@ mod tests {
             defense,
         )
         .expect("candidate controller");
-        let endpoints = [
-            (QcsdEndpointId(1), QcsdStreamId(0), "https://one.example"),
-            (QcsdEndpointId(2), QcsdStreamId(4), "https://two.example"),
-        ];
+        let endpoints = candidate_endpoints();
         for (endpoint, stream, origin) in endpoints {
             ready(&mut controller, endpoint.0, origin);
             controller.observe(
@@ -9417,131 +9427,153 @@ mod tests {
                     >= u64::from(packet_size) * 2
             );
         }
+        (controller, endpoints)
+    }
 
-        let mut at = Duration::ZERO;
-        let mut outgoing_endpoints = Vec::new();
-        let mut incoming_streams = Vec::new();
-        let mut scheduled_slots = BTreeSet::new();
-        for _ in 0..64 {
-            let deadline = controller
-                .next_deadline()
-                .expect("candidate retains a next opportunity");
-            at = at.max(deadline);
-            controller.poll(at);
-            let actions: Vec<_> = controller.drain_actions().collect();
-            let mut terminal_observations = Vec::new();
-            let mut incoming_slots = Vec::new();
-            for action in actions {
-                match action {
-                    QcsdAction::SendPacket {
-                        endpoint,
-                        packet,
-                        slot,
-                        allow_stream_data,
-                        send_policy,
-                        ..
-                    } => {
-                        assert!(endpoints.iter().any(|candidate| candidate.0 == endpoint));
-                        assert_eq!(packet.direction(), Direction::Outgoing);
-                        assert_eq!(packet.length(), packet_size);
-                        assert!(allow_stream_data);
-                        assert_eq!(send_policy, expected_send_policy);
-                        assert!(scheduled_slots.insert(slot), "slot identity was reused");
-                        outgoing_endpoints.push(endpoint);
-                        terminal_observations.push(match send_policy {
-                            QcsdSendPolicy::Exact => QcsdObservation::SlotSatisfied {
-                                endpoint,
-                                slot,
-                                observed_size: packet.length(),
-                            },
-                            QcsdSendPolicy::CongestionSensitive => QcsdObservation::SlotResolved {
-                                endpoint,
-                                slot,
-                                packet,
-                                outcome: QcsdSlotOutcome::Full {
-                                    composition: QcsdSlotComposition {
-                                        desired_udp_bytes: packet.length(),
-                                        observed_udp_bytes: packet.length(),
-                                        defense_control_bytes: 1,
-                                        quic_padding_bytes: packet.length() - 1,
-                                        ..QcsdSlotComposition::default()
-                                    },
-                                },
-                            },
-                        });
-                    }
-                    QcsdAction::IncreaseReceiveLimit {
-                        endpoint,
-                        stream,
-                        absolute_limit,
-                        packet,
-                        slot,
-                    } => {
-                        assert!(
-                            endpoints.iter().any(|candidate| {
-                                candidate.0 == endpoint && candidate.1 == stream
-                            })
-                        );
-                        assert_eq!(packet.direction(), Direction::Incoming);
-                        assert_eq!(packet.length(), packet_size);
-                        assert!(scheduled_slots.insert(slot), "slot identity was reused");
-                        incoming_streams.push((endpoint, stream));
-                        incoming_slots.push((slot, endpoint, packet));
-                        terminal_observations.push(QcsdObservation::ReceiveLimitAdvertised {
-                            endpoint,
-                            stream,
-                            absolute_limit,
-                            slot: Some(slot),
-                        });
-                        let consumed = controller
-                            .streams
-                            .consumed(endpoint, stream)
-                            .expect("registered application stream");
-                        let bytes = absolute_limit.saturating_sub(consumed);
-                        assert!(bytes >= u64::from(packet.length()));
-                        terminal_observations.push(QcsdObservation::BytesRead {
-                            endpoint,
-                            stream,
-                            bytes,
-                        });
-                    }
-                    QcsdAction::SlotMissed { reason, .. } => {
-                        panic!("candidate opportunity was missed: {reason:?}");
-                    }
-                    _ => panic!("unexpected candidate action: {action:?}"),
-                }
-            }
-            for observation in terminal_observations {
-                controller.observe(observation, at);
-            }
-            controller.drain_observations();
-            let terminal_actions: Vec<_> = controller.drain_actions().collect();
-            assert_eq!(terminal_actions.len(), incoming_slots.len());
-            for action in terminal_actions {
-                let QcsdAction::SlotSatisfied {
-                    endpoint: Some(endpoint),
-                    packet,
-                    slot,
-                } = action
-                else {
-                    panic!("unexpected incoming terminal action: {action:?}");
-                };
-                assert_eq!(packet.direction(), Direction::Incoming);
-                assert!(incoming_slots.iter().any(|candidate| {
-                    candidate.0 == slot && candidate.1 == endpoint && candidate.2 == packet
-                }));
-            }
-            if outgoing_endpoints.len() >= 2 && incoming_streams.len() >= 2 {
-                break;
-            }
+    fn successful_candidate_send(
+        send_policy: QcsdSendPolicy,
+        endpoint: QcsdEndpointId,
+        slot: QcsdSlotId,
+        packet: Packet,
+    ) -> QcsdObservation {
+        match send_policy {
+            QcsdSendPolicy::Exact => QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot,
+                observed_size: packet.length(),
+            },
+            QcsdSendPolicy::CongestionSensitive => QcsdObservation::SlotResolved {
+                endpoint,
+                slot,
+                packet,
+                outcome: QcsdSlotOutcome::Full {
+                    composition: QcsdSlotComposition {
+                        desired_udp_bytes: packet.length(),
+                        observed_udp_bytes: packet.length(),
+                        defense_control_bytes: 1,
+                        quic_padding_bytes: packet.length() - 1,
+                        ..QcsdSlotComposition::default()
+                    },
+                },
+            },
         }
+    }
 
+    fn record_candidate_action(
+        controller: &QcsdController,
+        endpoints: &[CandidateEndpoint],
+        expected_packet_size: u16,
+        expected_send_policy: QcsdSendPolicy,
+        state: &mut CandidateExerciseState,
+        tick: &mut CandidateTick,
+        action: &QcsdAction,
+    ) {
+        match action {
+            QcsdAction::SendPacket {
+                endpoint,
+                packet,
+                slot,
+                allow_stream_data,
+                send_policy,
+                ..
+            } => {
+                assert!(endpoints.iter().any(|candidate| candidate.0 == *endpoint));
+                assert_eq!(packet.direction(), Direction::Outgoing);
+                assert_eq!(packet.length(), expected_packet_size);
+                assert!(*allow_stream_data);
+                assert_eq!(*send_policy, expected_send_policy);
+                assert!(
+                    state.scheduled_slots.insert(*slot),
+                    "slot identity was reused"
+                );
+                state.outgoing_endpoints.push(*endpoint);
+                tick.terminal_observations.push(successful_candidate_send(
+                    *send_policy,
+                    *endpoint,
+                    *slot,
+                    *packet,
+                ));
+            }
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit,
+                packet,
+                slot,
+            } => {
+                assert!(
+                    endpoints
+                        .iter()
+                        .any(|candidate| candidate.0 == *endpoint && candidate.1 == *stream)
+                );
+                assert_eq!(packet.direction(), Direction::Incoming);
+                assert_eq!(packet.length(), expected_packet_size);
+                assert!(
+                    state.scheduled_slots.insert(*slot),
+                    "slot identity was reused"
+                );
+                state.incoming_streams.push((*endpoint, *stream));
+                tick.incoming_slots.push((*slot, *endpoint, *packet));
+                tick.terminal_observations
+                    .push(QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: *endpoint,
+                        stream: *stream,
+                        absolute_limit: *absolute_limit,
+                        slot: Some(*slot),
+                    });
+                let consumed = controller
+                    .streams
+                    .consumed(*endpoint, *stream)
+                    .expect("registered application stream");
+                let bytes = absolute_limit.saturating_sub(consumed);
+                assert!(bytes >= u64::from(packet.length()));
+                tick.terminal_observations.push(QcsdObservation::BytesRead {
+                    endpoint: *endpoint,
+                    stream: *stream,
+                    bytes,
+                });
+            }
+            QcsdAction::SlotMissed { reason, .. } => {
+                panic!("candidate opportunity was missed: {reason:?}");
+            }
+            _ => panic!("unexpected candidate action: {action:?}"),
+        }
+    }
+
+    fn settle_candidate_tick(controller: &mut QcsdController, at: Duration, tick: CandidateTick) {
+        for observation in tick.terminal_observations {
+            controller.observe(observation, at);
+        }
+        controller.drain_observations();
+        let terminal_actions: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(terminal_actions.len(), tick.incoming_slots.len());
+        for action in terminal_actions {
+            let QcsdAction::SlotSatisfied {
+                endpoint: Some(endpoint),
+                packet,
+                slot,
+            } = action
+            else {
+                panic!("unexpected incoming terminal action: {action:?}");
+            };
+            assert_eq!(packet.direction(), Direction::Incoming);
+            assert!(tick.incoming_slots.iter().any(|candidate| {
+                candidate.0 == slot && candidate.1 == endpoint && candidate.2 == packet
+            }));
+        }
+    }
+
+    fn assert_candidate_settled(
+        controller: &QcsdController,
+        packet_size: u16,
+        state: &CandidateExerciseState,
+    ) {
         assert_eq!(
-            outgoing_endpoints.get(..2),
+            state.outgoing_endpoints.get(..2),
             Some(&[QcsdEndpointId(1), QcsdEndpointId(2)][..])
         );
         assert_eq!(
-            incoming_streams.get(..2),
+            state.incoming_streams.get(..2),
             Some(
                 &[
                     (QcsdEndpointId(1), QcsdStreamId(0)),
@@ -9550,8 +9582,8 @@ mod tests {
             )
         );
         assert_eq!(
-            scheduled_slots.len(),
-            outgoing_endpoints.len() + incoming_streams.len()
+            state.scheduled_slots.len(),
+            state.outgoing_endpoints.len() + state.incoming_streams.len()
         );
         assert!(controller.pending_slots().is_empty());
         assert!(controller.control.outgoing.is_empty());
@@ -9563,7 +9595,8 @@ mod tests {
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(
             diagnostics.scheduled_incoming_requested_bytes,
-            u64::try_from(incoming_streams.len()).expect("incoming count") * u64::from(packet_size)
+            u64::try_from(state.incoming_streams.len()).expect("incoming count")
+                * u64::from(packet_size)
         );
         assert_eq!(
             diagnostics.scheduled_incoming_advertised_bytes,
@@ -9575,7 +9608,47 @@ mod tests {
         );
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
-        (controller, outgoing_endpoints, incoming_streams)
+    }
+
+    fn exercise_candidate_across_two_endpoints(
+        defense: Box<dyn Defense>,
+        packet_size: u16,
+        expected_send_policy: QcsdSendPolicy,
+    ) -> (
+        QcsdController,
+        Vec<QcsdEndpointId>,
+        Vec<(QcsdEndpointId, QcsdStreamId)>,
+    ) {
+        let (mut controller, endpoints) =
+            prepare_candidate_across_two_endpoints(defense, packet_size);
+        let mut at = Duration::ZERO;
+        let mut state = CandidateExerciseState::default();
+        for _ in 0..64 {
+            let deadline = controller
+                .next_deadline()
+                .expect("candidate retains a next opportunity");
+            at = at.max(deadline);
+            controller.poll(at);
+            let mut tick = CandidateTick::default();
+            let actions: Vec<_> = controller.drain_actions().collect();
+            for action in &actions {
+                record_candidate_action(
+                    &controller,
+                    &endpoints,
+                    packet_size,
+                    expected_send_policy,
+                    &mut state,
+                    &mut tick,
+                    action,
+                );
+            }
+            settle_candidate_tick(&mut controller, at, tick);
+            if state.outgoing_endpoints.len() >= 2 && state.incoming_streams.len() >= 2 {
+                break;
+            }
+        }
+        assert_candidate_settled(&controller, packet_size, &state);
+        (controller, state.outgoing_endpoints, state.incoming_streams)
     }
 
     #[test]
