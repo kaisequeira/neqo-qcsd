@@ -63,6 +63,55 @@ const SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS: usize = 5;
 const SUSTAINED_QUALIFICATION_WAVES: usize =
     SUSTAINED_QUALIFICATION_REQUESTS / SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS;
 
+fn resolve_remote_address(host: &str, port: u16) -> Result<SocketAddr, Error> {
+    let addresses = format!("{host}:{port}")
+        .to_socket_addrs()?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(Error::Argument(format!("could not resolve {host}:{port}")));
+    }
+    if std::env::var_os("QCSD_PUBLIC_ORIGIN_ONLY").is_some()
+        && addresses
+            .iter()
+            .any(|address| !is_public_network_address(address.ip()))
+    {
+        return Err(Error::Argument(format!(
+            "public-origin policy rejected a non-public DNS answer for {host}:{port}"
+        )));
+    }
+    Ok(addresses[0])
+}
+
+fn is_public_network_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, c, _d] = address.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0)
+                || (a == 192 && b == 168)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
+        }
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            let global_unicast = octets[0] & 0xe0 == 0x20;
+            let ietf_special = octets[0] == 0x20 && octets[1] == 0x01 && octets[2] & 0xfe == 0;
+            let deprecated_6to4 = octets[0] == 0x20 && octets[1] == 0x02;
+            let documentation = octets[..4] == [0x20, 0x01, 0x0d, 0xb8]
+                || (octets[0] == 0x3f && octets[1] == 0xff && octets[2] & 0xf0 == 0);
+            global_unicast && !ietf_special && !deprecated_6to4 && !documentation
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid arguments: {0}")]
@@ -1575,6 +1624,10 @@ struct PrefixNumericProfile {
 struct PrefixPackSpec {
     schema_version: u32,
     artifact_type: String,
+    /// Present only on the independently fitted 100-class study projection.
+    /// The historical schema-two format remains byte-for-byte accepted.
+    source_walkie_talkie_schema_version: Option<u32>,
+    numeric_profile_derivation: Option<String>,
     workload_id: String,
     packet_size: u16,
     max_stream_data_excess: u64,
@@ -2314,10 +2367,7 @@ async fn qualify_chaff_response(
         .ok_or_else(|| Error::Argument("URL has no authority".into()))?;
     let host = authority.host().to_owned();
     let port = authority.port_u16().unwrap_or(443);
-    let remote_addr = format!("{host}:{port}")
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::Argument(format!("could not resolve {host}:{port}")))?;
+    let remote_addr = resolve_remote_address(&host, port)?;
     let wildcard = match remote_addr {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -3199,10 +3249,7 @@ async fn qualify_chaff_prefix(
         .ok_or_else(|| Error::Argument("application root URL has no authority".into()))?;
     let host = authority.host().to_owned();
     let port = authority.port_u16().unwrap_or(443);
-    let remote_addr = format!("{host}:{port}")
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::Argument(format!("could not resolve {host}:{port}")))?;
+    let remote_addr = resolve_remote_address(&host, port)?;
     let wildcard = match remote_addr {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -3842,21 +3889,37 @@ fn all_future_receiver_continuation_reserve_horizon(bursts: &[PrefixBurst]) -> u
     bursts.iter().filter(|burst| burst.incoming > 0).count()
 }
 
-fn prefix_numeric_profile_sha256(profile: &PrefixNumericProfile) -> Result<String, Error> {
+fn prefix_numeric_profile_sha256(
+    profile: &PrefixNumericProfile,
+    domain: &[u8],
+) -> Result<String, Error> {
     // This is the exact UTF-8 produced by Python's
     // json.dumps(value, sort_keys=True, separators=(",", ":")) for this
     // integer-only schema. Keeping the construction explicit makes the
     // cross-language domain separation independently auditable.
     let canonical = serde_json::to_vec(profile)?;
-    let mut preimage = b"qcsd-walkie-talkie-numeric-profile-v1\0".to_vec();
+    let mut preimage = domain.to_vec();
     preimage.extend_from_slice(&canonical);
     sha256(&preimage)
 }
 
 fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
     let horizon = all_future_receiver_continuation_reserve_horizon(&spec.numeric_profile.bursts);
-    if spec.schema_version != 2
-        || spec.artifact_type != "qcsd-walkie-talkie-prefix-pack-spec"
+    let historical = spec.schema_version == 2
+        && spec.artifact_type == "qcsd-walkie-talkie-prefix-pack-spec"
+        && spec.source_walkie_talkie_schema_version.is_none()
+        && spec.numeric_profile_derivation.is_none();
+    let class_study = spec.schema_version == 3
+        && spec.artifact_type == "qcsd-class-study-walkie-talkie-prefix-pack-spec"
+        && spec.source_walkie_talkie_schema_version == Some(6)
+        && spec.numeric_profile_derivation.as_deref()
+            == Some("schema-six-runtime-bursts-verbatim-no-additional-sender-framing");
+    let numeric_domain: &[u8] = if class_study {
+        b"qcsd-class-study-walkie-talkie-numeric-profile-v1\0"
+    } else {
+        b"qcsd-walkie-talkie-numeric-profile-v1\0"
+    };
+    if !(historical || class_study)
         || spec.workload_id.trim().is_empty()
         || spec.packet_size != 1_200
         || spec.max_stream_data_excess != 1_000
@@ -3871,7 +3934,8 @@ fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
         || spec.stream_activation_stages.len() != spec.numeric_profile.bursts.len()
         || !lower_hex_sha256(&spec.numeric_profile_sha256)
         || !lower_hex_sha256(&spec.source_walkie_talkie_artifact_sha256)
-        || prefix_numeric_profile_sha256(&spec.numeric_profile)? != spec.numeric_profile_sha256
+        || prefix_numeric_profile_sha256(&spec.numeric_profile, numeric_domain)?
+            != spec.numeric_profile_sha256
     {
         return Err(Error::Argument(
             "prefix-pack specification schema or numeric derivation is invalid".into(),
@@ -5195,10 +5259,7 @@ fn create_endpoints(
         .into_iter()
         .enumerate()
         .map(|(index, ((host, port), pending))| {
-            let remote_addr = format!("{host}:{port}")
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| Error::Argument(format!("could not resolve {host}:{port}")))?;
+            let remote_addr = resolve_remote_address(&host, port)?;
             let wildcard = match remote_addr {
                 SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                 SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -9333,7 +9394,8 @@ mod tests {
         ensure_defense_realizable, expected_application_response_length, finish_application_record,
         finish_chaff_record, finish_stream, forward_qcsd_observation, handle_all_qcsd_observations,
         handle_http_events, has_in_flight_application_stream, is_candidate_defense,
-        normalize_rolling_prearm_window, now, pending_receive_identity_is_reconciled,
+        is_public_network_address, normalize_rolling_prearm_window, now,
+        pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
         prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
         prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
@@ -9346,7 +9408,7 @@ mod tests {
         terminalize_pending_slots,
         trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_chaff_cancellation_target,
-        validate_chaff_manifest_defense, validate_prefix_capacity_plan,
+        validate_chaff_manifest_defense, validate_prefix_capacity_plan, validate_prefix_pack_spec,
         validate_qualified_chaff_binding, validate_terminal_chaff_receive_identities,
         validate_walkie_talkie_chaff_precondition, wait_for_activity_until,
         walkie_talkie_qualification_binding_matches, write_run_json,
@@ -9361,6 +9423,39 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create trace test directory");
         path
+    }
+
+    #[test]
+    fn public_origin_policy_matches_shared_golden_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("public-address-policy-v1.json"))
+                .expect("parse public-address policy vectors");
+        assert_eq!(vectors["schema_version"], 1);
+        assert_eq!(vectors["policy"], "qcsd-public-network-address-v1");
+        for (label, expected) in [("accepted", true), ("rejected", false)] {
+            let cases = vectors[label]
+                .as_array()
+                .expect("public-address policy case array");
+            assert!(
+                cases
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|raw| raw.contains('.')))
+            );
+            assert!(
+                cases
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|raw| raw.contains(':')))
+            );
+            for value in cases {
+                let raw = value.as_str().expect("public-address policy string");
+                let address: IpAddr = raw.parse().expect("public-address policy IP literal");
+                assert_eq!(
+                    is_public_network_address(address),
+                    expected,
+                    "{label}: {raw}"
+                );
+            }
+        }
     }
 
     fn application(status: Option<u16>, complete: bool) -> StreamRecord {
@@ -16734,6 +16829,8 @@ mod tests {
         PrefixPackSpec {
             schema_version: 2,
             artifact_type: "qcsd-walkie-talkie-prefix-pack-spec".into(),
+            source_walkie_talkie_schema_version: None,
+            numeric_profile_derivation: None,
             workload_id: "capacity-test".into(),
             packet_size: 1_200,
             max_stream_data_excess: 1_000,
@@ -16820,6 +16917,33 @@ mod tests {
         let mut sparse = two_stage_prefix_spec();
         sparse.stream_activation_stages.pop();
         assert!(validate_prefix_capacity_plan(&sparse).is_err());
+    }
+
+    #[test]
+    fn prefix_spec_accepts_both_frozen_schema_two_and_class_study_schema_three() {
+        let mut historical = two_stage_prefix_spec();
+        historical.numeric_profile_sha256 = prefix_numeric_profile_sha256(
+            &historical.numeric_profile,
+            b"qcsd-walkie-talkie-numeric-profile-v1\0",
+        )
+        .expect("historical numeric hash");
+        validate_prefix_pack_spec(&historical).expect("historical schema two");
+
+        let mut class_study = two_stage_prefix_spec();
+        class_study.schema_version = 3;
+        class_study.artifact_type = "qcsd-class-study-walkie-talkie-prefix-pack-spec".into();
+        class_study.source_walkie_talkie_schema_version = Some(6);
+        class_study.numeric_profile_derivation =
+            Some("schema-six-runtime-bursts-verbatim-no-additional-sender-framing".into());
+        class_study.numeric_profile_sha256 = prefix_numeric_profile_sha256(
+            &class_study.numeric_profile,
+            b"qcsd-class-study-walkie-talkie-numeric-profile-v1\0",
+        )
+        .expect("class-study numeric hash");
+        validate_prefix_pack_spec(&class_study).expect("class-study schema three");
+
+        class_study.numeric_profile_derivation = Some("double-framed".into());
+        assert!(validate_prefix_pack_spec(&class_study).is_err());
     }
 
     #[test]
