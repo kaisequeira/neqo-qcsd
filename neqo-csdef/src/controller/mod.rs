@@ -427,6 +427,15 @@ pub struct QcsdController {
     /// `BuFLO` schedule-stop decision made at the barrier.
     terminal_state_observation_at: Duration,
     last_effective_egress_backlog_pending: Option<bool>,
+    /// A terminal local chaff cancellation has handed RESET/STOP work to the
+    /// adapter, but the controller has not yet reduced a fresh aggregate empty
+    /// snapshot produced after every queued cancellation action left its
+    /// action boundary.
+    terminal_chaff_cancellation_empty_snapshot_required: bool,
+    /// The adapter produced that post-cancellation aggregate empty snapshot.
+    /// This remains provisional until [`Self::sync_candidate_egress_backlog`]
+    /// can deliver the corresponding effective `false` to the defense.
+    terminal_chaff_cancellation_empty_snapshot_observed: bool,
     buflo_terminal_subcell_pending_request_cancellations: u64,
     buflo_terminal_subcell_stream_cancellations: u64,
     buflo_terminal_subcell_exact_capacity_bytes_cancelled: u64,
@@ -607,6 +616,8 @@ impl QcsdController {
             adapter_stream_egress_snapshot_fresh: false,
             terminal_state_observation_at: Duration::ZERO,
             last_effective_egress_backlog_pending: None,
+            terminal_chaff_cancellation_empty_snapshot_required: false,
+            terminal_chaff_cancellation_empty_snapshot_observed: false,
             buflo_terminal_subcell_pending_request_cancellations: 0,
             buflo_terminal_subcell_stream_cancellations: 0,
             buflo_terminal_subcell_exact_capacity_bytes_cancelled: 0,
@@ -726,6 +737,23 @@ impl QcsdController {
             return false;
         }
         self.defense.can_start_application_batch()
+    }
+
+    /// Whether the runner must publish a fresh aggregate egress-backlog
+    /// snapshot after terminal local chaff cancellation.
+    ///
+    /// The request becomes visible only after every queued [`QcsdAction::CancelChaff`]
+    /// has crossed the controller action boundary. It remains asserted until a
+    /// subsequent controller poll synchronizes an actual post-cancellation
+    /// empty snapshot into the defense. The runner must report its current
+    /// transport state; this never authorizes manufacturing a `false` value.
+    #[must_use]
+    pub fn requires_terminal_egress_backlog_snapshot(&self) -> bool {
+        self.terminal_chaff_cancellation_empty_snapshot_required
+            && !self
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::CancelChaff { .. }))
     }
 
     /// Reduce every queued defense observation without polling for new work.
@@ -1374,6 +1402,19 @@ impl QcsdController {
             QcsdObservation::EgressBacklog { pending } => {
                 if self.defense.requires_terminal_chaff_drain() {
                     self.adapter_egress_backlog_pending = pending;
+                    if self.terminal_chaff_cancellation_empty_snapshot_required {
+                        // A retained pre-cancellation false cannot discharge
+                        // RESET/STOP control. Nor can a false observed while a
+                        // CancelChaff action is still queued: that action has
+                        // not crossed the adapter boundary yet. A later true
+                        // invalidates an otherwise fresh proof before it is
+                        // synchronized into the defense.
+                        self.terminal_chaff_cancellation_empty_snapshot_observed = !pending
+                            && !self
+                                .actions
+                                .iter()
+                                .any(|action| matches!(action, QcsdAction::CancelChaff { .. }));
+                    }
                     if !pending {
                         // Aggregate empty necessarily implies STREAM empty.
                         // Production also publishes the split observation,
@@ -4553,8 +4594,21 @@ impl QcsdController {
         if !self.defense.requires_terminal_chaff_drain() {
             return;
         }
-        let pending =
-            self.adapter_egress_backlog_pending || self.candidate_defense_control_backlog_pending();
+        let controller_control_pending = self.candidate_defense_control_backlog_pending();
+        if self.terminal_chaff_cancellation_empty_snapshot_required
+            && self.terminal_chaff_cancellation_empty_snapshot_observed
+            && !self.adapter_egress_backlog_pending
+            && !controller_control_pending
+        {
+            // Clear the proof latch only at the same reducer boundary that can
+            // publish the effective empty snapshot. Direct completion checks
+            // therefore cannot consume a merely queued adapter observation.
+            self.terminal_chaff_cancellation_empty_snapshot_required = false;
+            self.terminal_chaff_cancellation_empty_snapshot_observed = false;
+        }
+        let pending = self.adapter_egress_backlog_pending
+            || controller_control_pending
+            || self.terminal_chaff_cancellation_empty_snapshot_required;
         // Candidate termination is irreversible. BuFLO terminal-tail closure
         // and CS-BuFLO pre-onLoad quiet termination therefore consume a fresh
         // aggregate `false` snapshot, never a value retained across later
@@ -4628,7 +4682,16 @@ impl QcsdController {
             }
         }
 
-        for (endpoint, stream) in self.streams.open_chaff_streams() {
+        let open_chaff_streams = self.streams.open_chaff_streams();
+        if !open_chaff_streams.is_empty() {
+            // The aggregate false that authorized terminal cancellation
+            // predates the RESET/STOP work queued below and is no longer valid
+            // completion evidence. Require one new adapter proof after every
+            // cancellation action has crossed the action boundary.
+            self.terminal_chaff_cancellation_empty_snapshot_required = true;
+            self.terminal_chaff_cancellation_empty_snapshot_observed = false;
+        }
+        for (endpoint, stream) in open_chaff_streams {
             self.actions.push_back(QcsdAction::CancelChaff {
                 endpoint,
                 stream,
@@ -4791,6 +4854,7 @@ impl QcsdController {
             || !self.advertised_incoming_credit.is_empty()
             || !self.pending_slots.is_empty()
             || !self.observations.is_empty()
+            || self.terminal_chaff_cancellation_empty_snapshot_required
             || (self.defense.terminal_chaff_cancellation_reason()
                 == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
                 && self.cs_buflo_local_et_before_application_complete
@@ -15754,6 +15818,17 @@ mod tests {
 
         subcell.poll(Duration::from_micros(40));
         assert!(
+            !subcell
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        subcell.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(41),
+        );
+        subcell.poll(Duration::from_micros(41));
+        assert!(
             subcell
                 .drain_actions()
                 .any(|action| matches!(action, QcsdAction::DefenseComplete))
@@ -16454,19 +16529,70 @@ mod tests {
         );
         controller.poll(Duration::from_micros(31));
         assert!(controller.defense.is_complete());
-        assert!(controller.actions.iter().any(|action| matches!(
+        assert!(!controller.requires_terminal_egress_backlog_snapshot());
+        let terminal_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(terminal_actions.iter().any(|action| matches!(
             action,
             QcsdAction::CancelChaff {
                 reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
                 ..
             }
         )));
+        assert!(
+            !terminal_actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
 
-        // The queued STOP_SENDING/RESET work makes effective backlog true on
-        // this poll. The first eligible terminal boundary remains irreversible.
+        // Handing the queued STOP_SENDING/RESET work to the adapter invalidates
+        // the false snapshot that authorized terminal cancellation. Merely
+        // removing CancelChaff from the controller queue cannot complete.
         controller.poll(Duration::from_micros(32));
         assert!(controller.defense.is_complete());
         assert_eq!(controller.defense.next_event_at(), None);
+        assert!(
+            controller
+                .defense_diagnostics()
+                .buflo_egress_backlog_pending
+        );
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+
+        // Only a fresh post-cancellation aggregate empty snapshot, reduced by
+        // the normal poll boundary, can discharge the terminal control proof.
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(33),
+        );
+        controller.update_completion(Duration::from_micros(33));
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+        controller.poll(Duration::from_micros(33));
+        assert!(!controller.requires_terminal_egress_backlog_snapshot());
+        assert!(
+            !controller
+                .defense_diagnostics()
+                .buflo_egress_backlog_pending
+        );
+        assert!(
+            controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+
+        // The first eligible terminal boundary remains irreversible even as
+        // the post-cancellation backlog proof changes.
         controller.poll(Duration::from_micros(40));
         assert!(!controller.actions.iter().any(|action| matches!(
             action,
@@ -17598,7 +17724,7 @@ mod tests {
     }
 
     #[test]
-    fn local_et_cancels_an_open_chaff_stream_before_defense_complete() {
+    fn local_et_cancellation_requires_fresh_empty_backlog_before_defense_complete() {
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
                 tail_wait_us: 0,
@@ -17657,9 +17783,51 @@ mod tests {
                 .cs_buflo_local_et_stream_cancellations,
             1
         );
+        assert!(!controller.requires_terminal_egress_backlog_snapshot());
 
+        // A false observed while CancelChaff is still queued predates the
+        // adapter handoff and cannot discharge its RESET/STOP control.
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(1),
+        );
         controller.drain_actions().for_each(drop);
-        controller.update_completion(Duration::ZERO);
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+        controller.poll(Duration::from_micros(1));
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: true },
+            Duration::from_micros(2),
+        );
+        controller.poll(Duration::from_micros(2));
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(3),
+        );
+        controller.update_completion(Duration::from_micros(3));
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+        assert!(
+            !controller
+                .actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
+        controller.poll(Duration::from_micros(3));
+        assert!(!controller.requires_terminal_egress_backlog_snapshot());
         assert!(matches!(
             controller.next_action(),
             Some(QcsdAction::DefenseComplete)

@@ -1355,6 +1355,9 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     })
 }
 
+const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 4;
+const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_is_one_realization_window_before_guard; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct RunnerWakeupMetrics {
     schema_version: u32,
@@ -1369,13 +1372,16 @@ struct RunnerWakeupMetrics {
     buflo_exact_release_active_wait_nanoseconds: u64,
     buflo_exact_release_max_passive_wake_lateness_nanoseconds: u64,
     buflo_exact_release_max_guard_exit_lateness_nanoseconds: u64,
+    cs_exact_incoming_retry_drives: u64,
+    cs_exact_incoming_retry_resolutions: u64,
+    cs_exact_incoming_retry_max_phase_lateness_nanoseconds: u64,
 }
 
 impl RunnerWakeupMetrics {
     const fn new() -> Self {
         Self {
-            schema_version: 3,
-            semantics: "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_output_is_interrupted_at_guard",
+            schema_version: RUNNER_WAKEUP_METRICS_SCHEMA_VERSION,
+            semantics: RUNNER_WAKEUP_METRICS_SEMANTICS,
             wait_returns: 0,
             socket_readiness_wakeups: 0,
             timer_wakeups: 0,
@@ -1386,6 +1392,9 @@ impl RunnerWakeupMetrics {
             buflo_exact_release_active_wait_nanoseconds: 0,
             buflo_exact_release_max_passive_wake_lateness_nanoseconds: 0,
             buflo_exact_release_max_guard_exit_lateness_nanoseconds: 0,
+            cs_exact_incoming_retry_drives: 0,
+            cs_exact_incoming_retry_resolutions: 0,
+            cs_exact_incoming_retry_max_phase_lateness_nanoseconds: 0,
         }
     }
 
@@ -1437,6 +1446,23 @@ impl RunnerWakeupMetrics {
             .max(duration_as_u64_nanos(
                 dispatch_at.saturating_duration_since(release),
             ));
+    }
+
+    fn record_cs_exact_incoming_retry_drive(&mut self, phase_at: Instant, attempted_at: Instant) {
+        self.cs_exact_incoming_retry_drives = self.cs_exact_incoming_retry_drives.saturating_add(1);
+        self.cs_exact_incoming_retry_max_phase_lateness_nanoseconds = self
+            .cs_exact_incoming_retry_max_phase_lateness_nanoseconds
+            .max(duration_as_u64_nanos(
+                attempted_at.saturating_duration_since(phase_at),
+            ));
+    }
+
+    fn record_cs_exact_incoming_retry_resolution(&mut self) {
+        self.cs_exact_incoming_retry_resolutions =
+            self.cs_exact_incoming_retry_resolutions.saturating_add(1);
+        debug_assert!(
+            self.cs_exact_incoming_retry_resolutions <= self.cs_exact_incoming_retry_drives
+        );
     }
 }
 
@@ -4690,11 +4716,12 @@ async fn execute_run_inner(
     let mut application_batches =
         ApplicationBatchLifecycle::new(&spec.config.defense, spec.request_policy);
     let mut runner_wakeup_metrics = RunnerWakeupMetrics::new();
+    let mut cs_exact_incoming_retry_attempted = BTreeSet::new();
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
     let bound_ordinary_work = matches!(&spec.config.defense, DefenseConfig::Buflo(_));
 
     let loop_result: Result<(), Error> = async {
-        macro_rules! yield_to_buflo_guard {
+        macro_rules! yield_to_exact_boundaries {
             ($runner:lifetime) => {
                 if dispatch_due_buflo_exact_release(
                     &spec.config.defense,
@@ -4706,6 +4733,21 @@ async fn execute_run_inner(
                     defense_start,
                     deadline,
                     spec.timeout_seconds,
+                    &mut runner_wakeup_metrics,
+                )
+                .await?
+                {
+                    continue $runner;
+                }
+                if dispatch_due_cs_exact_incoming_retry(
+                    &spec.config.defense,
+                    &mut endpoints,
+                    &mut controller,
+                    spec.chaff_manifest.as_ref(),
+                    &mut traces,
+                    &observation_clock,
+                    defense_start,
+                    &mut cs_exact_incoming_retry_attempted,
                     &mut runner_wakeup_metrics,
                 )
                 .await?
@@ -4725,12 +4767,12 @@ async fn execute_run_inner(
                 ));
             }
 
-            yield_to_buflo_guard!('runner);
+            yield_to_exact_boundaries!('runner);
 
             let elapsed_before_http =
                 defense_start.map(|start| loop_now.saturating_duration_since(start));
             for endpoint_index in 0..endpoints.len() {
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 // Socket activity is reduced into defense signals before a due
                 // timer is polled. This lets a real packet cancel a pending
                 // reactive-defense decision.
@@ -4746,7 +4788,7 @@ async fn execute_run_inner(
                         !bound_ordinary_work || defense_start.is_none(),
                     )?;
                 }
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 {
                     let endpoint = &mut endpoints[endpoint_index];
                     handle_http_events(
@@ -4775,9 +4817,9 @@ async fn execute_run_inner(
                         elapsed_before_http.unwrap_or(Duration::ZERO),
                     );
                 }
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
             }
-            yield_to_buflo_guard!('runner);
+            yield_to_exact_boundaries!('runner);
 
             if defense_start.is_none() && endpoints.iter().all(|endpoint| endpoint.connected) {
                 // Handshake datagrams predate the defense clock even though
@@ -4801,7 +4843,7 @@ async fn execute_run_inner(
                     defense_start = Some(loop_now);
                 }
             }
-            yield_to_buflo_guard!('runner);
+            yield_to_exact_boundaries!('runner);
 
             // Refresh after input/HTTP processing: actions reduced below must
             // never be stamped before the observations that produced them.
@@ -4823,7 +4865,7 @@ async fn execute_run_inner(
                     &mut traces,
                     barrier_elapsed,
                 )?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 let application_stream_in_flight = has_in_flight_application_stream(
                     endpoints
                         .iter()
@@ -4838,7 +4880,7 @@ async fn execute_run_inner(
                 }
                 controller.flush_defense_observations();
                 ensure_defense_realizable(&controller)?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 let reconcile_rolling = rolling_lifecycle_before_batch
                     || rolling_output_lifecycle_active(&controller, &endpoints);
                 if reconcile_rolling {
@@ -4857,11 +4899,11 @@ async fn execute_run_inner(
                         barrier_now,
                         barrier_elapsed,
                     )?;
-                    yield_to_buflo_guard!('runner);
+                    yield_to_exact_boundaries!('runner);
                 }
                 let request_work_interrupt =
                     next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?
-                        .map(|guard| guard.guard_at);
+                        .map(|guard| guard.output_admission_at);
                 let started_requests = dispatch_ready_requests(
                     &mut endpoints,
                     spec,
@@ -4871,7 +4913,7 @@ async fn execute_run_inner(
                     controller.can_start_application_batch(),
                     request_work_interrupt,
                 )?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 let batch_started = application_batches.after_dispatch(started_requests)?;
                 handle_all_qcsd_observations(
                     &mut endpoints,
@@ -4884,7 +4926,7 @@ async fn execute_run_inner(
                     traces.observation(None, &record)?;
                     controller.observe(record.into_observation(), barrier_elapsed);
                 }
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
             }
 
             let wake_base = now();
@@ -4892,13 +4934,13 @@ async fn execute_run_inner(
                 .ok_or_else(|| Error::RunAborted("runner wake deadline overflow".into()))?;
             let mut controller_deadline_selected = false;
             for endpoint_index in 0..endpoints.len() {
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 // Flush output that was already available (including newly
                 // dispatched application requests) so its Wire signals precede
                 // the defense poll.
                 let output_guard =
                     next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
-                let work_interrupt = output_guard.map(|guard| guard.guard_at);
+                let work_boundary = output_guard.map(BufloExactReleaseGuard::output_work_boundary);
                 let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
@@ -4908,8 +4950,9 @@ async fn execute_run_inner(
                     &mut traces,
                     &observation_clock,
                     defense_start,
-                    work_interrupt,
+                    work_boundary,
                     unshaped_handoff_interrupt,
+                    None,
                 )
                 .await?
                     && wakeup < next_wakeup
@@ -4917,7 +4960,7 @@ async fn execute_run_inner(
                     next_wakeup = wakeup;
                     controller_deadline_selected = false;
                 }
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
             }
 
             let control_now = now();
@@ -4930,7 +4973,7 @@ async fn execute_run_inner(
                     &mut traces,
                     defense_elapsed,
                 )?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 let candidate_defense = is_candidate_defense(&spec.config.defense);
                 let exclude_stopped_buflo_chaff_sends =
                     matches!(&spec.config.defense, DefenseConfig::Buflo(_))
@@ -4969,7 +5012,16 @@ async fn execute_run_inner(
                     traces.observation(None, &record)?;
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
-                if backlog_component_changed(&mut last_egress_backlog, egress_backlog_pending) {
+                if candidate_aggregate_snapshot_should_emit(
+                    &mut last_egress_backlog,
+                    egress_backlog_pending,
+                    controller.requires_terminal_egress_backlog_snapshot(),
+                ) {
+                    // Terminal chaff cancellation invalidates the aggregate
+                    // snapshot that authorised it. Once every CancelChaff
+                    // action has crossed the adapter boundary, publish the
+                    // freshly recomputed endpoint truth even when it remains
+                    // false-to-false; never synthesize an empty snapshot.
                     let record = observation_clock.record(QcsdObservation::EgressBacklog {
                         pending: egress_backlog_pending,
                     });
@@ -4986,7 +5038,7 @@ async fn execute_run_inner(
                 }
                 controller.flush_defense_observations();
                 ensure_defense_realizable(&controller)?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 if controller.has_rolling_outgoing_prearm()
                     || controller.has_due_rolling_reconciliation()
                 {
@@ -4996,7 +5048,7 @@ async fn execute_run_inner(
                     controller.reconcile_due_rolling(defense_elapsed)?;
                     controller.flush_defense_observations();
                     ensure_defense_realizable(&controller)?;
-                    yield_to_buflo_guard!('runner);
+                    yield_to_exact_boundaries!('runner);
                 }
                 controller.poll(defense_elapsed);
                 ensure_defense_realizable(&controller)?;
@@ -5008,16 +5060,16 @@ async fn execute_run_inner(
                     control_now,
                     defense_elapsed,
                 )?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
             }
 
             for endpoint_index in 0..endpoints.len() {
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 // Retain a post-action flush so newly scheduled packet targets can
                 // be placed on the wire without waiting for another loop turn.
                 let output_guard =
                     next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
-                let work_interrupt = output_guard.map(|guard| guard.guard_at);
+                let work_boundary = output_guard.map(BufloExactReleaseGuard::output_work_boundary);
                 let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
@@ -5027,8 +5079,9 @@ async fn execute_run_inner(
                     &mut traces,
                     &observation_clock,
                     defense_start,
-                    work_interrupt,
+                    work_boundary,
                     unshaped_handoff_interrupt,
+                    None,
                 )
                 .await?
                     && wakeup < next_wakeup
@@ -5036,7 +5089,7 @@ async fn execute_run_inner(
                     next_wakeup = wakeup;
                     controller_deadline_selected = false;
                 }
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
                 let endpoint = &mut endpoints[endpoint_index];
                 let input_now = now();
                 let input_elapsed =
@@ -5050,7 +5103,7 @@ async fn execute_run_inner(
                     input_elapsed,
                     !bound_ordinary_work || defense_start.is_none(),
                 )?;
-                yield_to_buflo_guard!('runner);
+                yield_to_exact_boundaries!('runner);
             }
 
             if application_complete_observed
@@ -5089,6 +5142,32 @@ async fn execute_run_inner(
                 // socket readiness may win this select, but the next loop turn
                 // enters the guard before processing that input.
                 next_wakeup = guard.guard_at;
+                controller_deadline_selected = false;
+            }
+            let cs_retry_inventory = cs_exact_incoming_retry_inventory(
+                &spec.config.defense,
+                &endpoints,
+                &controller,
+                defense_start,
+                now(),
+                &mut cs_exact_incoming_retry_attempted,
+            )?;
+            let cs_retry_wakeup = cs_retry_inventory
+                .earliest_expired_deadline
+                .into_iter()
+                .chain(
+                    cs_retry_inventory
+                        .retries
+                        .first()
+                        .map(|retry| retry.phase_at),
+                )
+                .min();
+            if let Some(cs_retry_wakeup) = cs_retry_wakeup
+                && cs_retry_wakeup <= next_wakeup
+            {
+                // The next loop turn enters the identity-bound retry seam
+                // before ordinary input, HTTP, request, or output work.
+                next_wakeup = cs_retry_wakeup;
                 controller_deadline_selected = false;
             }
             let wake = wait_for_activity_until(
@@ -5603,6 +5682,14 @@ fn backlog_component_changed(previous: &mut Option<bool>, current: bool) -> bool
 fn candidate_stream_snapshot_should_emit(previous: &mut Option<bool>, current: bool) -> bool {
     let changed = backlog_component_changed(previous, current);
     changed || !current
+}
+
+fn candidate_aggregate_snapshot_should_emit(
+    previous: &mut Option<bool>,
+    current: bool,
+    force_fresh: bool,
+) -> bool {
+    backlog_component_changed(previous, current) || force_fresh
 }
 
 fn endpoint_send_terminal(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
@@ -8070,10 +8157,96 @@ struct BufloExactReleaseGuard {
     slot: QcsdSlotId,
     packet: Packet,
     phase: BufloExactReleasePhase,
+    /// Stop admitting fresh ordinary transport work early enough that its
+    /// complete realization allowance ends before the exact-release guard.
+    output_admission_at: Instant,
     guard_at: Instant,
     active_wait_at: Instant,
     release: Instant,
     deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutputWorkBoundary {
+    admission_at: Instant,
+    resume_at: Instant,
+}
+
+impl OutputWorkBoundary {
+    const fn new(admission_at: Instant, resume_at: Instant) -> Self {
+        Self {
+            admission_at,
+            resume_at,
+        }
+    }
+
+    fn closed_wakeup(self, current: Instant) -> Option<Instant> {
+        (current >= self.admission_at).then_some(self.resume_at)
+    }
+}
+
+fn earliest_output_work_boundary(
+    current: Option<OutputWorkBoundary>,
+    candidate: OutputWorkBoundary,
+) -> OutputWorkBoundary {
+    current.map_or(candidate, |current| {
+        if (candidate.admission_at, candidate.resume_at) < (current.admission_at, current.resume_at)
+        {
+            candidate
+        } else {
+            current
+        }
+    })
+}
+
+impl BufloExactReleaseGuard {
+    const fn output_work_boundary(self) -> OutputWorkBoundary {
+        OutputWorkBoundary::new(self.output_admission_at, self.guard_at)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CsExactIncomingRetryPhase {
+    Quarter,
+    Half,
+    ThreeQuarter,
+}
+
+impl CsExactIncomingRetryPhase {
+    const ALL: [Self; 3] = [Self::Quarter, Self::Half, Self::ThreeQuarter];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CsExactIncomingRetry {
+    endpoint_index: usize,
+    endpoint: QcsdEndpointId,
+    slot: QcsdSlotId,
+    phase: CsExactIncomingRetryPhase,
+    target: Instant,
+    phase_at: Instant,
+    deadline: Instant,
+}
+
+type CsExactIncomingRetryKey = (QcsdEndpointId, QcsdSlotId, CsExactIncomingRetryPhase);
+
+fn cs_exact_incoming_retry_times(target: Instant, deadline: Instant) -> Option<[Instant; 3]> {
+    let window = deadline.checked_duration_since(target)?;
+    let quarter = window / 4;
+    if quarter.is_zero() {
+        return None;
+    }
+    let quarter_at = target.checked_add(quarter)?;
+    let half_at = quarter_at.checked_add(quarter)?;
+    let three_quarter_at = half_at.checked_add(quarter)?;
+    (target < quarter_at && three_quarter_at < deadline).then_some([
+        quarter_at,
+        half_at,
+        three_quarter_at,
+    ])
+}
+
+fn cs_exact_incoming_retry_is_due(retry: &CsExactIncomingRetry, current: Instant) -> bool {
+    current >= retry.target && current >= retry.phase_at && current < retry.deadline
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8184,12 +8357,14 @@ fn buflo_exact_release_guard_excluding_candidates(
         .release
         .checked_sub(realization_window)
         .unwrap_or(candidate.release);
+    let output_admission_at = guard_at.checked_sub(realization_window).unwrap_or(guard_at);
     Ok(Some(BufloExactReleaseGuard {
         endpoint_index: candidate.endpoint_index,
         endpoint: candidate.endpoint,
         slot: candidate.slot,
         packet: candidate.packet,
         phase: candidate.phase,
+        output_admission_at,
         guard_at,
         active_wait_at,
         release: candidate.release,
@@ -8336,6 +8511,257 @@ fn buflo_guard_identity_matches_runner(
     }
 }
 
+#[derive(Debug, Default)]
+struct CsExactIncomingRetryInventory {
+    retries: Vec<CsExactIncomingRetry>,
+    earliest_expired_deadline: Option<Instant>,
+}
+
+fn cs_exact_incoming_retry_inventory(
+    defense: &DefenseConfig,
+    endpoints: &[Endpoint],
+    controller: &QcsdController,
+    defense_start: Option<Instant>,
+    current: Instant,
+    attempted: &mut BTreeSet<CsExactIncomingRetryKey>,
+) -> Result<CsExactIncomingRetryInventory, Error> {
+    if !matches!(defense, DefenseConfig::CsBuflo(_)) {
+        attempted.clear();
+        return Ok(CsExactIncomingRetryInventory::default());
+    }
+    let Some(defense_start) = defense_start else {
+        attempted.clear();
+        return Ok(CsExactIncomingRetryInventory::default());
+    };
+
+    let pending_slots: BTreeMap<_, _> = controller.pending_slots().into_iter().collect();
+    let mut active = BTreeMap::new();
+    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+        for identity in endpoint.client.qcsd_pending_receive_action_identities() {
+            if identity.endpoint() != endpoint.id {
+                return Err(Error::SlotInvariant(format!(
+                    "adapter {} reported cross-endpoint pending identity {identity:?}",
+                    endpoint.id.0
+                )));
+            }
+            let Some(slot) = identity.slot() else {
+                continue;
+            };
+            let Some(packet) = pending_slots.get(&slot).copied() else {
+                // The controller can terminalize an exact slot before an
+                // already-accepted adapter suffix is physically discarded.
+                // It is no longer eligible for a runner retry.
+                continue;
+            };
+            if packet.direction() != Direction::Incoming {
+                return Err(Error::SlotInvariant(format!(
+                    "CS-BuFLO receive identity for slot {} was bound to an outgoing packet",
+                    slot.0
+                )));
+            }
+            active.insert((endpoint.id, slot), (endpoint_index, packet));
+        }
+    }
+
+    attempted.retain(|(endpoint, slot, _)| active.contains_key(&(*endpoint, *slot)));
+    let mut inventory = CsExactIncomingRetryInventory::default();
+    for ((endpoint, slot), (endpoint_index, packet)) in active {
+        let target = defense_start
+            .checked_add(packet.timestamp())
+            .ok_or_else(|| {
+                Error::RunAborted(format!("CS-BuFLO incoming slot {} target overflow", slot.0))
+            })?;
+        let deadline = target
+            .checked_add(controller.config().control_interval())
+            .ok_or_else(|| {
+                Error::RunAborted(format!(
+                    "CS-BuFLO incoming slot {} deadline overflow",
+                    slot.0
+                ))
+            })?;
+        let Some(phase_times) = cs_exact_incoming_retry_times(target, deadline) else {
+            return Err(Error::SlotInvariant(format!(
+                "CS-BuFLO incoming slot {} had no strict interior retry instants",
+                slot.0
+            )));
+        };
+        if current >= deadline {
+            inventory.earliest_expired_deadline = inventory
+                .earliest_expired_deadline
+                .into_iter()
+                .chain([deadline])
+                .min();
+            continue;
+        }
+        for (phase, phase_at) in CsExactIncomingRetryPhase::ALL.into_iter().zip(phase_times) {
+            if !attempted.contains(&(endpoint, slot, phase)) {
+                inventory.retries.push(CsExactIncomingRetry {
+                    endpoint_index,
+                    endpoint,
+                    slot,
+                    phase,
+                    target,
+                    phase_at,
+                    deadline,
+                });
+            }
+        }
+    }
+    inventory
+        .retries
+        .sort_unstable_by_key(|retry| (retry.phase_at, retry.endpoint, retry.slot, retry.phase));
+    Ok(inventory)
+}
+
+fn cs_exact_incoming_identity_is_pending(
+    endpoints: &[Endpoint],
+    endpoint: QcsdEndpointId,
+    slot: QcsdSlotId,
+) -> bool {
+    endpoints.iter().any(|candidate| {
+        candidate.id == endpoint
+            && candidate
+                .client
+                .qcsd_pending_receive_action_identities()
+                .iter()
+                .any(|identity| identity.slot() == Some(slot))
+    })
+}
+
+fn expire_due_cs_exact_incoming_credit(
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    defense_start: Option<Instant>,
+    expired_at: Instant,
+) -> Result<(), Error> {
+    let started = defense_start.ok_or_else(|| {
+        Error::RunAborted("CS-BuFLO exact incoming deadline preceded the defense clock".into())
+    })?;
+    let elapsed = expired_at.saturating_duration_since(started);
+    // Expire the half-open local-realization window before any ordinary
+    // output can encode the accepted action late. This is the same normal
+    // controller boundary used below, only selected with exact priority.
+    handle_all_qcsd_observations(endpoints, controller, traces, elapsed)?;
+    controller.poll(elapsed);
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    apply_queued_actions(
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        expired_at,
+        elapsed,
+    )?;
+    Ok(())
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "the current-thread runner owns each finite exact-incoming retry boundary"
+)]
+async fn dispatch_due_cs_exact_incoming_retry(
+    defense: &DefenseConfig,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Option<Instant>,
+    attempted: &mut BTreeSet<CsExactIncomingRetryKey>,
+    runner_wakeup_metrics: &mut RunnerWakeupMetrics,
+) -> Result<bool, Error> {
+    let current = now();
+    let inventory = cs_exact_incoming_retry_inventory(
+        defense,
+        endpoints,
+        controller,
+        defense_start,
+        current,
+        attempted,
+    )?;
+    if inventory.earliest_expired_deadline.is_some() {
+        expire_due_cs_exact_incoming_credit(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            defense_start,
+            current,
+        )?;
+        return Ok(true);
+    }
+
+    let Some(retry) = inventory.retries.first().copied() else {
+        return Ok(false);
+    };
+    if !cs_exact_incoming_retry_is_due(&retry, current) {
+        return Ok(false);
+    }
+    let attempted_at = now();
+    if attempted_at >= retry.deadline {
+        expire_due_cs_exact_incoming_credit(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            defense_start,
+            attempted_at,
+        )?;
+        return Ok(true);
+    }
+    debug_assert!(retry.target < retry.phase_at && retry.phase_at <= attempted_at);
+    for due in inventory.retries.iter().filter(|candidate| {
+        candidate.endpoint == retry.endpoint
+            && candidate.slot == retry.slot
+            && candidate.phase_at <= attempted_at
+    }) {
+        attempted.insert((due.endpoint, due.slot, due.phase));
+    }
+    runner_wakeup_metrics.record_cs_exact_incoming_retry_drive(retry.phase_at, attempted_at);
+
+    _ = drive_endpoint_output_until(
+        retry.endpoint_index,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        defense_start,
+        Some(OutputWorkBoundary::new(retry.deadline, retry.deadline)),
+        Some(retry.deadline),
+        Some(retry.deadline),
+    )
+    .await?;
+    let completed_at = now();
+    let started = defense_start.ok_or_else(|| {
+        Error::RunAborted("CS-BuFLO retry completed without a defense clock".into())
+    })?;
+    let completed_elapsed = completed_at.saturating_duration_since(started);
+    // Reduce a successful physical advertisement before any ordinary runner
+    // work can consume the remaining half-open window. A late observation is
+    // still passed at its current strict reducer instant and fails closed.
+    handle_all_qcsd_observations(endpoints, controller, traces, completed_elapsed)?;
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    apply_queued_actions(
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        completed_at,
+        completed_elapsed,
+    )?;
+    let resolved = !cs_exact_incoming_identity_is_pending(endpoints, retry.endpoint, retry.slot);
+    if resolved {
+        runner_wakeup_metrics.record_cs_exact_incoming_retry_resolution();
+    }
+    Ok(true)
+}
+
 fn buflo_unadvertised_scheduled_receive_credit_endpoints(endpoints: &[Endpoint]) -> Vec<usize> {
     endpoints
         .iter()
@@ -8381,6 +8807,7 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
             traces,
             observation_clock,
             Some(defense_start),
+            Some(OutputWorkBoundary::new(guard.deadline, guard.deadline)),
             Some(guard.deadline),
             Some(guard.deadline),
         )
@@ -8994,6 +9421,7 @@ async fn drive_endpoint_output(
         defense_start,
         None,
         None,
+        None,
         false,
         &mut monotonic_clock,
     )
@@ -9013,8 +9441,9 @@ async fn drive_endpoint_output_until(
     traces: &mut TraceFiles,
     observation_clock: &QcsdObservationClock,
     defense_start: Option<Instant>,
-    work_interrupt: Option<Instant>,
+    work_boundary: Option<OutputWorkBoundary>,
     unshaped_handoff_interrupt: Option<Instant>,
+    absolute_handoff_deadline: Option<Instant>,
 ) -> Result<Option<Instant>, Error> {
     let mut monotonic_clock = now;
     drive_endpoint_output_with_clock_until(
@@ -9025,8 +9454,9 @@ async fn drive_endpoint_output_until(
         traces,
         observation_clock,
         defense_start,
-        work_interrupt,
+        work_boundary,
         unshaped_handoff_interrupt,
+        absolute_handoff_deadline,
         true,
         &mut monotonic_clock,
     )
@@ -9062,6 +9492,7 @@ async fn drive_endpoint_output_with_clock(
         defense_start,
         None,
         None,
+        None,
         false,
         monotonic_clock,
     )
@@ -9088,22 +9519,21 @@ async fn drive_endpoint_output_with_clock_until(
     traces: &mut TraceFiles,
     observation_clock: &QcsdObservationClock,
     defense_start: Option<Instant>,
-    work_interrupt: Option<Instant>,
+    work_boundary: Option<OutputWorkBoundary>,
     unshaped_handoff_interrupt: Option<Instant>,
+    absolute_handoff_deadline: Option<Instant>,
     interrupt_new_buflo_guards: bool,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<Option<Instant>, Error> {
-    let mut work_interrupt = work_interrupt;
+    let mut work_boundary = work_boundary;
     let mut unshaped_handoff_interrupt = unshaped_handoff_interrupt;
     loop {
         // One fresh timestamp governs the complete fixed-schedule microstep:
         // reconcile every event due at that instant, apply its incoming
         // actions, and only then let transport observe target eligibility.
         let mut drive_now = monotonic_clock();
-        if let Some(interrupt) = work_interrupt
-            && drive_now >= interrupt
-        {
-            return Ok(Some(interrupt));
+        if let Some(wakeup) = work_boundary.and_then(|boundary| boundary.closed_wakeup(drive_now)) {
+            return Ok(Some(wakeup));
         }
         let mut output_endpoint_index = endpoint_index;
         let mut due_rolling_slots_before_output = BTreeSet::new();
@@ -9146,16 +9576,19 @@ async fn drive_endpoint_output_with_clock_until(
                 if let Some(guard) =
                     next_buflo_exact_release_guard(&defense, controller, endpoints)?
                 {
-                    work_interrupt = work_interrupt.into_iter().chain([guard.guard_at]).min();
+                    work_boundary = Some(earliest_output_work_boundary(
+                        work_boundary,
+                        guard.output_work_boundary(),
+                    ));
                     unshaped_handoff_interrupt = unshaped_handoff_interrupt
                         .into_iter()
                         .chain([guard.release])
                         .min();
                 }
-                if let Some(interrupt) = work_interrupt {
+                if let Some(boundary) = work_boundary {
                     drive_now = monotonic_clock();
-                    if drive_now >= interrupt {
-                        return Ok(Some(interrupt));
+                    if let Some(wakeup) = boundary.closed_wakeup(drive_now) {
+                        return Ok(Some(wakeup));
                     }
                 }
             }
@@ -9203,7 +9636,7 @@ async fn drive_endpoint_output_with_clock_until(
 
         let rolling_lifecycle_before_output =
             rolling_output_lifecycle_active(controller, endpoints);
-        // `work_interrupt` is only the admission boundary for a fresh unit of
+        // `work_boundary` is only the admission boundary for a fresh unit of
         // ordinary work. Once this output microstep has started strictly before
         // that guard, its targetless UDP handoff retains the actual rolling
         // controller/adapter release as its hard bound. Conflating the two
@@ -9226,6 +9659,7 @@ async fn drive_endpoint_output_with_clock_until(
             drive_now,
             defense_start,
             effective_unshaped_handoff_interrupt,
+            absolute_handoff_deadline,
             monotonic_clock,
         )
         .await?;
@@ -9312,6 +9746,7 @@ async fn process_output_once_with_clock(
     drive_now: Instant,
     defense_start: Option<Instant>,
     unshaped_handoff_interrupt: Option<Instant>,
+    absolute_handoff_deadline: Option<Instant>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
     #[cfg(test)]
@@ -9365,10 +9800,11 @@ async fn process_output_once_with_clock(
         )));
     }
 
-    let target_deadlines: Vec<_> = attributed_datagrams
+    let mut target_deadlines: Vec<_> = attributed_datagrams
         .iter()
         .filter_map(|(_, satisfied, _)| satisfied.map(|target| target.deadline))
         .collect();
+    target_deadlines.extend(absolute_handoff_deadline);
     let (sent_at, late_handoff) = loop {
         #[cfg(test)]
         let force_socket_handoff_success = endpoint.test_force_socket_handoff_success;
@@ -9755,10 +10191,12 @@ mod tests {
     use super::{
         ActivityWake, ApplicationBatchLifecycle, Args, BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
         BufloExactReleaseCandidate, BufloExactReleaseGuard, BufloExactReleasePhase,
-        BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg, DefenseArg, Error,
-        ExpectedChaffIdentity, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
-        PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg, QcsdRequestRole,
-        QualificationAcknowledgement, QualifierStream, RequestPolicyArg, ResourceRunState,
+        BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg, CsExactIncomingRetry,
+        CsExactIncomingRetryPhase, DefenseArg, Error, ExpectedChaffIdentity, OutputWorkBoundary,
+        PrefixBurst, PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt,
+        PreparedExpectedResponse, Preset, ProfileArg, QcsdRequestRole,
+        QualificationAcknowledgement, QualifierStream, RUNNER_WAKEUP_METRICS_SCHEMA_VERSION,
+        RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg, ResourceRunState,
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
         RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
         SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
@@ -9771,7 +10209,10 @@ mod tests {
         buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
         buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
         cancel_uncommitted_prearms_on_abort, chaff_send_halves_peer_confirmed, create_endpoints,
-        cs_buflo_run_summary, datagram_observation, deadline_error, defense_parameter_provenance,
+        cs_buflo_run_summary, cs_exact_incoming_identity_is_pending,
+        cs_exact_incoming_retry_inventory, cs_exact_incoming_retry_is_due,
+        cs_exact_incoming_retry_times, datagram_observation, deadline_error,
+        defense_parameter_provenance, dispatch_due_cs_exact_incoming_retry,
         dispatch_ready_requests, drain_qualifier_stream_data,
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_with_clock, drive_endpoint_output_with_clock_until,
@@ -11139,8 +11580,8 @@ mod tests {
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
                 runner_wakeup_metrics: Some(RunnerWakeupMetrics {
-                    schema_version: 3,
-                    semantics: "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_output_is_interrupted_at_guard",
+                    schema_version: RUNNER_WAKEUP_METRICS_SCHEMA_VERSION,
+                    semantics: RUNNER_WAKEUP_METRICS_SEMANTICS,
                     wait_returns: 3,
                     socket_readiness_wakeups: 1,
                     timer_wakeups: 2,
@@ -11151,6 +11592,9 @@ mod tests {
                     buflo_exact_release_active_wait_nanoseconds: 5,
                     buflo_exact_release_max_passive_wake_lateness_nanoseconds: 0,
                     buflo_exact_release_max_guard_exit_lateness_nanoseconds: 1,
+                    cs_exact_incoming_retry_drives: 3,
+                    cs_exact_incoming_retry_resolutions: 1,
+                    cs_exact_incoming_retry_max_phase_lateness_nanoseconds: 2,
                 }),
             },
         )
@@ -11162,10 +11606,18 @@ mod tests {
         assert!(receipt.get("resolved_workload").is_none());
         assert!(receipt.get("urls").is_none());
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 3);
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 4);
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
         assert_eq!(
             receipt["runner_wakeup_metrics"]["buflo_exact_release_guard_entries"],
+            1
+        );
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["cs_exact_incoming_retry_drives"],
+            3
+        );
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["cs_exact_incoming_retry_resolutions"],
             1
         );
         assert_eq!(receipt["process_scheduler"]["schema_version"], 1);
@@ -11722,6 +12174,28 @@ mod tests {
             !super::candidate_stream_snapshot_should_emit(&mut previous, true),
             "a retained true remains safe and edge-triggered"
         );
+    }
+
+    #[test]
+    fn terminal_cancellation_can_force_a_fresh_unchanged_aggregate_snapshot() {
+        let mut previous = Some(false);
+        assert!(!super::candidate_aggregate_snapshot_should_emit(
+            &mut previous,
+            false,
+            false
+        ));
+        assert!(super::candidate_aggregate_snapshot_should_emit(
+            &mut previous,
+            false,
+            true
+        ));
+        assert_eq!(previous, Some(false));
+        assert!(super::candidate_aggregate_snapshot_should_emit(
+            &mut previous,
+            true,
+            true
+        ));
+        assert_eq!(previous, Some(true));
     }
 
     #[test]
@@ -13032,6 +13506,193 @@ mod tests {
         fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
             Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
         }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the connected regression binds controller cancellation, real transport drain, and fresh runner evidence"
+    )]
+    async fn terminal_cancel_applied_to_adapter_forces_fresh_false_after_real_drain() {
+        let output = trace_output_dir("terminal-cancel-fresh-false");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+
+        // Establish a real open chaff response whose request and critical
+        // STREAM bytes are fully acknowledged. The runner's retained aggregate
+        // snapshot is therefore an actual pre-cancellation false, not a
+        // synthetic test value.
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let resource = Resource {
+            id: 0,
+            url: "https://127.0.0.1:4433/chaff".into(),
+            kind: "Other".into(),
+            content_length: Some(5),
+            data_length: 5,
+            chaff_priority: true,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        let request_id = QcsdChaffRequestId(7);
+        let stream = endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::RequestChaff {
+                    endpoint: endpoint.id,
+                    resource: resource.clone(),
+                    request_id,
+                },
+            )
+            .expect("create real chaff request")
+            .expect("chaff request stream");
+        endpoint
+            .client
+            .stream_close_send(stream, started)
+            .expect("close chaff request send handler");
+        endpoint.chaff_send_streams.insert(stream);
+        let mut record = chaff(b"cover", false);
+        record.url.clone_from(&resource.url);
+        endpoint.streams.insert(stream, record);
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert!(chaff_send_halves_peer_confirmed(&endpoint));
+        assert!(
+            !endpoint.client.qcsd_has_pending_required_stream_send(&[]),
+            "the open chaff response has no pre-cancellation request backlog"
+        );
+        assert!(!endpoint.client.qcsd_has_pending_defense_control());
+        endpoint.client.qcsd_enable_send_shaping(true);
+        drop(endpoint.client.qcsd_timestamped_observations());
+
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RunnerBarrierLocalEtDefense { complete: true }),
+        )
+        .expect("terminal test controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoint.id,
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: endpoint.id,
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Chaff {
+                    resource_id: resource.id,
+                    request_id: None,
+                },
+                expected_response_length: None,
+            },
+            Duration::ZERO,
+        );
+
+        let mut endpoints = vec![endpoint];
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_queued_actions(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+        )
+        .expect("apply manual receive configuration");
+        let pre_cancel_backlog = endpoint_candidate_egress_backlog(&mut endpoints[0], false);
+        assert_eq!(pre_cancel_backlog, (false, false));
+        let mut last_egress_backlog = Some(pre_cancel_backlog.1);
+
+        controller.observe(
+            QcsdObservation::EgressBacklog {
+                pending: pre_cancel_backlog.1,
+            },
+            Duration::ZERO,
+        );
+        controller.flush_defense_observations();
+        let cancel_at = Duration::from_micros(1);
+        controller.poll(cancel_at);
+        assert!(!controller.is_complete());
+        assert!(
+            !controller.requires_terminal_egress_backlog_snapshot(),
+            "a queued CancelChaff has not crossed the adapter boundary"
+        );
+
+        apply_queued_actions(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started + cancel_at,
+            cancel_at,
+        )
+        .expect("apply terminal chaff cancellation to the real adapter");
+        assert!(endpoints[0].streams.is_empty());
+        assert!(endpoints[0].client.qcsd_has_pending_defense_control());
+        assert!(!endpoint_send_terminal(&mut endpoints[0], true));
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+        assert!(!controller.is_complete());
+
+        // Model the fast-drain production path: RESET/STOP is acknowledged
+        // before the next control barrier, so the runner never observes the
+        // transient true and its retained aggregate remains false.
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+        assert!(!endpoints[0].client.qcsd_has_pending_defense_control());
+        assert!(chaff_send_halves_peer_confirmed(&endpoints[0]));
+        assert!(endpoint_send_terminal(&mut endpoints[0], true));
+        let post_cancel_backlog = endpoint_candidate_egress_backlog(&mut endpoints[0], false);
+        assert_eq!(post_cancel_backlog, (false, false));
+        assert_eq!(last_egress_backlog, Some(false));
+
+        assert!(super::candidate_aggregate_snapshot_should_emit(
+            &mut last_egress_backlog,
+            post_cancel_backlog.1,
+            controller.requires_terminal_egress_backlog_snapshot(),
+        ));
+        assert_eq!(last_egress_backlog, Some(false));
+        let fresh_at = Duration::from_micros(2);
+        controller.observe(
+            QcsdObservation::EgressBacklog {
+                pending: post_cancel_backlog.1,
+            },
+            fresh_at,
+        );
+        controller.flush_defense_observations();
+        assert!(controller.requires_terminal_egress_backlog_snapshot());
+        assert!(!controller.is_complete());
+
+        controller.poll(fresh_at);
+        assert!(!controller.requires_terminal_egress_backlog_snapshot());
+        assert!(controller.is_complete());
+        let completion_actions: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(
+            completion_actions
+                .iter()
+                .filter(|action| matches!(action, QcsdAction::DefenseComplete))
+                .count(),
+            1
+        );
+
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[tokio::test]
@@ -14720,6 +15381,13 @@ mod tests {
         );
         controller.poll(Duration::ZERO);
         let actions: Vec<_> = controller.drain_actions().collect();
+        let incoming_slot = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .expect("scheduled incoming slot");
         assert!(actions.iter().any(|action| matches!(
             action,
             QcsdAction::IncreaseReceiveLimit {
@@ -14747,6 +15415,48 @@ mod tests {
             buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints),
             [0]
         );
+        let cs_buflo = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "test-only-cs-buflo-parameters.json".into(),
+        });
+        let retry_defense_start = now() + Duration::from_secs(1);
+        let retry_current = now();
+        let mut attempted = BTreeSet::new();
+        let inventory = cs_exact_incoming_retry_inventory(
+            &cs_buflo,
+            &endpoints,
+            &controller,
+            Some(retry_defense_start),
+            retry_current,
+            &mut attempted,
+        )
+        .expect("bind exact incoming retry to its transport identity");
+        assert_eq!(inventory.retries.len(), 3);
+        assert!(inventory.earliest_expired_deadline.is_none());
+        assert!(inventory.retries.iter().all(|retry| {
+            retry.endpoint_index == 0
+                && retry.endpoint == QcsdEndpointId(0)
+                && retry.slot == incoming_slot
+                && retry.target == retry_defense_start
+        }));
+        attempted.insert((
+            QcsdEndpointId(0),
+            incoming_slot,
+            CsExactIncomingRetryPhase::Quarter,
+        ));
+        assert_eq!(
+            cs_exact_incoming_retry_inventory(
+                &cs_buflo,
+                &endpoints,
+                &controller,
+                Some(retry_defense_start),
+                retry_current,
+                &mut attempted,
+            )
+            .expect("retain only unattempted finite phases")
+            .retries
+            .len(),
+            2
+        );
 
         let release = now();
         let outgoing =
@@ -14757,6 +15467,7 @@ mod tests {
             slot: QcsdSlotId(999),
             packet: outgoing,
             phase: BufloExactReleasePhase::Committed,
+            output_admission_at: release,
             guard_at: release,
             active_wait_at: release,
             release,
@@ -14775,6 +15486,20 @@ mod tests {
         .expect("cross-endpoint receive control drive");
         assert!(buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints).is_empty());
         assert!(
+            cs_exact_incoming_retry_inventory(
+                &cs_buflo,
+                &endpoints,
+                &controller,
+                Some(retry_defense_start),
+                retry_current,
+                &mut attempted,
+            )
+            .expect("retire retry state after transport encodes the identity")
+            .retries
+            .is_empty()
+        );
+        assert!(attempted.is_empty());
+        assert!(
             endpoints[1].test_observation_on_next_output.is_some(),
             "an unrelated endpoint receives no speculative output turn"
         );
@@ -14791,6 +15516,168 @@ mod tests {
         drop(endpoints);
         drop(credit_server);
         drop(outgoing_server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the production retry oracle needs one live receive action and socket handoff"
+    )]
+    async fn cs_exact_incoming_retry_dispatches_the_owner_once_and_receipts_resolution() {
+        let output = trace_output_dir("cs-exact-incoming-retry-dispatch");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            1_000_000,
+        );
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let request_url = http::Uri::from_static("https://127.0.0.1:4433/controlled");
+        let stream = endpoint
+            .client
+            .fetch(
+                started,
+                "GET",
+                &request_url,
+                &[],
+                neqo_http3::Priority::default(),
+            )
+            .expect("create controlled request stream");
+        endpoint
+            .client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(10_000))
+            .expect("register controlled response stream");
+        endpoint
+            .client
+            .stream_close_send(stream, started)
+            .expect("close request send side");
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert!(!endpoint.client.qcsd_has_pending_stream_send());
+        endpoint.client.qcsd_enable_send_shaping(true);
+        drop(endpoint.client.qcsd_timestamped_observations());
+
+        let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("incoming");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 1_000_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([incoming]),
+            }),
+        )
+        .expect("incoming controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(0),
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let incoming_slot = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .expect("scheduled incoming slot");
+        let mut endpoints = vec![endpoint];
+        endpoints[0].test_force_socket_handoff_success = true;
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("apply exact incoming action");
+
+        let defense = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "test-only-cs-buflo-parameters.json".into(),
+        });
+        let defense_start = now()
+            .checked_sub(Duration::from_millis(251))
+            .expect("synthetic defense clock has a quarter-window predecessor");
+        let mut attempted = BTreeSet::new();
+        let mut metrics = RunnerWakeupMetrics::new();
+        assert!(
+            dispatch_due_cs_exact_incoming_retry(
+                &defense,
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                &observation_clock,
+                Some(defense_start),
+                &mut attempted,
+                &mut metrics,
+            )
+            .await
+            .expect("dispatch due quarter-window retry")
+        );
+        assert!(!cs_exact_incoming_identity_is_pending(
+            &endpoints,
+            QcsdEndpointId(0),
+            incoming_slot
+        ));
+        assert_eq!(metrics.cs_exact_incoming_retry_drives, 1);
+        assert_eq!(metrics.cs_exact_incoming_retry_resolutions, 1);
+        assert!(
+            metrics.cs_exact_incoming_retry_max_phase_lateness_nanoseconds < 100_000_000,
+            "attempt-time lateness excludes the output-drive completion tail"
+        );
+        assert!(
+            !dispatch_due_cs_exact_incoming_retry(
+                &defense,
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                &observation_clock,
+                Some(defense_start),
+                &mut attempted,
+                &mut metrics,
+            )
+            .await
+            .expect("resolved identity cannot rearm a retry")
+        );
+        assert!(attempted.is_empty());
+        assert_eq!(metrics.cs_exact_incoming_retry_drives, 1);
+
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            now(),
+            now().saturating_duration_since(defense_start),
+            MissedSlotReason::RunAborted,
+        )
+        .expect("terminalize unconsumed exact credit");
+        drop(traces);
+        drop(endpoints);
+        drop(server);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -16584,6 +17471,9 @@ mod tests {
         let guard_at = release
             .checked_sub(Duration::from_millis(5))
             .expect("release has a five-millisecond guard predecessor");
+        let output_admission_at = guard_at
+            .checked_sub(Duration::from_millis(5))
+            .expect("guard has a five-millisecond admission predecessor");
         let adapter_deadline = release + Duration::from_millis(5);
         let handoff_interrupt =
             resolve_rolling_output_interrupt(Some(started), [target], [adapter_deadline])
@@ -16591,12 +17481,12 @@ mod tests {
                 .expect("rolling release bounds targetless handoff");
         assert_eq!(handoff_interrupt, release);
 
-        let before_guard = guard_at
+        let before_admission = output_admission_at
             .checked_sub(Duration::from_nanos(1))
-            .expect("guard has a predecessor");
+            .expect("output admission has a predecessor");
         let inside_reserved_tail = guard_at + Duration::from_micros(80);
         assert!(inside_reserved_tail < release);
-        let mut crossing_guard = [before_guard, inside_reserved_tail].into_iter();
+        let mut crossing_guard = [before_admission, inside_reserved_tail].into_iter();
         assert_eq!(
             attempt_socket_handoff(
                 &[],
@@ -16609,7 +17499,7 @@ mod tests {
         );
 
         for too_late in [release, release + Duration::from_nanos(1)] {
-            let mut crossing_release = [before_guard, too_late].into_iter();
+            let mut crossing_release = [before_admission, too_late].into_iter();
             let late = attempt_socket_handoff(
                 &[],
                 Some(handoff_interrupt),
@@ -17292,7 +18182,17 @@ mod tests {
             release,
             release + Duration::from_nanos(7),
         );
-        assert_eq!(metrics.schema_version, 3);
+        let retry_phase = release + Duration::from_millis(1);
+        metrics.record_cs_exact_incoming_retry_drive(
+            retry_phase,
+            retry_phase + Duration::from_nanos(11),
+        );
+        metrics.record_cs_exact_incoming_retry_drive(
+            retry_phase,
+            retry_phase + Duration::from_nanos(7),
+        );
+        metrics.record_cs_exact_incoming_retry_resolution();
+        assert_eq!(metrics.schema_version, 4);
         assert_eq!(metrics.wait_returns, 3);
         assert_eq!(metrics.socket_readiness_wakeups, 1);
         assert_eq!(metrics.timer_wakeups, 2);
@@ -17314,6 +18214,12 @@ mod tests {
         assert_eq!(
             metrics.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
             7
+        );
+        assert_eq!(metrics.cs_exact_incoming_retry_drives, 2);
+        assert_eq!(metrics.cs_exact_incoming_retry_resolutions, 1);
+        assert_eq!(
+            metrics.cs_exact_incoming_retry_max_phase_lateness_nanoseconds,
+            11
         );
         assert_eq!(
             metrics.timer_wakeups,
@@ -17367,6 +18273,7 @@ mod tests {
         assert_eq!(guard.endpoint, QcsdEndpointId(0));
         assert_eq!(guard.slot, QcsdSlotId(1));
         assert_eq!(guard.packet, packet);
+        assert_eq!(guard.output_admission_at, base + Duration::from_millis(10));
         assert_eq!(guard.guard_at, base + Duration::from_millis(15));
         assert_eq!(guard.active_wait_at, guard.guard_at);
         assert_eq!(guard.release, release);
@@ -17416,6 +18323,67 @@ mod tests {
         )
         .expect_err("slot ids are globally unique across endpoint runners");
         assert!(matches!(duplicate, Error::SlotInvariant(_)));
+    }
+
+    #[test]
+    fn cs_exact_incoming_retries_are_finite_and_strictly_inside_the_window() {
+        let target = now() + Duration::from_millis(20);
+        let deadline = target + Duration::from_millis(5);
+        let phases = cs_exact_incoming_retry_times(target, deadline)
+            .expect("five-millisecond window has three interior phases");
+        assert_eq!(
+            phases,
+            [
+                target + Duration::from_micros(1_250),
+                target + Duration::from_micros(2_500),
+                target + Duration::from_micros(3_750),
+            ]
+        );
+        assert!(
+            phases
+                .into_iter()
+                .all(|phase| target < phase && phase < deadline)
+        );
+
+        let retry = CsExactIncomingRetry {
+            endpoint_index: 0,
+            endpoint: QcsdEndpointId(0),
+            slot: QcsdSlotId(7),
+            phase: CsExactIncomingRetryPhase::Quarter,
+            target,
+            phase_at: phases[0],
+            deadline,
+        };
+        assert!(!cs_exact_incoming_retry_is_due(
+            &retry,
+            target
+                .checked_sub(Duration::from_nanos(1))
+                .expect("target has a predecessor")
+        ));
+        assert!(!cs_exact_incoming_retry_is_due(&retry, target));
+        assert!(!cs_exact_incoming_retry_is_due(
+            &retry,
+            phases[0]
+                .checked_sub(Duration::from_nanos(1))
+                .expect("phase has a predecessor")
+        ));
+        assert!(cs_exact_incoming_retry_is_due(&retry, phases[0]));
+        assert!(cs_exact_incoming_retry_is_due(
+            &retry,
+            deadline
+                .checked_sub(Duration::from_nanos(1))
+                .expect("deadline has a predecessor")
+        ));
+        assert!(!cs_exact_incoming_retry_is_due(&retry, deadline));
+        assert!(!cs_exact_incoming_retry_is_due(
+            &retry,
+            deadline + Duration::from_nanos(1)
+        ));
+        assert!(
+            cs_exact_incoming_retry_times(target, target + Duration::from_nanos(3)).is_none(),
+            "a window without three strict interior quarter points is rejected"
+        );
+        assert!(cs_exact_incoming_retry_times(target, target).is_none());
     }
 
     #[test]
@@ -17674,6 +18642,15 @@ mod tests {
         .expect("valid exact-release inventory")
         .expect("exact release guard");
         assert_eq!(
+            buflo_exact_release_wait_step(&guard, guard.output_admission_at),
+            BufloExactReleaseWaitStep::Passive(
+                guard
+                    .active_wait_at
+                    .duration_since(guard.output_admission_at)
+            ),
+            "the earlier output-admission boundary cannot dispatch the exact slot"
+        );
+        assert_eq!(
             buflo_exact_release_wait_step(&guard, guard.guard_at),
             BufloExactReleaseWaitStep::Active
         );
@@ -17739,7 +18716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_work_start_at_guard_yields_without_touching_transport() {
+    async fn output_work_start_at_admission_yields_to_guard_without_touching_transport() {
         let output = trace_output_dir("output-work-interrupt");
         let started = test_fixture::now();
         let observation_clock = QcsdObservationClock::new(started);
@@ -17758,9 +18735,10 @@ mod tests {
         let mut controller =
             QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
-        let guard_at = started + Duration::from_millis(5);
+        let output_admission_at = started + Duration::from_millis(5);
+        let guard_at = output_admission_at + Duration::from_millis(5);
         let release = guard_at + Duration::from_millis(5);
-        let mut monotonic_clock = || guard_at;
+        let mut monotonic_clock = || output_admission_at;
 
         let wakeup = drive_endpoint_output_with_clock_until(
             0,
@@ -17770,8 +18748,9 @@ mod tests {
             &mut traces,
             &observation_clock,
             Some(started),
-            Some(guard_at),
+            Some(OutputWorkBoundary::new(output_admission_at, guard_at)),
             Some(release),
+            None,
             true,
             &mut monotonic_clock,
         )
