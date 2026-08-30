@@ -8098,10 +8098,33 @@ struct BufloExactReleaseCandidate {
     deadline: Instant,
 }
 
+fn buflo_candidate_has_queued_terminal_cancellation(
+    controller: &QcsdController,
+    candidate: &BufloExactReleaseCandidate,
+) -> bool {
+    candidate.phase == BufloExactReleasePhase::Prearmed
+        && controller.rolling_outgoing_prearm_identity().is_none()
+        && controller.has_queued_terminal_prearm_cancellation(
+            candidate.endpoint,
+            candidate.packet,
+            candidate.slot,
+        )
+}
+
+#[cfg(test)]
 fn buflo_exact_release_guard_from_candidates(
     enabled: bool,
     candidates: impl IntoIterator<Item = BufloExactReleaseCandidate>,
     active_wait_tail: Duration,
+) -> Result<Option<BufloExactReleaseGuard>, Error> {
+    buflo_exact_release_guard_excluding_candidates(enabled, candidates, active_wait_tail, |_| false)
+}
+
+fn buflo_exact_release_guard_excluding_candidates(
+    enabled: bool,
+    candidates: impl IntoIterator<Item = BufloExactReleaseCandidate>,
+    active_wait_tail: Duration,
+    excluded: impl Fn(&BufloExactReleaseCandidate) -> bool,
 ) -> Result<Option<BufloExactReleaseGuard>, Error> {
     if !enabled {
         return Ok(None);
@@ -8133,14 +8156,18 @@ fn buflo_exact_release_guard_from_candidates(
         }
     }
 
-    let Some(candidate) = candidates.into_iter().min_by_key(|candidate| {
-        (
-            candidate.release,
-            candidate.deadline,
-            candidate.slot,
-            candidate.endpoint_index,
-        )
-    }) else {
+    let Some(candidate) = candidates
+        .into_iter()
+        .filter(|candidate| !excluded(candidate))
+        .min_by_key(|candidate| {
+            (
+                candidate.release,
+                candidate.deadline,
+                candidate.slot,
+                candidate.endpoint_index,
+            )
+        })
+    else {
         return Ok(None);
     };
     let realization_window = candidate.deadline.duration_since(candidate.release);
@@ -8171,7 +8198,7 @@ fn next_buflo_exact_release_guard(
     controller: &QcsdController,
     endpoints: &[Endpoint],
 ) -> Result<Option<BufloExactReleaseGuard>, Error> {
-    let guard = buflo_exact_release_guard_from_candidates(
+    let guard = buflo_exact_release_guard_excluding_candidates(
         matches!(defense, DefenseConfig::Buflo(_)),
         endpoints
             .iter()
@@ -8206,6 +8233,7 @@ fn next_buflo_exact_release_guard(
                     )
             }),
         BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        |candidate| buflo_candidate_has_queued_terminal_cancellation(controller, candidate),
     )?;
     let Some(guard) = guard else {
         return Ok(None);
@@ -9718,11 +9746,11 @@ mod tests {
         activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
         apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
         await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
-        bounded_qualification_wait, buflo_exact_release_guard_from_candidates,
-        buflo_exact_release_wait_step, buflo_run_summary,
-        buflo_unadvertised_scheduled_receive_credit_endpoints, cancel_uncommitted_prearms_on_abort,
-        chaff_send_halves_peer_confirmed, create_endpoints, cs_buflo_run_summary,
-        datagram_observation, deadline_error, defense_parameter_provenance,
+        bounded_qualification_wait, buflo_exact_release_guard_excluding_candidates,
+        buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
+        buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
+        cancel_uncommitted_prearms_on_abort, chaff_send_halves_peer_confirmed, create_endpoints,
+        cs_buflo_run_summary, datagram_observation, deadline_error, defense_parameter_provenance,
         dispatch_ready_requests, drain_qualifier_stream_data,
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_with_clock, drive_endpoint_output_with_clock_until,
@@ -9731,14 +9759,14 @@ mod tests {
         expected_application_response_length, finish_application_record, finish_chaff_record,
         finish_stream, forward_qcsd_observation, handle_all_qcsd_observations, handle_http_events,
         has_in_flight_application_stream, is_candidate_defense, is_public_network_address,
-        normalize_rolling_prearm_window, now, pending_receive_identity_is_reconciled,
-        prefix_numeric_profile_sha256, prefix_receipts_pass, prefix_targetless_stream_bytes,
-        preflight_receive_actions_with, prepare_chaff_cancellation, projected_ael,
-        projected_identity_chaff_headers, qcsd_connection_parameters,
-        qualification_content_encoding, ready_request_batch, record_adapter_action_error,
-        record_receive_limit_error, record_terminal_action, register_action_batch,
-        remaining_wakeup_delay, resolve_rolling_output_interrupt, resolve_run_config,
-        resolve_run_config_with_workload, response_qualification_mode,
+        next_buflo_exact_release_guard, normalize_rolling_prearm_window, now,
+        pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
+        prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
+        prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
+        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
+        record_adapter_action_error, record_receive_limit_error, record_terminal_action,
+        register_action_batch, remaining_wakeup_delay, resolve_rolling_output_interrupt,
+        resolve_run_config, resolve_run_config_with_workload, response_qualification_mode,
         rolling_output_lifecycle_active, sanitize_chaff_action_headers, sha256,
         shapes_stream_sends, sustained_qualification_content_encoding,
         sustained_representation_failure, sustained_requests_are_classifiable,
@@ -12744,6 +12772,52 @@ mod tests {
 
         fn is_outgoing_complete(&self) -> bool {
             self.events.is_empty()
+        }
+
+        fn mode(&self) -> DefenseMode {
+            DefenseMode::ChaffAndShape
+        }
+    }
+
+    #[derive(Debug)]
+    struct RollingOutgoingTerminalOnApplication {
+        events: VecDeque<Packet>,
+        terminal: bool,
+    }
+
+    impl Defense for RollingOutgoingTerminalOnApplication {
+        fn observe(&mut self, signal: DefenseSignal) {
+            self.terminal |= matches!(signal.kind, SignalKind::ApplicationComplete);
+        }
+
+        fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
+            if self.terminal {
+                return None;
+            }
+            self.events
+                .front()
+                .filter(|packet| packet.timestamp() <= elapsed)?;
+            self.events.pop_front()
+        }
+
+        fn next_outgoing_prearm(&self) -> Option<Packet> {
+            (!self.terminal)
+                .then(|| self.events.front().copied())
+                .flatten()
+        }
+
+        fn next_event_at(&self) -> Option<Duration> {
+            (!self.terminal)
+                .then(|| self.events.front().copied().map(Packet::timestamp))
+                .flatten()
+        }
+
+        fn is_complete(&self) -> bool {
+            false
+        }
+
+        fn is_outgoing_complete(&self) -> bool {
+            self.terminal
         }
 
         fn mode(&self) -> DefenseMode {
@@ -17260,6 +17334,239 @@ mod tests {
         )
         .expect_err("slot ids are globally unique across endpoint runners");
         assert!(matches!(duplicate, Error::SlotInvariant(_)));
+    }
+
+    #[test]
+    fn buflo_exact_release_guard_filters_only_the_terminally_cancelled_preview() {
+        let base = now();
+        let window = Duration::from_millis(5);
+        let cancelled_packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let live_packet =
+            Packet::new(Duration::from_millis(40), Direction::Outgoing, 1_200).expect("packet");
+        let cancelled = BufloExactReleaseCandidate {
+            endpoint_index: 0,
+            endpoint: QcsdEndpointId(0),
+            slot: QcsdSlotId(1),
+            packet: cancelled_packet,
+            phase: BufloExactReleasePhase::Prearmed,
+            release: base + Duration::from_millis(20),
+            deadline: base + Duration::from_millis(20) + window,
+        };
+        let live = BufloExactReleaseCandidate {
+            endpoint_index: 1,
+            endpoint: QcsdEndpointId(1),
+            slot: QcsdSlotId(2),
+            packet: live_packet,
+            phase: BufloExactReleasePhase::Prearmed,
+            release: base + Duration::from_millis(40),
+            deadline: base + Duration::from_millis(40) + window,
+        };
+
+        let guard = buflo_exact_release_guard_excluding_candidates(
+            true,
+            [cancelled, live],
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+            |candidate| candidate == &cancelled,
+        )
+        .expect("terminal cancellation exclusion is valid")
+        .expect("the other endpoint retains its exact guard");
+        assert_eq!(guard.endpoint, live.endpoint);
+        assert_eq!(guard.slot, live.slot);
+        assert_eq!(guard.packet, live.packet);
+
+        assert!(
+            buflo_exact_release_guard_excluding_candidates(
+                true,
+                [cancelled],
+                BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+                |candidate| candidate == &cancelled,
+            )
+            .expect("the exact cancelled preview is valid")
+            .is_none()
+        );
+
+        let invalid_cancelled = BufloExactReleaseCandidate {
+            deadline: cancelled.release,
+            ..cancelled
+        };
+        assert!(matches!(
+            buflo_exact_release_guard_excluding_candidates(
+                true,
+                [invalid_cancelled],
+                BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+                |_| true,
+            ),
+            Err(Error::SlotInvariant(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the production handoff, identity failures, and surviving candidate must share one controller/adapter lifecycle"
+    )]
+    async fn buflo_exact_release_guard_honours_the_real_terminal_cancellation_handoff() {
+        let output = trace_output_dir("buflo-terminal-preview-guard");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let committed_packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let terminal_preview_packet =
+            Packet::new(Duration::from_millis(40), Direction::Outgoing, 1_200).expect("packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingTerminalOnApplication {
+                events: VecDeque::from([committed_packet, terminal_preview_packet]),
+                terminal: false,
+            }),
+        )
+        .expect("controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(0),
+                origin: "https://example.com".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.poll(Duration::ZERO);
+        let first_preview = controller
+            .drain_actions()
+            .find(|action| {
+                matches!(
+                    action,
+                    QcsdAction::PrearmPacket { packet, .. } if *packet == committed_packet
+                )
+            })
+            .expect("first rolling preview");
+
+        let mut endpoints = vec![connected_runner_endpoint(
+            &output,
+            started,
+            &observation_clock,
+        )];
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            vec![first_preview],
+        )
+        .expect("apply first preview");
+
+        controller
+            .reconcile_due_rolling(Duration::from_millis(20))
+            .expect("commit first preview and arm its successor");
+        let transition: Vec<_> = controller.drain_actions().collect();
+        assert!(transition.iter().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket { packet, .. } if *packet == committed_packet
+        )));
+        assert!(transition.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket { packet, .. } if *packet == terminal_preview_packet
+        )));
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started + Duration::from_millis(20),
+            Duration::from_millis(20),
+            transition,
+        )
+        .expect("apply rolling transition");
+        assert_eq!(endpoints[0].scheduled_outgoing.len(), 1);
+        assert_eq!(endpoints[0].prearmed_outgoing.len(), 1);
+        let terminal_preview_slot = endpoints[0].prearmed_outgoing[0].slot;
+
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_millis(21),
+        );
+        controller.flush_defense_observations();
+        assert_eq!(controller.rolling_outgoing_prearm_identity(), None);
+        assert!(controller.has_queued_terminal_prearm_cancellation(
+            QcsdEndpointId(0),
+            terminal_preview_packet,
+            terminal_preview_slot,
+        ));
+
+        let buflo = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: "test-only-buflo-parameters.json".into(),
+        });
+        let committed = endpoints[0]
+            .scheduled_outgoing
+            .pop_front()
+            .expect("committed candidate");
+        assert!(
+            next_buflo_exact_release_guard(&buflo, &controller, &endpoints)
+                .expect("exact terminal cancellation is a valid handoff")
+                .is_none(),
+            "the adapter preview awaiting its exact terminal cancellation must not retain a guard"
+        );
+
+        endpoints[0].scheduled_outgoing.push_front(committed);
+        let remaining = next_buflo_exact_release_guard(&buflo, &controller, &endpoints)
+            .expect("the remaining committed candidate is valid")
+            .expect("the committed candidate retains its guard");
+        assert_eq!(remaining.phase, BufloExactReleasePhase::Committed);
+        assert_eq!(remaining.slot, committed.slot);
+        assert_eq!(remaining.packet, committed.packet);
+        let committed = endpoints[0]
+            .scheduled_outgoing
+            .pop_front()
+            .expect("remove the committed candidate for negative cases");
+
+        endpoints[0].prearmed_outgoing[0].slot = QcsdSlotId(terminal_preview_slot.0 + 1);
+        assert!(matches!(
+            next_buflo_exact_release_guard(&buflo, &controller, &endpoints),
+            Err(Error::SlotInvariant(_))
+        ));
+        endpoints[0].prearmed_outgoing[0].slot = terminal_preview_slot;
+
+        let aborted_preview = controller
+            .take_rolling_prearm_for_abort()
+            .expect("normalize the queued terminal cancellation for abort");
+        assert!(matches!(
+            &aborted_preview,
+            QcsdAction::CancelPrearmedPacket {
+                endpoint: QcsdEndpointId(0),
+                packet,
+                slot,
+                reason: neqo_csdef::QcsdPrearmCancellationReason::RunAborted,
+            } if *packet == terminal_preview_packet && *slot == terminal_preview_slot
+        ));
+        assert!(matches!(
+            next_buflo_exact_release_guard(&buflo, &controller, &endpoints),
+            Err(Error::SlotInvariant(_))
+        ));
+
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started + Duration::from_millis(21),
+            Duration::from_millis(21),
+            vec![aborted_preview],
+        )
+        .expect("apply abort-normalized preview cancellation");
+        assert!(endpoints[0].prearmed_outgoing.is_empty());
+        endpoints[0].scheduled_outgoing.push_front(committed);
+
+        drop(traces);
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[test]

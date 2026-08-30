@@ -3041,6 +3041,34 @@ impl QcsdController {
         }
     }
 
+    /// Whether ownership of this exact rolling preview has already moved to
+    /// a queued terminal cancellation.
+    ///
+    /// Between the controller closing `BuFLO`'s schedule and the runner
+    /// applying its action queue, the adapter still owns the preview while
+    /// `rolling_outgoing_prearm` is intentionally empty.  The runner may
+    /// ignore only the exact identity proven by this predicate; every other
+    /// controller/adapter mismatch remains a fidelity failure.
+    #[must_use]
+    pub fn has_queued_terminal_prearm_cancellation(
+        &self,
+        endpoint: QcsdEndpointId,
+        packet: crate::Packet,
+        slot: QcsdSlotId,
+    ) -> bool {
+        self.actions.iter().any(|action| {
+            matches!(
+                action,
+                QcsdAction::CancelPrearmedPacket {
+                    endpoint: action_endpoint,
+                    packet: action_packet,
+                    slot: action_slot,
+                    reason: QcsdPrearmCancellationReason::DefenseTerminal,
+                } if *action_endpoint == endpoint && *action_packet == packet && *action_slot == slot
+            )
+        })
+    }
+
     /// Retract the controller's provisional rolling target during abnormal
     /// shutdown and return its single typed adapter reconciliation action.
     ///
@@ -15807,6 +15835,33 @@ mod tests {
             Duration::from_micros(52),
         );
         controller.flush_defense_observations();
+        assert_eq!(controller.rolling_outgoing_prearm_identity(), None);
+        assert!(controller.has_queued_terminal_prearm_cancellation(
+            endpoint,
+            preview_packet,
+            preview_slot,
+        ));
+        assert!(!controller.has_queued_terminal_prearm_cancellation(
+            QcsdEndpointId(endpoint.0 + 1),
+            preview_packet,
+            preview_slot,
+        ));
+        assert!(!controller.has_queued_terminal_prearm_cancellation(
+            endpoint,
+            preview_packet,
+            QcsdSlotId(preview_slot.0 + 1),
+        ));
+        let mismatched_packet = Packet::new(
+            preview_packet.timestamp() + Duration::from_micros(1),
+            preview_packet.direction(),
+            preview_packet.length(),
+        )
+        .expect("mismatched preview packet");
+        assert!(!controller.has_queued_terminal_prearm_cancellation(
+            endpoint,
+            mismatched_packet,
+            preview_slot,
+        ));
         let stop_actions: Vec<_> = controller.drain_actions().collect();
         assert!(stop_actions.iter().any(|action| matches!(
             action,
