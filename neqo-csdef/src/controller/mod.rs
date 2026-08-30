@@ -17725,6 +17725,14 @@ mod tests {
 
     #[test]
     fn local_et_cancellation_requires_fresh_empty_backlog_before_defense_complete() {
+        let assert_no_defense_complete = |controller: &QcsdController| {
+            assert!(
+                !controller
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, QcsdAction::DefenseComplete))
+            );
+        };
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
                 tail_wait_us: 0,
@@ -17771,12 +17779,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            !controller
-                .actions
-                .iter()
-                .any(|action| matches!(action, QcsdAction::DefenseComplete))
-        );
+        assert_no_defense_complete(&controller);
         assert_eq!(
             controller
                 .defense_diagnostics()
@@ -17794,12 +17797,7 @@ mod tests {
         controller.drain_actions().for_each(drop);
         assert!(controller.requires_terminal_egress_backlog_snapshot());
         controller.poll(Duration::from_micros(1));
-        assert!(
-            !controller
-                .actions
-                .iter()
-                .any(|action| matches!(action, QcsdAction::DefenseComplete))
-        );
+        assert_no_defense_complete(&controller);
 
         controller.observe(
             QcsdObservation::EgressBacklog { pending: true },
@@ -17807,12 +17805,7 @@ mod tests {
         );
         controller.poll(Duration::from_micros(2));
         assert!(controller.requires_terminal_egress_backlog_snapshot());
-        assert!(
-            !controller
-                .actions
-                .iter()
-                .any(|action| matches!(action, QcsdAction::DefenseComplete))
-        );
+        assert_no_defense_complete(&controller);
 
         controller.observe(
             QcsdObservation::EgressBacklog { pending: false },
@@ -17820,12 +17813,7 @@ mod tests {
         );
         controller.update_completion(Duration::from_micros(3));
         assert!(controller.requires_terminal_egress_backlog_snapshot());
-        assert!(
-            !controller
-                .actions
-                .iter()
-                .any(|action| matches!(action, QcsdAction::DefenseComplete))
-        );
+        assert_no_defense_complete(&controller);
         controller.poll(Duration::from_micros(3));
         assert!(!controller.requires_terminal_egress_backlog_snapshot());
         assert!(matches!(
