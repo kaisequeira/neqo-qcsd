@@ -1158,6 +1158,7 @@ impl Defense for WtfPad {
             }
             | SignalKind::Capacity(_)
             | SignalKind::EgressBacklog { .. }
+            | SignalKind::TerminalCellCapacityExhausted { .. }
             | SignalKind::ApplicationBatchStarted
             | SignalKind::ApplicationBatchCompleted
             | SignalKind::IncomingCreditScheduled { .. }

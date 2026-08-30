@@ -1612,6 +1612,7 @@ impl Defense for WalkieTalkie {
             }
             | SignalKind::Capacity(_)
             | SignalKind::EgressBacklog { .. }
+            | SignalKind::TerminalCellCapacityExhausted { .. }
             | SignalKind::TrafficMorphingEgress { .. }
             | SignalKind::ReceiveCreditRequested { .. }
             | SignalKind::IncomingCreditScheduled { .. }

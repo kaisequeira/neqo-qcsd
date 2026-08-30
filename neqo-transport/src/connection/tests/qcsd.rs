@@ -2623,6 +2623,85 @@ fn chaff_can_finish_after_outgoing_shaping_is_released() {
 }
 
 #[test]
+fn sent_unacknowledged_chaff_can_revive_as_targetless_retransmission_after_release() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+    client.qcsd_enable(QcsdEndpointId(7), true);
+    let chaff = client.stream_create(StreamType::BiDi).unwrap();
+    client.stream_send(chaff, &[0xCC; 800]).unwrap();
+    client.stream_close_send(chaff).unwrap();
+    client
+        .qcsd_register_stream_role(
+            chaff,
+            QcsdRequestRole::Chaff {
+                resource_id: 1,
+                request_id: None,
+            },
+        )
+        .unwrap();
+
+    queue_target(&mut client, 94, 1_200, true).unwrap();
+    let dropped = client
+        .process_output(now())
+        .dgram()
+        .expect("scheduled target carries the original chaff request");
+    assert_eq!(dropped.len(), 1_200);
+    assert!(drain_observations(&mut client).iter().any(|observation| {
+        matches!(
+            observation,
+            QcsdObservation::StreamDataTransmitted {
+                stream,
+                role: QcsdRequestRole::Chaff { .. },
+                slot: Some(QcsdSlotId(94)),
+                ..
+            } if stream.0 == chaff.as_u64()
+        )
+    }));
+    assert!(!client.qcsd_has_pending_stream_send());
+    assert!(!client.qcsd_chaff_send_stream_peer_confirmed(chaff));
+
+    let recovery_at = now() + AT_LEAST_PTO;
+    drop(client.process_output(recovery_at));
+    assert!(
+        client.qcsd_has_pending_stream_send(),
+        "loss revives sent request bytes/FIN as pending STREAM work"
+    );
+    assert!(!client.qcsd_chaff_send_stream_peer_confirmed(chaff));
+    assert!(
+        !drain_observations(&mut client)
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                QcsdObservation::StreamDataTransmitted {
+                    role: QcsdRequestRole::Chaff { .. },
+                    ..
+                }
+            )),
+        "retained send shaping suppresses targetless chaff recovery"
+    );
+
+    client.qcsd_release_chaff_send_shaping();
+    let recovery = client
+        .process_output(recovery_at)
+        .dgram()
+        .expect("released chaff retransmission becomes targetless");
+    server.process_input(recovery, recovery_at);
+    let mut buffer = [0; 1_024];
+    let (read, fin) = server.stream_recv(chaff, &mut buffer).unwrap();
+    assert_eq!(read, 800);
+    assert!(fin);
+
+    let ack_at = recovery_at + DEFAULT_RTT;
+    let acknowledgment = server
+        .process_output(ack_at)
+        .dgram()
+        .expect("peer acknowledgment for recovered chaff request");
+    client.process_input(acknowledgment, ack_at);
+    assert!(client.qcsd_chaff_send_stream_peer_confirmed(chaff));
+}
+
+#[test]
 fn cs_local_et_releases_only_application_sends_and_reenable_resets_the_proof() {
     let mut client = default_client();
     let mut server = default_server();
@@ -2807,6 +2886,7 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
     client.stream_send(chaff, &[0xCC; 400]).unwrap();
     client.stream_close_send(chaff).unwrap();
     client.qcsd_register_stream_role(chaff, role).unwrap();
+    assert!(!client.qcsd_chaff_send_stream_peer_confirmed(chaff));
 
     // Locally queued chaff data, including FIN, cannot cross without a molded
     // outgoing target while stream-send shaping is active.
@@ -2834,6 +2914,14 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
         .process_output(sent_at)
         .dgram()
         .expect("molded target carries the chaff request");
+    assert!(
+        !client.qcsd_has_pending_stream_send(),
+        "locally sent request bytes/FIN are not current pending-send work"
+    );
+    assert!(
+        !client.qcsd_chaff_send_stream_peer_confirmed(chaff),
+        "DataSent is not terminal because later loss can revive retransmission work"
+    );
     let transmitted = drain_observations(&mut client);
     assert!(transmitted.iter().any(|observation| matches!(
         observation,
@@ -2887,6 +2975,7 @@ fn shaped_chaff_request_waits_for_a_target_and_reports_complete_peer_ack() {
             fin: true,
         } if stream.0 == chaff.as_u64() && *observed_role == role
     )));
+    assert!(client.qcsd_chaff_send_stream_peer_confirmed(chaff));
 }
 
 #[test]

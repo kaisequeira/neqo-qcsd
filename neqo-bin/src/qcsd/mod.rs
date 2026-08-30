@@ -1845,6 +1845,12 @@ struct Endpoint {
     /// remain after response retirement so candidate-defense completion can
     /// require peer confirmation of the corresponding QUIC bytes and FIN.
     application_send_streams: BTreeSet<StreamId>,
+    /// Every chaff request send half opened on this endpoint. Entries remain
+    /// after response retirement or typed cancellation. A stopped `BuFLO` may
+    /// exclude these identities from its drain snapshot only while chaff send
+    /// shaping stays enabled; neither candidate may finish before the original
+    /// bytes or cancellation RESET is peer-confirmed.
+    chaff_send_streams: BTreeSet<StreamId>,
     completed: Vec<StreamRecord>,
     connected: bool,
     retired_applications: Vec<(u32, ResourceRunState)>,
@@ -4680,6 +4686,7 @@ async fn execute_run_inner(
     let mut application_completion = None;
     let mut application_complete_observed = false;
     let mut last_egress_backlog = None;
+    let mut last_egress_stream_backlog = None;
     let mut application_batches =
         ApplicationBatchLifecycle::new(&spec.config.defense, spec.request_policy);
     let mut runner_wakeup_metrics = RunnerWakeupMetrics::new();
@@ -4923,11 +4930,44 @@ async fn execute_run_inner(
                 )?;
                 yield_to_buflo_guard!('runner);
                 let candidate_defense = is_candidate_defense(&spec.config.defense);
-                let egress_backlog_pending = endpoints
-                    .iter_mut()
-                    .any(|endpoint| endpoint_egress_backlog_pending(endpoint, candidate_defense));
-                if last_egress_backlog != Some(egress_backlog_pending) {
-                    last_egress_backlog = Some(egress_backlog_pending);
+                let exclude_stopped_buflo_chaff_sends =
+                    matches!(&spec.config.defense, DefenseConfig::Buflo(_))
+                        && controller.defense_diagnostics().buflo_schedule_stop_latched;
+                let (egress_stream_backlog_pending, egress_backlog_pending) = if candidate_defense {
+                    endpoints
+                        .iter_mut()
+                        .fold((false, false), |state, endpoint| {
+                            let current = endpoint_candidate_egress_backlog(
+                                endpoint,
+                                exclude_stopped_buflo_chaff_sends,
+                            );
+                            (state.0 || current.0, state.1 || current.1)
+                        })
+                } else {
+                    (
+                        false,
+                        endpoints
+                            .iter_mut()
+                            .any(|endpoint| endpoint_egress_backlog_pending(endpoint, false)),
+                    )
+                };
+                if candidate_defense
+                    && candidate_stream_snapshot_should_emit(
+                        &mut last_egress_stream_backlog,
+                        egress_stream_backlog_pending,
+                    )
+                {
+                    // A false split snapshot is one-shot schedule-stop
+                    // authority. Re-publish it at every candidate control
+                    // barrier because transport loss can make STREAM work
+                    // pending again without producing a controller event.
+                    let record = observation_clock.record(QcsdObservation::EgressStreamBacklog {
+                        pending: egress_stream_backlog_pending,
+                    });
+                    traces.observation(None, &record)?;
+                    controller.observe(record.into_observation(), defense_elapsed);
+                }
+                if backlog_component_changed(&mut last_egress_backlog, egress_backlog_pending) {
                     let record = observation_clock.record(QcsdObservation::EgressBacklog {
                         pending: egress_backlog_pending,
                     });
@@ -5315,6 +5355,7 @@ fn create_endpoints(
                 pending,
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
+                chaff_send_streams: BTreeSet::new(),
                 completed: Vec::new(),
                 connected: false,
                 retired_applications: Vec::new(),
@@ -5494,17 +5535,77 @@ fn application_send_halves_peer_confirmed(endpoint: &Endpoint) -> bool {
 /// established all-STREAM observation.
 fn endpoint_egress_backlog_pending(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
     if candidate_defense {
-        endpoint.client.qcsd_has_pending_required_stream_send(&[])
-            || endpoint.client.qcsd_has_pending_defense_control()
+        // Final candidate termination checks peer-confirmed send halves
+        // separately. This shared predicate retains ordinary pre-termination
+        // STREAM semantics and CS-BuFLO's path to typed local ET.
+        endpoint_candidate_egress_backlog(endpoint, false).1
     } else {
         endpoint.client.qcsd_has_pending_stream_send()
     }
 }
 
+/// Candidate backlog split used by `BuFLO`'s stop-then-drain boundary.
+///
+/// Both components retain required STREAM work and unconfirmed application
+/// send halves. After `BuFLO` stops its schedule, retained chaff request streams
+/// are the sole exception: shaping remains enabled, so a later loss cannot
+/// transmit targetlessly, and the typed terminal cancellation will replace
+/// that send work after already-advertised incoming credit drains. Before the
+/// stop, chaff STREAM data and retransmission remain ordinary required work.
+/// The aggregate additionally retains defense receive control; the STREAM
+/// component excludes that control so an already-encoded, RTT-delayed
+/// `MAX_STREAM_DATA` cannot manufacture authority for another exact cell.
+fn endpoint_candidate_egress_backlog(
+    endpoint: &mut Endpoint,
+    exclude_stopped_buflo_chaff_sends: bool,
+) -> (bool, bool) {
+    let allowed_chaff_requests: Vec<_> = if exclude_stopped_buflo_chaff_sends {
+        endpoint.chaff_send_streams.iter().copied().collect()
+    } else {
+        Vec::new()
+    };
+    let required_stream_pending = endpoint
+        .client
+        .qcsd_has_pending_required_stream_send(&allowed_chaff_requests);
+    let defense_control_pending = endpoint.client.qcsd_has_pending_defense_control();
+    candidate_egress_backlog_components(
+        required_stream_pending,
+        application_send_halves_peer_confirmed(endpoint),
+        defense_control_pending,
+    )
+}
+
+const fn candidate_egress_backlog_components(
+    required_stream_pending: bool,
+    application_send_halves_peer_confirmed: bool,
+    defense_control_pending: bool,
+) -> (bool, bool) {
+    (
+        required_stream_pending || !application_send_halves_peer_confirmed,
+        required_stream_pending
+            || !application_send_halves_peer_confirmed
+            || defense_control_pending,
+    )
+}
+
+fn backlog_component_changed(previous: &mut Option<bool>, current: bool) -> bool {
+    if *previous == Some(current) {
+        return false;
+    }
+    *previous = Some(current);
+    true
+}
+
+fn candidate_stream_snapshot_should_emit(previous: &mut Option<bool>, current: bool) -> bool {
+    let changed = backlog_component_changed(previous, current);
+    changed || !current
+}
+
 fn endpoint_send_terminal(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
     !candidate_defense
         || (!endpoint_egress_backlog_pending(endpoint, true)
-            && application_send_halves_peer_confirmed(endpoint))
+            && application_send_halves_peer_confirmed(endpoint)
+            && chaff_send_halves_peer_confirmed(endpoint))
 }
 
 fn tracked_application_send_halves_peer_confirmed(
@@ -5512,6 +5613,14 @@ fn tracked_application_send_halves_peer_confirmed(
     mut peer_confirmed: impl FnMut(StreamId) -> bool,
 ) -> bool {
     streams.iter().copied().all(&mut peer_confirmed)
+}
+
+fn chaff_send_halves_peer_confirmed(endpoint: &Endpoint) -> bool {
+    endpoint.chaff_send_streams.iter().copied().all(|stream| {
+        endpoint
+            .client
+            .qcsd_chaff_send_stream_peer_confirmed(stream)
+    })
 }
 
 fn ready_request_batch(
@@ -5915,8 +6024,13 @@ fn handle_qcsd_observations(
 ) -> Result<(), Error> {
     let observations = endpoint.client.qcsd_timestamped_observations();
     for observation in observations {
-        record_qcsd_observation(endpoint, traces, &observation)?;
+        let terminal = terminal_observation_slot(observation.observation());
+        let terminal_us = terminal.map(|_| duration_as_trace_micros(defense_elapsed));
+        record_qcsd_observation(endpoint, traces, &observation, terminal_us)?;
         controller.observe(observation.into_observation(), defense_elapsed);
+        if let Some(slot) = terminal {
+            require_controller_terminal_resolution(controller, slot, defense_elapsed)?;
+        }
     }
     Ok(())
 }
@@ -5928,8 +6042,18 @@ fn handle_all_qcsd_observations(
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
     for (endpoint_index, observation) in take_all_qcsd_observations(endpoints) {
-        record_qcsd_observation(&mut endpoints[endpoint_index], traces, &observation)?;
+        let terminal = terminal_observation_slot(observation.observation());
+        let terminal_us = terminal.map(|_| duration_as_trace_micros(defense_elapsed));
+        record_qcsd_observation(
+            &mut endpoints[endpoint_index],
+            traces,
+            &observation,
+            terminal_us,
+        )?;
         controller.observe(observation.into_observation(), defense_elapsed);
+        if let Some(slot) = terminal {
+            require_controller_terminal_resolution(controller, slot, defense_elapsed)?;
+        }
     }
     Ok(())
 }
@@ -5982,10 +6106,58 @@ fn handle_defense_activation_observations(
     traces: &mut TraceFiles,
 ) -> Result<(), Error> {
     for (endpoint_index, observation) in take_all_qcsd_observations(endpoints) {
-        record_qcsd_observation(&mut endpoints[endpoint_index], traces, &observation)?;
+        record_qcsd_observation(&mut endpoints[endpoint_index], traces, &observation, None)?;
         forward_qcsd_observation(controller, observation, None);
     }
     Ok(())
+}
+
+const fn terminal_observation_slot(observation: &QcsdObservation) -> Option<QcsdSlotId> {
+    match observation {
+        QcsdObservation::SlotSatisfied { slot, .. }
+        | QcsdObservation::SlotMissed { slot, .. }
+        | QcsdObservation::SlotResolved { slot, .. } => Some(*slot),
+        _ => None,
+    }
+}
+
+fn duration_as_trace_micros(value: Duration) -> u64 {
+    u64::try_from(value.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn require_controller_terminal_resolution(
+    controller: &QcsdController,
+    slot: QcsdSlotId,
+    expected: Duration,
+) -> Result<u64, Error> {
+    let observed = controller.terminal_slot_resolution_at(slot).ok_or_else(|| {
+        Error::SlotInvariant(format!(
+            "slot {} produced terminal trace evidence without a controller resolution timestamp",
+            slot.0
+        ))
+    })?;
+    if observed != expected {
+        return Err(Error::SlotInvariant(format!(
+            "slot {} controller resolution time {observed:?} differs from terminal reducer time {expected:?}",
+            slot.0
+        )));
+    }
+    Ok(duration_as_trace_micros(observed))
+}
+
+fn controller_terminal_resolution_us(
+    controller: &QcsdController,
+    slot: QcsdSlotId,
+) -> Result<u64, Error> {
+    let at = controller
+        .terminal_slot_resolution_at(slot)
+        .ok_or_else(|| {
+            Error::SlotInvariant(format!(
+                "slot {} terminal action lacks a controller resolution timestamp",
+                slot.0
+            ))
+        })?;
+    Ok(duration_as_trace_micros(at))
 }
 
 fn satisfied_datagrams_for(
@@ -6098,8 +6270,14 @@ fn record_qcsd_observation(
     endpoint: &mut Endpoint,
     traces: &mut TraceFiles,
     record: &TimestampedQcsdObservation,
+    terminal_defense_elapsed_us: Option<u64>,
 ) -> Result<(), Error> {
     let observation = record.observation();
+    if terminal_observation_slot(observation).is_some() != terminal_defense_elapsed_us.is_some() {
+        return Err(Error::SlotInvariant(
+            "terminal observation and controller-resolution timestamp differ".into(),
+        ));
+    }
     match observation {
         QcsdObservation::SlotSatisfied {
             slot,
@@ -6129,6 +6307,8 @@ fn record_qcsd_observation(
                 miss_reason: "",
                 slot: scheduled.slot,
                 qcsd: QcsdTraceColumns::exact(scheduled.packet.length(), Some(*observed_size)),
+                terminal_defense_elapsed_us: terminal_defense_elapsed_us
+                    .expect("terminal observation timestamp checked"),
             })?;
         }
         QcsdObservation::SlotMissed {
@@ -6144,16 +6324,32 @@ fn record_qcsd_observation(
                 .and_then(|index| endpoint.scheduled_outgoing.remove(index));
             let scheduled_packet = scheduled.map_or(*packet, |value| value.packet);
             let miss_reason = format!("{reason:?}");
-            traces.schedule(&ScheduleTraceRow {
-                action_time_us: record.produced_monotonic_ns() / 1_000,
-                endpoint: Some(endpoint.id),
-                packet: scheduled_packet,
-                satisfaction: "missed",
-                observed: None,
-                miss_reason: &miss_reason,
-                slot: *slot,
-                qcsd: QcsdTraceColumns::default(),
-            })?;
+            let semantics = if matches!(
+                reason,
+                MissedSlotReason::EndpointClosed
+                    | MissedSlotReason::KeysUnavailable
+                    | MissedSlotReason::PathMtu
+            ) {
+                TerminalActionSemantics::ExplicitCancellation(*reason)
+            } else {
+                TerminalActionSemantics::OpportunityResolution
+            };
+            schedule_terminal_row(
+                traces,
+                &ScheduleTraceRow {
+                    action_time_us: record.produced_monotonic_ns() / 1_000,
+                    endpoint: Some(endpoint.id),
+                    packet: scheduled_packet,
+                    satisfaction: "missed",
+                    observed: None,
+                    miss_reason: &miss_reason,
+                    slot: *slot,
+                    qcsd: QcsdTraceColumns::default(),
+                    terminal_defense_elapsed_us: terminal_defense_elapsed_us
+                        .expect("terminal observation timestamp checked"),
+                },
+                semantics,
+            )?;
         }
         QcsdObservation::SlotResolved {
             slot,
@@ -6194,6 +6390,8 @@ fn record_qcsd_observation(
                 miss_reason: &miss_reason,
                 slot: *slot,
                 qcsd: QcsdTraceColumns::from_outcome(scheduled_packet, *outcome),
+                terminal_defense_elapsed_us: terminal_defense_elapsed_us
+                    .expect("terminal observation timestamp checked"),
             })?;
         }
         QcsdObservation::EndpointClosed { .. } => {
@@ -6208,37 +6406,86 @@ fn record_qcsd_observation(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalActionSemantics {
+    OpportunityResolution,
+    ExplicitCancellation(MissedSlotReason),
+}
+
+fn schedule_terminal_row(
+    traces: &mut TraceFiles,
+    row: &ScheduleTraceRow<'_>,
+    semantics: TerminalActionSemantics,
+) -> Result<(), Error> {
+    match semantics {
+        TerminalActionSemantics::ExplicitCancellation(reason)
+            if row.terminal_defense_elapsed_us < row.packet.timestamp_us() =>
+        {
+            traces.schedule_future_cancellation(row, reason)
+        }
+        TerminalActionSemantics::OpportunityResolution
+        | TerminalActionSemantics::ExplicitCancellation(_) => traces.schedule(row),
+    }
+}
+
 fn record_terminal_action(
     traces: &mut TraceFiles,
     now: Instant,
     action_time_us: u64,
+    terminal_defense_elapsed_us: Option<u64>,
     event_outcome: &str,
+    semantics: TerminalActionSemantics,
     action: &QcsdAction,
 ) -> Result<bool, Error> {
-    let (endpoint, packet, satisfaction, miss_reason, slot) = match action {
+    let (endpoint, packet, satisfaction, miss_reason, slot, action_reason) = match action {
         QcsdAction::SlotMissed {
             endpoint,
             packet,
             slot,
             reason,
-        } => (*endpoint, *packet, "missed", format!("{reason:?}"), *slot),
+        } => (
+            *endpoint,
+            *packet,
+            "missed",
+            format!("{reason:?}"),
+            *slot,
+            Some(*reason),
+        ),
         QcsdAction::SlotSatisfied {
             endpoint,
             packet,
             slot,
-        } => (*endpoint, *packet, "satisfied", String::new(), *slot),
+        } => (*endpoint, *packet, "satisfied", String::new(), *slot, None),
         _ => return Ok(false),
     };
-    traces.schedule(&ScheduleTraceRow {
-        action_time_us,
-        endpoint,
-        packet,
-        satisfaction,
-        observed: None,
-        miss_reason: &miss_reason,
-        slot,
-        qcsd: QcsdTraceColumns::exact(packet.length(), None),
-    })?;
+    if let TerminalActionSemantics::ExplicitCancellation(reason) = semantics
+        && action_reason != Some(reason)
+    {
+        return Err(Error::SlotInvariant(format!(
+            "slot {} explicit cancellation reason {reason:?} disagrees with terminal action",
+            slot.0
+        )));
+    }
+    schedule_terminal_row(
+        traces,
+        &ScheduleTraceRow {
+            action_time_us,
+            endpoint,
+            packet,
+            satisfaction,
+            observed: None,
+            miss_reason: &miss_reason,
+            slot,
+            qcsd: QcsdTraceColumns::exact(packet.length(), None),
+            terminal_defense_elapsed_us: terminal_defense_elapsed_us.ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "slot {} terminal action lacks an exact defense-clock resolution",
+                    slot.0
+                ))
+            })?,
+        },
+        semantics,
+    )?;
     traces.event(now, endpoint, "action", event_outcome, action)?;
     Ok(true)
 }
@@ -6389,9 +6636,19 @@ fn terminalize_pending_slots(
     defense_elapsed: Duration,
     reason: MissedSlotReason,
 ) -> Result<(), Error> {
-    record_queued_terminal_actions(controller, traces, now)?;
+    record_queued_terminal_actions(
+        controller,
+        traces,
+        now,
+        TerminalActionSemantics::OpportunityResolution,
+    )?;
     controller.abort_pending_slots(defense_elapsed, reason);
-    record_queued_terminal_actions(controller, traces, now)?;
+    record_queued_terminal_actions(
+        controller,
+        traces,
+        now,
+        TerminalActionSemantics::ExplicitCancellation(reason),
+    )?;
 
     let mut pending = BTreeMap::new();
     let terminal_time_us = traces.elapsed_us(now);
@@ -6427,7 +6684,16 @@ fn terminalize_pending_slots(
             slot,
             reason,
         };
-        record_terminal_action(traces, now, action_time_us, "terminalized_run_end", &action)?;
+        let terminal_us = controller_terminal_resolution_us(controller, slot)?;
+        record_terminal_action(
+            traces,
+            now,
+            action_time_us,
+            Some(terminal_us),
+            "terminalized_run_end",
+            TerminalActionSemantics::ExplicitCancellation(reason),
+            &action,
+        )?;
     }
     Ok(())
 }
@@ -6436,8 +6702,10 @@ fn record_queued_terminal_actions(
     controller: &mut QcsdController,
     traces: &mut TraceFiles,
     now: Instant,
+    semantics: TerminalActionSemantics,
 ) -> Result<(), Error> {
-    for action in controller.drain_actions() {
+    let actions: Vec<_> = controller.drain_actions().collect();
+    for action in actions {
         let terminal_slot = match &action {
             QcsdAction::SlotMissed { slot, .. } | QcsdAction::SlotSatisfied { slot, .. } => {
                 Some(*slot)
@@ -6448,14 +6716,23 @@ fn record_queued_terminal_actions(
             continue;
         }
         let action_time_us = traces.elapsed_us(now);
-        if !record_terminal_action(traces, now, action_time_us, "terminalized_queued", &action)?
-            && matches!(
-                action,
-                QcsdAction::PrearmPacket { .. }
-                    | QcsdAction::CommitPrearmedPacket { .. }
-                    | QcsdAction::CancelPrearmedPacket { .. }
-            )
-        {
+        let terminal_us = terminal_slot
+            .map(|slot| controller_terminal_resolution_us(controller, slot))
+            .transpose()?;
+        if !record_terminal_action(
+            traces,
+            now,
+            action_time_us,
+            terminal_us,
+            "terminalized_queued",
+            semantics,
+            &action,
+        )? && matches!(
+            action,
+            QcsdAction::PrearmPacket { .. }
+                | QcsdAction::CommitPrearmedPacket { .. }
+                | QcsdAction::CancelPrearmedPacket { .. }
+        ) {
             traces.event(
                 now,
                 action_endpoint(&action),
@@ -7322,7 +7599,29 @@ fn apply_action(
     )?;
     let endpoint_id = action_endpoint(&action);
     let action_time_us = traces.elapsed_us(now);
-    if record_terminal_action(traces, now, action_time_us, "recorded", &action)? {
+    let terminal_slot = match &action {
+        QcsdAction::SlotMissed { slot, .. } | QcsdAction::SlotSatisfied { slot, .. } => Some(*slot),
+        _ => None,
+    };
+    let terminal_us = terminal_slot
+        .map(|slot| controller_terminal_resolution_us(controller, slot))
+        .transpose()?;
+    let terminal_semantics = match &action {
+        QcsdAction::SlotMissed {
+            reason: MissedSlotReason::EndpointClosed,
+            ..
+        } => TerminalActionSemantics::ExplicitCancellation(MissedSlotReason::EndpointClosed),
+        _ => TerminalActionSemantics::OpportunityResolution,
+    };
+    if record_terminal_action(
+        traces,
+        now,
+        action_time_us,
+        terminal_us,
+        "recorded",
+        terminal_semantics,
+        &action,
+    )? {
         return Ok(());
     }
     if matches!(&action, QcsdAction::DefenseComplete) {
@@ -7376,16 +7675,23 @@ fn apply_action(
                 defense_elapsed,
             );
             let miss_reason = format!("{reason:?}");
-            traces.schedule(&ScheduleTraceRow {
-                action_time_us: traces.elapsed_us(now),
-                endpoint: Some(endpoint),
-                packet,
-                satisfaction: "missed",
-                observed: None,
-                miss_reason: &miss_reason,
-                slot,
-                qcsd: QcsdTraceColumns::default(),
-            })?;
+            schedule_terminal_row(
+                traces,
+                &ScheduleTraceRow {
+                    action_time_us: traces.elapsed_us(now),
+                    endpoint: Some(endpoint),
+                    packet,
+                    satisfaction: "missed",
+                    observed: None,
+                    miss_reason: &miss_reason,
+                    slot,
+                    qcsd: QcsdTraceColumns::default(),
+                    terminal_defense_elapsed_us: controller_terminal_resolution_us(
+                        controller, slot,
+                    )?,
+                },
+                TerminalActionSemantics::ExplicitCancellation(reason),
+            )?;
         }
         traces.event(now, endpoint_id, "action", "missing_endpoint", &action)?;
         return Ok(());
@@ -7551,6 +7857,7 @@ fn apply_action(
                 endpoint.scheduled_outgoing.push_back(scheduled);
             }
             if let Some(stream_id) = chaff_stream {
+                endpoint.chaff_send_streams.insert(stream_id);
                 let (resource_id, request_id, url, request_headers) = match &trace_action {
                     QcsdAction::RequestChaff {
                         resource,
@@ -7668,16 +7975,23 @@ fn apply_action(
                     defense_elapsed,
                 );
                 let miss_reason = format!("{reason:?}");
-                traces.schedule(&ScheduleTraceRow {
-                    action_time_us: traces.elapsed_us(now),
-                    endpoint: endpoint_id,
-                    packet,
-                    satisfaction: "missed",
-                    observed: None,
-                    miss_reason: &miss_reason,
-                    slot,
-                    qcsd: QcsdTraceColumns::default(),
-                })?;
+                schedule_terminal_row(
+                    traces,
+                    &ScheduleTraceRow {
+                        action_time_us: traces.elapsed_us(now),
+                        endpoint: endpoint_id,
+                        packet,
+                        satisfaction: "missed",
+                        observed: None,
+                        miss_reason: &miss_reason,
+                        slot,
+                        qcsd: QcsdTraceColumns::default(),
+                        terminal_defense_elapsed_us: controller_terminal_resolution_us(
+                            controller, slot,
+                        )?,
+                    },
+                    TerminalActionSemantics::ExplicitCancellation(reason),
+                )?;
             }
             record_adapter_action_error(traces, now, &trace_action, &error)?;
             return Err(error.into());
@@ -8147,8 +8461,14 @@ async fn dispatch_buflo_exact_release(
                 },
                 dispatch_at,
             );
-            record_qcsd_observation(&mut endpoints[guard.endpoint_index], traces, &record)?;
+            record_qcsd_observation(
+                &mut endpoints[guard.endpoint_index],
+                traces,
+                &record,
+                Some(duration_as_trace_micros(dispatch_elapsed)),
+            )?;
             controller.observe(record.into_observation(), dispatch_elapsed);
+            require_controller_terminal_resolution(controller, guard.slot, dispatch_elapsed)?;
             controller.flush_defense_observations();
         }
         ensure_defense_realizable(controller)?;
@@ -9038,8 +9358,22 @@ async fn process_output_once_with_clock(
     };
     let wire_elapsed = defense_start.map(|started| sent_at.saturating_duration_since(started));
     for observation in observations {
-        record_qcsd_observation(endpoint, traces, &observation)?;
+        let terminal = terminal_observation_slot(observation.observation());
+        let terminal_us = match (terminal, wire_elapsed) {
+            (Some(_), Some(at)) => Some(duration_as_trace_micros(at)),
+            (Some(slot), None) => {
+                return Err(Error::SlotInvariant(format!(
+                    "slot {} reached a terminal adapter state before defense activation",
+                    slot.0
+                )));
+            }
+            (None, _) => None,
+        };
+        record_qcsd_observation(endpoint, traces, &observation, terminal_us)?;
         forward_qcsd_observation(controller, observation, wire_elapsed);
+        if let (Some(slot), Some(at)) = (terminal, wire_elapsed) {
+            require_controller_terminal_resolution(controller, slot, at)?;
+        }
     }
     for (observed, satisfied, composition) in attributed_datagrams {
         let qcsd = satisfied
@@ -9183,11 +9517,12 @@ fn buflo_run_summary(
     };
     diagnostics.map(|diagnostics| {
         json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "kind": "buflo",
             "implementation_scope": "client_only_quic",
             "paper_equivalent": false,
             "incoming_opportunity_semantics": "client_receive_credit_and_response_qualified_chaff_attempt",
+            "terminal_schedule_stop_policy": "stop_new_opportunities_at_first_terminal_whole_cell_capacity_exhaustion_then_drain_already_advertised_incoming_credit",
             "terminal_subcell_policy": "drain_whole_cells_then_client_local_http3_cancel_unallocatable_reviewed_chaff_tail",
             "terminal_subcell_observer_effect": "typed_stop_sending_and_reset_stream_defense_control_may_follow_the_last_exact_cell",
             "unavailable_peer_properties": [
@@ -9378,30 +9713,32 @@ mod tests {
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
         RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
         SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
-        StreamRecord, StreamType, SustainedResponseQualificationRequest, TrafficMorphingActivation,
-        absolute_wakeup, action_failure_reason, activate_traffic_morphing,
-        application_send_halves_peer_confirmed, apply_action_batch, apply_queued_actions,
-        attempt_socket_handoff, attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
-        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
-        buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
-        buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
-        cancel_uncommitted_prearms_on_abort, create_endpoints, cs_buflo_run_summary,
+        StreamRecord, StreamType, SustainedResponseQualificationRequest, TerminalActionSemantics,
+        TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
+        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
+        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
+        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
+        bounded_qualification_wait, buflo_exact_release_guard_from_candidates,
+        buflo_exact_release_wait_step, buflo_run_summary,
+        buflo_unadvertised_scheduled_receive_credit_endpoints, cancel_uncommitted_prearms_on_abort,
+        chaff_send_halves_peer_confirmed, create_endpoints, cs_buflo_run_summary,
         datagram_observation, deadline_error, defense_parameter_provenance,
         dispatch_ready_requests, drain_qualifier_stream_data,
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_with_clock, drive_endpoint_output_with_clock_until,
-        due_rolling_output_target, endpoint_egress_backlog_pending, endpoint_send_terminal,
-        ensure_defense_realizable, expected_application_response_length, finish_application_record,
-        finish_chaff_record, finish_stream, forward_qcsd_observation, handle_all_qcsd_observations,
-        handle_http_events, has_in_flight_application_stream, is_candidate_defense,
-        is_public_network_address, normalize_rolling_prearm_window, now,
-        pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
-        prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
-        prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
-        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
-        record_adapter_action_error, record_receive_limit_error, record_terminal_action,
-        register_action_batch, remaining_wakeup_delay, resolve_rolling_output_interrupt,
-        resolve_run_config, resolve_run_config_with_workload, response_qualification_mode,
+        due_rolling_output_target, endpoint_candidate_egress_backlog,
+        endpoint_egress_backlog_pending, endpoint_send_terminal, ensure_defense_realizable,
+        expected_application_response_length, finish_application_record, finish_chaff_record,
+        finish_stream, forward_qcsd_observation, handle_all_qcsd_observations, handle_http_events,
+        has_in_flight_application_stream, is_candidate_defense, is_public_network_address,
+        normalize_rolling_prearm_window, now, pending_receive_identity_is_reconciled,
+        prefix_numeric_profile_sha256, prefix_receipts_pass, prefix_targetless_stream_bytes,
+        preflight_receive_actions_with, prepare_chaff_cancellation, projected_ael,
+        projected_identity_chaff_headers, qcsd_connection_parameters,
+        qualification_content_encoding, ready_request_batch, record_adapter_action_error,
+        record_receive_limit_error, record_terminal_action, register_action_batch,
+        remaining_wakeup_delay, resolve_rolling_output_interrupt, resolve_run_config,
+        resolve_run_config_with_workload, response_qualification_mode,
         rolling_output_lifecycle_active, sanitize_chaff_action_headers, sha256,
         shapes_stream_sends, sustained_qualification_content_encoding,
         sustained_representation_failure, sustained_requests_are_classifiable,
@@ -9717,7 +10054,19 @@ mod tests {
             .client
             .stream_close_send(stream, started)
             .expect("close chaff request send handler");
+        endpoint.chaff_send_streams.insert(stream);
         endpoint.streams.insert(stream, chaff(b"cover", false));
+        assert!(!chaff_send_halves_peer_confirmed(&endpoint));
+        assert_eq!(
+            endpoint_candidate_egress_backlog(&mut endpoint, false),
+            (true, true),
+            "pre-stop chaff request STREAM work remains schedule-authorising backlog"
+        );
+        assert_eq!(
+            endpoint_candidate_egress_backlog(&mut endpoint, true),
+            (false, false),
+            "post-stop drain excludes only the retained, still-shaped chaff request identity"
+        );
 
         let stream = QcsdStreamId(stream.as_u64());
         let configure = QcsdAction::ConfigureManualReceive {
@@ -9867,6 +10216,10 @@ mod tests {
             .expect("retire chaff record");
         assert!(endpoint.streams.is_empty());
         assert!(endpoint.client.qcsd_has_pending_defense_control());
+        assert!(
+            !chaff_send_halves_peer_confirmed(&endpoint),
+            "a locally queued cancellation is not peer-confirmed terminal evidence"
+        );
         assert!(endpoint_egress_backlog_pending(&mut endpoint, true));
         assert!(
             !endpoint_send_terminal(&mut endpoint, true),
@@ -9897,6 +10250,10 @@ mod tests {
         );
         assert!(!endpoint.client.qcsd_has_pending_defense_control());
         assert!(application_send_halves_peer_confirmed(&endpoint));
+        assert!(
+            chaff_send_halves_peer_confirmed(&endpoint),
+            "RESET_STREAM acknowledgment terminalizes the retained chaff send identity"
+        );
         assert!(
             !endpoint_egress_backlog_pending(&mut endpoint, true),
             "candidate quiet state excludes only decoder-only transport backlog"
@@ -10822,13 +11179,17 @@ mod tests {
         });
 
         let buflo_summary = buflo_run_summary(&buflo, Some(&diagnostics)).expect("BuFLO summary");
-        assert_eq!(buflo_summary["schema_version"], 3);
+        assert_eq!(buflo_summary["schema_version"], 4);
         assert_eq!(buflo_summary["kind"], "buflo");
         assert_eq!(buflo_summary["implementation_scope"], "client_only_quic");
         assert_eq!(buflo_summary["paper_equivalent"], false);
         assert_eq!(
             buflo_summary["incoming_opportunity_semantics"],
             "client_receive_credit_and_response_qualified_chaff_attempt"
+        );
+        assert_eq!(
+            buflo_summary["terminal_schedule_stop_policy"],
+            "stop_new_opportunities_at_first_terminal_whole_cell_capacity_exhaustion_then_drain_already_advertised_incoming_credit"
         );
         assert_eq!(
             buflo_summary["terminal_subcell_policy"],
@@ -11250,6 +11611,71 @@ mod tests {
     }
 
     #[test]
+    fn candidate_backlog_components_separate_stream_work_from_control_debt() {
+        assert_eq!(
+            super::candidate_egress_backlog_components(false, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            super::candidate_egress_backlog_components(true, true, false),
+            (true, true)
+        );
+        assert_eq!(
+            super::candidate_egress_backlog_components(false, true, true),
+            (false, true)
+        );
+        assert_eq!(
+            super::candidate_egress_backlog_components(false, false, false),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn candidate_backlog_required_stream_edge_is_observable_while_aggregate_stays_pending() {
+        let before = super::candidate_egress_backlog_components(true, true, true);
+        let after = super::candidate_egress_backlog_components(false, true, true);
+        assert_eq!(before, (true, true));
+        assert_eq!(after, (false, true));
+
+        let mut last_stream = None;
+        let mut last_aggregate = None;
+        assert!(super::backlog_component_changed(&mut last_stream, before.0));
+        assert!(super::backlog_component_changed(
+            &mut last_aggregate,
+            before.1
+        ));
+
+        assert!(super::backlog_component_changed(&mut last_stream, after.0));
+        assert!(!super::backlog_component_changed(
+            &mut last_aggregate,
+            after.1
+        ));
+        assert_eq!(last_stream, Some(false));
+        assert_eq!(last_aggregate, Some(true));
+    }
+
+    #[test]
+    fn candidate_false_stream_snapshot_is_republished_at_every_control_barrier() {
+        let mut previous = None;
+        assert!(super::candidate_stream_snapshot_should_emit(
+            &mut previous,
+            false
+        ));
+        assert!(
+            super::candidate_stream_snapshot_should_emit(&mut previous, false),
+            "a retained false is not reusable stop authority"
+        );
+        assert!(super::candidate_stream_snapshot_should_emit(
+            &mut previous,
+            true
+        ));
+        assert!(
+            !super::candidate_stream_snapshot_should_emit(&mut previous, true),
+            "a retained true remains safe and edge-triggered"
+        );
+    }
+
+    #[test]
     fn application_batch_lifecycle_closes_before_dependent_batch_dispatch() {
         let defense = DefenseConfig::None;
         let mut lifecycle = ApplicationBatchLifecycle::new(&defense, RequestPolicyArg::HalfDuplex);
@@ -11590,7 +12016,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_files_preserve_historical_prefixes_and_append_typed_outcome_v1() {
+    fn trace_files_preserve_historical_prefixes_and_append_terminal_schedule_v3() {
         let output = trace_output_dir("typed-outcome-columns");
         let started = now();
         let clock = QcsdObservationClock::new(started);
@@ -11636,6 +12062,7 @@ mod tests {
                 miss_reason: "CongestionLimited",
                 slot,
                 qcsd,
+                terminal_defense_elapsed_us: 77,
             })
             .expect("schedule row");
         let observation = clock.record(QcsdObservation::SlotResolved {
@@ -11667,29 +12094,25 @@ mod tests {
         assert!(schedule.lines().next().expect("header").starts_with(
             "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id,"
         ));
-        let expected_suffix =
-            ",1,congestion_sensitive,600,400,100,50,75,1,100,74,23,congestion_limited,,,,";
+        let non_schedule_suffix =
+            ",1,congestion_sensitive,600,400,100,50,75,1,100,74,23,congestion_limited,,,,,";
         assert!(
             packets
                 .lines()
                 .nth(1)
                 .expect("packet row")
-                .ends_with(expected_suffix)
+                .ends_with(non_schedule_suffix)
         );
         assert!(
             events
                 .lines()
                 .nth(1)
                 .expect("event row")
-                .ends_with(expected_suffix)
+                .ends_with(non_schedule_suffix)
         );
-        assert!(
-            schedule
-                .lines()
-                .nth(1)
-                .expect("schedule row")
-                .ends_with(expected_suffix)
-        );
+        assert!(schedule.lines().nth(1).expect("schedule row").ends_with(
+            ",3,congestion_sensitive,600,400,100,50,75,1,100,74,23,congestion_limited,,,,,77"
+        ));
         drop(traces);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
@@ -11753,6 +12176,7 @@ mod tests {
                 miss_reason: "EndpointClosed",
                 slot,
                 qcsd: QcsdTraceColumns::default(),
+                terminal_defense_elapsed_us: 99,
             })
             .expect("terminal row");
         assert!(
@@ -11868,7 +12292,9 @@ mod tests {
                 &mut traces,
                 started + Duration::from_micros(7),
                 7,
+                Some(7),
                 "recorded",
+                TerminalActionSemantics::OpportunityResolution,
                 &QcsdAction::SlotSatisfied {
                     endpoint: Some(endpoint),
                     packet,
@@ -11887,11 +12313,11 @@ mod tests {
         assert_eq!(fields.next(), Some(""));
         assert_eq!(fields.next(), Some(""));
         assert_eq!(fields.next(), Some("21"));
-        assert_eq!(fields.next(), Some("2"));
+        assert_eq!(fields.next(), Some("3"));
         assert_eq!(fields.next(), Some("exact"));
         assert!(schedule.contains("credit_advertised_at_us"));
         assert!(schedule.contains("credit_consumed_at_us"));
-        assert!(row.ends_with(",3,3,7,7"));
+        assert!(row.ends_with(",3,3,7,7,7"));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -11921,6 +12347,7 @@ mod tests {
                 miss_reason: "RunAborted",
                 slot,
                 qcsd: QcsdTraceColumns::default(),
+                terminal_defense_elapsed_us: 0,
             })
             .expect("terminal row");
         assert!(
@@ -11928,6 +12355,72 @@ mod tests {
                 .register_slot(started, QcsdEndpointId(1), packet, slot)
                 .is_err()
         );
+        drop(traces);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    fn schedule_schema_three_rejects_controller_terminal_time_before_target() {
+        let output = trace_output_dir("terminal-before-target");
+        let started = now();
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let packet =
+            Packet::new(Duration::from_micros(100), Direction::Outgoing, 1_200).expect("packet");
+        let slot = QcsdSlotId(91);
+        traces
+            .register_slot(started, QcsdEndpointId(1), packet, slot)
+            .expect("slot registration");
+
+        assert!(matches!(
+            traces.schedule(&ScheduleTraceRow {
+                action_time_us: 0,
+                endpoint: Some(QcsdEndpointId(1)),
+                packet,
+                satisfaction: "satisfied",
+                observed: Some(1_200),
+                miss_reason: "",
+                slot,
+                qcsd: QcsdTraceColumns::exact(1_200, Some(1_200)),
+                terminal_defense_elapsed_us: 99,
+            }),
+            Err(Error::SlotInvariant(message)) if message.contains("predates target")
+        ));
+        assert!(traces.is_slot_pending(slot));
+        assert!(matches!(
+            traces.schedule_future_cancellation(
+                &ScheduleTraceRow {
+                    action_time_us: 99,
+                    endpoint: Some(QcsdEndpointId(1)),
+                    packet,
+                    satisfaction: "missed",
+                    observed: None,
+                    miss_reason: "EndpointClosed",
+                    slot,
+                    qcsd: QcsdTraceColumns::default(),
+                    terminal_defense_elapsed_us: 99,
+                },
+                MissedSlotReason::RunAborted,
+            ),
+            Err(Error::SlotInvariant(message)) if message.contains("matching typed miss")
+        ));
+        assert!(traces.is_slot_pending(slot));
+        traces
+            .schedule_future_cancellation(
+                &ScheduleTraceRow {
+                    action_time_us: 99,
+                    endpoint: Some(QcsdEndpointId(1)),
+                    packet,
+                    satisfaction: "missed",
+                    observed: None,
+                    miss_reason: "RunAborted",
+                    slot,
+                    qcsd: QcsdTraceColumns::default(),
+                    terminal_defense_elapsed_us: 99,
+                },
+                MissedSlotReason::RunAborted,
+            )
+            .expect("typed future-slot cancellation remains receiptable");
+        assert!(traces.is_slot_terminal(slot));
         drop(traces);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
@@ -12043,7 +12536,9 @@ mod tests {
                 &mut traces,
                 started + Duration::from_micros(5),
                 5,
+                Some(5),
                 "recorded",
+                TerminalActionSemantics::OpportunityResolution,
                 &QcsdAction::SlotSatisfied {
                     endpoint: Some(endpoint),
                     packet,
@@ -12057,7 +12552,9 @@ mod tests {
                 &mut traces,
                 started + Duration::from_micros(6),
                 6,
+                Some(6),
                 "recorded",
+                TerminalActionSemantics::OpportunityResolution,
                 &QcsdAction::SlotSatisfied {
                     endpoint: Some(endpoint),
                     packet,
@@ -12103,7 +12600,9 @@ mod tests {
                 &mut traces,
                 started + Duration::from_micros(9),
                 9,
+                Some(9),
                 "recorded",
+                TerminalActionSemantics::OpportunityResolution,
                 &QcsdAction::SlotSatisfied {
                     endpoint: Some(endpoint),
                     packet,
@@ -12133,11 +12632,17 @@ mod tests {
         let output = trace_output_dir("owned-parser-lease-missing-adapter");
         let started = now();
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
-        let mut controller =
-            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
         let endpoint = QcsdEndpointId(9);
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 10).expect("packet");
-        let slot = QcsdSlotId(24);
+        let slot = QcsdSlotId(0);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+        controller.poll(Duration::ZERO);
+        assert_eq!(controller.pending_slots(), [(slot, packet)]);
         let lease = QcsdAction::LeaseParserReceive {
             endpoint,
             stream: QcsdStreamId(4),
@@ -12171,7 +12676,8 @@ mod tests {
         assert_eq!(fields[4], "3");
         assert_eq!(fields[5], "missed");
         assert_eq!(fields[7], "EndpointClosed");
-        assert_eq!(fields[8], "24");
+        assert_eq!(fields[8], "0");
+        assert_eq!(fields.last(), Some(&"3"));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
@@ -14607,6 +15113,7 @@ mod tests {
                 miss_reason: "RunAborted",
                 slot,
                 qcsd: QcsdTraceColumns::default(),
+                terminal_defense_elapsed_us: 0,
             })
             .expect("terminal row");
         assert!(
@@ -14620,6 +15127,7 @@ mod tests {
                     miss_reason: "RunAborted",
                     slot,
                     qcsd: QcsdTraceColumns::default(),
+                    terminal_defense_elapsed_us: 1,
                 })
                 .is_err()
         );
@@ -14644,22 +15152,29 @@ mod tests {
         let output = trace_output_dir("sibling-failure");
         let started = now();
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
-        let mut controller =
-            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("packet");
+        let slot = QcsdSlotId(0);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+        controller.poll(Duration::ZERO);
+        assert_eq!(controller.pending_slots(), [(slot, packet)]);
         let first = QcsdAction::IncreaseReceiveLimit {
             endpoint: QcsdEndpointId(9),
             stream: QcsdStreamId(0),
             absolute_limit: 116,
             packet,
-            slot: QcsdSlotId(3),
+            slot,
         };
         let second = QcsdAction::IncreaseReceiveLimit {
             endpoint: QcsdEndpointId(9),
             stream: QcsdStreamId(4),
             absolute_limit: 216,
             packet,
-            slot: QcsdSlotId(3),
+            slot,
         };
         let mut endpoints = Vec::new();
 
@@ -14712,6 +15227,72 @@ mod tests {
         .expect("FRONT controller with a frozen schedule");
         assert!(controller.has_fixed_schedule_staging());
         assert!(!rolling_output_lifecycle_active(&controller, &[]));
+    }
+
+    #[test]
+    fn run_abort_receipts_prearmed_future_fixed_slots() {
+        let output = trace_output_dir("future-fixed-abort");
+        let started = now();
+        let mut controller = QcsdController::new(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                max_udp_payload_size: 1_200,
+                defense: DefenseConfig::Front(FrontConfig {
+                    n_client_packets: 4,
+                    n_server_packets: 4,
+                    packet_size: 1_200,
+                    peak_minimum_seconds: 0.01,
+                    peak_maximum_seconds: 0.02,
+                }),
+                ..QcsdConfig::default()
+            },
+            42,
+            None,
+        )
+        .expect("FRONT controller with deterministic future slots");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(1),
+                origin: "https://front.example".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.reconcile_due_fixed(Duration::ZERO);
+        let future_slots = controller.pending_slots();
+        assert!(!future_slots.is_empty());
+        assert!(
+            future_slots
+                .iter()
+                .all(|(_, packet)| packet.timestamp() > Duration::ZERO)
+        );
+
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            MissedSlotReason::RunAborted,
+        )
+        .expect("receipt not-yet-due fixed slots during abort");
+        traces
+            .ensure_no_pending_slots()
+            .expect("future abort leaves no trace debt");
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule trace");
+        let rows: Vec<_> = schedule.lines().skip(1).collect();
+        assert_eq!(rows.len(), future_slots.len());
+        for row in rows {
+            let fields: Vec<_> = row.split(',').collect();
+            assert!(fields[0].parse::<u64>().expect("target time") > 0);
+            assert_eq!(fields[5], "missed");
+            assert_eq!(fields[7], "RunAborted");
+            assert_eq!(fields.last(), Some(&"0"));
+        }
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[test]
@@ -14800,10 +15381,15 @@ mod tests {
             .collect();
         assert_eq!(fields[7], "RunAborted");
         assert_eq!(fields[8], "0");
-        assert_eq!(fields[9], "2");
+        assert_eq!(fields[9], "3");
         assert_eq!(fields[10], "exact");
         assert_eq!(fields[11], "100");
-        assert!(fields[12..].iter().all(|field| field.is_empty()));
+        assert!(
+            fields[12..fields.len() - 1]
+                .iter()
+                .all(|field| field.is_empty())
+        );
+        assert_eq!(fields.last(), Some(&"9"));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 

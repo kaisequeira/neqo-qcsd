@@ -710,6 +710,7 @@ impl Defense for TrafficMorphing {
             | SignalKind::ApplicationBatchStarted
             | SignalKind::ApplicationBatchCompleted
             | SignalKind::EgressBacklog { .. }
+            | SignalKind::TerminalCellCapacityExhausted { .. }
             | SignalKind::IncomingCreditScheduled { .. }
             | SignalKind::IncomingCreditAdvertised { .. }
             | SignalKind::IncomingCreditResolved { .. }

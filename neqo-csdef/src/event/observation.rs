@@ -362,8 +362,17 @@ pub enum QcsdObservation {
     /// Every application stream belonging to the current global batch terminated.
     ApplicationBatchCompleted,
     ApplicationComplete,
-    /// Aggregate client STREAM backlog edge sampled by the single-threaded runner.
+    /// Aggregate egress-backlog edge sampled by the single-threaded runner.
+    /// Candidate defenses include required STREAM work, unconfirmed
+    /// application send halves, and defense receive-control debt.
     EgressBacklog {
+        pending: bool,
+    },
+    /// Aggregate client STREAM work excluding candidate-defense receive
+    /// control. In-flight receive-limit frames remain part of
+    /// [`Self::EgressBacklog`] but do not by themselves authorise another
+    /// `BuFLO` cell.
+    EgressStreamBacklog {
         pending: bool,
     },
     Datagram {

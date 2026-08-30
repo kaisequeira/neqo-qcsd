@@ -121,6 +121,13 @@ pub enum SignalKind {
     Capacity(Capacity),
     /// Whether any client STREAM frame remains pending across all endpoints.
     EgressBacklog { pending: bool },
+    /// The first post-tau boundary at which no complete terminal cell can be
+    /// allocated and no prospective client STREAM work can expose one.
+    ///
+    /// This is distinct from [`Self::EgressBacklog`]: already-advertised
+    /// receive credit and its in-flight `MAX_STREAM_DATA` are drain debt, not
+    /// authority to schedule another cell. Only `BuFLO` consumes this signal.
+    TerminalCellCapacityExhausted { available: u64, required: u64 },
     /// A previously emitted event reached a terminal outcome.
     Resolved {
         packet: Packet,
@@ -394,6 +401,22 @@ pub struct DefenseDiagnostics {
     pub buflo_egress_backlog_pending: bool,
     /// Whether the application-complete signal was observed.
     pub buflo_application_complete: bool,
+    /// Whether `BuFLO` irreversibly stopped creating new cells before drain completion.
+    pub buflo_schedule_stop_latched: bool,
+    /// Controller elapsed time at the `BuFLO` schedule-stop boundary.
+    pub buflo_schedule_stop_latched_at_us: u64,
+    /// Exact aggregate incoming capacity left when the schedule stopped.
+    pub buflo_schedule_stop_available_bytes: u64,
+    /// Whole-cell capacity required to keep the schedule open.
+    pub buflo_schedule_stop_required_bytes: u64,
+    /// Incoming cells scheduled when the schedule-stop boundary latched.
+    pub buflo_schedule_stop_scheduled_incoming_cells: u64,
+    /// Outgoing cells scheduled when the schedule-stop boundary latched.
+    pub buflo_schedule_stop_scheduled_outgoing_cells: u64,
+    /// Incoming cells terminal when the schedule-stop boundary latched.
+    pub buflo_schedule_stop_terminal_incoming_cells: u64,
+    /// Outgoing cells terminal when the schedule-stop boundary latched.
+    pub buflo_schedule_stop_terminal_outgoing_cells: u64,
     /// Pending reviewed-chaff requests discarded at an ineligible terminal sub-cell tail.
     pub buflo_terminal_subcell_pending_request_cancellations: u64,
     /// Open reviewed-chaff streams canceled at an ineligible terminal sub-cell tail.

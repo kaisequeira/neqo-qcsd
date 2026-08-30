@@ -341,6 +341,20 @@ impl Connection {
         ) && self.streams.qcsd_send_stream_peer_confirmed(stream_id)
     }
 
+    /// Whether a registered chaff request's QUIC send half is terminal and
+    /// peer-confirmed.
+    ///
+    /// A locally sent request body/FIN is not terminal evidence: loss can make
+    /// it retransmission-pending later. The role check prevents an application
+    /// or unknown stream identity from satisfying the chaff-drain predicate.
+    #[must_use]
+    pub fn qcsd_chaff_send_stream_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        matches!(
+            self.qcsd_stream_roles.get(&stream_id),
+            Some(QcsdRequestRole::Chaff { .. })
+        ) && self.streams.qcsd_send_stream_peer_confirmed(stream_id)
+    }
+
     pub(super) fn qcsd_observe_stream_transmissions(&mut self, tokens: &recovery::Tokens) {
         let slot = self.qcsd_active_target.map(|target| target.slot);
         let transmissions: Vec<_> = tokens

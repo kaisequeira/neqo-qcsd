@@ -143,6 +143,13 @@ impl Http3Client {
             .qcsd_application_send_stream_peer_confirmed(stream_id)
     }
 
+    /// Whether a registered chaff request's QUIC send half is terminal with
+    /// peer confirmation.
+    #[must_use]
+    pub fn qcsd_chaff_send_stream_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        self.conn.qcsd_chaff_send_stream_peer_confirmed(stream_id)
+    }
+
     /// Open a same-origin nonblocking-QPACK request for qualification without
     /// installing shaped transport stream roles.
     ///

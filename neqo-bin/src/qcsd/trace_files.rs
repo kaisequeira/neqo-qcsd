@@ -20,8 +20,9 @@ use std::{
 };
 
 use neqo_csdef::{
-    Direction, Packet, QcsdCongestionReason, QcsdEndpointId, QcsdObservation, QcsdSendPolicy,
-    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamId, TimestampedQcsdObservation,
+    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdEndpointId, QcsdObservation,
+    QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamId,
+    TimestampedQcsdObservation,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -59,6 +60,23 @@ pub(super) struct ScheduleTraceRow<'a> {
     pub(super) miss_reason: &'a str,
     pub(super) slot: QcsdSlotId,
     pub(super) qcsd: QcsdTraceColumns,
+    /// Exact controller terminal-resolution time relative to defense start.
+    ///
+    /// This is not an adapter-production, packet-emission, or trace-write
+    /// timestamp. Every current runner schedule row must carry the exact
+    /// `Duration at` used by the controller's terminal slot transition.
+    pub(super) terminal_defense_elapsed_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleTerminalSemantics {
+    /// A scheduled opportunity reached its ordinary terminal boundary.
+    OpportunityResolution,
+    /// Run/endpoint teardown or typed adapter rejection explicitly cancelled
+    /// a target that was still in the future. The typed missed reason remains
+    /// in the historical `miss_reason` column; target and terminal timestamps
+    /// prove chronology.
+    FutureCancellation(MissedSlotReason),
 }
 
 /// Versioned nullable extension shared by packets/events/schedule traces.
@@ -88,6 +106,10 @@ pub(super) struct QcsdTraceColumns {
     /// packet timestamp or server-side padding-complete signal.
     credit_consumed_at_us: Option<u64>,
     credit_consumption_delay_us: Option<u64>,
+    /// Exact controller terminal-resolution time on the defense clock.
+    /// Populated only for schedule rows; packet and event rows retain a blank
+    /// nullable suffix for schema compatibility.
+    terminal_defense_elapsed_us: Option<u64>,
 }
 
 impl QcsdTraceColumns {
@@ -109,6 +131,7 @@ impl QcsdTraceColumns {
             credit_advertisement_delay_us: None,
             credit_consumed_at_us: None,
             credit_consumption_delay_us: None,
+            terminal_defense_elapsed_us: None,
         }
     }
 
@@ -170,6 +193,7 @@ impl QcsdTraceColumns {
             credit_advertisement_delay_us: None,
             credit_consumed_at_us: None,
             credit_consumption_delay_us: None,
+            terminal_defense_elapsed_us: None,
         }
     }
 
@@ -239,6 +263,7 @@ impl QcsdTraceColumns {
             number(self.credit_advertisement_delay_us),
             number(self.credit_consumed_at_us),
             number(self.credit_consumption_delay_us),
+            number(self.terminal_defense_elapsed_us),
         ]
         .join(",")
     }
@@ -286,7 +311,7 @@ impl TraceFiles {
         );
         writeln!(
             packets,
-            "direction,monotonic_us,connection,observed_udp_length,scheduled_target,satisfaction,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
+            "direction,monotonic_us,connection,observed_udp_length,scheduled_target,satisfaction,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us,terminal_defense_elapsed_us"
         )?;
         let mut events = BufWriter::with_capacity(
             TRACE_BUFFER_BYTES,
@@ -294,7 +319,7 @@ impl TraceFiles {
         );
         writeln!(
             events,
-            "monotonic_us,connection,event,outcome,details,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
+            "monotonic_us,connection,event,outcome,details,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us,terminal_defense_elapsed_us"
         )?;
         let mut schedule = BufWriter::with_capacity(
             TRACE_BUFFER_BYTES,
@@ -302,7 +327,7 @@ impl TraceFiles {
         );
         writeln!(
             schedule,
-            "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us"
+            "target_time_us,direction,size,connection,action_time_us,satisfaction,observed_size,miss_reason,slot_id,qcsd_outcome_schema_version,send_policy,desired_udp_bytes,observed_udp_bytes,application_stream_bytes,retransmission_stream_bytes,chaff_stream_bytes,defense_control_bytes,quic_padding_bytes,other_quic_bytes,lateness_us,congestion_reason,credit_advertised_at_us,credit_advertisement_delay_us,credit_consumed_at_us,credit_consumption_delay_us,terminal_defense_elapsed_us"
         )?;
         Ok(Self {
             packets,
@@ -608,6 +633,68 @@ impl TraceFiles {
     }
 
     pub(super) fn schedule(&mut self, row: &ScheduleTraceRow<'_>) -> Result<(), Error> {
+        self.schedule_with_semantics(row, ScheduleTerminalSemantics::OpportunityResolution)
+    }
+
+    /// Record an explicitly cancelled not-yet-due slot.
+    ///
+    /// This narrow path preserves abnormal-run evidence without weakening the
+    /// ordinary controller-clock invariant enforced by [`Self::schedule`].
+    /// The caller supplies the typed cancellation reason, which must agree
+    /// with the row and may only identify run/endpoint teardown or a typed
+    /// adapter rejection while installing the future target.
+    pub(super) fn schedule_future_cancellation(
+        &mut self,
+        row: &ScheduleTraceRow<'_>,
+        reason: MissedSlotReason,
+    ) -> Result<(), Error> {
+        self.schedule_with_semantics(row, ScheduleTerminalSemantics::FutureCancellation(reason))
+    }
+
+    fn schedule_with_semantics(
+        &mut self,
+        row: &ScheduleTraceRow<'_>,
+        semantics: ScheduleTerminalSemantics,
+    ) -> Result<(), Error> {
+        let target_time_us = row.packet.timestamp_us();
+        match semantics {
+            ScheduleTerminalSemantics::OpportunityResolution => {
+                if row.terminal_defense_elapsed_us < target_time_us {
+                    return Err(Error::SlotInvariant(format!(
+                        "slot {} terminal defense time {}us predates target {target_time_us}us",
+                        row.slot.0, row.terminal_defense_elapsed_us
+                    )));
+                }
+            }
+            ScheduleTerminalSemantics::FutureCancellation(reason) => {
+                if row.terminal_defense_elapsed_us >= target_time_us {
+                    return Err(Error::SlotInvariant(format!(
+                        "slot {} future cancellation time {}us did not predate target {target_time_us}us",
+                        row.slot.0, row.terminal_defense_elapsed_us
+                    )));
+                }
+                if !matches!(
+                    reason,
+                    MissedSlotReason::EndpointClosed
+                        | MissedSlotReason::DeadlineExpired
+                        | MissedSlotReason::KeysUnavailable
+                        | MissedSlotReason::PathMtu
+                        | MissedSlotReason::RunAborted
+                ) {
+                    return Err(Error::SlotInvariant(format!(
+                        "slot {} used invalid future-cancellation reason {reason:?}",
+                        row.slot.0
+                    )));
+                }
+                let expected_reason = format!("{reason:?}");
+                if row.satisfaction != "missed" || row.miss_reason != expected_reason {
+                    return Err(Error::SlotInvariant(format!(
+                        "slot {} future cancellation must be a matching typed miss ({reason:?})",
+                        row.slot.0
+                    )));
+                }
+            }
+        }
         let terminal_time_us = row.action_time_us;
         let mut action_time_us = row.action_time_us;
         let endpoint = row.endpoint;
@@ -643,6 +730,11 @@ impl TraceFiles {
                 }
             }
         }
+        // Schedule schema three binds every terminal row directly to the
+        // controller's defense-relative resolution time. This supersedes the
+        // schema-one/two outcome identity while preserving every older field.
+        qcsd.schema_version = Some(3);
+        qcsd.terminal_defense_elapsed_us = Some(row.terminal_defense_elapsed_us);
         self.pending_slots.remove(&slot);
         self.incoming_target_limits.remove(&slot);
         self.terminal_slots.insert(slot, packet);

@@ -39,6 +39,14 @@ pub struct Buflo {
     event_guard_triggered: bool,
     catch_up_failure_triggered: bool,
     realization_failed: bool,
+    schedule_stop_latched: bool,
+    schedule_stop_latched_at_us: u64,
+    schedule_stop_available_bytes: u64,
+    schedule_stop_required_bytes: u64,
+    schedule_stop_scheduled_incoming: u64,
+    schedule_stop_scheduled_outgoing: u64,
+    schedule_stop_terminal_incoming: u64,
+    schedule_stop_terminal_outgoing: u64,
     terminal_latched: bool,
 }
 
@@ -78,6 +86,14 @@ impl Buflo {
             event_guard_triggered: false,
             catch_up_failure_triggered: false,
             realization_failed: false,
+            schedule_stop_latched: false,
+            schedule_stop_latched_at_us: 0,
+            schedule_stop_available_bytes: 0,
+            schedule_stop_required_bytes: 0,
+            schedule_stop_scheduled_incoming: 0,
+            schedule_stop_scheduled_outgoing: 0,
+            schedule_stop_terminal_incoming: 0,
+            schedule_stop_terminal_outgoing: 0,
             terminal_latched: false,
         }
     }
@@ -93,13 +109,34 @@ impl Buflo {
             && !self.catch_up_failure_triggered
             && !self.realization_failed
             && self.minimum_schedule_emitted()
+            && self.schedule_stop_latched
             && !self.egress_backlog_pending
             && self.terminal_incoming == self.scheduled_incoming
             && self.terminal_outgoing == self.scheduled_outgoing
     }
 
     const fn schedule_closed(&self) -> bool {
-        self.terminal_latched
+        self.schedule_stop_latched
+    }
+
+    const fn latch_schedule_stop(&mut self, available: u64, required: u64) {
+        if self.schedule_stop_latched
+            || !self.application_complete
+            || !self.minimum_schedule_emitted()
+            || self.event_guard_triggered
+            || self.catch_up_failure_triggered
+            || self.realization_failed
+        {
+            return;
+        }
+        self.schedule_stop_latched = true;
+        self.schedule_stop_latched_at_us = self.latest_elapsed_us;
+        self.schedule_stop_available_bytes = available;
+        self.schedule_stop_required_bytes = required;
+        self.schedule_stop_scheduled_incoming = self.scheduled_incoming;
+        self.schedule_stop_scheduled_outgoing = self.scheduled_outgoing;
+        self.schedule_stop_terminal_incoming = self.terminal_incoming;
+        self.schedule_stop_terminal_outgoing = self.terminal_outgoing;
     }
 
     const fn latch_terminal_if_ready(&mut self) {
@@ -109,7 +146,7 @@ impl Buflo {
     }
 
     const fn normally_complete(&self) -> bool {
-        self.schedule_closed()
+        self.terminal_latched
     }
 
     const fn record_outcome(&mut self, packet: Packet, outcome: EventOutcome) {
@@ -215,7 +252,15 @@ impl Defense for Buflo {
             matches!(signal.kind, SignalKind::EgressBacklog { pending: false });
         match signal.kind {
             SignalKind::ApplicationComplete => self.application_complete = true,
+            // Aggregate backlog remains the final drain-completion evidence,
+            // but it cannot itself close the schedule. Only the controller's
+            // typed decision proves that every schedule-authorising blocker,
+            // including a due rolling identity, has cleared.
             SignalKind::EgressBacklog { pending } => self.egress_backlog_pending = pending,
+            SignalKind::TerminalCellCapacityExhausted {
+                available,
+                required,
+            } => self.latch_schedule_stop(available, required),
             SignalKind::Resolved { packet, outcome } => self.record_outcome(packet, outcome),
             _ => {}
         }
@@ -287,7 +332,16 @@ impl Defense for Buflo {
     }
 
     fn is_outgoing_complete(&self) -> bool {
-        self.is_complete()
+        (self.schedule_closed() && self.terminal_outgoing == self.scheduled_outgoing)
+            || self.is_complete()
+    }
+
+    fn can_release_chaff_send_shaping(&self) -> bool {
+        // A sent request/FIN can become retransmission-pending after the
+        // schedule stops. BuFLO has no targetless cleanup phase: retain Normal
+        // stream shaping until the final typed chaff cancellation replaces any
+        // such work with peer-confirmed RESET/STOP_SENDING control.
+        false
     }
 
     fn terminal_failure(&self) -> Option<&'static str> {
@@ -307,6 +361,15 @@ impl Defense for Buflo {
     }
 
     fn incoming_slot_must_resolve_in_window(&self) -> bool {
+        true
+    }
+
+    fn base_chaff_requires_peer_acknowledgment(&self) -> bool {
+        // Scheduled receive credit must never be owned by a request whose
+        // STREAM bytes or FIN can return to the send backlog after loss.  A
+        // complete peer acknowledgment makes that request prefix terminal;
+        // terminal BuFLO drain can then retain the response credit without a
+        // targetless opportunity to retransmit the request after stop.
         true
     }
 
@@ -348,6 +411,14 @@ impl Defense for Buflo {
                 .saturating_sub(self.terminal_incoming),
             buflo_egress_backlog_pending: self.egress_backlog_pending,
             buflo_application_complete: self.application_complete,
+            buflo_schedule_stop_latched: self.schedule_stop_latched,
+            buflo_schedule_stop_latched_at_us: self.schedule_stop_latched_at_us,
+            buflo_schedule_stop_available_bytes: self.schedule_stop_available_bytes,
+            buflo_schedule_stop_required_bytes: self.schedule_stop_required_bytes,
+            buflo_schedule_stop_scheduled_incoming_cells: self.schedule_stop_scheduled_incoming,
+            buflo_schedule_stop_scheduled_outgoing_cells: self.schedule_stop_scheduled_outgoing,
+            buflo_schedule_stop_terminal_incoming_cells: self.schedule_stop_terminal_incoming,
+            buflo_schedule_stop_terminal_outgoing_cells: self.schedule_stop_terminal_outgoing,
             buflo_minimum_duration_reached: self.minimum_schedule_emitted(),
             buflo_event_guard_triggered: self.event_guard_triggered,
             ..DefenseDiagnostics::default()
@@ -424,6 +495,13 @@ mod tests {
             at: Duration::from_micros(30),
             kind: SignalKind::EgressBacklog { pending: false },
         });
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(30),
+            kind: SignalKind::TerminalCellCapacityExhausted {
+                available: 0,
+                required: 1_200,
+            },
+        });
         for (_, direction) in actual {
             let packet = crate::Packet::new(Duration::ZERO, direction, 1_200).expect("packet");
             defense.observe(DefenseSignal {
@@ -442,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn egress_backlog_keeps_the_schedule_open_after_tau_and_onload() {
+    fn aggregate_empty_stops_new_cells_then_drains_old_outcomes() {
         let mut defense = Buflo::from_parameters(parameters());
         defense.observe(DefenseSignal {
             at: Duration::from_micros(5),
@@ -468,15 +546,19 @@ mod tests {
             at: Duration::from_micros(41),
             kind: SignalKind::EgressBacklog { pending: false },
         });
-        assert_eq!(defense.next_event_at(), Some(Duration::from_micros(50)));
-        while let Some(packet) = defense.next_event(Duration::from_micros(50)) {
-            scheduled.push(packet);
-        }
-        assert_eq!(scheduled.len(), 12);
-        assert_eq!(scheduled[10].timestamp_us(), 50);
-        assert_eq!(scheduled[10].direction(), Direction::Outgoing);
-        assert_eq!(scheduled[11].timestamp_us(), 50);
-        assert_eq!(scheduled[11].direction(), Direction::Incoming);
+        assert!(!defense.diagnostics().buflo_schedule_stop_latched);
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(41),
+            kind: SignalKind::TerminalCellCapacityExhausted {
+                available: 0,
+                required: 1_200,
+            },
+        });
+        assert!(!defense.is_outgoing_complete());
+        assert!(defense.diagnostics().buflo_schedule_stop_latched);
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.next_event(Duration::from_micros(50)), None);
+        assert_eq!(scheduled.len(), 10);
         assert!(!defense.is_complete());
         for packet in scheduled {
             defense.observe(DefenseSignal {
@@ -489,6 +571,87 @@ mod tests {
         }
         defense.observe(DefenseSignal {
             at: Duration::from_micros(50),
+            kind: SignalKind::EgressBacklog { pending: false },
+        });
+        assert!(defense.is_complete());
+    }
+
+    #[test]
+    fn terminal_capacity_stop_blocks_new_cells_while_advertised_credit_drains() {
+        let mut defense = Buflo::from_parameters(parameters());
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(5),
+            kind: SignalKind::ApplicationComplete,
+        });
+        let mut outgoing = Vec::new();
+        let mut incoming = Vec::new();
+        for at in [0, 10, 20, 30] {
+            while let Some(packet) = defense.next_event(Duration::from_micros(at)) {
+                match packet.direction() {
+                    Direction::Outgoing => outgoing.push(packet),
+                    Direction::Incoming => incoming.push(packet),
+                }
+            }
+        }
+        for packet in outgoing {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(30),
+                kind: SignalKind::Resolved {
+                    packet,
+                    outcome: crate::EventOutcome::Satisfied { observed: 1_200 },
+                },
+            });
+        }
+        for packet in incoming.iter().copied().take(2) {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(30),
+                kind: SignalKind::Resolved {
+                    packet,
+                    outcome: crate::EventOutcome::Satisfied { observed: 1_200 },
+                },
+            });
+        }
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(31),
+            kind: SignalKind::TerminalCellCapacityExhausted {
+                available: 655,
+                required: 1_200,
+            },
+        });
+
+        assert!(defense.is_outgoing_complete());
+        assert!(
+            !defense.can_release_chaff_send_shaping(),
+            "a stopped BuFLO schedule never authorizes targetless chaff STREAM recovery"
+        );
+        assert!(!defense.is_complete());
+        assert_eq!(defense.next_event_at(), None);
+        assert_eq!(defense.next_event(Duration::from_micros(100)), None);
+        let diagnostics = defense.diagnostics();
+        assert!(diagnostics.buflo_schedule_stop_latched);
+        assert_eq!(diagnostics.buflo_schedule_stop_latched_at_us, 31);
+        assert_eq!(diagnostics.buflo_schedule_stop_available_bytes, 655);
+        assert_eq!(diagnostics.buflo_schedule_stop_required_bytes, 1_200);
+        assert_eq!(diagnostics.buflo_schedule_stop_scheduled_outgoing_cells, 4);
+        assert_eq!(diagnostics.buflo_schedule_stop_scheduled_incoming_cells, 4);
+        assert_eq!(diagnostics.buflo_schedule_stop_terminal_outgoing_cells, 4);
+        assert_eq!(diagnostics.buflo_schedule_stop_terminal_incoming_cells, 2);
+
+        for packet in incoming.into_iter().skip(2) {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(81),
+                kind: SignalKind::Resolved {
+                    packet,
+                    outcome: crate::EventOutcome::Satisfied { observed: 1_200 },
+                },
+            });
+        }
+        assert!(
+            !defense.is_complete(),
+            "aggregate transport debt still drains"
+        );
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(82),
             kind: SignalKind::EgressBacklog { pending: false },
         });
         assert!(defense.is_complete());
@@ -532,6 +695,13 @@ mod tests {
         defense.observe(DefenseSignal {
             at: Duration::from_micros(31),
             kind: SignalKind::EgressBacklog { pending: false },
+        });
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(31),
+            kind: SignalKind::TerminalCellCapacityExhausted {
+                available: 0,
+                required: 1_200,
+            },
         });
         for packet in scheduled {
             defense.observe(DefenseSignal {
@@ -633,6 +803,15 @@ mod tests {
                     defense.observe(DefenseSignal {
                         at,
                         kind: SignalKind::EgressBacklog { pending: false },
+                    });
+                }
+                if tick == first_closed_tick {
+                    defense.observe(DefenseSignal {
+                        at,
+                        kind: SignalKind::TerminalCellCapacityExhausted {
+                            available: 0,
+                            required: 1_200,
+                        },
                     });
                 }
                 while let Some(packet) = defense.next_event(at) {
