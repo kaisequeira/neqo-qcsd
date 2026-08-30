@@ -4896,9 +4896,10 @@ async fn execute_run_inner(
                 // Flush output that was already available (including newly
                 // dispatched application requests) so its Wire signals precede
                 // the defense poll.
-                let work_interrupt =
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?
-                        .map(|guard| guard.guard_at);
+                let output_guard =
+                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
+                let work_interrupt = output_guard.map(|guard| guard.guard_at);
+                let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
                     &mut endpoints,
@@ -4908,6 +4909,7 @@ async fn execute_run_inner(
                     &observation_clock,
                     defense_start,
                     work_interrupt,
+                    unshaped_handoff_interrupt,
                 )
                 .await?
                     && wakeup < next_wakeup
@@ -5013,9 +5015,10 @@ async fn execute_run_inner(
                 yield_to_buflo_guard!('runner);
                 // Retain a post-action flush so newly scheduled packet targets can
                 // be placed on the wire without waiting for another loop turn.
-                let work_interrupt =
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?
-                        .map(|guard| guard.guard_at);
+                let output_guard =
+                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
+                let work_interrupt = output_guard.map(|guard| guard.guard_at);
+                let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
                     &mut endpoints,
@@ -5025,6 +5028,7 @@ async fn execute_run_inner(
                     &observation_clock,
                     defense_start,
                     work_interrupt,
+                    unshaped_handoff_interrupt,
                 )
                 .await?
                     && wakeup < next_wakeup
@@ -8378,6 +8382,7 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
             observation_clock,
             Some(defense_start),
             Some(guard.deadline),
+            Some(guard.deadline),
         )
         .await?;
     }
@@ -8743,13 +8748,13 @@ fn late_socket_handoff_error(
 #[cfg(test)]
 fn attempt_socket_handoff(
     target_deadlines: &[Instant],
-    rolling_interrupt: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
     send: impl FnOnce() -> io::Result<()>,
     clock: impl FnMut() -> Instant,
 ) -> Result<SocketHandoff, Error> {
     attempt_socket_handoff_timestamped(
         target_deadlines,
-        rolling_interrupt,
+        unshaped_handoff_interrupt,
         || send().map(|()| None),
         clock,
     )
@@ -8757,7 +8762,7 @@ fn attempt_socket_handoff(
 
 fn attempt_socket_handoff_timestamped(
     target_deadlines: &[Instant],
-    rolling_interrupt: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
     send: impl FnOnce() -> io::Result<Option<Instant>>,
     mut clock: impl FnMut() -> Instant,
 ) -> Result<SocketHandoff, Error> {
@@ -8776,7 +8781,7 @@ fn attempt_socket_handoff_timestamped(
     }
     let unshaped_interrupt = target_deadlines
         .is_empty()
-        .then_some(rolling_interrupt)
+        .then_some(unshaped_handoff_interrupt)
         .flatten();
     if let Some(interrupt) = unshaped_interrupt {
         let attempted_at = clock();
@@ -8834,12 +8839,12 @@ fn attempt_socket_handoff_timestamped(
 
 async fn await_unshaped_socket_retry<F>(
     writable: F,
-    rolling_interrupt: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
 ) -> Result<(), Error>
 where
     F: Future<Output = io::Result<()>>,
 {
-    let Some(interrupt) = rolling_interrupt else {
+    let Some(interrupt) = unshaped_handoff_interrupt else {
         writable.await?;
         return Ok(());
     };
@@ -8988,6 +8993,7 @@ async fn drive_endpoint_output(
         observation_clock,
         defense_start,
         None,
+        None,
         false,
         &mut monotonic_clock,
     )
@@ -9008,6 +9014,7 @@ async fn drive_endpoint_output_until(
     observation_clock: &QcsdObservationClock,
     defense_start: Option<Instant>,
     work_interrupt: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
 ) -> Result<Option<Instant>, Error> {
     let mut monotonic_clock = now;
     drive_endpoint_output_with_clock_until(
@@ -9019,6 +9026,7 @@ async fn drive_endpoint_output_until(
         observation_clock,
         defense_start,
         work_interrupt,
+        unshaped_handoff_interrupt,
         true,
         &mut monotonic_clock,
     )
@@ -9053,6 +9061,7 @@ async fn drive_endpoint_output_with_clock(
         observation_clock,
         defense_start,
         None,
+        None,
         false,
         monotonic_clock,
     )
@@ -9080,10 +9089,12 @@ async fn drive_endpoint_output_with_clock_until(
     observation_clock: &QcsdObservationClock,
     defense_start: Option<Instant>,
     work_interrupt: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
     interrupt_new_buflo_guards: bool,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<Option<Instant>, Error> {
     let mut work_interrupt = work_interrupt;
+    let mut unshaped_handoff_interrupt = unshaped_handoff_interrupt;
     loop {
         // One fresh timestamp governs the complete fixed-schedule microstep:
         // reconcile every event due at that instant, apply its incoming
@@ -9132,13 +9143,15 @@ async fn drive_endpoint_output_with_clock_until(
             }
             if interrupt_new_buflo_guards {
                 let defense = controller.config().defense.clone();
-                work_interrupt = work_interrupt
-                    .into_iter()
-                    .chain(
-                        next_buflo_exact_release_guard(&defense, controller, endpoints)?
-                            .map(|guard| guard.guard_at),
-                    )
-                    .min();
+                if let Some(guard) =
+                    next_buflo_exact_release_guard(&defense, controller, endpoints)?
+                {
+                    work_interrupt = work_interrupt.into_iter().chain([guard.guard_at]).min();
+                    unshaped_handoff_interrupt = unshaped_handoff_interrupt
+                        .into_iter()
+                        .chain([guard.release])
+                        .min();
+                }
                 if let Some(interrupt) = work_interrupt {
                     drive_now = monotonic_clock();
                     if drive_now >= interrupt {
@@ -9190,14 +9203,21 @@ async fn drive_endpoint_output_with_clock_until(
 
         let rolling_lifecycle_before_output =
             rolling_output_lifecycle_active(controller, endpoints);
-        let rolling_interrupt = if rolling_lifecycle_before_output {
+        // `work_interrupt` is only the admission boundary for a fresh unit of
+        // ordinary work. Once this output microstep has started strictly before
+        // that guard, its targetless UDP handoff retains the actual rolling
+        // controller/adapter release as its hard bound. Conflating the two
+        // boundaries would reject a successful syscall merely for finishing in
+        // the reserved pre-release tail even though no new work can start there.
+        let rolling_handoff_interrupt = if rolling_lifecycle_before_output {
             rolling_output_interrupt(controller, endpoints, defense_start)?
         } else {
             None
-        }
-        .into_iter()
-        .chain(work_interrupt)
-        .min();
+        };
+        let effective_unshaped_handoff_interrupt = rolling_handoff_interrupt
+            .into_iter()
+            .chain(unshaped_handoff_interrupt)
+            .min();
         let output = process_output_once_with_clock(
             &mut endpoints[output_endpoint_index],
             controller,
@@ -9205,7 +9225,7 @@ async fn drive_endpoint_output_with_clock_until(
             observation_clock,
             drive_now,
             defense_start,
-            rolling_interrupt,
+            effective_unshaped_handoff_interrupt,
             monotonic_clock,
         )
         .await?;
@@ -9291,7 +9311,7 @@ async fn process_output_once_with_clock(
     observation_clock: &QcsdObservationClock,
     drive_now: Instant,
     defense_start: Option<Instant>,
-    rolling_interrupt: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
     #[cfg(test)]
@@ -9357,7 +9377,7 @@ async fn process_output_once_with_clock(
         let socket_handoff_policy = endpoint.socket_handoff_policy;
         match attempt_socket_handoff_timestamped(
             &target_deadlines,
-            rolling_interrupt,
+            unshaped_handoff_interrupt,
             || {
                 #[cfg(test)]
                 if force_socket_handoff_success {
@@ -9380,7 +9400,8 @@ async fn process_output_once_with_clock(
                 boundary,
             } => break (sent_at, Some((deadline, boundary))),
             SocketHandoff::RetryUnshaped => {
-                await_unshaped_socket_retry(endpoint.socket.writable(), rolling_interrupt).await?;
+                await_unshaped_socket_retry(endpoint.socket.writable(), unshaped_handoff_interrupt)
+                    .await?;
             }
         }
     };
@@ -9759,8 +9780,8 @@ mod tests {
         expected_application_response_length, finish_application_record, finish_chaff_record,
         finish_stream, forward_qcsd_observation, handle_all_qcsd_observations, handle_http_events,
         has_in_flight_application_stream, is_candidate_defense, is_public_network_address,
-        next_buflo_exact_release_guard, normalize_rolling_prearm_window, now,
-        pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
+        late_socket_handoff_error, next_buflo_exact_release_guard, normalize_rolling_prearm_window,
+        now, pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
         prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
         prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
@@ -16556,6 +16577,67 @@ mod tests {
     }
 
     #[test]
+    fn admitted_unshaped_handoff_can_finish_after_guard_but_not_at_release() {
+        let started = now();
+        let target = Duration::from_millis(20);
+        let release = started + target;
+        let guard_at = release
+            .checked_sub(Duration::from_millis(5))
+            .expect("release has a five-millisecond guard predecessor");
+        let adapter_deadline = release + Duration::from_millis(5);
+        let handoff_interrupt =
+            resolve_rolling_output_interrupt(Some(started), [target], [adapter_deadline])
+                .expect("rolling release is representable")
+                .expect("rolling release bounds targetless handoff");
+        assert_eq!(handoff_interrupt, release);
+
+        let before_guard = guard_at
+            .checked_sub(Duration::from_nanos(1))
+            .expect("guard has a predecessor");
+        let inside_reserved_tail = guard_at + Duration::from_micros(80);
+        assert!(inside_reserved_tail < release);
+        let mut crossing_guard = [before_guard, inside_reserved_tail].into_iter();
+        assert_eq!(
+            attempt_socket_handoff(
+                &[],
+                Some(handoff_interrupt),
+                || Ok(()),
+                || crossing_guard.next().expect("pre/post handoff clock"),
+            )
+            .expect("an admitted targetless handoff may finish before release"),
+            SocketHandoff::Sent(inside_reserved_tail)
+        );
+
+        for too_late in [release, release + Duration::from_nanos(1)] {
+            let mut crossing_release = [before_guard, too_late].into_iter();
+            let late = attempt_socket_handoff(
+                &[],
+                Some(handoff_interrupt),
+                || Ok(()),
+                || crossing_release.next().expect("pre/post handoff clock"),
+            )
+            .expect("a successful late syscall retains its terminal evidence");
+            assert_eq!(
+                late,
+                SocketHandoff::SentLate {
+                    sent_at: too_late,
+                    deadline: release,
+                    boundary: SocketHandoffBoundary::RollingDefenseDeadline,
+                }
+            );
+            assert!(matches!(
+                late_socket_handoff_error(
+                    too_late,
+                    release,
+                    SocketHandoffBoundary::RollingDefenseDeadline,
+                ),
+                Error::SlotInvariant(message)
+                    if message.contains("at or after a rolling defense deadline")
+            ));
+        }
+    }
+
+    #[test]
     fn target_socket_backpressure_aborts_without_retrying_committed_datagram() {
         let deadline = now() + Duration::from_millis(5);
         let mut attempts = 0;
@@ -17657,7 +17739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_work_interrupt_yields_before_touching_transport() {
+    async fn output_work_start_at_guard_yields_without_touching_transport() {
         let output = trace_output_dir("output-work-interrupt");
         let started = test_fixture::now();
         let observation_clock = QcsdObservationClock::new(started);
@@ -17676,8 +17758,9 @@ mod tests {
         let mut controller =
             QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
-        let interrupt = started + Duration::from_millis(5);
-        let mut monotonic_clock = || interrupt;
+        let guard_at = started + Duration::from_millis(5);
+        let release = guard_at + Duration::from_millis(5);
+        let mut monotonic_clock = || guard_at;
 
         let wakeup = drive_endpoint_output_with_clock_until(
             0,
@@ -17687,14 +17770,15 @@ mod tests {
             &mut traces,
             &observation_clock,
             Some(started),
-            Some(interrupt),
+            Some(guard_at),
+            Some(release),
             true,
             &mut monotonic_clock,
         )
         .await
         .expect("work interruption is a normal runner yield");
 
-        assert_eq!(wakeup, Some(interrupt));
+        assert_eq!(wakeup, Some(guard_at));
         assert!(
             endpoints[0].test_observation_on_next_output.is_some(),
             "transport output remains untouched at the guard boundary"
