@@ -1032,6 +1032,18 @@ impl QcsdController {
         pending
     }
 
+    /// Whether every byte of one live scheduled incoming slot has been
+    /// physically advertised by the transport.
+    ///
+    /// This is a local-realisation receipt, not terminal completion: the slot
+    /// remains live until the peer consumes or retires the advertised credit.
+    #[must_use]
+    pub fn incoming_slot_is_locally_realized(&self, slot: QcsdSlotId) -> bool {
+        self.incoming_credit_ledger
+            .get(&slot)
+            .is_some_and(|ledger| ledger.local_realization_emitted)
+    }
+
     /// Exact defense-clock resolution instant for one terminal scheduled slot.
     ///
     /// The value is recorded in [`Self::resolve_slot`] before the terminal
@@ -2131,13 +2143,16 @@ impl QcsdController {
             );
         }
 
-        // A lease that was originally unowned may acquire scheduling
-        // ownership only when its raw bytes are actually consumed. Debit the
-        // oldest same-stream claims and recycle exactly that overlap; any
-        // remainder stays permanently charged to the lifetime unowned cap.
+        // A lease that was originally unowned may acquire ordinary scheduling
+        // ownership only when its raw bytes are actually consumed. Exact
+        // incoming opportunities cannot inherit an earlier slotless physical
+        // advertisement: they must stage slot-owned credit and advertise it
+        // inside their own half-open window. Debit the oldest same-stream
+        // claims only for non-exact defenses and recycle exactly that overlap;
+        // any remainder stays permanently charged to the lifetime unowned cap.
         let mut reclassified = 0_u64;
         let mut reclassified_by_slot = BTreeMap::new();
-        if unowned_overlap > 0 {
+        if unowned_overlap > 0 && !self.defense.incoming_slot_must_resolve_in_window() {
             let mut indices: Vec<_> = self
                 .control
                 .claims
@@ -11699,6 +11714,7 @@ mod tests {
             panic!("expected attributed receive credit");
         };
         assert!(controller.next_action().is_none());
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
 
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
@@ -11710,6 +11726,7 @@ mod tests {
             Duration::ZERO,
         );
         assert!(controller.next_action().is_none());
+        assert!(controller.incoming_slot_is_locally_realized(slot));
         assert_eq!(controller.pending_slots(), [(slot, packet)]);
         assert_eq!(
             controller
@@ -11996,6 +12013,107 @@ mod tests {
         assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 4);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 4);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn exact_incoming_never_inherits_pre_window_unowned_parser_advertisement() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 4).expect("packet");
+        let slot = QcsdSlotId(605);
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let (mut defense, outcomes) = ExactIncomingOneShot::new(packet);
+        // This is a controller-ledger oracle: install the exact-window
+        // policy without also letting the test defense enqueue a second copy
+        // of the packet when EndpointReady is observed below.
+        assert_eq!(defense.event.take(), Some(packet));
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 16,
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("exact incoming controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .bytes_read(1);
+        assert_eq!(controller.streams.claim_stream(endpoint, stream, 4), 4);
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 4;
+        controller.control.claims.push(PendingClaim {
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 4,
+        });
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                start: 1,
+                end: 5,
+                owner: None,
+                unowned: true,
+                advertised: true,
+            }],
+        );
+
+        // The bytes were physically advertised before this exact slot owned
+        // them. Even a post-deadline read cannot retroactively turn that old
+        // handoff into local realization before the next expiry pass.
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 4,
+            },
+            Duration::from_millis(6),
+        );
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(controller.control.claims.len(), 1);
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 4);
+
+        controller.poll(Duration::from_millis(6));
+        assert!(controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed {
+                slot: observed,
+                reason: MissedSlotReason::DeadlineExpired,
+                ..
+            } if observed == slot
+        )));
+        assert_eq!(
+            outcomes.borrow().as_slice(),
+            [EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 4);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 

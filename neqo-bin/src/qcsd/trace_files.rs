@@ -20,9 +20,9 @@ use std::{
 };
 
 use neqo_csdef::{
-    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdEndpointId, QcsdObservation,
-    QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamId,
-    TimestampedQcsdObservation,
+    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdController, QcsdEndpointId,
+    QcsdObservation, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome,
+    QcsdStreamId, TimestampedQcsdObservation,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -35,8 +35,13 @@ pub(super) struct PendingSlot {
     pub(super) packet: Packet,
     /// First adapter action issued for this logical scheduled slot.
     pub(super) action_time_us: u64,
-    /// Latest on-wire `MAX_STREAM_DATA` encoding time for this logical slot.
+    /// First whole-slot local-realisation boundary, once all original
+    /// fan-out children have advertised their credit.
     pub(super) credit_advertised_at_us: Option<u64>,
+    /// Latest original fan-out advertisement while that whole-slot boundary
+    /// remains incomplete.  This becomes `credit_advertised_at_us` exactly
+    /// once, when the controller first reports local realisation.
+    credit_advertisement_candidate_at_us: Option<u64>,
 }
 
 pub(super) struct PacketTraceRow<'a> {
@@ -407,6 +412,7 @@ impl TraceFiles {
                 packet,
                 action_time_us,
                 credit_advertised_at_us: None,
+                credit_advertisement_candidate_at_us: None,
             },
         );
         Ok(())
@@ -471,6 +477,7 @@ impl TraceFiles {
                     packet,
                     action_time_us,
                     credit_advertised_at_us: None,
+                    credit_advertisement_candidate_at_us: None,
                 },
             );
         }
@@ -489,6 +496,22 @@ impl TraceFiles {
             .collect();
         pending.sort_unstable_by_key(|(slot, _)| *slot);
         pending
+    }
+
+    /// Endpoint attribution for one logical pending slot.
+    ///
+    /// Incoming receive credit may fan out across streams and connections.
+    /// The raw transport observation still has one physical carrier, while
+    /// the schedule row represents the logical slot and therefore has no
+    /// connection attribution when more than one endpoint owns a child.
+    pub(super) fn pending_slot_endpoint(&self, slot: QcsdSlotId) -> Option<QcsdEndpointId> {
+        let pending = self.pending_slots.get(&slot)?;
+        let Some(targets) = self.incoming_target_limits.get(&slot) else {
+            return Some(pending.endpoint);
+        };
+        let mut endpoints = targets.keys().map(|(endpoint, _)| *endpoint);
+        let first = endpoints.next().unwrap_or(pending.endpoint);
+        endpoints.all(|endpoint| endpoint == first).then_some(first)
     }
 
     pub(super) fn is_slot_pending(&self, slot: QcsdSlotId) -> bool {
@@ -543,28 +566,114 @@ impl TraceFiles {
         endpoint: Option<QcsdEndpointId>,
         record: &TimestampedQcsdObservation,
     ) -> Result<(), Error> {
+        self.observation_with_controller(endpoint, record, None, None)
+    }
+
+    /// Persist an adapter observation after the controller has reduced it.
+    ///
+    /// A `ReceiveLimitAdvertised` observation is only a whole-slot local
+    /// realisation after every original fan-out child has been advertised.
+    /// The controller is the sole owner of that logical ledger, and the
+    /// successful socket handoff is the physical boundary, so only this
+    /// causally ordered path may freeze the runtime receipt timestamp.
+    pub(super) fn observation_after_controller(
+        &mut self,
+        endpoint: Option<QcsdEndpointId>,
+        record: &TimestampedQcsdObservation,
+        controller: &QcsdController,
+        receive_credit_handoff_at: Option<Instant>,
+    ) -> Result<(), Error> {
+        self.observation_with_controller(
+            endpoint,
+            record,
+            Some(controller),
+            receive_credit_handoff_at,
+        )
+    }
+
+    fn observation_with_controller(
+        &mut self,
+        endpoint: Option<QcsdEndpointId>,
+        record: &TimestampedQcsdObservation,
+        controller: Option<&QcsdController>,
+        receive_credit_handoff_at: Option<Instant>,
+    ) -> Result<(), Error> {
         let mut qcsd =
             QcsdTraceColumns::from_observation(record.observation(), &self.terminal_slots);
         if let QcsdObservation::ReceiveLimitAdvertised {
-            slot: Some(slot), ..
+            endpoint,
+            stream,
+            absolute_limit,
+            slot,
         } = record.observation()
         {
-            let advertised_at_us = record.produced_monotonic_ns() / 1_000;
-            let pending = self.pending_slots.get_mut(slot).ok_or_else(|| {
-                Error::SlotInvariant(format!(
-                    "receive-credit advertisement targeted unknown slot {}",
-                    slot.0
-                ))
-            })?;
-            pending.credit_advertised_at_us = Some(
-                pending
+            let advertised_at_us = match (controller, receive_credit_handoff_at) {
+                (Some(_), Some(handoff_at)) => self.elapsed_us(handoff_at),
+                (Some(_), None) => {
+                    return Err(Error::SlotInvariant(
+                        "runtime receive-credit advertisement lacked a successful socket-handoff timestamp"
+                            .into(),
+                    ));
+                }
+                // Isolated trace tests and historical generic callers have no
+                // runtime controller/handoff boundary. Production adapter
+                // observations always use the fail-closed branch above.
+                (None, _) => record.produced_monotonic_ns() / 1_000,
+            };
+            let slots = self.advertised_credit_slots(*endpoint, *stream, *absolute_limit, *slot);
+            for slot in &slots {
+                let pending = self.pending_slots.get_mut(slot).ok_or_else(|| {
+                    Error::SlotInvariant(format!(
+                        "receive-credit advertisement targeted unknown slot {}",
+                        slot.0
+                    ))
+                })?;
+                match controller {
+                    Some(controller) => {
+                        if pending.credit_advertised_at_us.is_none() {
+                            pending.credit_advertisement_candidate_at_us = Some(
+                                pending
+                                    .credit_advertisement_candidate_at_us
+                                    .map_or(advertised_at_us, |previous| {
+                                        previous.max(advertised_at_us)
+                                    }),
+                            );
+                            if controller.incoming_slot_is_locally_realized(*slot) {
+                                pending.credit_advertised_at_us =
+                                    pending.credit_advertisement_candidate_at_us;
+                            }
+                        }
+                    }
+                    // This compatibility path serves isolated trace-file tests
+                    // and historical generic callers that do not own a
+                    // controller.  All runtime adapter observations use the
+                    // ordered controller-aware path above.
+                    None => {
+                        pending.credit_advertised_at_us = Some(
+                            pending
+                                .credit_advertised_at_us
+                                .map_or(advertised_at_us, |previous| {
+                                    previous.max(advertised_at_us)
+                                }),
+                        );
+                    }
+                }
+            }
+            // An explicitly attributed scheduled release retains honest
+            // scalar event provenance even when the same physical frame also
+            // covers preceding parser-owned capacity. A slotless parser-lease
+            // advertisement has scalar provenance only when it covers exactly
+            // one logical owner. Every covered schedule row always retains
+            // its own independently frozen boundary.
+            let scalar_slot = (*slot).or_else(|| (slots.len() == 1).then_some(slots[0]));
+            if let Some(scalar_slot) = scalar_slot {
+                let pending = &self.pending_slots[&scalar_slot];
+                qcsd.schema_version = Some(2);
+                qcsd.credit_advertised_at_us = pending.credit_advertised_at_us;
+                qcsd.credit_advertisement_delay_us = pending
                     .credit_advertised_at_us
-                    .map_or(advertised_at_us, |previous| previous.max(advertised_at_us)),
-            );
-            qcsd.schema_version = Some(2);
-            qcsd.credit_advertised_at_us = Some(advertised_at_us);
-            qcsd.credit_advertisement_delay_us =
-                Some(advertised_at_us.saturating_sub(pending.action_time_us));
+                    .map(|advertised| advertised.saturating_sub(pending.action_time_us));
+            }
         }
         let mut details = serde_json::to_value(record.observation())?;
         let Value::Object(fields) = &mut details else {
@@ -588,6 +697,36 @@ impl TraceFiles {
             details,
             qcsd,
         })
+    }
+
+    /// Resolve every logical incoming slot whose registered physical target
+    /// is covered by one on-wire `MAX_STREAM_DATA` advertisement. A frame may
+    /// carry one explicit scheduled release while also covering preceding
+    /// parser-owned capacity, so the explicit identity is additive rather
+    /// than an alternative to reverse target attribution.
+    fn advertised_credit_slots(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        explicit_slot: Option<QcsdSlotId>,
+    ) -> Vec<QcsdSlotId> {
+        let mut slots: Vec<_> = self
+            .incoming_target_limits
+            .iter()
+            .filter_map(|(slot, targets)| {
+                targets
+                    .get(&(endpoint, stream))
+                    .is_some_and(|target| *target <= absolute_limit)
+                    .then_some(*slot)
+            })
+            .collect();
+        if let Some(slot) = explicit_slot {
+            slots.push(slot);
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots
     }
 
     fn push_event(&mut self, row: EventTraceRow) -> Result<(), Error> {
