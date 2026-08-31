@@ -14506,6 +14506,42 @@ mod tests {
     }
 
     #[test]
+    fn slotless_unowned_receive_advertisement_records_without_scalar_provenance() {
+        let output = trace_output_dir("slotless-unowned-receive-advertisement");
+        let started = now();
+        let clock = QcsdObservationClock::new(started);
+        let endpoint = QcsdEndpointId(1);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let controller = QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let advertisement = clock.record_at(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: QcsdStreamId(0),
+                absolute_limit: 16,
+                slot: None,
+            },
+            started + Duration::from_micros(3),
+        );
+
+        traces
+            .observation_after_controller(
+                Some(endpoint),
+                &advertisement,
+                &controller,
+                Some(started + Duration::from_micros(4)),
+            )
+            .expect("record slotless unowned receive advertisement");
+        drop(traces);
+
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert_eq!(events.lines().count(), 2);
+        assert!(events.lines().nth(1).is_some_and(|event| {
+            event.starts_with("3,1,observation,recorded,") && event.contains("\"\"slot\"\":null")
+        }));
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
     fn missing_adapter_terminalizes_an_owned_parser_lease_once() {
         let output = trace_output_dir("owned-parser-lease-missing-adapter");
         let started = now();
@@ -18438,10 +18474,21 @@ mod tests {
             runner_wakeup_metrics.buflo_exact_incoming_retry_resolutions,
             0
         );
-        assert_eq!(runner_wakeup_metrics.buflo_exact_incoming_retry_drives, 6);
-        assert_eq!(runner_wakeup_metrics.wait_returns, 6);
-        assert_eq!(runner_wakeup_metrics.timer_wakeups, 6);
-        assert!(endpoints[0].test_output_drives.is_empty());
+        let retry_drives = runner_wakeup_metrics.buflo_exact_incoming_retry_drives;
+        assert!((1..=6).contains(&retry_drives));
+        assert!(runner_wakeup_metrics.wait_returns <= retry_drives);
+        assert!(retry_drives <= runner_wakeup_metrics.wait_returns.saturating_add(1));
+        assert_eq!(
+            runner_wakeup_metrics.timer_wakeups,
+            runner_wakeup_metrics.wait_returns
+        );
+        assert_eq!(
+            retry_drives
+                + u64::try_from(endpoints[0].test_output_drives.len())
+                    .expect("synthetic drive inventory fits u64"),
+            6,
+            "the real deadline may win before every synthetic callback, but each callback is consumed at most once"
+        );
 
         drop(traces);
         let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");

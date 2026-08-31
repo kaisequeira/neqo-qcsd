@@ -665,7 +665,10 @@ impl TraceFiles {
             // advertisement has scalar provenance only when it covers exactly
             // one logical owner. Every covered schedule row always retains
             // its own independently frozen boundary.
-            let scalar_slot = (*slot).or_else(|| (slots.len() == 1).then_some(slots[0]));
+            let scalar_slot = (*slot).or(match slots.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            });
             if let Some(scalar_slot) = scalar_slot {
                 let pending = &self.pending_slots[&scalar_slot];
                 qcsd.schema_version = Some(2);
