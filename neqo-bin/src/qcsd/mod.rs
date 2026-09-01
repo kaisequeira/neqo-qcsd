@@ -1388,8 +1388,100 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     })
 }
 
-const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 6;
-const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=10000; buflo_exact_release_active_wait_tail_us=10000; buflo_exact_release_guard_coincides_with_output_admission=true; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss";
+const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 7;
+const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=10000; buflo_exact_release_active_wait_tail_us=10000; buflo_exact_release_guard_coincides_with_output_admission=true; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard; buflo_exact_release_dispatch_lateness_histogram_counts_one_guard_exit_per_guard; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_aux_clocks=linux_clock_monotonic_raw_and_thread_cputime_id_or_unavailable; buflo_exact_release_aux_clock_unavailable_includes_missing_or_nonmonotonic_sample=true; buflo_exact_release_estimated_off_cpu_is_monotonic_elapsed_minus_thread_cpu_elapsed_saturating; buflo_exact_release_aux_clock_cannot_attribute_guest_scheduler_vs_hypervisor_steal; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=twice_actual_adapter_window_ns; buflo_exact_release_10000us_lead_fields_are_configured_maxima=true";
+
+#[cfg(target_os = "linux")]
+const BUFLO_EXACT_RELEASE_AUX_CLOCK_SOURCE: &str =
+    "linux-clock-gettime-monotonic-raw-and-thread-cputime-id-v1";
+#[cfg(not(target_os = "linux"))]
+const BUFLO_EXACT_RELEASE_AUX_CLOCK_SOURCE: &str = "unavailable-on-platform";
+
+const BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD: Duration = Duration::from_micros(50);
+const BUFLO_EXACT_RELEASE_TIMING_HISTOGRAM_UPPER_BOUNDS_NANOSECONDS: [u64; 7] = [
+    50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct BufloExactReleaseTimingHistogram {
+    upper_bounds_nanoseconds: [u64; 7],
+    counts: [u64; 8],
+}
+
+impl BufloExactReleaseTimingHistogram {
+    const fn new() -> Self {
+        Self {
+            upper_bounds_nanoseconds: BUFLO_EXACT_RELEASE_TIMING_HISTOGRAM_UPPER_BOUNDS_NANOSECONDS,
+            counts: [0; 8],
+        }
+    }
+
+    fn record(&mut self, nanoseconds: u64) {
+        let bucket = self
+            .upper_bounds_nanoseconds
+            .partition_point(|upper_bound| nanoseconds > *upper_bound);
+        self.counts[bucket] = self.counts[bucket].saturating_add(1);
+    }
+
+    fn total(self) -> u64 {
+        self.counts.into_iter().fold(0_u64, u64::saturating_add)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BufloExactReleaseAuxClockSample {
+    monotonic_raw_nanoseconds: Option<u64>,
+    thread_cpu_nanoseconds: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufloExactReleaseWaitEvidence {
+    entered_at: Instant,
+    active_wait_started_at: Instant,
+    dispatch_at: Instant,
+    passive_sleep_calls: u64,
+    passive_sleep_requested_nanoseconds: u64,
+    passive_sleep_elapsed_nanoseconds: u64,
+    max_passive_sleep_overrun_nanoseconds: u64,
+    active_wait_iterations: u64,
+    active_spin_interruptions: u64,
+    active_spin_interruption_nanoseconds: u64,
+    max_active_spin_gap_nanoseconds: u64,
+    active_wait_start_clocks: BufloExactReleaseAuxClockSample,
+    active_wait_end_clocks: BufloExactReleaseAuxClockSample,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct BufloExactReleaseWorstGuard {
+    endpoint: QcsdEndpointId,
+    slot: QcsdSlotId,
+    phase: &'static str,
+    packet_timestamp_us: u64,
+    guard_at_defense_nanoseconds: Option<u64>,
+    entered_at_defense_nanoseconds: Option<u64>,
+    active_wait_at_defense_nanoseconds: Option<u64>,
+    active_wait_started_at_defense_nanoseconds: Option<u64>,
+    release_at_defense_nanoseconds: Option<u64>,
+    deadline_at_defense_nanoseconds: Option<u64>,
+    dispatch_at_defense_nanoseconds: Option<u64>,
+    guard_entry_lateness_nanoseconds: u64,
+    passive_sleep_calls: u64,
+    passive_sleep_requested_nanoseconds: u64,
+    passive_sleep_elapsed_nanoseconds: u64,
+    max_passive_sleep_overrun_nanoseconds: u64,
+    active_wait_iterations: u64,
+    active_wait_monotonic_nanoseconds: u64,
+    active_wait_monotonic_raw_nanoseconds: Option<u64>,
+    active_wait_thread_cpu_nanoseconds: Option<u64>,
+    active_wait_estimated_off_cpu_nanoseconds: Option<u64>,
+    active_wait_monotonic_raw_divergence_nanoseconds: Option<u64>,
+    active_spin_interruptions: u64,
+    active_spin_interruption_nanoseconds: u64,
+    max_active_spin_gap_nanoseconds: u64,
+    dispatch_lateness_nanoseconds: u64,
+    dispatch_at_or_after_deadline: bool,
+    dispatch_after_deadline_nanoseconds: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct RunnerWakeupMetrics {
@@ -1405,6 +1497,28 @@ struct RunnerWakeupMetrics {
     buflo_exact_release_active_wait_nanoseconds: u64,
     buflo_exact_release_max_passive_wake_lateness_nanoseconds: u64,
     buflo_exact_release_max_guard_exit_lateness_nanoseconds: u64,
+    buflo_exact_release_max_guard_entry_lateness_nanoseconds: u64,
+    buflo_exact_release_passive_sleep_calls: u64,
+    buflo_exact_release_passive_sleep_requested_nanoseconds: u64,
+    buflo_exact_release_passive_sleep_elapsed_nanoseconds: u64,
+    buflo_exact_release_max_passive_sleep_overrun_nanoseconds: u64,
+    buflo_exact_release_active_wait_iterations: u64,
+    buflo_exact_release_active_spin_interruptions: u64,
+    buflo_exact_release_active_spin_interruption_nanoseconds: u64,
+    buflo_exact_release_max_active_spin_gap_nanoseconds: u64,
+    buflo_exact_release_aux_clock_source: &'static str,
+    buflo_exact_release_active_wait_aux_clock_guards: u64,
+    buflo_exact_release_active_wait_aux_clock_unavailable_guards: u64,
+    buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards: u64,
+    buflo_exact_release_active_wait_monotonic_raw_nanoseconds: u64,
+    buflo_exact_release_active_wait_thread_cpu_nanoseconds: u64,
+    buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds: u64,
+    buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds: u64,
+    buflo_exact_release_max_active_wait_monotonic_raw_divergence_nanoseconds: u64,
+    buflo_exact_release_dispatch_at_or_after_deadline_guards: u64,
+    buflo_exact_release_dispatch_lateness_histogram: BufloExactReleaseTimingHistogram,
+    buflo_exact_release_active_spin_gap_histogram: BufloExactReleaseTimingHistogram,
+    buflo_exact_release_worst_guard: Option<BufloExactReleaseWorstGuard>,
     buflo_exact_incoming_retry_drives: u64,
     buflo_exact_incoming_retry_resolutions: u64,
     buflo_exact_incoming_retry_max_wake_lateness_nanoseconds: u64,
@@ -1428,6 +1542,29 @@ impl RunnerWakeupMetrics {
             buflo_exact_release_active_wait_nanoseconds: 0,
             buflo_exact_release_max_passive_wake_lateness_nanoseconds: 0,
             buflo_exact_release_max_guard_exit_lateness_nanoseconds: 0,
+            buflo_exact_release_max_guard_entry_lateness_nanoseconds: 0,
+            buflo_exact_release_passive_sleep_calls: 0,
+            buflo_exact_release_passive_sleep_requested_nanoseconds: 0,
+            buflo_exact_release_passive_sleep_elapsed_nanoseconds: 0,
+            buflo_exact_release_max_passive_sleep_overrun_nanoseconds: 0,
+            buflo_exact_release_active_wait_iterations: 0,
+            buflo_exact_release_active_spin_interruptions: 0,
+            buflo_exact_release_active_spin_interruption_nanoseconds: 0,
+            buflo_exact_release_max_active_spin_gap_nanoseconds: 0,
+            buflo_exact_release_aux_clock_source: BUFLO_EXACT_RELEASE_AUX_CLOCK_SOURCE,
+            buflo_exact_release_active_wait_aux_clock_guards: 0,
+            buflo_exact_release_active_wait_aux_clock_unavailable_guards: 0,
+            buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards: 0,
+            buflo_exact_release_active_wait_monotonic_raw_nanoseconds: 0,
+            buflo_exact_release_active_wait_thread_cpu_nanoseconds: 0,
+            buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds: 0,
+            buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds: 0,
+            buflo_exact_release_max_active_wait_monotonic_raw_divergence_nanoseconds: 0,
+            buflo_exact_release_dispatch_at_or_after_deadline_guards: 0,
+            buflo_exact_release_dispatch_lateness_histogram: BufloExactReleaseTimingHistogram::new(
+            ),
+            buflo_exact_release_active_spin_gap_histogram: BufloExactReleaseTimingHistogram::new(),
+            buflo_exact_release_worst_guard: None,
             buflo_exact_incoming_retry_drives: 0,
             buflo_exact_incoming_retry_resolutions: 0,
             buflo_exact_incoming_retry_max_wake_lateness_nanoseconds: 0,
@@ -1455,14 +1592,61 @@ impl RunnerWakeupMetrics {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one atomic recorder keeps every schema-7 aggregate and its bounded worst-guard evidence consistent"
+    )]
     fn record_buflo_exact_release_guard(
         &mut self,
-        entered_at: Instant,
-        active_wait_at: Instant,
-        active_wait_started_at: Instant,
-        release: Instant,
-        dispatch_at: Instant,
+        guard: &BufloExactReleaseGuard,
+        defense_start: Option<Instant>,
+        evidence: &BufloExactReleaseWaitEvidence,
     ) {
+        let BufloExactReleaseWaitEvidence {
+            entered_at,
+            active_wait_started_at,
+            dispatch_at,
+            passive_sleep_calls,
+            passive_sleep_requested_nanoseconds,
+            passive_sleep_elapsed_nanoseconds,
+            max_passive_sleep_overrun_nanoseconds,
+            active_wait_iterations,
+            active_spin_interruptions,
+            active_spin_interruption_nanoseconds,
+            max_active_spin_gap_nanoseconds,
+            active_wait_start_clocks,
+            active_wait_end_clocks,
+        } = *evidence;
+        let active_wait_monotonic_nanoseconds =
+            duration_as_u64_nanos(dispatch_at.saturating_duration_since(active_wait_started_at));
+        let monotonic_raw_elapsed = optional_clock_elapsed(
+            active_wait_start_clocks.monotonic_raw_nanoseconds,
+            active_wait_end_clocks.monotonic_raw_nanoseconds,
+        );
+        let thread_cpu_elapsed = optional_clock_elapsed(
+            active_wait_start_clocks.thread_cpu_nanoseconds,
+            active_wait_end_clocks.thread_cpu_nanoseconds,
+        );
+        let aux_clock_complete = monotonic_raw_elapsed.is_some() && thread_cpu_elapsed.is_some();
+        let aux_clock_nonmonotonic = clock_pair_is_nonmonotonic(
+            active_wait_start_clocks.monotonic_raw_nanoseconds,
+            active_wait_end_clocks.monotonic_raw_nanoseconds,
+        ) || clock_pair_is_nonmonotonic(
+            active_wait_start_clocks.thread_cpu_nanoseconds,
+            active_wait_end_clocks.thread_cpu_nanoseconds,
+        );
+        let estimated_off_cpu = thread_cpu_elapsed
+            .map(|thread_cpu| active_wait_monotonic_nanoseconds.saturating_sub(thread_cpu));
+        let monotonic_raw_divergence = monotonic_raw_elapsed
+            .map(|monotonic_raw| active_wait_monotonic_nanoseconds.abs_diff(monotonic_raw));
+        let guard_entry_lateness =
+            duration_as_u64_nanos(entered_at.saturating_duration_since(guard.guard_at));
+        let dispatch_lateness =
+            duration_as_u64_nanos(dispatch_at.saturating_duration_since(guard.release));
+        let dispatch_after_deadline =
+            duration_as_u64_nanos(dispatch_at.saturating_duration_since(guard.deadline));
+        let dispatch_at_or_after_deadline = dispatch_at >= guard.deadline;
+
         self.buflo_exact_release_guard_entries =
             self.buflo_exact_release_guard_entries.saturating_add(1);
         self.buflo_exact_release_guard_wait_nanoseconds = self
@@ -1472,19 +1656,178 @@ impl RunnerWakeupMetrics {
             ));
         self.buflo_exact_release_active_wait_nanoseconds = self
             .buflo_exact_release_active_wait_nanoseconds
-            .saturating_add(duration_as_u64_nanos(
-                dispatch_at.saturating_duration_since(active_wait_started_at),
-            ));
+            .saturating_add(active_wait_monotonic_nanoseconds);
         self.buflo_exact_release_max_passive_wake_lateness_nanoseconds = self
             .buflo_exact_release_max_passive_wake_lateness_nanoseconds
             .max(duration_as_u64_nanos(
-                active_wait_started_at.saturating_duration_since(active_wait_at),
+                active_wait_started_at.saturating_duration_since(guard.active_wait_at),
             ));
         self.buflo_exact_release_max_guard_exit_lateness_nanoseconds = self
             .buflo_exact_release_max_guard_exit_lateness_nanoseconds
-            .max(duration_as_u64_nanos(
-                dispatch_at.saturating_duration_since(release),
-            ));
+            .max(dispatch_lateness);
+        self.buflo_exact_release_max_guard_entry_lateness_nanoseconds = self
+            .buflo_exact_release_max_guard_entry_lateness_nanoseconds
+            .max(guard_entry_lateness);
+        self.buflo_exact_release_passive_sleep_calls = self
+            .buflo_exact_release_passive_sleep_calls
+            .saturating_add(passive_sleep_calls);
+        self.buflo_exact_release_passive_sleep_requested_nanoseconds = self
+            .buflo_exact_release_passive_sleep_requested_nanoseconds
+            .saturating_add(passive_sleep_requested_nanoseconds);
+        self.buflo_exact_release_passive_sleep_elapsed_nanoseconds = self
+            .buflo_exact_release_passive_sleep_elapsed_nanoseconds
+            .saturating_add(passive_sleep_elapsed_nanoseconds);
+        self.buflo_exact_release_max_passive_sleep_overrun_nanoseconds = self
+            .buflo_exact_release_max_passive_sleep_overrun_nanoseconds
+            .max(max_passive_sleep_overrun_nanoseconds);
+        self.buflo_exact_release_active_wait_iterations = self
+            .buflo_exact_release_active_wait_iterations
+            .saturating_add(active_wait_iterations);
+        self.buflo_exact_release_active_spin_interruptions = self
+            .buflo_exact_release_active_spin_interruptions
+            .saturating_add(active_spin_interruptions);
+        self.buflo_exact_release_active_spin_interruption_nanoseconds = self
+            .buflo_exact_release_active_spin_interruption_nanoseconds
+            .saturating_add(active_spin_interruption_nanoseconds);
+        self.buflo_exact_release_max_active_spin_gap_nanoseconds = self
+            .buflo_exact_release_max_active_spin_gap_nanoseconds
+            .max(max_active_spin_gap_nanoseconds);
+        self.buflo_exact_release_active_spin_gap_histogram
+            .record(max_active_spin_gap_nanoseconds);
+        self.buflo_exact_release_dispatch_lateness_histogram
+            .record(dispatch_lateness);
+        if dispatch_at_or_after_deadline {
+            self.buflo_exact_release_dispatch_at_or_after_deadline_guards = self
+                .buflo_exact_release_dispatch_at_or_after_deadline_guards
+                .saturating_add(1);
+        }
+        if aux_clock_complete {
+            self.buflo_exact_release_active_wait_aux_clock_guards = self
+                .buflo_exact_release_active_wait_aux_clock_guards
+                .saturating_add(1);
+        } else {
+            self.buflo_exact_release_active_wait_aux_clock_unavailable_guards = self
+                .buflo_exact_release_active_wait_aux_clock_unavailable_guards
+                .saturating_add(1);
+        }
+        if aux_clock_nonmonotonic {
+            self.buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards = self
+                .buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards
+                .saturating_add(1);
+        }
+        if let Some(monotonic_raw) = monotonic_raw_elapsed {
+            self.buflo_exact_release_active_wait_monotonic_raw_nanoseconds = self
+                .buflo_exact_release_active_wait_monotonic_raw_nanoseconds
+                .saturating_add(monotonic_raw);
+        }
+        if let Some(thread_cpu) = thread_cpu_elapsed {
+            self.buflo_exact_release_active_wait_thread_cpu_nanoseconds = self
+                .buflo_exact_release_active_wait_thread_cpu_nanoseconds
+                .saturating_add(thread_cpu);
+        }
+        if let Some(off_cpu) = estimated_off_cpu {
+            self.buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds = self
+                .buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds
+                .saturating_add(off_cpu);
+            self.buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds = self
+                .buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds
+                .max(off_cpu);
+        }
+        if let Some(divergence) = monotonic_raw_divergence {
+            self.buflo_exact_release_max_active_wait_monotonic_raw_divergence_nanoseconds = self
+                .buflo_exact_release_max_active_wait_monotonic_raw_divergence_nanoseconds
+                .max(divergence);
+        }
+
+        let replace_worst = self
+            .buflo_exact_release_worst_guard
+            .is_none_or(|current| dispatch_lateness > current.dispatch_lateness_nanoseconds);
+        if replace_worst {
+            self.buflo_exact_release_worst_guard = Some(BufloExactReleaseWorstGuard {
+                endpoint: guard.endpoint,
+                slot: guard.slot,
+                phase: guard.phase.as_str(),
+                packet_timestamp_us: guard.packet.timestamp_us(),
+                guard_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    guard.guard_at,
+                    defense_start,
+                ),
+                entered_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    entered_at,
+                    defense_start,
+                ),
+                active_wait_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    guard.active_wait_at,
+                    defense_start,
+                ),
+                active_wait_started_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    active_wait_started_at,
+                    defense_start,
+                ),
+                release_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    guard.release,
+                    defense_start,
+                ),
+                deadline_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    guard.deadline,
+                    defense_start,
+                ),
+                dispatch_at_defense_nanoseconds: instant_after_start_nanoseconds(
+                    dispatch_at,
+                    defense_start,
+                ),
+                guard_entry_lateness_nanoseconds: guard_entry_lateness,
+                passive_sleep_calls,
+                passive_sleep_requested_nanoseconds,
+                passive_sleep_elapsed_nanoseconds,
+                max_passive_sleep_overrun_nanoseconds,
+                active_wait_iterations,
+                active_wait_monotonic_nanoseconds,
+                active_wait_monotonic_raw_nanoseconds: monotonic_raw_elapsed,
+                active_wait_thread_cpu_nanoseconds: thread_cpu_elapsed,
+                active_wait_estimated_off_cpu_nanoseconds: estimated_off_cpu,
+                active_wait_monotonic_raw_divergence_nanoseconds: monotonic_raw_divergence,
+                active_spin_interruptions,
+                active_spin_interruption_nanoseconds,
+                max_active_spin_gap_nanoseconds,
+                dispatch_lateness_nanoseconds: dispatch_lateness,
+                dispatch_at_or_after_deadline,
+                dispatch_after_deadline_nanoseconds: dispatch_after_deadline,
+            });
+        }
+        debug_assert!(self.buflo_exact_release_invariants_hold());
+    }
+
+    fn buflo_exact_release_invariants_hold(self) -> bool {
+        let guards = self.buflo_exact_release_guard_entries;
+        let worst_matches_guard_count =
+            self.buflo_exact_release_worst_guard.is_some() == (guards > 0);
+        let worst_matches_max_dispatch = self.buflo_exact_release_worst_guard.is_none_or(|worst| {
+            worst.dispatch_lateness_nanoseconds
+                == self.buflo_exact_release_max_guard_exit_lateness_nanoseconds
+        });
+        self.buflo_exact_release_dispatch_lateness_histogram.total() == guards
+            && self.buflo_exact_release_active_spin_gap_histogram.total() == guards
+            && self
+                .buflo_exact_release_active_wait_aux_clock_guards
+                .saturating_add(self.buflo_exact_release_active_wait_aux_clock_unavailable_guards)
+                == guards
+            && self.buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards
+                <= self.buflo_exact_release_active_wait_aux_clock_unavailable_guards
+            && self.buflo_exact_release_dispatch_at_or_after_deadline_guards <= guards
+            && worst_matches_guard_count
+            && worst_matches_max_dispatch
+            && self.buflo_exact_release_max_passive_sleep_overrun_nanoseconds
+                <= self.buflo_exact_release_passive_sleep_elapsed_nanoseconds
+            && self.buflo_exact_release_max_active_spin_gap_nanoseconds
+                <= self.buflo_exact_release_active_wait_nanoseconds
+            && self.buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds
+                <= self.buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds
+            && ((self.buflo_exact_release_active_spin_interruptions == 0)
+                == (self.buflo_exact_release_active_spin_interruption_nanoseconds == 0))
+            && (self.buflo_exact_release_max_active_spin_gap_nanoseconds
+                <= duration_as_u64_nanos(BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD)
+                || self.buflo_exact_release_active_spin_interruptions > 0)
     }
 
     fn record_cs_exact_incoming_retry_drive(&mut self, phase_at: Instant, attempted_at: Instant) {
@@ -1542,6 +1885,20 @@ impl RunnerWakeupMetrics {
 
 fn duration_as_u64_nanos(value: Duration) -> u64 {
     u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn optional_clock_elapsed(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+    end?.checked_sub(start?)
+}
+
+const fn clock_pair_is_nonmonotonic(start: Option<u64>, end: Option<u64>) -> bool {
+    matches!((start, end), (Some(start), Some(end)) if end < start)
+}
+
+fn instant_after_start_nanoseconds(instant: Instant, start: Option<Instant>) -> Option<u64> {
+    let start = start?;
+    let elapsed = instant.checked_duration_since(start)?;
+    Some(duration_as_u64_nanos(elapsed))
 }
 
 #[derive(Debug, Serialize)]
@@ -8379,6 +8736,15 @@ enum BufloExactReleasePhase {
     Committed,
 }
 
+impl BufloExactReleasePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prearmed => "prearmed",
+            Self::Committed => "committed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BufloExactReleaseWaitStep {
     Passive(Duration),
@@ -8586,23 +8952,120 @@ fn buflo_exact_release_wait_step(
     }
 }
 
-fn wait_for_buflo_exact_release(guard: &BufloExactReleaseGuard) -> (Instant, Instant, Instant) {
+#[cfg(target_os = "linux")]
+fn linux_clock_nanoseconds(clock_id: libc::clockid_t) -> Option<u64> {
+    let mut value: libc::timespec = unsafe { mem::zeroed() };
+    if unsafe { libc::clock_gettime(clock_id, &raw mut value) } != 0
+        || value.tv_sec < 0
+        || value.tv_nsec < 0
+    {
+        return None;
+    }
+    u64::try_from(value.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(value.tv_nsec).ok()?)
+}
+
+fn buflo_exact_release_aux_clock_sample() -> BufloExactReleaseAuxClockSample {
+    #[cfg(target_os = "linux")]
+    {
+        BufloExactReleaseAuxClockSample {
+            monotonic_raw_nanoseconds: linux_clock_nanoseconds(libc::CLOCK_MONOTONIC_RAW),
+            thread_cpu_nanoseconds: linux_clock_nanoseconds(libc::CLOCK_THREAD_CPUTIME_ID),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        BufloExactReleaseAuxClockSample::default()
+    }
+}
+
+fn record_active_spin_gap(
+    evidence: &mut BufloExactReleaseWaitEvidence,
+    previous: Instant,
+    current: Instant,
+) {
+    let gap = duration_as_u64_nanos(current.saturating_duration_since(previous));
+    evidence.max_active_spin_gap_nanoseconds = evidence.max_active_spin_gap_nanoseconds.max(gap);
+    if gap > duration_as_u64_nanos(BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD) {
+        evidence.active_spin_interruptions = evidence.active_spin_interruptions.saturating_add(1);
+        evidence.active_spin_interruption_nanoseconds = evidence
+            .active_spin_interruption_nanoseconds
+            .saturating_add(gap);
+    }
+}
+
+fn wait_for_buflo_exact_release(guard: &BufloExactReleaseGuard) -> BufloExactReleaseWaitEvidence {
     let entered_at = now();
     let mut active_wait_started_at = None;
+    let mut active_wait_start_clocks = None;
+    let mut previous_active_sample_at = None;
+    let mut evidence = BufloExactReleaseWaitEvidence {
+        entered_at,
+        active_wait_started_at: entered_at,
+        dispatch_at: entered_at,
+        passive_sleep_calls: 0,
+        passive_sleep_requested_nanoseconds: 0,
+        passive_sleep_elapsed_nanoseconds: 0,
+        max_passive_sleep_overrun_nanoseconds: 0,
+        active_wait_iterations: 0,
+        active_spin_interruptions: 0,
+        active_spin_interruption_nanoseconds: 0,
+        max_active_spin_gap_nanoseconds: 0,
+        active_wait_start_clocks: BufloExactReleaseAuxClockSample::default(),
+        active_wait_end_clocks: BufloExactReleaseAuxClockSample::default(),
+    };
     loop {
         let current = now();
         match buflo_exact_release_wait_step(guard, current) {
-            BufloExactReleaseWaitStep::Passive(delay) => std::thread::sleep(delay),
+            BufloExactReleaseWaitStep::Passive(delay) => {
+                std::thread::sleep(delay);
+                let returned_at = now();
+                let elapsed = duration_as_u64_nanos(returned_at.saturating_duration_since(current));
+                let requested = duration_as_u64_nanos(delay);
+                evidence.passive_sleep_calls = evidence.passive_sleep_calls.saturating_add(1);
+                evidence.passive_sleep_requested_nanoseconds = evidence
+                    .passive_sleep_requested_nanoseconds
+                    .saturating_add(requested);
+                evidence.passive_sleep_elapsed_nanoseconds = evidence
+                    .passive_sleep_elapsed_nanoseconds
+                    .saturating_add(elapsed);
+                evidence.max_passive_sleep_overrun_nanoseconds = evidence
+                    .max_passive_sleep_overrun_nanoseconds
+                    .max(elapsed.saturating_sub(requested));
+            }
             BufloExactReleaseWaitStep::Active => {
-                _ = active_wait_started_at.get_or_insert(current);
+                if active_wait_started_at.is_none() {
+                    active_wait_started_at = Some(current);
+                    active_wait_start_clocks = Some(buflo_exact_release_aux_clock_sample());
+                    // Keep auxiliary clock-read overhead out of the observed
+                    // inter-iteration gaps used to identify active-spin
+                    // interruptions.
+                    previous_active_sample_at = Some(now());
+                } else if let Some(previous) = previous_active_sample_at.replace(current) {
+                    record_active_spin_gap(&mut evidence, previous, current);
+                }
+                evidence.active_wait_iterations = evidence.active_wait_iterations.saturating_add(1);
                 std::hint::spin_loop();
             }
             BufloExactReleaseWaitStep::Dispatch => {
-                return (
-                    entered_at,
-                    active_wait_started_at.unwrap_or(current),
-                    current,
-                );
+                if let Some(previous) = previous_active_sample_at {
+                    record_active_spin_gap(&mut evidence, previous, current);
+                }
+                let (active_wait_start_clocks, active_wait_end_clocks) = active_wait_start_clocks
+                    .map_or_else(
+                        || {
+                            let sample = buflo_exact_release_aux_clock_sample();
+                            (sample, sample)
+                        },
+                        |start| (start, buflo_exact_release_aux_clock_sample()),
+                    );
+                evidence.active_wait_started_at = active_wait_started_at.unwrap_or(current);
+                evidence.dispatch_at = current;
+                evidence.active_wait_start_clocks = active_wait_start_clocks;
+                evidence.active_wait_end_clocks = active_wait_end_clocks;
+                return evidence;
             }
         }
     }
@@ -9801,13 +10264,12 @@ async fn dispatch_due_buflo_exact_release(
     // Callers invoke this boundary between every bounded unit of ordinary work
     // as well as at the loop head.
     debug_assert!(guard.release < guard.deadline);
-    let (entered_at, active_wait_started_at, dispatch_at) = wait_for_buflo_exact_release(&guard);
+    let exact_release_evidence = wait_for_buflo_exact_release(&guard);
+    let dispatch_at = exact_release_evidence.dispatch_at;
     runner_wakeup_metrics.record_buflo_exact_release_guard(
-        entered_at,
-        guard.active_wait_at,
-        active_wait_started_at,
-        guard.release,
-        dispatch_at,
+        &guard,
+        defense_start,
+        &exact_release_evidence,
     );
     if dispatch_at >= run_deadline {
         return Err(deadline_error(
@@ -11059,30 +11521,30 @@ mod tests {
 
     use super::{
         ActivityWake, ApplicationBatchLifecycle, Args, BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
-        BufloExactReleaseCandidate, BufloExactReleaseGuard, BufloExactReleasePhase,
+        BufloExactReleaseAuxClockSample, BufloExactReleaseCandidate, BufloExactReleaseGuard,
+        BufloExactReleasePhase, BufloExactReleaseTimingHistogram, BufloExactReleaseWaitEvidence,
         BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg, CsExactIncomingRetry,
         CsExactIncomingRetryPhase, DefenseArg, Error, ExpectedChaffIdentity,
         OutputDriveCardinality, OutputWorkBoundary, PrefixBurst, PrefixNumericProfile,
         PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg,
         QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
-        RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg,
-        ResourceRunState, ResponseQualificationMode, ResponseQualificationRequest, RunCompletion,
-        RunSpec, RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket,
-        SocketHandoff, SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg,
-        StreamActivationStage, StreamRecord, StreamType, SustainedResponseQualificationRequest,
-        TerminalActionSemantics, TestOutputDrive, TrafficMorphingActivation, absolute_wakeup,
-        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
-        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
-        attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
-        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
-        buflo_exact_incoming_identities, buflo_exact_incoming_identity_is_pending,
-        buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
-        buflo_exact_release_wait_step, buflo_run_summary,
-        buflo_unadvertised_scheduled_receive_credit_endpoints, cancel_uncommitted_prearms_on_abort,
-        chaff_send_halves_peer_confirmed, create_endpoints, cs_buflo_run_summary,
-        cs_exact_incoming_identity_is_pending, cs_exact_incoming_retry_inventory,
-        cs_exact_incoming_retry_is_due, datagram_observation, deadline_error,
-        defense_parameter_provenance, dispatch_buflo_exact_release,
+        RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RequestPolicyArg, ResourceRunState,
+        ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
+        RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
+        SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
+        StreamRecord, StreamType, SustainedResponseQualificationRequest, TerminalActionSemantics,
+        TestOutputDrive, TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
+        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
+        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
+        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
+        bounded_qualification_wait, buflo_exact_incoming_identities,
+        buflo_exact_incoming_identity_is_pending, buflo_exact_release_guard_excluding_candidates,
+        buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
+        buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
+        cancel_uncommitted_prearms_on_abort, chaff_send_halves_peer_confirmed, create_endpoints,
+        cs_buflo_run_summary, cs_exact_incoming_identity_is_pending,
+        cs_exact_incoming_retry_inventory, cs_exact_incoming_retry_is_due, datagram_observation,
+        deadline_error, defense_parameter_provenance, dispatch_buflo_exact_release,
         dispatch_due_cs_exact_incoming_retry, dispatch_ready_requests, drain_qualifier_stream_data,
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_until, drive_endpoint_output_with_clock,
@@ -12604,8 +13066,65 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the receipt fixture explicitly checks the complete serialized evidence boundary"
+    )]
     fn run_receipt_keeps_evidence_without_duplicate_workload_fields() {
         let output = trace_output_dir("minimal-run-receipt");
+        let defense_start = now();
+        let release = defense_start + Duration::from_millis(20);
+        let deadline = release + Duration::from_millis(5);
+        let guard_at = release
+            .checked_sub(Duration::from_millis(10))
+            .expect("release has a guard predecessor");
+        let guard = BufloExactReleaseGuard {
+            endpoint_index: 0,
+            endpoint: QcsdEndpointId(0),
+            slot: QcsdSlotId(9),
+            packet: Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
+                .expect("packet"),
+            phase: BufloExactReleasePhase::Committed,
+            output_admission_at: guard_at,
+            guard_at,
+            active_wait_at: guard_at,
+            release,
+            deadline,
+        };
+        let mut runner_wakeup_metrics = RunnerWakeupMetrics {
+            wait_returns: 3,
+            socket_readiness_wakeups: 1,
+            timer_wakeups: 2,
+            controller_deadline_timer_wakeups: 1,
+            other_timer_wakeups: 1,
+            buflo_exact_incoming_retry_drives: 2,
+            buflo_exact_incoming_retry_resolutions: 1,
+            buflo_exact_incoming_retry_max_wake_lateness_nanoseconds: 3,
+            cs_exact_incoming_retry_drives: 3,
+            cs_exact_incoming_retry_resolutions: 1,
+            cs_exact_incoming_retry_max_phase_lateness_nanoseconds: 2,
+            ..RunnerWakeupMetrics::new()
+        };
+        runner_wakeup_metrics.record_buflo_exact_release_guard(
+            &guard,
+            Some(defense_start),
+            &BufloExactReleaseWaitEvidence {
+                entered_at: guard_at,
+                active_wait_started_at: guard_at,
+                dispatch_at: release + Duration::from_nanos(1),
+                passive_sleep_calls: 0,
+                passive_sleep_requested_nanoseconds: 0,
+                passive_sleep_elapsed_nanoseconds: 0,
+                max_passive_sleep_overrun_nanoseconds: 0,
+                active_wait_iterations: 1,
+                active_spin_interruptions: 0,
+                active_spin_interruption_nanoseconds: 0,
+                max_active_spin_gap_nanoseconds: 0,
+                active_wait_start_clocks: BufloExactReleaseAuxClockSample::default(),
+                active_wait_end_clocks: BufloExactReleaseAuxClockSample::default(),
+            },
+        );
+        assert!(runner_wakeup_metrics.buflo_exact_release_invariants_hold());
         let spec = RunSpec {
             method: "GET",
             workload: ResourceManifest {
@@ -12636,26 +13155,7 @@ mod tests {
                 defense_start_monotonic_ns: Some(3),
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
-                runner_wakeup_metrics: Some(RunnerWakeupMetrics {
-                    schema_version: RUNNER_WAKEUP_METRICS_SCHEMA_VERSION,
-                    semantics: RUNNER_WAKEUP_METRICS_SEMANTICS,
-                    wait_returns: 3,
-                    socket_readiness_wakeups: 1,
-                    timer_wakeups: 2,
-                    controller_deadline_timer_wakeups: 1,
-                    other_timer_wakeups: 1,
-                    buflo_exact_release_guard_entries: 1,
-                    buflo_exact_release_guard_wait_nanoseconds: 10,
-                    buflo_exact_release_active_wait_nanoseconds: 5,
-                    buflo_exact_release_max_passive_wake_lateness_nanoseconds: 0,
-                    buflo_exact_release_max_guard_exit_lateness_nanoseconds: 1,
-                    buflo_exact_incoming_retry_drives: 2,
-                    buflo_exact_incoming_retry_resolutions: 1,
-                    buflo_exact_incoming_retry_max_wake_lateness_nanoseconds: 3,
-                    cs_exact_incoming_retry_drives: 3,
-                    cs_exact_incoming_retry_resolutions: 1,
-                    cs_exact_incoming_retry_max_phase_lateness_nanoseconds: 2,
-                }),
+                runner_wakeup_metrics: Some(runner_wakeup_metrics),
             },
         )
         .expect("write run receipt");
@@ -12673,6 +13173,24 @@ mod tests {
             RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         );
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["buflo_exact_release_dispatch_lateness_histogram"]["upper_bounds_nanoseconds"],
+            json!([
+                50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000
+            ])
+        );
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["buflo_exact_release_dispatch_lateness_histogram"]["counts"],
+            json!([1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["buflo_exact_release_active_spin_gap_histogram"]["counts"],
+            json!([1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["buflo_exact_release_worst_guard"]["slot"],
+            9
+        );
         assert_eq!(
             receipt["runner_wakeup_metrics"]["buflo_exact_release_guard_entries"],
             1
@@ -18759,6 +19277,124 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cross-clock fixture keeps normalisation, guard construction, and serialized evidence together"
+    )]
+    fn fractional_prearm_serializes_nominal_packet_and_actual_adapter_window() {
+        let defense_start = now();
+        let action_elapsed = Duration::from_millis(10) + Duration::from_nanos(456);
+        let action_at = defense_start + action_elapsed;
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let mut action = QcsdAction::PrearmPacket {
+            endpoint: QcsdEndpointId(3),
+            packet,
+            slot: QcsdSlotId(17),
+            not_before_after_us: 0,
+            deadline_after_us: 0,
+            allow_stream_data: true,
+        };
+        normalize_rolling_prearm_window(&mut action, action_elapsed, Duration::from_millis(5))
+            .expect("fractional prearm retains a nonempty adapter window");
+        let QcsdAction::PrearmPacket {
+            not_before_after_us,
+            deadline_after_us,
+            ..
+        } = action
+        else {
+            unreachable!("test action remains a prearm")
+        };
+        assert_eq!(not_before_after_us, 10_000);
+        assert_eq!(deadline_after_us, 14_999);
+
+        let release = action_at + Duration::from_micros(not_before_after_us);
+        let deadline = action_at + Duration::from_micros(deadline_after_us);
+        let guard = buflo_exact_release_guard_from_candidates(
+            true,
+            [BufloExactReleaseCandidate {
+                endpoint_index: 0,
+                endpoint: QcsdEndpointId(3),
+                slot: QcsdSlotId(17),
+                packet,
+                phase: BufloExactReleasePhase::Prearmed,
+                release,
+                deadline,
+            }],
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        )
+        .expect("fractional candidate is valid")
+        .expect("fractional candidate establishes a guard");
+        assert_eq!(
+            release.saturating_duration_since(defense_start),
+            Duration::from_nanos(20_000_456)
+        );
+        assert_eq!(
+            deadline.saturating_duration_since(defense_start),
+            Duration::from_nanos(24_999_456)
+        );
+        assert_eq!(
+            deadline.saturating_duration_since(release),
+            Duration::from_nanos(4_999_000)
+        );
+        assert_eq!(
+            release.saturating_duration_since(guard.guard_at),
+            Duration::from_nanos(9_998_000)
+        );
+        assert_eq!(guard.guard_at, guard.active_wait_at);
+        assert_eq!(guard.guard_at, guard.output_admission_at);
+
+        let dispatch_at = release + Duration::from_nanos(7);
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.record_buflo_exact_release_guard(
+            &guard,
+            Some(defense_start),
+            &BufloExactReleaseWaitEvidence {
+                entered_at: guard.guard_at,
+                active_wait_started_at: guard.guard_at,
+                dispatch_at,
+                passive_sleep_calls: 0,
+                passive_sleep_requested_nanoseconds: 0,
+                passive_sleep_elapsed_nanoseconds: 0,
+                max_passive_sleep_overrun_nanoseconds: 0,
+                active_wait_iterations: 1,
+                active_spin_interruptions: 0,
+                active_spin_interruption_nanoseconds: 0,
+                max_active_spin_gap_nanoseconds: 0,
+                active_wait_start_clocks: BufloExactReleaseAuxClockSample::default(),
+                active_wait_end_clocks: BufloExactReleaseAuxClockSample::default(),
+            },
+        );
+        assert!(metrics.buflo_exact_release_invariants_hold());
+
+        let serialized = serde_json::to_value(metrics).expect("serialize fractional metrics");
+        let semantics = serialized["semantics"]
+            .as_str()
+            .expect("runner semantics are a string");
+        for clause in [
+            "buflo_rolling_prearm_not_before_relative_us_rounding=ceil",
+            "buflo_rolling_prearm_deadline_relative_us_rounding=floor",
+            "buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release",
+            "buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants",
+            "buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000",
+            "buflo_exact_release_actual_guard_and_active_wait_lead_ns=twice_actual_adapter_window_ns",
+            "buflo_exact_release_10000us_lead_fields_are_configured_maxima=true",
+        ] {
+            assert!(semantics.contains(clause), "missing semantics clause {clause}");
+        }
+        let worst = &serialized["buflo_exact_release_worst_guard"];
+        assert_eq!(worst["packet_timestamp_us"], 20_000);
+        assert_eq!(worst["guard_at_defense_nanoseconds"], 10_002_456);
+        assert_eq!(worst["active_wait_at_defense_nanoseconds"], 10_002_456);
+        assert_eq!(worst["release_at_defense_nanoseconds"], 20_000_456);
+        assert_eq!(worst["deadline_at_defense_nanoseconds"], 24_999_456);
+        assert_eq!(worst["dispatch_at_defense_nanoseconds"], 20_000_463);
+        assert_eq!(worst["dispatch_lateness_nanoseconds"], 7);
+        assert_eq!(worst["dispatch_at_or_after_deadline"], false);
+        assert_eq!(worst["dispatch_after_deadline_nanoseconds"], 0);
+    }
+
+    #[test]
     fn adapter_errors_use_specific_send_reasons_and_abort_other_actions() {
         let send = QcsdAction::SendPacket {
             endpoint: QcsdEndpointId(1),
@@ -21192,6 +21828,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "the schema fixture explicitly asserts every aggregate and partition invariant"
+    )]
     fn runner_wakeup_metrics_partition_actual_select_returns() {
         let mut metrics = RunnerWakeupMetrics::new();
         metrics.record(ActivityWake::SocketReady, true);
@@ -21202,12 +21843,44 @@ mod tests {
             .checked_sub(Duration::from_millis(10))
             .expect("release has a guard predecessor");
         let active_wait_started_at = entered_at;
-        metrics.record_buflo_exact_release_guard(
-            entered_at,
-            active_wait_started_at,
-            active_wait_started_at,
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let guard = BufloExactReleaseGuard {
+            endpoint_index: 2,
+            endpoint: QcsdEndpointId(7),
+            slot: QcsdSlotId(11),
+            packet,
+            phase: BufloExactReleasePhase::Committed,
+            output_admission_at: entered_at,
+            guard_at: entered_at,
+            active_wait_at: entered_at,
             release,
-            release + Duration::from_nanos(7),
+            deadline: release + Duration::from_millis(5),
+        };
+        metrics.record_buflo_exact_release_guard(
+            &guard,
+            entered_at.checked_sub(Duration::from_millis(10)),
+            &BufloExactReleaseWaitEvidence {
+                entered_at,
+                active_wait_started_at,
+                dispatch_at: release + Duration::from_nanos(7),
+                passive_sleep_calls: 1,
+                passive_sleep_requested_nanoseconds: 5_000_000,
+                passive_sleep_elapsed_nanoseconds: 5_000_013,
+                max_passive_sleep_overrun_nanoseconds: 13,
+                active_wait_iterations: 42,
+                active_spin_interruptions: 1,
+                active_spin_interruption_nanoseconds: 6_000_000,
+                max_active_spin_gap_nanoseconds: 6_000_000,
+                active_wait_start_clocks: BufloExactReleaseAuxClockSample {
+                    monotonic_raw_nanoseconds: Some(1_000),
+                    thread_cpu_nanoseconds: Some(2_000),
+                },
+                active_wait_end_clocks: BufloExactReleaseAuxClockSample {
+                    monotonic_raw_nanoseconds: Some(10_001_010),
+                    thread_cpu_nanoseconds: Some(8_002_000),
+                },
+            },
         );
         let retry_phase = release + Duration::from_millis(1);
         metrics.record_cs_exact_incoming_retry_drive(
@@ -21230,7 +21903,7 @@ mod tests {
             buflo_deadline,
             buflo_deadline + Duration::from_nanos(17),
         );
-        assert_eq!(metrics.schema_version, 6);
+        assert_eq!(metrics.schema_version, 7);
         assert_eq!(metrics.wait_returns, 3);
         assert_eq!(metrics.socket_readiness_wakeups, 1);
         assert_eq!(metrics.timer_wakeups, 2);
@@ -21253,6 +21926,86 @@ mod tests {
             metrics.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
             7
         );
+        assert_eq!(
+            metrics.buflo_exact_release_max_guard_entry_lateness_nanoseconds,
+            0
+        );
+        assert_eq!(metrics.buflo_exact_release_passive_sleep_calls, 1);
+        assert_eq!(
+            metrics.buflo_exact_release_passive_sleep_requested_nanoseconds,
+            5_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_passive_sleep_elapsed_nanoseconds,
+            5_000_013
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_passive_sleep_overrun_nanoseconds,
+            13
+        );
+        assert_eq!(metrics.buflo_exact_release_active_wait_iterations, 42);
+        assert_eq!(metrics.buflo_exact_release_active_spin_interruptions, 1);
+        assert_eq!(
+            metrics.buflo_exact_release_active_spin_interruption_nanoseconds,
+            6_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_active_spin_gap_nanoseconds,
+            6_000_000
+        );
+        assert_eq!(metrics.buflo_exact_release_active_wait_aux_clock_guards, 1);
+        assert!(!metrics.buflo_exact_release_aux_clock_source.is_empty());
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_aux_clock_unavailable_guards,
+            0
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards,
+            0
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_monotonic_raw_nanoseconds,
+            10_000_010
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_thread_cpu_nanoseconds,
+            8_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds,
+            2_000_007
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds,
+            2_000_007
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_active_wait_monotonic_raw_divergence_nanoseconds,
+            3
+        );
+        assert_eq!(
+            metrics
+                .buflo_exact_release_dispatch_lateness_histogram
+                .counts,
+            [1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_spin_gap_histogram.counts,
+            [0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        let worst = metrics
+            .buflo_exact_release_worst_guard
+            .expect("one guard establishes bounded worst-case evidence");
+        assert_eq!(worst.endpoint, QcsdEndpointId(7));
+        assert_eq!(worst.slot, QcsdSlotId(11));
+        assert_eq!(worst.phase, "committed");
+        assert_eq!(worst.packet_timestamp_us, 20_000);
+        assert_eq!(worst.guard_at_defense_nanoseconds, Some(10_000_000));
+        assert_eq!(worst.release_at_defense_nanoseconds, Some(20_000_000));
+        assert_eq!(worst.dispatch_at_defense_nanoseconds, Some(20_000_007));
+        assert_eq!(worst.dispatch_lateness_nanoseconds, 7);
+        assert!(!worst.dispatch_at_or_after_deadline);
+        assert_eq!(worst.dispatch_after_deadline_nanoseconds, 0);
         assert_eq!(metrics.cs_exact_incoming_retry_drives, 2);
         assert_eq!(metrics.cs_exact_incoming_retry_resolutions, 1);
         assert_eq!(
@@ -21279,6 +22032,343 @@ mod tests {
                 .semantics
                 .contains("buflo_exact_release_guard_coincides_with_output_admission=true")
         );
+        assert!(metrics.semantics.contains(
+            "buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true"
+        ));
+        assert!(metrics.semantics.contains(
+            "buflo_exact_release_aux_clock_cannot_attribute_guest_scheduler_vs_hypervisor_steal"
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the deterministic failure-signature fixture keeps phase and clock assertions together"
+    )]
+    fn exact_release_metrics_distinguish_late_entry_active_interruption_and_clock_elapsed() {
+        let defense_start = now();
+        let release = defense_start + Duration::from_millis(20);
+        let deadline = release + Duration::from_millis(5);
+        let guard_at = release
+            .checked_sub(Duration::from_millis(10))
+            .expect("release has a guard predecessor");
+        let entered_at = guard_at + Duration::from_millis(2);
+        let dispatch_at = release + Duration::from_millis(6);
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let guard = BufloExactReleaseGuard {
+            endpoint_index: 1,
+            endpoint: QcsdEndpointId(3),
+            slot: QcsdSlotId(638),
+            packet,
+            phase: BufloExactReleasePhase::Prearmed,
+            output_admission_at: guard_at,
+            guard_at,
+            active_wait_at: guard_at,
+            release,
+            deadline,
+        };
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.record_buflo_exact_release_guard(
+            &guard,
+            Some(defense_start),
+            &BufloExactReleaseWaitEvidence {
+                entered_at,
+                active_wait_started_at: entered_at,
+                dispatch_at,
+                passive_sleep_calls: 0,
+                passive_sleep_requested_nanoseconds: 0,
+                passive_sleep_elapsed_nanoseconds: 0,
+                max_passive_sleep_overrun_nanoseconds: 0,
+                active_wait_iterations: 8_000,
+                active_spin_interruptions: 1,
+                active_spin_interruption_nanoseconds: 6_000_000,
+                max_active_spin_gap_nanoseconds: 6_000_000,
+                active_wait_start_clocks: BufloExactReleaseAuxClockSample {
+                    monotonic_raw_nanoseconds: Some(10_000),
+                    thread_cpu_nanoseconds: Some(20_000),
+                },
+                active_wait_end_clocks: BufloExactReleaseAuxClockSample {
+                    monotonic_raw_nanoseconds: Some(14_010_000),
+                    thread_cpu_nanoseconds: Some(8_020_000),
+                },
+            },
+        );
+
+        assert_eq!(
+            metrics.buflo_exact_release_max_guard_entry_lateness_nanoseconds,
+            2_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_passive_wake_lateness_nanoseconds, 2_000_000,
+            "legacy v2 field remains the active-wait-transition lateness"
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
+            6_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_dispatch_at_or_after_deadline_guards,
+            1
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_nanoseconds,
+            14_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_monotonic_raw_nanoseconds,
+            14_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_thread_cpu_nanoseconds,
+            8_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_estimated_off_cpu_nanoseconds,
+            6_000_000
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_active_wait_monotonic_raw_divergence_nanoseconds,
+            0
+        );
+        assert_eq!(
+            metrics
+                .buflo_exact_release_dispatch_lateness_histogram
+                .counts,
+            [0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        let worst = metrics
+            .buflo_exact_release_worst_guard
+            .expect("late guard is retained");
+        assert_eq!(worst.endpoint, QcsdEndpointId(3));
+        assert_eq!(worst.slot, QcsdSlotId(638));
+        assert_eq!(worst.phase, "prearmed");
+        assert_eq!(worst.guard_at_defense_nanoseconds, Some(10_000_000));
+        assert_eq!(worst.entered_at_defense_nanoseconds, Some(12_000_000));
+        assert_eq!(worst.release_at_defense_nanoseconds, Some(20_000_000));
+        assert_eq!(worst.deadline_at_defense_nanoseconds, Some(25_000_000));
+        assert_eq!(worst.dispatch_at_defense_nanoseconds, Some(26_000_000));
+        assert!(worst.dispatch_at_or_after_deadline);
+        assert_eq!(worst.dispatch_after_deadline_nanoseconds, 1_000_000);
+    }
+
+    #[test]
+    fn mixed_adapter_windows_do_not_project_aggregate_deadline_status_onto_worst_guard() {
+        let defense_start = now();
+        let fractional_packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let fractional_guard = buflo_exact_release_guard_from_candidates(
+            true,
+            [BufloExactReleaseCandidate {
+                endpoint_index: 0,
+                endpoint: QcsdEndpointId(0),
+                slot: QcsdSlotId(1),
+                packet: fractional_packet,
+                phase: BufloExactReleasePhase::Committed,
+                release: defense_start + Duration::from_nanos(20_000_456),
+                deadline: defense_start + Duration::from_nanos(24_999_456),
+            }],
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        )
+        .expect("fractional candidate is valid")
+        .expect("fractional candidate establishes a guard");
+        let aligned_packet =
+            Packet::new(Duration::from_millis(40), Direction::Outgoing, 1_200).expect("packet");
+        let aligned_guard = buflo_exact_release_guard_from_candidates(
+            true,
+            [BufloExactReleaseCandidate {
+                endpoint_index: 0,
+                endpoint: QcsdEndpointId(0),
+                slot: QcsdSlotId(2),
+                packet: aligned_packet,
+                phase: BufloExactReleasePhase::Committed,
+                release: defense_start + Duration::from_millis(40),
+                deadline: defense_start + Duration::from_millis(45),
+            }],
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        )
+        .expect("aligned candidate is valid")
+        .expect("aligned candidate establishes a guard");
+        let evidence =
+            |guard: &BufloExactReleaseGuard, dispatch_at| BufloExactReleaseWaitEvidence {
+                entered_at: guard.guard_at,
+                active_wait_started_at: guard.guard_at,
+                dispatch_at,
+                passive_sleep_calls: 0,
+                passive_sleep_requested_nanoseconds: 0,
+                passive_sleep_elapsed_nanoseconds: 0,
+                max_passive_sleep_overrun_nanoseconds: 0,
+                active_wait_iterations: 1,
+                active_spin_interruptions: 0,
+                active_spin_interruption_nanoseconds: 0,
+                max_active_spin_gap_nanoseconds: 0,
+                active_wait_start_clocks: BufloExactReleaseAuxClockSample::default(),
+                active_wait_end_clocks: BufloExactReleaseAuxClockSample::default(),
+            };
+
+        let fractional_dispatch = fractional_guard.release + Duration::from_nanos(4_999_500);
+        assert!(fractional_dispatch >= fractional_guard.deadline);
+        let aligned_dispatch = aligned_guard.release + Duration::from_nanos(4_999_800);
+        assert!(aligned_dispatch < aligned_guard.deadline);
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.record_buflo_exact_release_guard(
+            &fractional_guard,
+            Some(defense_start),
+            &evidence(&fractional_guard, fractional_dispatch),
+        );
+        metrics.record_buflo_exact_release_guard(
+            &aligned_guard,
+            Some(defense_start),
+            &evidence(&aligned_guard, aligned_dispatch),
+        );
+
+        assert!(metrics.buflo_exact_release_invariants_hold());
+        assert_eq!(
+            metrics.buflo_exact_release_dispatch_at_or_after_deadline_guards,
+            1
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
+            4_999_800
+        );
+        assert_eq!(
+            metrics
+                .buflo_exact_release_dispatch_lateness_histogram
+                .counts,
+            [0, 0, 0, 0, 0, 0, 2, 0]
+        );
+        let worst = metrics
+            .buflo_exact_release_worst_guard
+            .expect("maximum-lateness guard is retained");
+        assert_eq!(worst.slot, QcsdSlotId(2));
+        assert_eq!(worst.dispatch_lateness_nanoseconds, 4_999_800);
+        assert!(!worst.dispatch_at_or_after_deadline);
+        assert_eq!(worst.dispatch_after_deadline_nanoseconds, 0);
+    }
+
+    #[test]
+    fn exact_release_metrics_treat_deadline_as_outside_and_serialize_missing_clocks_as_null() {
+        let defense_start = now();
+        let release = defense_start + Duration::from_millis(20);
+        let deadline = release + Duration::from_millis(5);
+        let guard_at = release
+            .checked_sub(Duration::from_millis(10))
+            .expect("release has a guard predecessor");
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let guard = BufloExactReleaseGuard {
+            endpoint_index: 0,
+            endpoint: QcsdEndpointId(0),
+            slot: QcsdSlotId(1),
+            packet,
+            phase: BufloExactReleasePhase::Committed,
+            output_admission_at: guard_at,
+            guard_at,
+            active_wait_at: guard_at,
+            release,
+            deadline,
+        };
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.record_buflo_exact_release_guard(
+            &guard,
+            Some(defense_start),
+            &BufloExactReleaseWaitEvidence {
+                entered_at: guard_at,
+                active_wait_started_at: guard_at,
+                dispatch_at: deadline,
+                passive_sleep_calls: 0,
+                passive_sleep_requested_nanoseconds: 0,
+                passive_sleep_elapsed_nanoseconds: 0,
+                max_passive_sleep_overrun_nanoseconds: 0,
+                active_wait_iterations: 1,
+                active_spin_interruptions: 0,
+                active_spin_interruption_nanoseconds: 0,
+                max_active_spin_gap_nanoseconds: 0,
+                active_wait_start_clocks: BufloExactReleaseAuxClockSample::default(),
+                active_wait_end_clocks: BufloExactReleaseAuxClockSample::default(),
+            },
+        );
+
+        assert_eq!(metrics.buflo_exact_release_guard_entries, 1);
+        assert_eq!(
+            metrics.buflo_exact_release_dispatch_at_or_after_deadline_guards, 1,
+            "the exact deadline is outside the half-open realization window"
+        );
+        assert_eq!(
+            metrics
+                .buflo_exact_release_dispatch_lateness_histogram
+                .counts,
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            "the five-millisecond upper histogram bound remains inclusive"
+        );
+        assert_eq!(metrics.buflo_exact_release_active_wait_aux_clock_guards, 0);
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_aux_clock_unavailable_guards,
+            1
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards,
+            0
+        );
+        assert!(metrics.buflo_exact_release_invariants_hold());
+
+        let serialized = serde_json::to_value(metrics).expect("serialize runner metrics");
+        let worst = &serialized["buflo_exact_release_worst_guard"];
+        assert_eq!(worst["dispatch_at_or_after_deadline"], true);
+        assert_eq!(worst["dispatch_after_deadline_nanoseconds"], 0);
+        for nullable in [
+            "active_wait_monotonic_raw_nanoseconds",
+            "active_wait_thread_cpu_nanoseconds",
+            "active_wait_estimated_off_cpu_nanoseconds",
+            "active_wait_monotonic_raw_divergence_nanoseconds",
+        ] {
+            assert_eq!(worst[nullable], serde_json::Value::Null, "{nullable}");
+        }
+    }
+
+    #[test]
+    fn exact_release_timing_histogram_has_inclusive_bounds_and_overflow() {
+        let mut histogram = BufloExactReleaseTimingHistogram::new();
+        for value in [0, 50_000, 50_001, 5_000_000, 5_000_001] {
+            histogram.record(value);
+        }
+        assert_eq!(histogram.counts, [2, 1, 0, 0, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn exact_release_metric_invariants_cover_histograms_clocks_worst_guard_and_maxima() {
+        let valid = RunnerWakeupMetrics::new();
+        assert!(valid.buflo_exact_release_invariants_hold());
+
+        let mut invalid_histogram = valid;
+        invalid_histogram
+            .buflo_exact_release_dispatch_lateness_histogram
+            .counts[0] = 1;
+        assert!(!invalid_histogram.buflo_exact_release_invariants_hold());
+
+        let mut invalid_aux_partition = valid;
+        invalid_aux_partition.buflo_exact_release_active_wait_aux_clock_guards = 1;
+        assert!(!invalid_aux_partition.buflo_exact_release_invariants_hold());
+
+        let mut invalid_nonmonotonic = valid;
+        invalid_nonmonotonic.buflo_exact_release_active_wait_aux_clock_nonmonotonic_guards = 1;
+        assert!(!invalid_nonmonotonic.buflo_exact_release_invariants_hold());
+
+        let mut invalid_worst_presence = valid;
+        invalid_worst_presence.buflo_exact_release_guard_entries = 1;
+        assert!(!invalid_worst_presence.buflo_exact_release_invariants_hold());
+
+        let mut invalid_passive_max = valid;
+        invalid_passive_max.buflo_exact_release_max_passive_sleep_overrun_nanoseconds = 1;
+        assert!(!invalid_passive_max.buflo_exact_release_invariants_hold());
+
+        let mut invalid_spin_max = valid;
+        invalid_spin_max.buflo_exact_release_max_active_spin_gap_nanoseconds = 1;
+        assert!(!invalid_spin_max.buflo_exact_release_invariants_hold());
+
+        let mut invalid_off_cpu_max = valid;
+        invalid_off_cpu_max.buflo_exact_release_max_active_wait_estimated_off_cpu_nanoseconds = 1;
+        assert!(!invalid_off_cpu_max.buflo_exact_release_invariants_hold());
     }
 
     #[test]
