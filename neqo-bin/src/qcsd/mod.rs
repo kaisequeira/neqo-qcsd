@@ -12595,6 +12595,39 @@ mod tests {
         );
     }
 
+    fn assert_runner_wakeup_receipt(metrics: &serde_json::Value) {
+        assert_eq!(
+            metrics["schema_version"],
+            RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
+        );
+        assert_eq!(RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 8);
+        assert!(
+            RUNNER_WAKEUP_METRICS_SEMANTICS.ends_with(
+                "buflo_exact_release_active_wait_poll=poll_instant_without_arch_spin_hint"
+            )
+        );
+        assert_eq!(metrics["timer_wakeups"], 2);
+        assert_eq!(
+            metrics["buflo_exact_release_dispatch_lateness_histogram"]["upper_bounds_nanoseconds"],
+            json!([
+                50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000
+            ])
+        );
+        assert_eq!(
+            metrics["buflo_exact_release_dispatch_lateness_histogram"]["counts"],
+            json!([1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            metrics["buflo_exact_release_active_spin_gap_histogram"]["counts"],
+            json!([1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(metrics["buflo_exact_release_worst_guard"]["slot"], 9);
+        assert_eq!(metrics["buflo_exact_release_guard_entries"], 1);
+        assert_eq!(metrics["buflo_exact_incoming_retry_drives"], 2);
+        assert_eq!(metrics["cs_exact_incoming_retry_drives"], 3);
+        assert_eq!(metrics["cs_exact_incoming_retry_resolutions"], 1);
+    }
+
     #[test]
     fn runtime_chaff_manifest_dispatches_only_strict_schema_two_three_and_four_inputs() {
         let response_only = response_only_chaff_manifest();
@@ -13174,51 +13207,7 @@ mod tests {
         assert_eq!(receipt["error"], serde_json::Value::Null);
         assert_eq!(receipt["error_class"], serde_json::Value::Null);
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["schema_version"],
-            RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
-        );
-        assert_eq!(RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 8);
-        assert!(
-            RUNNER_WAKEUP_METRICS_SEMANTICS.ends_with(
-                "buflo_exact_release_active_wait_poll=poll_instant_without_arch_spin_hint"
-            )
-        );
-        assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["buflo_exact_release_dispatch_lateness_histogram"]["upper_bounds_nanoseconds"],
-            json!([
-                50_000, 100_000, 250_000, 500_000, 1_000_000, 2_000_000, 5_000_000
-            ])
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["buflo_exact_release_dispatch_lateness_histogram"]["counts"],
-            json!([1, 0, 0, 0, 0, 0, 0, 0])
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["buflo_exact_release_active_spin_gap_histogram"]["counts"],
-            json!([1, 0, 0, 0, 0, 0, 0, 0])
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["buflo_exact_release_worst_guard"]["slot"],
-            9
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["buflo_exact_release_guard_entries"],
-            1
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["buflo_exact_incoming_retry_drives"],
-            2
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["cs_exact_incoming_retry_drives"],
-            3
-        );
-        assert_eq!(
-            receipt["runner_wakeup_metrics"]["cs_exact_incoming_retry_resolutions"],
-            1
-        );
+        assert_runner_wakeup_receipt(&receipt["runner_wakeup_metrics"]);
         assert_eq!(receipt["process_scheduler"]["schema_version"], 1);
         assert!(receipt["process_scheduler"]["policy"].is_string());
         assert!(receipt["process_scheduler"]["affinity_cpus"].is_array());
