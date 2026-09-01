@@ -14048,8 +14048,9 @@ mod tests {
     }
 
     #[expect(
+        clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "the canonical schema-9 producer golden intentionally binds every serialized field"
+        reason = "the canonical schema-9 producer golden intentionally binds every serialized field and cross-field invariant"
     )]
     fn assert_runner_wakeup_receipt(metrics: &serde_json::Value) {
         let mut actual_fields: Vec<_> = metrics
@@ -24735,8 +24736,9 @@ mod tests {
 
     #[test]
     #[expect(
+        clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "the schema fixture binds every terminal wait reason to its serialized flags and nullable dispatch"
+        reason = "the schema fixture binds every terminal wait reason to its serialized flags, counters, and nullable dispatch"
     )]
     fn exact_release_typed_wait_failures_round_trip_through_schema_nine() {
         let base = now();
