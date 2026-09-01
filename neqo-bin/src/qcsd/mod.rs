@@ -12668,7 +12668,10 @@ mod tests {
         assert_eq!(receipt["error"], serde_json::Value::Null);
         assert_eq!(receipt["error_class"], serde_json::Value::Null);
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 5);
+        assert_eq!(
+            receipt["runner_wakeup_metrics"]["schema_version"],
+            RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
+        );
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
         assert_eq!(
             receipt["runner_wakeup_metrics"]["buflo_exact_release_guard_entries"],
