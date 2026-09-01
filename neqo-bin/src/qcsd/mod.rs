@@ -19380,7 +19380,10 @@ mod tests {
             "buflo_exact_release_actual_guard_and_active_wait_lead_ns=twice_actual_adapter_window_ns",
             "buflo_exact_release_10000us_lead_fields_are_configured_maxima=true",
         ] {
-            assert!(semantics.contains(clause), "missing semantics clause {clause}");
+            assert!(
+                semantics.contains(clause),
+                "missing semantics clause {clause}"
+            );
         }
         let worst = &serialized["buflo_exact_release_worst_guard"];
         assert_eq!(worst["packet_timestamp_us"], 20_000);
