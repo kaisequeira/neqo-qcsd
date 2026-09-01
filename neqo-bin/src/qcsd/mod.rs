@@ -1388,8 +1388,8 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     })
 }
 
-const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 7;
-const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=10000; buflo_exact_release_active_wait_tail_us=10000; buflo_exact_release_guard_coincides_with_output_admission=true; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard; buflo_exact_release_dispatch_lateness_histogram_counts_one_guard_exit_per_guard; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_aux_clocks=linux_clock_monotonic_raw_and_thread_cputime_id_or_unavailable; buflo_exact_release_aux_clock_unavailable_includes_missing_or_nonmonotonic_sample=true; buflo_exact_release_estimated_off_cpu_is_monotonic_elapsed_minus_thread_cpu_elapsed_saturating; buflo_exact_release_aux_clock_cannot_attribute_guest_scheduler_vs_hypervisor_steal; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=twice_actual_adapter_window_ns; buflo_exact_release_10000us_lead_fields_are_configured_maxima=true";
+const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 8;
+const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=10000; buflo_exact_release_active_wait_tail_us=10000; buflo_exact_release_guard_coincides_with_output_admission=true; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard; buflo_exact_release_dispatch_lateness_histogram_counts_one_guard_exit_per_guard; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_aux_clocks=linux_clock_monotonic_raw_and_thread_cputime_id_or_unavailable; buflo_exact_release_aux_clock_unavailable_includes_missing_or_nonmonotonic_sample=true; buflo_exact_release_estimated_off_cpu_is_monotonic_elapsed_minus_thread_cpu_elapsed_saturating; buflo_exact_release_aux_clock_cannot_attribute_guest_scheduler_vs_hypervisor_steal; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=twice_actual_adapter_window_ns; buflo_exact_release_10000us_lead_fields_are_configured_maxima=true; buflo_exact_release_active_wait_poll=poll_instant_without_arch_spin_hint";
 
 #[cfg(target_os = "linux")]
 const BUFLO_EXACT_RELEASE_AUX_CLOCK_SOURCE: &str =
@@ -9047,7 +9047,12 @@ fn wait_for_buflo_exact_release(guard: &BufloExactReleaseGuard) -> BufloExactRel
                     record_active_spin_gap(&mut evidence, previous, current);
                 }
                 evidence.active_wait_iterations = evidence.active_wait_iterations.saturating_add(1);
-                std::hint::spin_loop();
+                // `spin_loop()` is a shared-memory synchronization hint.  On
+                // AArch64 it lowers to an ISB, which needlessly serializes
+                // every iteration of this deadline clock poll.  The loop
+                // remains an active wait: its next iteration immediately
+                // samples `Instant` again without an architecture-specific
+                // processor hint.
             }
             BufloExactReleaseWaitStep::Dispatch => {
                 if let Some(previous) = previous_active_sample_at {
@@ -11528,7 +11533,8 @@ mod tests {
         OutputDriveCardinality, OutputWorkBoundary, PrefixBurst, PrefixNumericProfile,
         PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg,
         QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
-        RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RequestPolicyArg, ResourceRunState,
+        RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg,
+        ResourceRunState,
         ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
         RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
         SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
@@ -13172,6 +13178,9 @@ mod tests {
             receipt["runner_wakeup_metrics"]["schema_version"],
             RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         );
+        assert_eq!(RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 8);
+        assert!(RUNNER_WAKEUP_METRICS_SEMANTICS
+            .ends_with("buflo_exact_release_active_wait_poll=poll_instant_without_arch_spin_hint"));
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
         assert_eq!(
             receipt["runner_wakeup_metrics"]["buflo_exact_release_dispatch_lateness_histogram"]["upper_bounds_nanoseconds"],
