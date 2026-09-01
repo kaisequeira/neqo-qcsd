@@ -12960,8 +12960,8 @@ mod tests {
         validate_chaff_manifest_defense, validate_prefix_capacity_plan, validate_prefix_pack_spec,
         validate_qualified_chaff_binding, validate_terminal_chaff_receive_identities,
         validate_walkie_talkie_chaff_precondition, wait_for_activity_until,
-        wait_for_buflo_exact_release_with_clocks, walkie_talkie_qualification_binding_matches,
-        write_run_json,
+        wait_for_buflo_exact_release, wait_for_buflo_exact_release_with_clocks,
+        walkie_talkie_qualification_binding_matches, write_run_json,
     };
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     use super::{ProductionBufloExactReleasePollClock, validate_counter_frequency_hz};
@@ -19302,24 +19302,40 @@ mod tests {
             .front()
             .copied()
             .expect("committed outgoing owner");
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 1,
-            endpoint: QcsdEndpointId(1),
-            slot: scheduled.slot,
-            packet: scheduled.packet,
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: scheduled.not_before,
-            guard_at: scheduled.not_before,
-            active_wait_at: scheduled.not_before,
-            release: scheduled.not_before,
-            deadline: scheduled.deadline,
-        };
+        let guard = buflo_exact_release_guard_from_candidates(
+            true,
+            [BufloExactReleaseCandidate {
+                endpoint_index: 1,
+                endpoint: QcsdEndpointId(1),
+                slot: scheduled.slot,
+                packet: scheduled.packet,
+                phase: BufloExactReleasePhase::Committed,
+                release: scheduled.not_before,
+                deadline: scheduled.deadline,
+            }],
+            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        )
+        .expect("valid committed exact-release candidate")
+        .expect("committed outgoing owner has a release guard");
         assert_eq!(guard.release, release);
         assert_eq!(guard.deadline, release + Duration::from_millis(5));
+        assert_eq!(
+            guard.guard_at,
+            release
+                .checked_sub(Duration::from_millis(5))
+                .expect("release has one adapter-window predecessor")
+        );
+        assert_eq!(guard.active_wait_at, guard.guard_at);
 
-        tokio::time::sleep_until(tokio::time::Instant::from_std(release)).await;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(guard.guard_at)).await;
+        let exact_release_evidence = wait_for_buflo_exact_release(&guard)
+            .expect("production exact-release wait remains inside the adapter window");
+        let dispatch_at = exact_release_evidence
+            .dispatch_at
+            .expect("dispatch-ready exact-release evidence");
+        assert!(dispatch_at >= guard.release && dispatch_at < guard.deadline);
         let mut metrics = RunnerWakeupMetrics::new();
-        dispatch_buflo_exact_release(
+        let dispatch_result = dispatch_buflo_exact_release(
             &guard,
             &mut endpoints,
             &mut controller,
@@ -19329,8 +19345,14 @@ mod tests {
             Some(defense_start),
             &mut metrics,
         )
-        .await
-        .expect("outgoing owner then incoming owner fit the same exact window");
+        .await;
+        metrics
+            .record_buflo_exact_release_guard(&guard, Some(defense_start), &exact_release_evidence)
+            .expect("record production exact-release wait after transport dispatch");
+        dispatch_result.expect("outgoing owner then incoming owner fit the same exact window");
+        assert_eq!(metrics.buflo_exact_release_guard_entries, 1);
+        assert_eq!(metrics.buflo_exact_release_dispatch_ready_guards, 1);
+        assert_eq!(metrics.buflo_exact_release_failed_guards, 0);
         assert_eq!(metrics.buflo_exact_incoming_retry_drives, 1);
         assert_eq!(metrics.buflo_exact_incoming_retry_resolutions, 1);
         assert_eq!(metrics.wait_returns, 0);
