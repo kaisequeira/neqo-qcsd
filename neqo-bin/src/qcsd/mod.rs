@@ -21918,7 +21918,10 @@ mod tests {
             buflo_deadline,
             buflo_deadline + Duration::from_nanos(17),
         );
-        assert_eq!(metrics.schema_version, 7);
+        assert_eq!(
+            metrics.schema_version,
+            RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
+        );
         assert_eq!(metrics.wait_returns, 3);
         assert_eq!(metrics.socket_readiness_wakeups, 1);
         assert_eq!(metrics.timer_wakeups, 2);
