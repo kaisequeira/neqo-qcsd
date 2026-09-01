@@ -11534,23 +11534,23 @@ mod tests {
         PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg,
         QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
         RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg,
-        ResourceRunState,
-        ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
-        RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
-        SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
-        StreamRecord, StreamType, SustainedResponseQualificationRequest, TerminalActionSemantics,
-        TestOutputDrive, TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
-        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
-        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
-        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
-        bounded_qualification_wait, buflo_exact_incoming_identities,
-        buflo_exact_incoming_identity_is_pending, buflo_exact_release_guard_excluding_candidates,
-        buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
-        buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
-        cancel_uncommitted_prearms_on_abort, chaff_send_halves_peer_confirmed, create_endpoints,
-        cs_buflo_run_summary, cs_exact_incoming_identity_is_pending,
-        cs_exact_incoming_retry_inventory, cs_exact_incoming_retry_is_due, datagram_observation,
-        deadline_error, defense_parameter_provenance, dispatch_buflo_exact_release,
+        ResourceRunState, ResponseQualificationMode, ResponseQualificationRequest, RunCompletion,
+        RunSpec, RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket,
+        SocketHandoff, SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg,
+        StreamActivationStage, StreamRecord, StreamType, SustainedResponseQualificationRequest,
+        TerminalActionSemantics, TestOutputDrive, TrafficMorphingActivation, absolute_wakeup,
+        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
+        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
+        attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
+        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
+        buflo_exact_incoming_identities, buflo_exact_incoming_identity_is_pending,
+        buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
+        buflo_exact_release_wait_step, buflo_run_summary,
+        buflo_unadvertised_scheduled_receive_credit_endpoints, cancel_uncommitted_prearms_on_abort,
+        chaff_send_halves_peer_confirmed, create_endpoints, cs_buflo_run_summary,
+        cs_exact_incoming_identity_is_pending, cs_exact_incoming_retry_inventory,
+        cs_exact_incoming_retry_is_due, datagram_observation, deadline_error,
+        defense_parameter_provenance, dispatch_buflo_exact_release,
         dispatch_due_cs_exact_incoming_retry, dispatch_ready_requests, drain_qualifier_stream_data,
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_until, drive_endpoint_output_with_clock,
@@ -13179,8 +13179,11 @@ mod tests {
             RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         );
         assert_eq!(RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 8);
-        assert!(RUNNER_WAKEUP_METRICS_SEMANTICS
-            .ends_with("buflo_exact_release_active_wait_poll=poll_instant_without_arch_spin_hint"));
+        assert!(
+            RUNNER_WAKEUP_METRICS_SEMANTICS.ends_with(
+                "buflo_exact_release_active_wait_poll=poll_instant_without_arch_spin_hint"
+            )
+        );
         assert_eq!(receipt["runner_wakeup_metrics"]["timer_wakeups"], 2);
         assert_eq!(
             receipt["runner_wakeup_metrics"]["buflo_exact_release_dispatch_lateness_histogram"]["upper_bounds_nanoseconds"],
