@@ -1388,8 +1388,8 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     })
 }
 
-const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 5;
-const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_is_one_realization_window_before_guard; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss";
+const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 6;
+const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=10000; buflo_exact_release_active_wait_tail_us=10000; buflo_exact_release_guard_coincides_with_output_admission=true; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_at_guard; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct RunnerWakeupMetrics {
@@ -8386,7 +8386,7 @@ enum BufloExactReleaseWaitStep {
     Dispatch,
 }
 
-const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL: Duration = Duration::from_millis(5);
+const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BufloExactReleaseCandidate {
@@ -8472,16 +8472,21 @@ fn buflo_exact_release_guard_excluding_candidates(
         return Ok(None);
     };
     let realization_window = candidate.deadline.duration_since(candidate.release);
-    let active_wait_tail = active_wait_tail.min(realization_window);
+    let admission_lead = realization_window.saturating_mul(2);
+    let active_wait_tail = active_wait_tail.min(admission_lead);
     let active_wait_at = candidate
         .release
         .checked_sub(active_wait_tail)
         .unwrap_or(candidate.release);
-    let guard_at = candidate
+    let nominal_guard_at = candidate
         .release
         .checked_sub(realization_window)
         .unwrap_or(candidate.release);
-    let output_admission_at = guard_at.checked_sub(realization_window).unwrap_or(guard_at);
+    let output_admission_at = candidate
+        .release
+        .checked_sub(admission_lead)
+        .unwrap_or(candidate.release);
+    let guard_at = nominal_guard_at.min(active_wait_at);
     Ok(Some(BufloExactReleaseGuard {
         endpoint_index: candidate.endpoint_index,
         endpoint: candidate.endpoint,
@@ -9789,8 +9794,10 @@ async fn dispatch_due_buflo_exact_release(
 
     // Tokio's current-thread timer and ordinary socket/HTTP work can otherwise
     // consume the complete half-open realization window before a due BuFLO
-    // target reaches transport. Reserve exactly that candidate's own window
-    // and remain runnable for the full five-millisecond realization interval.
+    // target reaches transport. Reserve the candidate at the existing
+    // two-window ordinary-output admission boundary and remain runnable until
+    // the exact release. The physical realization interval remains the same
+    // half-open five-millisecond adapter window after release.
     // Callers invoke this boundary between every bounded unit of ordinary work
     // as well as at the loop head.
     debug_assert!(guard.release < guard.deadline);
@@ -21189,7 +21196,7 @@ mod tests {
         metrics.record(ActivityWake::Timer, true);
         let release = now();
         let entered_at = release
-            .checked_sub(Duration::from_millis(5))
+            .checked_sub(Duration::from_millis(10))
             .expect("release has a guard predecessor");
         let active_wait_started_at = entered_at;
         metrics.record_buflo_exact_release_guard(
@@ -21220,7 +21227,7 @@ mod tests {
             buflo_deadline,
             buflo_deadline + Duration::from_nanos(17),
         );
-        assert_eq!(metrics.schema_version, 5);
+        assert_eq!(metrics.schema_version, 6);
         assert_eq!(metrics.wait_returns, 3);
         assert_eq!(metrics.socket_readiness_wakeups, 1);
         assert_eq!(metrics.timer_wakeups, 2);
@@ -21229,11 +21236,11 @@ mod tests {
         assert_eq!(metrics.buflo_exact_release_guard_entries, 1);
         assert_eq!(
             metrics.buflo_exact_release_guard_wait_nanoseconds,
-            5_000_007
+            10_000_007
         );
         assert_eq!(
             metrics.buflo_exact_release_active_wait_nanoseconds,
-            5_000_007
+            10_000_007
         );
         assert_eq!(
             metrics.buflo_exact_release_max_passive_wake_lateness_nanoseconds,
@@ -21262,7 +21269,12 @@ mod tests {
         assert!(
             metrics
                 .semantics
-                .contains("buflo_exact_release_active_wait_tail_us=5000")
+                .contains("buflo_exact_release_active_wait_tail_us=10000")
+        );
+        assert!(
+            metrics
+                .semantics
+                .contains("buflo_exact_release_guard_coincides_with_output_admission=true")
         );
     }
 
@@ -21284,7 +21296,7 @@ mod tests {
     }
 
     #[test]
-    fn buflo_exact_release_guard_reserves_one_window_and_selects_full_identity() {
+    fn buflo_exact_release_guard_reserves_at_admission_and_selects_full_identity() {
         let base = now();
         let window = Duration::from_millis(5);
         let later_release = base + Duration::from_millis(40);
@@ -21325,7 +21337,7 @@ mod tests {
         assert_eq!(guard.slot, QcsdSlotId(1));
         assert_eq!(guard.packet, packet);
         assert_eq!(guard.output_admission_at, base + Duration::from_millis(10));
-        assert_eq!(guard.guard_at, base + Duration::from_millis(15));
+        assert_eq!(guard.guard_at, guard.output_admission_at);
         assert_eq!(guard.active_wait_at, guard.guard_at);
         assert_eq!(guard.release, release);
         assert_eq!(guard.deadline, deadline);
@@ -21694,12 +21706,8 @@ mod tests {
         .expect("exact release guard");
         assert_eq!(
             buflo_exact_release_wait_step(&guard, guard.output_admission_at),
-            BufloExactReleaseWaitStep::Passive(
-                guard
-                    .active_wait_at
-                    .duration_since(guard.output_admission_at)
-            ),
-            "the earlier output-admission boundary cannot dispatch the exact slot"
+            BufloExactReleaseWaitStep::Active,
+            "the admission boundary begins the earlier active reservation"
         );
         assert_eq!(
             buflo_exact_release_wait_step(&guard, guard.guard_at),
@@ -21708,6 +21716,16 @@ mod tests {
         assert_eq!(
             buflo_exact_release_wait_step(&guard, guard.active_wait_at),
             BufloExactReleaseWaitStep::Active
+        );
+        assert_eq!(
+            buflo_exact_release_wait_step(
+                &guard,
+                release
+                    .checked_sub(Duration::from_micros(7_056))
+                    .expect("release has the v34 pre-guard chronology")
+            ),
+            BufloExactReleaseWaitStep::Active,
+            "the v34 last-control chronology must no longer return to the reactor"
         );
         assert_eq!(
             buflo_exact_release_wait_step(
