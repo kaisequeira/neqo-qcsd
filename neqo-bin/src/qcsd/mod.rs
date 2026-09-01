@@ -1390,15 +1390,21 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     })
 }
 
-const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 9;
-const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=5000; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guard_coincides_with_output_admission=false; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_exact_release_schema9_passive_wait_unreachable=true; buflo_exact_release_guard_wait_equals_active_wait=true; buflo_exact_release_max_passive_wake_lateness_equals_max_guard_entry_lateness=true; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_one_actual_adapter_window_before_release=true; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_wait_iterations=counter_read_attempts_including_ordered_and_unavailable_or_fallback_authoritative_polls; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard_entry; buflo_exact_release_dispatch_lateness_histogram_counts_one_dispatch_ready_guard; buflo_exact_release_guard_entries=dispatch_ready_guards+failed_guards; buflo_exact_release_failed_guards=sum_typed_failure_guards; buflo_exact_release_failed_guards_max=1; buflo_exact_release_last_failure_present_iff_failed_guards=1; buflo_exact_release_failure_dispatch_at_is_null=true; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=actual_adapter_window_ns; buflo_exact_release_configured_output_admission_lead_us=10000; buflo_exact_release_configured_guard_and_active_wait_lead_us=5000; buflo_exact_release_active_wait_poll=linux_aarch64_cntvct_el0_predictive_else_instant_authoritative_fallback; buflo_exact_release_counter_target_rounding=ceil; buflo_exact_release_counter_calibration=counter_instant_counter; buflo_exact_release_counter_is_predictive_only=true; buflo_exact_release_counter_frequency_hz_range_inclusive=1000000..4294967295; buflo_exact_release_counter_target_error=defensive_unreachable_for_valid_live_guard_and_frequency; buflo_exact_release_counter_unavailable=scripted_trait_failure_not_architectural_trap_receipt; buflo_exact_release_production_counter_access=target_gated_live_smoke_test; buflo_exact_release_counter_frequency_change=hard_failure_before_transport_dispatch_and_before_success_metrics_mutation; buflo_exact_release_cross_guard_frequency_precedence=typed_wait_failure_preserved_dispatch_ready_retyped; buflo_exact_release_dispatch_confirmation=authoritative_instant; buflo_exact_release_transport_and_socket_clock=authoritative_instant; buflo_exact_release_counter_regression=hard_failure; buflo_exact_release_guard_metrics_recorded_before_result_propagation=true; buflo_exact_release_transport_dispatch_result_precedes_guard_metrics=true";
+const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 10;
+const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=5000; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guard_coincides_with_output_admission=false; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_exact_release_schema10_passive_wait_unreachable=true; buflo_exact_release_guard_wait_equals_active_wait=true; buflo_exact_release_max_passive_wake_lateness_equals_max_guard_entry_lateness=true; buflo_exact_release_aggregate_entry_lateness_reachable=max_retained_failure_entry_or_5000000_plus_max_dispatch_lateness; buflo_exact_release_aggregate_active_wait_reachable=retained_success_plus_retained_failure_plus_bounded_unretained_successes_with_hidden_entry_max_subtraction_saturating; buflo_exact_release_active_derived_maxima_reachable=retained_per_metric_or_unretained_success_5000000_plus_dispatch; buflo_exact_release_deadline_count_reachable=outside_zero_or_max_dispatch_lateness_at_least_4999000; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_one_actual_adapter_window_before_release=true; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_wait_iterations=counter_read_attempts_including_ordered_and_unavailable_or_fallback_authoritative_polls; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard_entry; buflo_exact_release_dispatch_lateness_histogram_counts_one_dispatch_ready_guard; buflo_exact_release_guard_entries=dispatch_ready_guards+failed_guards; buflo_exact_release_failed_guards=sum_typed_failure_guards; buflo_exact_release_failed_guards_max=1; buflo_exact_release_last_failure_present_iff_failed_guards=1; buflo_exact_release_failure_dispatch_at_is_null=true; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=actual_adapter_window_ns; buflo_exact_release_configured_output_admission_lead_us=10000; buflo_exact_release_configured_guard_and_active_wait_lead_us=5000; buflo_exact_release_active_wait_poll=linux_aarch64_cntvct_el0_predictive_authoritative_watchdog_else_instant_authoritative_fallback; buflo_exact_release_counter_target_rounding=ceil; buflo_exact_release_counter_calibration=counter_instant_counter; buflo_exact_release_counter_is_predictive_with_periodic_authoritative_watchdog=true; buflo_exact_release_authoritative_watchdog_interval_successful_relaxed_reads=64; buflo_exact_release_authoritative_watchdog_dispatch_preserves_strict_half_open_transport_check=true; buflo_exact_release_authoritative_watchdog_cadence_validated_guards=count_dispatch_ready_production_guards_passing_exact_per_guard_cadence; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_reads=active_wait_iterations-2*counter_calibrations; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_bound=counter_calibrations=guards+early_confirmation_retries_and_64*checks<=remainder<64*(checks+guards)_and_remainder>=early_confirmation_retries; buflo_exact_release_zero_failure_empty_partition=zero_iterations_calibrations_checks_retries_dispatches; buflo_exact_release_remaining_success_guard_projection=subtract_worst_and_exact_retained_failure_then_same_remainder_bounds; buflo_exact_release_zero_failure_watchdog_dispatch_residue=dispatches<=checks_and_remainder-64*checks<=63*(guards-dispatches); buflo_exact_release_max_authoritative_sample_gap=consecutive_calibration_watchdog_or_final_authoritative_samples; buflo_exact_release_authoritative_counter_lag=max_authoritative_elapsed_minus_counter_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_authoritative_lead=max_counter_elapsed_minus_authoritative_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_frequency_hz_range_inclusive=1000000..4294967295; buflo_exact_release_counter_target_error=defensive_unreachable_for_valid_live_guard_and_frequency; buflo_exact_release_first_calibration_target_error=exactly_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_zero_calibration_counter_unavailable=one_or_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_counter_unavailable=scripted_trait_failure_not_architectural_trap_receipt; buflo_exact_release_production_counter_access=target_gated_live_smoke_test; buflo_exact_release_counter_frequency_change=hard_failure_before_transport_dispatch_and_before_success_metrics_mutation; buflo_exact_release_cross_guard_frequency_precedence=typed_wait_failure_preserved_dispatch_ready_retyped; buflo_exact_release_dispatch_confirmation=authoritative_instant; buflo_exact_release_transport_and_socket_clock=authoritative_instant; buflo_exact_release_counter_regression=hard_failure; buflo_exact_release_guard_metrics_recorded_before_result_propagation=true; buflo_exact_release_transport_dispatch_result_precedes_guard_metrics=true; buflo_exact_release_failure_authoritative_watchdog_cadence=successful_relaxed_reads_R_checks_floor_R_div_64; buflo_exact_release_failure_terminal_counter_reads=target_or_frequency_change_0_unavailable_or_nonmonotonic_1_or_2_C_eq_confirmations_plus_1_requires_1; buflo_exact_release_failure_retry_requires_successful_relaxed_read=true; buflo_exact_release_early_confirmation_retry_requires_positive_counter_nanoseconds=true; buflo_exact_release_failure_counter_comparison_absence=zero_watchdog_and_zero_confirmation_implies_zero_lag_and_lead; buflo_exact_release_sole_success_failure_projection=exact_saturating_sums_chronology_and_maxima; buflo_exact_release_retained_failure_exact_fields=iterations_active_duration_interruptions_interruption_nanoseconds_and_max_gap; buflo_exact_release_nullable_chronology_duration=adapter_window_exists_in_4999000_or_5000000_nanoseconds; buflo_exact_release_structural_count_partitions=checked_u64_exact_no_saturation; buflo_exact_release_histogram_integrity=max_bucket_and_coupled_G_plus_A_minus_H_times_50001; buflo_exact_release_remaining_histograms=subtract_exact_worst_and_failure; buflo_exact_release_remaining_success_duration=dispatch_bucket_floor_with_4999000ns_window; buflo_exact_incoming_retry_zero_drives_implies_zero_max_lateness=true; buflo_exact_release_predictive_interruptions=count_le_iterations_minus_anchor_and_nonmonotonic_or_calibrated_unavailable_failed_read_and_nanoseconds_le_counter";
+
+const BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE: &str =
+    "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
+const BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE: &str = "instant-authoritative-fallback-v1";
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE: &str = "linux-aarch64-cntvct-el0-predictive-v1";
+const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE: &str =
+    BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
 #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
-const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE: &str = "instant-authoritative-fallback-v1";
+const BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE: &str = BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE;
 
 const BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD: Duration = Duration::from_micros(50);
+const BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL: u64 = 64;
 // CNTFRQ_EL0 is architecturally 32 bits. Requiring at least a one-megahertz
 // counter bounds predictive quantisation to one microsecond, well inside the
 // strict five-millisecond realization window; lower-resolution counters fail
@@ -1433,6 +1439,115 @@ impl BufloExactReleaseTimingHistogram {
     fn total(self) -> u64 {
         self.counts.into_iter().fold(0_u64, u64::saturating_add)
     }
+
+    fn bucket(self, nanoseconds: u64) -> usize {
+        self.upper_bounds_nanoseconds
+            .partition_point(|upper_bound| nanoseconds > *upper_bound)
+    }
+
+    fn subtract_maxima(self, maxima: &[u64]) -> Option<[u64; 8]> {
+        let mut residual = self.counts;
+        for maximum in maxima {
+            let bucket = self.bucket(*maximum);
+            residual[bucket] = residual[bucket].checked_sub(1)?;
+        }
+        Some(residual)
+    }
+
+    fn maximum_consistent(self, maximum: u64) -> bool {
+        let bucket = self.bucket(maximum);
+        self.counts[bucket] > 0 && self.counts[bucket + 1..].iter().all(|count| *count == 0)
+    }
+}
+
+fn buflo_exact_release_residual_interruption_minimum(
+    histogram: &BufloExactReleaseTimingHistogram,
+    aggregate_maximum: u64,
+    nested_maxima: &[u64],
+    interruptions: u64,
+) -> Option<u64> {
+    let residual = (*histogram).subtract_maxima(nested_maxima)?;
+    let lowers = [
+        0, 50_001, 100_001, 250_001, 500_001, 1_000_001, 2_000_001, 5_000_001,
+    ];
+    let high_guards = residual[1..]
+        .iter()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
+    if interruptions < high_guards {
+        return None;
+    }
+    let mut minimum = residual
+        .into_iter()
+        .zip(lowers)
+        .fold(0_u64, |sum, (count, lower)| {
+            sum.saturating_add(count.saturating_mul(lower))
+        });
+    if aggregate_maximum > duration_as_u64_nanos(BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD)
+        && aggregate_maximum > nested_maxima.iter().copied().max().unwrap_or(0)
+    {
+        let bucket = histogram.bucket(aggregate_maximum);
+        if residual[bucket] == 0 {
+            return None;
+        }
+        minimum = minimum.saturating_add(aggregate_maximum.saturating_sub(lowers[bucket]));
+    }
+    Some(
+        minimum.saturating_add(
+            interruptions
+                .saturating_sub(high_guards)
+                .saturating_mul(50_001),
+        ),
+    )
+}
+
+fn buflo_exact_release_residual_active_duration_minimum(
+    histogram: &BufloExactReleaseTimingHistogram,
+    worst_dispatch_lateness: u64,
+    max_entry_lateness: u64,
+) -> Option<u64> {
+    let residual = (*histogram).subtract_maxima(&[worst_dispatch_lateness])?;
+    let lowers = [
+        0, 50_001, 100_001, 250_001, 500_001, 1_000_001, 2_000_001, 5_000_001,
+    ];
+    Some(
+        residual
+            .into_iter()
+            .zip(lowers)
+            .fold(0_u64, |sum, (count, lower)| {
+                sum.saturating_add(
+                    count.saturating_mul(
+                        4_999_000_u64
+                            .saturating_add(lower)
+                            .saturating_sub(max_entry_lateness),
+                    ),
+                )
+            }),
+    )
+}
+
+fn buflo_exact_release_aggregate_active_wait_ceiling(
+    maximum_success_active_wait_nanoseconds: u64,
+    maximum_success_active_wait_is_saturated: bool,
+    unretained_successes: u64,
+    required_hidden_success_entry_lateness_nanoseconds: u64,
+    retained_worst_active_wait_nanoseconds: u64,
+    retained_failure_active_wait_nanoseconds: u64,
+) -> Option<u64> {
+    if unretained_successes > 0 && maximum_success_active_wait_is_saturated {
+        return Some(u64::MAX);
+    }
+    (u128::from(maximum_success_active_wait_nanoseconds) * u128::from(unretained_successes))
+        .checked_sub(u128::from(
+            required_hidden_success_entry_lateness_nanoseconds,
+        ))
+        .and_then(|capacity| {
+            capacity.checked_add(u128::from(retained_worst_active_wait_nanoseconds))
+        })
+        .and_then(|capacity| {
+            capacity.checked_add(u128::from(retained_failure_active_wait_nanoseconds))
+        })
+        .map(|capacity| u64::try_from(capacity).unwrap_or(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1494,6 +1609,11 @@ struct BufloExactReleaseWaitEvidence {
     counter_calibrations: u64,
     instant_confirmations: u64,
     early_confirmation_retries: u64,
+    authoritative_watchdog_checks: u64,
+    authoritative_watchdog_dispatches: u64,
+    max_authoritative_sample_gap_nanoseconds: u64,
+    max_authoritative_counter_lag_nanoseconds: u64,
+    max_counter_authoritative_lead_nanoseconds: u64,
     counter_elapsed_ticks: u64,
     max_counter_gap_ticks: u64,
     max_counter_calibration_span_ticks: u64,
@@ -1527,6 +1647,11 @@ impl BufloExactReleaseWaitEvidence {
             counter_calibrations: 0,
             instant_confirmations: 0,
             early_confirmation_retries: 0,
+            authoritative_watchdog_checks: 0,
+            authoritative_watchdog_dispatches: 0,
+            max_authoritative_sample_gap_nanoseconds: 0,
+            max_authoritative_counter_lag_nanoseconds: 0,
+            max_counter_authoritative_lead_nanoseconds: 0,
             counter_elapsed_ticks: 0,
             max_counter_gap_ticks: 0,
             max_counter_calibration_span_ticks: 0,
@@ -1534,10 +1659,152 @@ impl BufloExactReleaseWaitEvidence {
     }
 }
 
+fn buflo_exact_release_authoritative_watchdog_cadence_validated(
+    evidence: &BufloExactReleaseWaitEvidence,
+) -> bool {
+    evidence
+        .counter_calibrations
+        .checked_mul(2)
+        .and_then(|calibration_reads| {
+            evidence
+                .active_wait_iterations
+                .checked_sub(calibration_reads)
+        })
+        .is_some_and(|successful_relaxed_reads| {
+            evidence.authoritative_watchdog_checks
+                == successful_relaxed_reads / BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL
+                && successful_relaxed_reads >= evidence.early_confirmation_retries
+                && (evidence.authoritative_watchdog_dispatches == 0
+                    || successful_relaxed_reads
+                        .is_multiple_of(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL))
+        })
+}
+
+fn buflo_exact_release_failure_watchdog_cadence_validated(
+    outcome: &str,
+    active_wait_iterations: u64,
+    counter_calibrations: u64,
+    instant_confirmations: u64,
+    early_confirmation_retries: u64,
+    authoritative_watchdog_checks: u64,
+    authoritative_watchdog_dispatches: u64,
+) -> bool {
+    let cadence_for_terminal_reads = |terminal_reads: u64| {
+        counter_calibrations
+            .checked_mul(2)
+            .and_then(|calibration_reads| calibration_reads.checked_add(terminal_reads))
+            .and_then(|non_relaxed_reads| active_wait_iterations.checked_sub(non_relaxed_reads))
+            .is_some_and(|successful_relaxed_reads| {
+                authoritative_watchdog_checks
+                    == successful_relaxed_reads
+                        / BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL
+                    && successful_relaxed_reads >= early_confirmation_retries
+                    && (authoritative_watchdog_dispatches == 0
+                        || successful_relaxed_reads
+                            .is_multiple_of(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL))
+            })
+    };
+
+    match outcome {
+        "invalid-counter-frequency" => {
+            active_wait_iterations == 0
+                && authoritative_watchdog_checks == 0
+                && authoritative_watchdog_dispatches == 0
+        }
+        "counter-target-error" if early_confirmation_retries == 0 => {
+            active_wait_iterations == 2
+                && counter_calibrations == 1
+                && instant_confirmations == 0
+                && authoritative_watchdog_checks == 0
+                && authoritative_watchdog_dispatches == 0
+        }
+        "counter-target-error" => {
+            authoritative_watchdog_dispatches == 0 && cadence_for_terminal_reads(0)
+        }
+        "counter-frequency-changed" => cadence_for_terminal_reads(0),
+        "counter-unavailable" if counter_calibrations == 0 => {
+            authoritative_watchdog_dispatches == 0
+                && authoritative_watchdog_checks == 0
+                && matches!(active_wait_iterations, 1 | 2)
+        }
+        "counter-nonmonotonic" if counter_calibrations == 0 => {
+            authoritative_watchdog_dispatches == 0
+                && active_wait_iterations == 2
+                && authoritative_watchdog_checks == 0
+        }
+        "counter-unavailable" | "counter-nonmonotonic"
+            if counter_calibrations == instant_confirmations.saturating_add(1) =>
+        {
+            authoritative_watchdog_dispatches == 0 && cadence_for_terminal_reads(1)
+        }
+        "counter-unavailable" | "counter-nonmonotonic" => {
+            authoritative_watchdog_dispatches == 0
+                && (cadence_for_terminal_reads(1) || cadence_for_terminal_reads(2))
+        }
+        _ => false,
+    }
+}
+
+fn buflo_exact_release_zero_failure_watchdog_remainder_bound(
+    active_wait_iterations: u64,
+    counter_calibrations: u64,
+    authoritative_watchdog_checks: u64,
+    early_confirmation_retries: u64,
+    authoritative_watchdog_dispatches: u64,
+    guards: u64,
+) -> bool {
+    let Some(remainder_reads) = counter_calibrations
+        .checked_mul(2)
+        .and_then(|calibration_reads| active_wait_iterations.checked_sub(calibration_reads))
+    else {
+        return false;
+    };
+    if guards == 0 {
+        return active_wait_iterations == 0
+            && counter_calibrations == 0
+            && remainder_reads == 0
+            && authoritative_watchdog_checks == 0
+            && early_confirmation_retries == 0
+            && authoritative_watchdog_dispatches == 0;
+    }
+    if authoritative_watchdog_checks < authoritative_watchdog_dispatches {
+        return false;
+    }
+    if guards.checked_add(early_confirmation_retries) != Some(counter_calibrations) {
+        return false;
+    }
+    let Some(lower_bound) = authoritative_watchdog_checks
+        .checked_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+    else {
+        return false;
+    };
+    let Some(strict_upper_bound) =
+        authoritative_watchdog_checks
+            .checked_add(guards)
+            .and_then(|checks_and_guards| {
+                checks_and_guards.checked_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+            })
+    else {
+        return false;
+    };
+    let Some(non_dispatch_guards) = guards.checked_sub(authoritative_watchdog_dispatches) else {
+        return false;
+    };
+    let Some(maximum_residue) = non_dispatch_guards
+        .checked_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL.saturating_sub(1))
+    else {
+        return false;
+    };
+    lower_bound <= remainder_reads
+        && remainder_reads < strict_upper_bound
+        && remainder_reads >= early_confirmation_retries
+        && remainder_reads.saturating_sub(lower_bound) <= maximum_residue
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "the immutable schema-9 failure receipt preserves typed transport evidence without lossy packing"
+    reason = "the immutable schema-10 failure receipt preserves typed transport evidence without lossy packing"
 )]
 struct BufloExactReleaseLastFailure {
     outcome: &'static str,
@@ -1561,9 +1828,19 @@ struct BufloExactReleaseLastFailure {
     counter_backed: bool,
     counter_unavailable: bool,
     counter_nonmonotonic: bool,
+    active_wait_iterations: u64,
+    active_wait_monotonic_nanoseconds: u64,
+    active_spin_interruptions: u64,
+    active_spin_interruption_nanoseconds: u64,
+    max_active_spin_gap_nanoseconds: u64,
     counter_calibrations: u64,
     instant_confirmations: u64,
     early_confirmation_retries: u64,
+    authoritative_watchdog_checks: u64,
+    authoritative_watchdog_dispatches: u64,
+    max_authoritative_sample_gap_nanoseconds: u64,
+    max_authoritative_counter_lag_nanoseconds: u64,
+    max_counter_authoritative_lead_nanoseconds: u64,
     counter_nanoseconds: Option<u64>,
     max_counter_gap_nanoseconds: Option<u64>,
     max_counter_calibration_span_nanoseconds: Option<u64>,
@@ -1600,15 +1877,174 @@ struct BufloExactReleaseWorstGuard {
     active_wait_counter_calibrations: u64,
     active_wait_instant_confirmations: u64,
     active_wait_early_confirmation_retries: u64,
+    active_wait_authoritative_watchdog_checks: u64,
+    active_wait_authoritative_watchdog_dispatches: u64,
     active_wait_counter_nanoseconds: Option<u64>,
     max_active_wait_counter_gap_nanoseconds: Option<u64>,
     max_counter_calibration_span_nanoseconds: Option<u64>,
+    max_authoritative_sample_gap_nanoseconds: u64,
+    max_authoritative_counter_lag_nanoseconds: u64,
+    max_counter_authoritative_lead_nanoseconds: u64,
     active_spin_interruptions: u64,
     active_spin_interruption_nanoseconds: u64,
     max_active_spin_gap_nanoseconds: u64,
     dispatch_lateness_nanoseconds: u64,
     dispatch_at_or_after_deadline: bool,
     dispatch_after_deadline_nanoseconds: u64,
+}
+
+fn buflo_exact_release_phase_valid(phase: &str) -> bool {
+    matches!(phase, "prearmed" | "committed")
+}
+
+fn buflo_exact_release_poll_source_valid(source: &str) -> bool {
+    matches!(
+        source,
+        BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE | BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE
+    )
+}
+
+const fn buflo_exact_release_nullable_counter_tuple_valid(
+    frequency_hz: Option<u64>,
+    counter_nanoseconds: Option<u64>,
+    max_counter_gap_nanoseconds: Option<u64>,
+    max_counter_calibration_span_nanoseconds: Option<u64>,
+) -> bool {
+    matches!(
+        (
+            frequency_hz,
+            counter_nanoseconds,
+            max_counter_gap_nanoseconds,
+            max_counter_calibration_span_nanoseconds,
+        ),
+        (None, None, None, None) | (Some(_), Some(_), Some(_), Some(_))
+    )
+}
+
+fn buflo_exact_release_normalized_adapter_window(
+    packet_timestamp_us: u64,
+    release: u64,
+    deadline: u64,
+) -> Option<u64> {
+    let nominal_release = packet_timestamp_us.checked_mul(1_000)?;
+    let release_skew = release.checked_sub(nominal_release)?;
+    let nominal_deadline = nominal_release.checked_add(5_000_000)?;
+    let deadline_skew = nominal_deadline.checked_sub(deadline)?;
+    let normalization_skew = release_skew.checked_add(deadline_skew)?;
+    let actual_window = deadline.checked_sub(release)?;
+    (release_skew <= 999
+        && deadline_skew <= 999
+        && matches!(normalization_skew, 0 | 1_000)
+        && 5_000_000_u64.checked_sub(normalization_skew) == Some(actual_window)
+        && matches!(actual_window, 4_999_000 | 5_000_000))
+    .then_some(actual_window)
+}
+
+fn buflo_exact_release_worst_chronology_valid(worst: &BufloExactReleaseWorstGuard) -> bool {
+    let scalar_geometry_valid = [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+        window
+            .checked_add(worst.dispatch_lateness_nanoseconds)
+            .and_then(|value| value.checked_sub(worst.guard_entry_lateness_nanoseconds))
+            == Some(worst.active_wait_monotonic_nanoseconds)
+            && worst.dispatch_at_or_after_deadline
+                == (worst.dispatch_lateness_nanoseconds >= window)
+            && worst.dispatch_after_deadline_nanoseconds
+                == worst.dispatch_lateness_nanoseconds.saturating_sub(window)
+    });
+    if !scalar_geometry_valid {
+        return false;
+    }
+    match (
+        worst.guard_at_defense_nanoseconds,
+        worst.entered_at_defense_nanoseconds,
+        worst.active_wait_at_defense_nanoseconds,
+        worst.active_wait_started_at_defense_nanoseconds,
+        worst.release_at_defense_nanoseconds,
+        worst.deadline_at_defense_nanoseconds,
+        worst.dispatch_at_defense_nanoseconds,
+    ) {
+        (None, None, None, None, None, None, None) => true,
+        (
+            Some(guard_at),
+            Some(entered),
+            Some(active_wait_at),
+            Some(active_wait_started),
+            Some(release),
+            Some(deadline),
+            Some(dispatch),
+        ) => {
+            let Some(window) = buflo_exact_release_normalized_adapter_window(
+                worst.packet_timestamp_us,
+                release,
+                deadline,
+            ) else {
+                return false;
+            };
+            active_wait_at == guard_at
+                && entered == active_wait_started
+                && release.checked_sub(guard_at) == Some(window)
+                && entered.checked_sub(guard_at) == Some(worst.guard_entry_lateness_nanoseconds)
+                && dispatch.checked_sub(active_wait_started)
+                    == Some(worst.active_wait_monotonic_nanoseconds)
+                && dispatch.checked_sub(release) == Some(worst.dispatch_lateness_nanoseconds)
+                && worst.dispatch_at_or_after_deadline == (dispatch >= deadline)
+                && worst.dispatch_after_deadline_nanoseconds == dispatch.saturating_sub(deadline)
+        }
+        _ => false,
+    }
+}
+
+fn buflo_exact_release_failure_chronology_valid(failure: &BufloExactReleaseLastFailure) -> bool {
+    let Some(elapsed_from_guard) = failure
+        .guard_entry_lateness_nanoseconds
+        .checked_add(failure.active_wait_monotonic_nanoseconds)
+    else {
+        return false;
+    };
+    let scalar_geometry_valid = [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+        failure.exit_before_release_nanoseconds == window.saturating_sub(elapsed_from_guard)
+            && failure.exit_at_or_after_deadline == (elapsed_from_guard >= window.saturating_mul(2))
+    });
+    if !scalar_geometry_valid {
+        return false;
+    }
+    match (
+        failure.guard_at_defense_nanoseconds,
+        failure.entered_at_defense_nanoseconds,
+        failure.active_wait_at_defense_nanoseconds,
+        failure.active_wait_started_at_defense_nanoseconds,
+        failure.release_at_defense_nanoseconds,
+        failure.deadline_at_defense_nanoseconds,
+        failure.exited_at_defense_nanoseconds,
+    ) {
+        (None, None, None, None, None, None, None) => true,
+        (
+            Some(guard_at),
+            Some(entered),
+            Some(active_wait_at),
+            Some(active_wait_started),
+            Some(release),
+            Some(deadline),
+            Some(exited),
+        ) => {
+            let Some(window) = buflo_exact_release_normalized_adapter_window(
+                failure.packet_timestamp_us,
+                release,
+                deadline,
+            ) else {
+                return false;
+            };
+            active_wait_at == guard_at
+                && entered == active_wait_started
+                && release.checked_sub(guard_at) == Some(window)
+                && entered.checked_sub(guard_at) == Some(failure.guard_entry_lateness_nanoseconds)
+                && exited.checked_sub(active_wait_started)
+                    == Some(failure.active_wait_monotonic_nanoseconds)
+                && failure.exit_before_release_nanoseconds == release.saturating_sub(exited)
+                && failure.exit_at_or_after_deadline == (exited >= deadline)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1649,9 +2085,15 @@ struct RunnerWakeupMetrics {
     buflo_exact_release_active_wait_counter_calibrations: u64,
     buflo_exact_release_active_wait_instant_confirmations: u64,
     buflo_exact_release_active_wait_early_confirmation_retries: u64,
+    buflo_exact_release_active_wait_authoritative_watchdog_checks: u64,
+    buflo_exact_release_active_wait_authoritative_watchdog_dispatches: u64,
+    buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards: u64,
     buflo_exact_release_active_wait_counter_nanoseconds: u64,
     buflo_exact_release_max_active_wait_counter_gap_nanoseconds: u64,
     buflo_exact_release_max_counter_calibration_span_nanoseconds: u64,
+    buflo_exact_release_max_authoritative_sample_gap_nanoseconds: u64,
+    buflo_exact_release_max_authoritative_counter_lag_nanoseconds: u64,
+    buflo_exact_release_max_counter_authoritative_lead_nanoseconds: u64,
     buflo_exact_release_dispatch_at_or_after_deadline_guards: u64,
     buflo_exact_release_dispatch_lateness_histogram: BufloExactReleaseTimingHistogram,
     buflo_exact_release_active_spin_gap_histogram: BufloExactReleaseTimingHistogram,
@@ -1705,9 +2147,15 @@ impl RunnerWakeupMetrics {
             buflo_exact_release_active_wait_counter_calibrations: 0,
             buflo_exact_release_active_wait_instant_confirmations: 0,
             buflo_exact_release_active_wait_early_confirmation_retries: 0,
+            buflo_exact_release_active_wait_authoritative_watchdog_checks: 0,
+            buflo_exact_release_active_wait_authoritative_watchdog_dispatches: 0,
+            buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards: 0,
             buflo_exact_release_active_wait_counter_nanoseconds: 0,
             buflo_exact_release_max_active_wait_counter_gap_nanoseconds: 0,
             buflo_exact_release_max_counter_calibration_span_nanoseconds: 0,
+            buflo_exact_release_max_authoritative_sample_gap_nanoseconds: 0,
+            buflo_exact_release_max_authoritative_counter_lag_nanoseconds: 0,
+            buflo_exact_release_max_counter_authoritative_lead_nanoseconds: 0,
             buflo_exact_release_dispatch_at_or_after_deadline_guards: 0,
             buflo_exact_release_dispatch_lateness_histogram: BufloExactReleaseTimingHistogram::new(
             ),
@@ -1743,7 +2191,7 @@ impl RunnerWakeupMetrics {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "one fail-closed validator binds the complete per-guard schema-9 evidence contract"
+        reason = "one fail-closed validator binds the complete per-guard schema-10 evidence contract"
     )]
     fn validate_buflo_exact_release_guard_evidence(
         &self,
@@ -1752,9 +2200,14 @@ impl RunnerWakeupMetrics {
     ) -> Result<(), Error> {
         let guard_lead = guard.release.duration_since(guard.guard_at);
         let realization_window = guard.deadline.duration_since(guard.release);
-        if guard.guard_at != guard.active_wait_at || guard_lead != realization_window {
+        let realization_window_nanoseconds = duration_as_u64_nanos(realization_window);
+        if guard.guard_at != guard.active_wait_at
+            || guard_lead != realization_window
+            || !matches!(realization_window_nanoseconds, 4_999_000 | 5_000_000)
+        {
             return Err(Error::DefenseExecution(
-                "BuFLO exact-release guard did not reserve one actual adapter window".into(),
+                "BuFLO exact-release guard did not reserve one canonical actual adapter window"
+                    .into(),
             ));
         }
         if evidence.entered_at < guard.guard_at
@@ -1773,7 +2226,7 @@ impl RunnerWakeupMetrics {
             || evidence.max_passive_sleep_overrun_nanoseconds != 0
         {
             return Err(Error::DefenseExecution(
-                "BuFLO schema-9 guard admitted an unreachable passive wait".into(),
+                "BuFLO schema-10 guard admitted an unreachable passive wait".into(),
             ));
         }
         if evidence.active_wait_poll_source != self.buflo_exact_release_active_wait_poll_source {
@@ -1802,6 +2255,11 @@ impl RunnerWakeupMetrics {
                 || evidence.counter_calibrations != 0
                 || evidence.instant_confirmations != 0
                 || evidence.early_confirmation_retries != 0
+                || evidence.authoritative_watchdog_checks != 0
+                || evidence.authoritative_watchdog_dispatches != 0
+                || evidence.max_authoritative_sample_gap_nanoseconds != 0
+                || evidence.max_authoritative_counter_lag_nanoseconds != 0
+                || evidence.max_counter_authoritative_lead_nanoseconds != 0
                 || evidence.counter_elapsed_ticks != 0
                 || evidence.max_counter_gap_ticks != 0
                 || evidence.max_counter_calibration_span_ticks != 0)
@@ -1820,6 +2278,74 @@ impl RunnerWakeupMetrics {
         {
             return Err(Error::DefenseExecution(
                 "BuFLO exact-release calibration/confirmation evidence was inconsistent".into(),
+            ));
+        }
+        let production_success_watchdog_cadence = evidence.active_wait_poll_source
+            != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+            || !matches!(
+                evidence.outcome,
+                BufloExactReleaseWaitOutcome::DispatchReady
+                    | BufloExactReleaseWaitOutcome::CounterFrequencyChanged
+            )
+            || buflo_exact_release_authoritative_watchdog_cadence_validated(evidence);
+        if evidence.authoritative_watchdog_dispatches > 1
+            || evidence.authoritative_watchdog_dispatches > evidence.authoritative_watchdog_checks
+            || evidence
+                .authoritative_watchdog_checks
+                .saturating_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+                .saturating_add(evidence.counter_calibrations.saturating_mul(2))
+                > evidence.active_wait_iterations
+            || (evidence.authoritative_watchdog_checks > 0
+                && (evidence.counter_calibrations == 0 || evidence.counter_frequency_hz.is_none()))
+            || (evidence.authoritative_watchdog_dispatches > 0
+                && (!matches!(
+                    evidence.outcome,
+                    BufloExactReleaseWaitOutcome::DispatchReady
+                        | BufloExactReleaseWaitOutcome::CounterFrequencyChanged
+                ) || evidence.instant_confirmations == evidence.early_confirmation_retries))
+            || !production_success_watchdog_cadence
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO exact-release authoritative watchdog accounting was unreachable".into(),
+            ));
+        }
+        if evidence.outcome == BufloExactReleaseWaitOutcome::CounterTargetError
+            && evidence.early_confirmation_retries == 0
+            && (evidence.active_wait_iterations != 2
+                || evidence.authoritative_watchdog_checks != 0
+                || evidence.authoritative_watchdog_dispatches != 0
+                || evidence.max_authoritative_counter_lag_nanoseconds != 0
+                || evidence.max_counter_authoritative_lead_nanoseconds != 0)
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO first-calibration counter-target failure contained post-calibration evidence"
+                    .into(),
+            ));
+        }
+        if evidence.outcome.is_failure()
+            && !buflo_exact_release_failure_watchdog_cadence_validated(
+                evidence.outcome.as_str(),
+                evidence.active_wait_iterations,
+                evidence.counter_calibrations,
+                evidence.instant_confirmations,
+                evidence.early_confirmation_retries,
+                evidence.authoritative_watchdog_checks,
+                evidence.authoritative_watchdog_dispatches,
+            )
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO exact-release failure watchdog cadence was unreachable".into(),
+            ));
+        }
+        if evidence.outcome.is_failure()
+            && evidence.authoritative_watchdog_checks == 0
+            && evidence.instant_confirmations == 0
+            && (evidence.max_authoritative_counter_lag_nanoseconds != 0
+                || evidence.max_counter_authoritative_lead_nanoseconds != 0)
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO exact-release failure contained counter-comparison maxima without a comparison"
+                    .into(),
             ));
         }
         if evidence.counter_calibrations == 0
@@ -1916,18 +2442,59 @@ impl RunnerWakeupMetrics {
             evidence.max_active_spin_gap_nanoseconds
                 == counter_ticks_to_nanoseconds(evidence.max_counter_gap_ticks, frequency)
         });
+        let counter_elapsed_nanoseconds = evidence.counter_frequency_hz.map_or(0, |frequency| {
+            counter_ticks_to_nanoseconds(evidence.counter_elapsed_ticks, frequency)
+        });
         if !counter_gap_matches_poll_gap
+            || (evidence.early_confirmation_retries > 0 && counter_elapsed_nanoseconds == 0)
             || evidence.max_active_spin_gap_nanoseconds > active_wait_nanoseconds
             || evidence.active_spin_interruption_nanoseconds > active_wait_nanoseconds
+            || evidence.max_authoritative_sample_gap_nanoseconds > active_wait_nanoseconds
+            || evidence.max_authoritative_counter_lag_nanoseconds > active_wait_nanoseconds
+            || evidence.max_counter_authoritative_lead_nanoseconds > counter_elapsed_nanoseconds
+            || (evidence.counter_frequency_hz.is_none()
+                && (evidence.authoritative_watchdog_checks != 0
+                    || evidence.authoritative_watchdog_dispatches != 0
+                    || (evidence.outcome != BufloExactReleaseWaitOutcome::InvalidCounterFrequency
+                        && evidence.max_authoritative_sample_gap_nanoseconds != 0)
+                    || evidence.max_authoritative_counter_lag_nanoseconds != 0
+                    || evidence.max_counter_authoritative_lead_nanoseconds != 0))
             || (evidence.active_spin_interruptions > 0) != has_interruption_gap
             || (evidence.active_spin_interruptions == 0)
                 != (evidence.active_spin_interruption_nanoseconds == 0)
             || (evidence.active_spin_interruptions > 0
                 && evidence.active_spin_interruption_nanoseconds
                     < evidence.max_active_spin_gap_nanoseconds)
+            || evidence.active_spin_interruption_nanoseconds
+                < evidence.active_spin_interruptions.saturating_mul(
+                    duration_as_u64_nanos(BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD)
+                        .saturating_add(1),
+                )
         {
             return Err(Error::DefenseExecution(
                 "BuFLO exact-release interruption accounting exceeded its active wait".into(),
+            ));
+        }
+        let predictive_interruption_iteration_bound = match evidence.outcome {
+            BufloExactReleaseWaitOutcome::InvalidCounterFrequency
+            | BufloExactReleaseWaitOutcome::Pending => 0,
+            BufloExactReleaseWaitOutcome::CounterUnavailable
+            | BufloExactReleaseWaitOutcome::CounterNonmonotonic => {
+                evidence.active_wait_iterations.saturating_sub(2)
+            }
+            BufloExactReleaseWaitOutcome::DispatchReady
+            | BufloExactReleaseWaitOutcome::CounterFrequencyChanged
+            | BufloExactReleaseWaitOutcome::CounterTargetError => {
+                evidence.active_wait_iterations.saturating_sub(1)
+            }
+        };
+        if evidence.active_wait_poll_source == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+            && (evidence.active_spin_interruptions > predictive_interruption_iteration_bound
+                || evidence.active_spin_interruption_nanoseconds > counter_elapsed_nanoseconds)
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO predictive interruption accounting exceeded counter-backed poll evidence"
+                    .into(),
             ));
         }
         if evidence.counter_backed
@@ -2045,7 +2612,7 @@ impl RunnerWakeupMetrics {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "one atomic recorder keeps every schema-9 aggregate and its bounded worst-guard evidence consistent"
+        reason = "one atomic recorder keeps every schema-10 aggregate and its bounded worst-guard evidence consistent"
     )]
     fn record_buflo_exact_release_guard(
         &mut self,
@@ -2077,6 +2644,11 @@ impl RunnerWakeupMetrics {
             counter_calibrations,
             instant_confirmations,
             early_confirmation_retries,
+            authoritative_watchdog_checks,
+            authoritative_watchdog_dispatches,
+            max_authoritative_sample_gap_nanoseconds,
+            max_authoritative_counter_lag_nanoseconds,
+            max_counter_authoritative_lead_nanoseconds,
             counter_elapsed_ticks,
             max_counter_gap_ticks,
             max_counter_calibration_span_ticks,
@@ -2239,9 +2811,19 @@ impl RunnerWakeupMetrics {
                 counter_backed,
                 counter_unavailable,
                 counter_nonmonotonic,
+                active_wait_iterations,
+                active_wait_monotonic_nanoseconds,
+                active_spin_interruptions,
+                active_spin_interruption_nanoseconds,
+                max_active_spin_gap_nanoseconds,
                 counter_calibrations,
                 instant_confirmations,
                 early_confirmation_retries,
+                authoritative_watchdog_checks,
+                authoritative_watchdog_dispatches,
+                max_authoritative_sample_gap_nanoseconds,
+                max_authoritative_counter_lag_nanoseconds,
+                max_counter_authoritative_lead_nanoseconds,
                 counter_nanoseconds: active_wait_counter_nanoseconds,
                 max_counter_gap_nanoseconds: max_active_wait_counter_gap_nanoseconds,
                 max_counter_calibration_span_nanoseconds,
@@ -2277,6 +2859,20 @@ impl RunnerWakeupMetrics {
         self.buflo_exact_release_active_wait_early_confirmation_retries = self
             .buflo_exact_release_active_wait_early_confirmation_retries
             .saturating_add(early_confirmation_retries);
+        self.buflo_exact_release_active_wait_authoritative_watchdog_checks = self
+            .buflo_exact_release_active_wait_authoritative_watchdog_checks
+            .saturating_add(authoritative_watchdog_checks);
+        self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches = self
+            .buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+            .saturating_add(authoritative_watchdog_dispatches);
+        if active_wait_poll_source == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+            && outcome == BufloExactReleaseWaitOutcome::DispatchReady
+            && buflo_exact_release_authoritative_watchdog_cadence_validated(evidence)
+        {
+            self.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards =
+                self.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards
+                    .saturating_add(1);
+        }
         self.buflo_exact_release_active_wait_counter_nanoseconds = self
             .buflo_exact_release_active_wait_counter_nanoseconds
             .saturating_add(active_wait_counter_nanoseconds.unwrap_or(0));
@@ -2286,6 +2882,15 @@ impl RunnerWakeupMetrics {
         self.buflo_exact_release_max_counter_calibration_span_nanoseconds = self
             .buflo_exact_release_max_counter_calibration_span_nanoseconds
             .max(max_counter_calibration_span_nanoseconds.unwrap_or(0));
+        self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds = self
+            .buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+            .max(max_authoritative_sample_gap_nanoseconds);
+        self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds = self
+            .buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+            .max(max_authoritative_counter_lag_nanoseconds);
+        self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds = self
+            .buflo_exact_release_max_counter_authoritative_lead_nanoseconds
+            .max(max_counter_authoritative_lead_nanoseconds);
 
         let replace_worst = dispatch_lateness.is_some_and(|dispatch_lateness| {
             self.buflo_exact_release_worst_guard
@@ -2342,9 +2947,14 @@ impl RunnerWakeupMetrics {
                 active_wait_counter_calibrations: counter_calibrations,
                 active_wait_instant_confirmations: instant_confirmations,
                 active_wait_early_confirmation_retries: early_confirmation_retries,
+                active_wait_authoritative_watchdog_checks: authoritative_watchdog_checks,
+                active_wait_authoritative_watchdog_dispatches: authoritative_watchdog_dispatches,
                 active_wait_counter_nanoseconds,
                 max_active_wait_counter_gap_nanoseconds,
                 max_counter_calibration_span_nanoseconds,
+                max_authoritative_sample_gap_nanoseconds,
+                max_authoritative_counter_lag_nanoseconds,
+                max_counter_authoritative_lead_nanoseconds,
                 active_spin_interruptions,
                 active_spin_interruption_nanoseconds,
                 max_active_spin_gap_nanoseconds,
@@ -2356,7 +2966,7 @@ impl RunnerWakeupMetrics {
         if !self.buflo_exact_release_invariants_hold() {
             *self = before;
             return Err(Error::DefenseExecution(
-                "BuFLO exact-release schema-9 aggregate invariants failed".into(),
+                "BuFLO exact-release schema-10 aggregate invariants failed".into(),
             ));
         }
         Ok(())
@@ -2364,7 +2974,7 @@ impl RunnerWakeupMetrics {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "schema-9 aggregate identities remain colocated for fail-closed evidence auditing"
+        reason = "schema-10 aggregate identities remain colocated for fail-closed evidence auditing"
     )]
     fn buflo_exact_release_invariants_hold(self) -> bool {
         let guards = self.buflo_exact_release_guard_entries;
@@ -2372,10 +2982,16 @@ impl RunnerWakeupMetrics {
         let failed = self.buflo_exact_release_failed_guards;
         let typed_failures = self
             .buflo_exact_release_invalid_counter_frequency_guards
-            .saturating_add(self.buflo_exact_release_counter_unavailable_failure_guards)
-            .saturating_add(self.buflo_exact_release_counter_nonmonotonic_failure_guards)
-            .saturating_add(self.buflo_exact_release_counter_frequency_changed_guards)
-            .saturating_add(self.buflo_exact_release_counter_target_error_guards);
+            .checked_add(self.buflo_exact_release_counter_unavailable_failure_guards)
+            .and_then(|value| {
+                value.checked_add(self.buflo_exact_release_counter_nonmonotonic_failure_guards)
+            })
+            .and_then(|value| {
+                value.checked_add(self.buflo_exact_release_counter_frequency_changed_guards)
+            })
+            .and_then(|value| {
+                value.checked_add(self.buflo_exact_release_counter_target_error_guards)
+            });
         let worst_matches_guard_count =
             self.buflo_exact_release_worst_guard.is_some() == (dispatch_ready > 0);
         let worst_matches_max_dispatch = self.buflo_exact_release_worst_guard.is_none_or(|worst| {
@@ -2384,8 +3000,10 @@ impl RunnerWakeupMetrics {
         });
         let counter_partition = self
             .buflo_exact_release_active_wait_counter_guards
-            .saturating_add(self.buflo_exact_release_active_wait_counter_unavailable_guards)
-            == guards;
+            .checked_add(self.buflo_exact_release_active_wait_counter_unavailable_guards)
+            == Some(guards);
+        let poll_source_valid =
+            buflo_exact_release_poll_source_valid(self.buflo_exact_release_active_wait_poll_source);
         let counter_frequency_consistent = self
             .buflo_exact_release_active_wait_counter_frequency_hz
             .is_none_or(|frequency| {
@@ -2398,7 +3016,28 @@ impl RunnerWakeupMetrics {
                     .buflo_exact_release_active_wait_counter_frequency_hz
                     .is_some());
         let worst_counter_consistent = self.buflo_exact_release_worst_guard.is_none_or(|worst| {
-            worst.active_wait_poll_source == self.buflo_exact_release_active_wait_poll_source
+            buflo_exact_release_worst_chronology_valid(&worst)
+                && buflo_exact_release_phase_valid(worst.phase)
+                && worst.active_wait_poll_source == self.buflo_exact_release_active_wait_poll_source
+                && buflo_exact_release_nullable_counter_tuple_valid(
+                    worst.active_wait_counter_frequency_hz,
+                    worst.active_wait_counter_nanoseconds,
+                    worst.max_active_wait_counter_gap_nanoseconds,
+                    worst.max_counter_calibration_span_nanoseconds,
+                )
+                && (worst.active_wait_early_confirmation_retries == 0
+                    || worst.active_wait_counter_nanoseconds.unwrap_or(0) > 0)
+                && worst.active_wait_iterations <= self.buflo_exact_release_active_wait_iterations
+                && worst.active_wait_monotonic_nanoseconds
+                    <= self.buflo_exact_release_active_wait_nanoseconds
+                && worst.active_spin_interruptions
+                    <= self.buflo_exact_release_active_spin_interruptions
+                && worst.active_spin_interruption_nanoseconds
+                    <= self.buflo_exact_release_active_spin_interruption_nanoseconds
+                && worst.guard_entry_lateness_nanoseconds
+                    <= self.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+                && worst.max_active_spin_gap_nanoseconds
+                    <= self.buflo_exact_release_max_active_spin_gap_nanoseconds
                 && worst.active_wait_counter_frequency_hz
                     == self.buflo_exact_release_active_wait_counter_frequency_hz
                 && worst.active_wait_counter_calibrations
@@ -2407,12 +3046,24 @@ impl RunnerWakeupMetrics {
                     <= self.buflo_exact_release_active_wait_instant_confirmations
                 && worst.active_wait_early_confirmation_retries
                     <= self.buflo_exact_release_active_wait_early_confirmation_retries
+                && worst.active_wait_authoritative_watchdog_checks
+                    <= self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+                && worst.active_wait_authoritative_watchdog_dispatches
+                    <= self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                && worst.active_wait_authoritative_watchdog_dispatches
+                    <= worst.active_wait_instant_confirmations
                 && worst.active_wait_counter_nanoseconds.unwrap_or(0)
                     <= self.buflo_exact_release_active_wait_counter_nanoseconds
                 && worst.max_active_wait_counter_gap_nanoseconds.unwrap_or(0)
                     <= self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds
                 && worst.max_counter_calibration_span_nanoseconds.unwrap_or(0)
                     <= self.buflo_exact_release_max_counter_calibration_span_nanoseconds
+                && worst.max_authoritative_sample_gap_nanoseconds
+                    <= self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+                && worst.max_authoritative_counter_lag_nanoseconds
+                    <= self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+                && worst.max_counter_authoritative_lead_nanoseconds
+                    <= self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds
         });
         let last_failure_consistent = self.buflo_exact_release_last_failure.is_none_or(|failure| {
             let reason_consistent = match failure.outcome {
@@ -2460,6 +3111,65 @@ impl RunnerWakeupMetrics {
                 }
                 _ => false,
             };
+            let state_machine_consistent = match failure.outcome {
+                "invalid-counter-frequency" => {
+                    failure.counter_calibrations == 0
+                        && failure.instant_confirmations == 0
+                        && failure.early_confirmation_retries == 0
+                }
+                "counter-frequency-changed" => {
+                    failure.counter_calibrations == failure.instant_confirmations
+                        && failure.early_confirmation_retries.checked_add(1)
+                            == Some(failure.instant_confirmations)
+                }
+                "counter-target-error" => {
+                    failure.instant_confirmations.checked_add(1)
+                        == Some(failure.counter_calibrations)
+                        && failure.early_confirmation_retries.checked_add(1)
+                            == Some(failure.counter_calibrations)
+                }
+                "counter-unavailable" | "counter-nonmonotonic" => {
+                    failure.instant_confirmations == failure.early_confirmation_retries
+                        && (failure.counter_calibrations == failure.instant_confirmations
+                            || failure.instant_confirmations.checked_add(1)
+                                == Some(failure.counter_calibrations))
+                }
+                _ => false,
+            };
+            let counter_measurements_consistent = failure.counter_nanoseconds.unwrap_or(0)
+                <= self.buflo_exact_release_active_wait_counter_nanoseconds
+                && failure.max_counter_gap_nanoseconds.unwrap_or(0)
+                    <= self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds
+                && failure
+                    .max_counter_calibration_span_nanoseconds
+                    .unwrap_or(0)
+                    <= self.buflo_exact_release_max_counter_calibration_span_nanoseconds
+                && failure.max_counter_gap_nanoseconds.unwrap_or(0)
+                    <= failure.counter_nanoseconds.unwrap_or(0)
+                && failure
+                    .max_counter_calibration_span_nanoseconds
+                    .unwrap_or(0)
+                    <= failure.counter_nanoseconds.unwrap_or(0)
+                && failure
+                    .max_counter_calibration_span_nanoseconds
+                    .unwrap_or(0)
+                    <= failure.max_counter_gap_nanoseconds.unwrap_or(0)
+                && (failure.counter_calibrations != 0
+                    || (failure.counter_nanoseconds.unwrap_or(0) == 0
+                        && failure.max_counter_gap_nanoseconds.unwrap_or(0) == 0
+                        && failure
+                            .max_counter_calibration_span_nanoseconds
+                            .unwrap_or(0)
+                            == 0));
+            let invalid_frequency_measurements_consistent = failure.outcome
+                != "invalid-counter-frequency"
+                || (failure.active_spin_interruptions == 0
+                    && failure.active_spin_interruption_nanoseconds == 0
+                    && failure.max_active_spin_gap_nanoseconds == 0
+                    && failure.authoritative_watchdog_checks == 0
+                    && failure.authoritative_watchdog_dispatches == 0
+                    && failure.max_authoritative_counter_lag_nanoseconds == 0
+                    && failure.max_counter_authoritative_lead_nanoseconds == 0);
             let planned_boundaries_consistent = match (
                 failure.guard_at_defense_nanoseconds,
                 failure.active_wait_at_defense_nanoseconds,
@@ -2485,15 +3195,77 @@ impl RunnerWakeupMetrics {
                 _ => false,
             };
             failure.dispatch_at_defense_nanoseconds.is_none()
+                && buflo_exact_release_failure_chronology_valid(&failure)
+                && buflo_exact_release_phase_valid(failure.phase)
+                && failure.active_wait_poll_source
+                    == self.buflo_exact_release_active_wait_poll_source
+                && failure.active_wait_poll_source == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+                && buflo_exact_release_nullable_counter_tuple_valid(
+                    failure.counter_frequency_hz,
+                    failure.counter_nanoseconds,
+                    failure.max_counter_gap_nanoseconds,
+                    failure.max_counter_calibration_span_nanoseconds,
+                )
                 && reason_consistent
+                && state_machine_consistent
+                && counter_measurements_consistent
+                && invalid_frequency_measurements_consistent
+                && (failure.early_confirmation_retries == 0
+                    || failure.counter_nanoseconds.unwrap_or(0) > 0)
                 && planned_boundaries_consistent
                 && entry_lateness_consistent
+                && failure.active_wait_iterations <= self.buflo_exact_release_active_wait_iterations
+                && failure.active_wait_monotonic_nanoseconds
+                    <= self.buflo_exact_release_active_wait_nanoseconds
+                && failure.active_spin_interruptions
+                    <= self.buflo_exact_release_active_spin_interruptions
+                && failure.active_spin_interruption_nanoseconds
+                    <= self.buflo_exact_release_active_spin_interruption_nanoseconds
+                && failure.guard_entry_lateness_nanoseconds
+                    <= self.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+                && failure.max_active_spin_gap_nanoseconds
+                    <= self.buflo_exact_release_max_active_spin_gap_nanoseconds
                 && failure.counter_backed != failure.counter_unavailable
                 && failure.counter_frequency_hz.is_none_or(|frequency| {
                     (BUFLO_EXACT_RELEASE_MIN_COUNTER_FREQUENCY_HZ
                         ..=BUFLO_EXACT_RELEASE_MAX_COUNTER_FREQUENCY_HZ)
                         .contains(&frequency)
                 })
+                && failure.authoritative_watchdog_dispatches <= 1
+                && failure.authoritative_watchdog_dispatches
+                    <= failure.authoritative_watchdog_checks
+                && failure.authoritative_watchdog_dispatches <= failure.instant_confirmations
+                && (failure.authoritative_watchdog_dispatches == 0
+                    || failure.outcome == "counter-frequency-changed")
+                && failure.counter_calibrations
+                    <= self.buflo_exact_release_active_wait_counter_calibrations
+                && failure.instant_confirmations
+                    <= self.buflo_exact_release_active_wait_instant_confirmations
+                && failure.early_confirmation_retries
+                    <= self.buflo_exact_release_active_wait_early_confirmation_retries
+                && failure.authoritative_watchdog_checks
+                    <= self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+                && failure.authoritative_watchdog_dispatches
+                    <= self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                && (failure.authoritative_watchdog_checks != 0
+                    || failure.instant_confirmations != 0
+                    || (failure.max_authoritative_counter_lag_nanoseconds == 0
+                        && failure.max_counter_authoritative_lead_nanoseconds == 0))
+                && failure.max_authoritative_sample_gap_nanoseconds
+                    <= self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+                && failure.max_authoritative_sample_gap_nanoseconds
+                    <= failure.active_wait_monotonic_nanoseconds
+                && (failure.outcome != "invalid-counter-frequency"
+                    || failure.max_authoritative_sample_gap_nanoseconds
+                        == failure.active_wait_monotonic_nanoseconds)
+                && failure.max_authoritative_counter_lag_nanoseconds
+                    <= self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+                && failure.max_authoritative_counter_lag_nanoseconds
+                    <= failure.active_wait_monotonic_nanoseconds
+                && failure.max_counter_authoritative_lead_nanoseconds
+                    <= self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds
+                && failure.max_counter_authoritative_lead_nanoseconds
+                    <= failure.counter_nanoseconds.unwrap_or(0)
                 && match (
                     failure.release_at_defense_nanoseconds,
                     failure.exited_at_defense_nanoseconds,
@@ -2515,10 +3287,326 @@ impl RunnerWakeupMetrics {
                     _ => false,
                 }
         });
+        let retained_failure_watchdog_cadence = if failed == 1 {
+            self.buflo_exact_release_last_failure
+                .is_some_and(|failure| {
+                    buflo_exact_release_failure_watchdog_cadence_validated(
+                        failure.outcome,
+                        failure.active_wait_iterations,
+                        failure.counter_calibrations,
+                        failure.instant_confirmations,
+                        failure.early_confirmation_retries,
+                        failure.authoritative_watchdog_checks,
+                        failure.authoritative_watchdog_dispatches,
+                    )
+                })
+        } else {
+            true
+        };
+        let exact_single_success_aggregates = if dispatch_ready == 1 && failed == 0 {
+            self.buflo_exact_release_worst_guard.is_some_and(|worst| {
+                let mut exact_spin_histogram = BufloExactReleaseTimingHistogram::new();
+                exact_spin_histogram.record(worst.max_active_spin_gap_nanoseconds);
+                let mut exact_dispatch_histogram = BufloExactReleaseTimingHistogram::new();
+                exact_dispatch_histogram.record(worst.dispatch_lateness_nanoseconds);
+                self.buflo_exact_release_active_wait_poll_source == worst.active_wait_poll_source
+                    && self.buflo_exact_release_active_wait_counter_frequency_hz
+                        == worst.active_wait_counter_frequency_hz
+                    && self.buflo_exact_release_guard_wait_nanoseconds
+                        == worst.active_wait_monotonic_nanoseconds
+                    && self.buflo_exact_release_active_wait_nanoseconds
+                        == worst.active_wait_monotonic_nanoseconds
+                    && self.buflo_exact_release_max_passive_wake_lateness_nanoseconds
+                        == worst.guard_entry_lateness_nanoseconds
+                    && self.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+                        == worst.guard_entry_lateness_nanoseconds
+                    && self.buflo_exact_release_max_guard_exit_lateness_nanoseconds
+                        == worst.dispatch_lateness_nanoseconds
+                    && self.buflo_exact_release_passive_sleep_calls == worst.passive_sleep_calls
+                    && self.buflo_exact_release_passive_sleep_requested_nanoseconds
+                        == worst.passive_sleep_requested_nanoseconds
+                    && self.buflo_exact_release_passive_sleep_elapsed_nanoseconds
+                        == worst.passive_sleep_elapsed_nanoseconds
+                    && self.buflo_exact_release_max_passive_sleep_overrun_nanoseconds
+                        == worst.max_passive_sleep_overrun_nanoseconds
+                    && self.buflo_exact_release_active_wait_iterations
+                        == worst.active_wait_iterations
+                    && self.buflo_exact_release_active_spin_interruptions
+                        == worst.active_spin_interruptions
+                    && self.buflo_exact_release_active_spin_interruption_nanoseconds
+                        == worst.active_spin_interruption_nanoseconds
+                    && self.buflo_exact_release_max_active_spin_gap_nanoseconds
+                        == worst.max_active_spin_gap_nanoseconds
+                    && self.buflo_exact_release_active_spin_gap_histogram == exact_spin_histogram
+                    && self.buflo_exact_release_dispatch_lateness_histogram
+                        == exact_dispatch_histogram
+                    && self.buflo_exact_release_active_wait_counter_calibrations
+                        == worst.active_wait_counter_calibrations
+                    && self.buflo_exact_release_active_wait_instant_confirmations
+                        == worst.active_wait_instant_confirmations
+                    && self.buflo_exact_release_active_wait_early_confirmation_retries
+                        == worst.active_wait_early_confirmation_retries
+                    && self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+                        == worst.active_wait_authoritative_watchdog_checks
+                    && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                        == worst.active_wait_authoritative_watchdog_dispatches
+                    && self.buflo_exact_release_active_wait_counter_nanoseconds
+                        == worst.active_wait_counter_nanoseconds.unwrap_or(0)
+                    && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds
+                        == worst.max_active_wait_counter_gap_nanoseconds.unwrap_or(0)
+                    && self.buflo_exact_release_max_counter_calibration_span_nanoseconds
+                        == worst.max_counter_calibration_span_nanoseconds.unwrap_or(0)
+                    && self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+                        == worst.max_authoritative_sample_gap_nanoseconds
+                    && self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+                        == worst.max_authoritative_counter_lag_nanoseconds
+                    && self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds
+                        == worst.max_counter_authoritative_lead_nanoseconds
+                    && self.buflo_exact_release_dispatch_at_or_after_deadline_guards
+                        == u64::from(worst.dispatch_at_or_after_deadline)
+            })
+        } else {
+            true
+        };
+        let exact_single_failure_aggregates = if dispatch_ready == 0 && failed == 1 {
+            self.buflo_exact_release_last_failure
+                .is_some_and(|failure| {
+                    let mut exact_spin_histogram = BufloExactReleaseTimingHistogram::new();
+                    exact_spin_histogram.record(failure.max_active_spin_gap_nanoseconds);
+                    self.buflo_exact_release_active_wait_poll_source
+                        == failure.active_wait_poll_source
+                        && self.buflo_exact_release_active_wait_counter_frequency_hz
+                            == failure.counter_frequency_hz
+                        && self.buflo_exact_release_guard_wait_nanoseconds
+                            == failure.active_wait_monotonic_nanoseconds
+                        && self.buflo_exact_release_active_wait_nanoseconds
+                            == failure.active_wait_monotonic_nanoseconds
+                        && self.buflo_exact_release_max_passive_wake_lateness_nanoseconds
+                            == failure.guard_entry_lateness_nanoseconds
+                        && self.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+                            == failure.guard_entry_lateness_nanoseconds
+                        && self.buflo_exact_release_max_guard_exit_lateness_nanoseconds == 0
+                        && self.buflo_exact_release_active_wait_iterations
+                            == failure.active_wait_iterations
+                        && self.buflo_exact_release_active_spin_interruptions
+                            == failure.active_spin_interruptions
+                        && self.buflo_exact_release_active_spin_interruption_nanoseconds
+                            == failure.active_spin_interruption_nanoseconds
+                        && self.buflo_exact_release_max_active_spin_gap_nanoseconds
+                            == failure.max_active_spin_gap_nanoseconds
+                        && self.buflo_exact_release_active_spin_gap_histogram
+                            == exact_spin_histogram
+                        && self.buflo_exact_release_active_wait_counter_calibrations
+                            == failure.counter_calibrations
+                        && self.buflo_exact_release_active_wait_instant_confirmations
+                            == failure.instant_confirmations
+                        && self.buflo_exact_release_active_wait_early_confirmation_retries
+                            == failure.early_confirmation_retries
+                        && self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+                            == failure.authoritative_watchdog_checks
+                        && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                            == failure.authoritative_watchdog_dispatches
+                        && self.buflo_exact_release_active_wait_counter_nanoseconds
+                            == failure.counter_nanoseconds.unwrap_or(0)
+                        && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds
+                            == failure.max_counter_gap_nanoseconds.unwrap_or(0)
+                        && self.buflo_exact_release_max_counter_calibration_span_nanoseconds
+                            == failure
+                                .max_counter_calibration_span_nanoseconds
+                                .unwrap_or(0)
+                        && self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+                            == failure.max_authoritative_sample_gap_nanoseconds
+                        && self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+                            == failure.max_authoritative_counter_lag_nanoseconds
+                        && self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds
+                            == failure.max_counter_authoritative_lead_nanoseconds
+                })
+        } else {
+            true
+        };
+        let exact_success_failure_aggregates = if dispatch_ready == 1 && failed == 1 {
+            match (
+                self.buflo_exact_release_worst_guard,
+                self.buflo_exact_release_last_failure,
+            ) {
+                (Some(worst), Some(failure)) => {
+                    let mut exact_spin_histogram = BufloExactReleaseTimingHistogram::new();
+                    exact_spin_histogram.record(worst.max_active_spin_gap_nanoseconds);
+                    exact_spin_histogram.record(failure.max_active_spin_gap_nanoseconds);
+                    let residual_interruptions_match = self
+                        .buflo_exact_release_active_wait_iterations
+                        == u64::MAX
+                        || self
+                            .buflo_exact_release_active_wait_iterations
+                            .checked_sub(worst.active_wait_iterations)
+                            .and_then(|failure_iterations| {
+                                let terminal_no_gap_reads = u64::from(matches!(
+                                    failure.outcome,
+                                    "counter-unavailable" | "counter-nonmonotonic"
+                                ));
+                                self.buflo_exact_release_active_spin_interruptions
+                                    .checked_sub(worst.active_spin_interruptions)
+                                    .zip(
+                                        self.buflo_exact_release_active_spin_interruption_nanoseconds
+                                            .checked_sub(
+                                                worst.active_spin_interruption_nanoseconds,
+                                            ),
+                                    )
+                                    .map(|(failure_interruptions, failure_interruption_ns)| {
+                                        failure_interruptions
+                                            <= failure_iterations
+                                                .saturating_sub(1)
+                                                .saturating_sub(terminal_no_gap_reads)
+                                            && failure_interruption_ns
+                                                >= failure_interruptions.saturating_mul(
+                                                    duration_as_u64_nanos(
+                                                        BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD,
+                                                    )
+                                                    .saturating_add(1),
+                                                )
+                                            && failure_interruption_ns
+                                                <= failure.counter_nanoseconds.unwrap_or(0)
+                                            && failure_interruption_ns
+                                                <= self
+                                                    .buflo_exact_release_active_wait_nanoseconds
+                                                    .saturating_sub(
+                                                        worst.active_wait_monotonic_nanoseconds,
+                                                    )
+                                    })
+                            })
+                            .unwrap_or(false);
+                    let duration_sums_match = self.buflo_exact_release_guard_wait_nanoseconds
+                        == worst
+                            .active_wait_monotonic_nanoseconds
+                            .saturating_add(failure.active_wait_monotonic_nanoseconds)
+                        && self.buflo_exact_release_active_wait_nanoseconds
+                            == worst
+                                .active_wait_monotonic_nanoseconds
+                                .saturating_add(failure.active_wait_monotonic_nanoseconds);
+                    residual_interruptions_match
+                        && self.buflo_exact_release_active_spin_gap_histogram
+                            == exact_spin_histogram
+                        && duration_sums_match
+                        && self.buflo_exact_release_active_wait_iterations
+                            == worst
+                                .active_wait_iterations
+                                .saturating_add(failure.active_wait_iterations)
+                        && self.buflo_exact_release_active_spin_interruptions
+                            == worst
+                                .active_spin_interruptions
+                                .saturating_add(failure.active_spin_interruptions)
+                        && self.buflo_exact_release_active_spin_interruption_nanoseconds
+                            == worst
+                                .active_spin_interruption_nanoseconds
+                                .saturating_add(failure.active_spin_interruption_nanoseconds)
+                        && self.buflo_exact_release_active_wait_counter_calibrations
+                            == worst
+                                .active_wait_counter_calibrations
+                                .saturating_add(failure.counter_calibrations)
+                        && self.buflo_exact_release_active_wait_instant_confirmations
+                            == worst
+                                .active_wait_instant_confirmations
+                                .saturating_add(failure.instant_confirmations)
+                        && self.buflo_exact_release_active_wait_early_confirmation_retries
+                            == worst
+                                .active_wait_early_confirmation_retries
+                                .saturating_add(failure.early_confirmation_retries)
+                        && self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+                            == worst
+                                .active_wait_authoritative_watchdog_checks
+                                .saturating_add(failure.authoritative_watchdog_checks)
+                        && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                            == worst
+                                .active_wait_authoritative_watchdog_dispatches
+                                .saturating_add(failure.authoritative_watchdog_dispatches)
+                        && self.buflo_exact_release_active_wait_counter_nanoseconds
+                            == worst
+                                .active_wait_counter_nanoseconds
+                                .unwrap_or(0)
+                                .saturating_add(failure.counter_nanoseconds.unwrap_or(0))
+                        && self.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+                            == worst
+                                .guard_entry_lateness_nanoseconds
+                                .max(failure.guard_entry_lateness_nanoseconds)
+                        && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds
+                            == worst
+                                .max_active_wait_counter_gap_nanoseconds
+                                .unwrap_or(0)
+                                .max(failure.max_counter_gap_nanoseconds.unwrap_or(0))
+                        && self.buflo_exact_release_max_counter_calibration_span_nanoseconds
+                            == worst
+                                .max_counter_calibration_span_nanoseconds
+                                .unwrap_or(0)
+                                .max(
+                                    failure
+                                        .max_counter_calibration_span_nanoseconds
+                                        .unwrap_or(0),
+                                )
+                        && self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+                            == worst
+                                .max_authoritative_sample_gap_nanoseconds
+                                .max(failure.max_authoritative_sample_gap_nanoseconds)
+                        && self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+                            == worst
+                                .max_authoritative_counter_lag_nanoseconds
+                                .max(failure.max_authoritative_counter_lag_nanoseconds)
+                        && self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds
+                            == worst
+                                .max_counter_authoritative_lead_nanoseconds
+                                .max(failure.max_counter_authoritative_lead_nanoseconds)
+                        && self.buflo_exact_release_dispatch_at_or_after_deadline_guards
+                            == u64::from(worst.dispatch_at_or_after_deadline)
+                }
+                _ => false,
+            }
+        } else {
+            true
+        };
+        let empty_guard_projection = guards != 0
+            || (self.buflo_exact_release_guard_wait_nanoseconds == 0
+                && self.buflo_exact_release_active_wait_nanoseconds == 0
+                && self.buflo_exact_release_max_passive_wake_lateness_nanoseconds == 0
+                && self.buflo_exact_release_max_guard_exit_lateness_nanoseconds == 0
+                && self.buflo_exact_release_max_guard_entry_lateness_nanoseconds == 0
+                && self.buflo_exact_release_passive_sleep_calls == 0
+                && self.buflo_exact_release_passive_sleep_requested_nanoseconds == 0
+                && self.buflo_exact_release_passive_sleep_elapsed_nanoseconds == 0
+                && self.buflo_exact_release_max_passive_sleep_overrun_nanoseconds == 0
+                && self.buflo_exact_release_active_wait_iterations == 0
+                && self.buflo_exact_release_active_spin_interruptions == 0
+                && self.buflo_exact_release_active_spin_interruption_nanoseconds == 0
+                && self.buflo_exact_release_max_active_spin_gap_nanoseconds == 0
+                && self
+                    .buflo_exact_release_active_wait_counter_frequency_hz
+                    .is_none()
+                && self.buflo_exact_release_active_wait_counter_guards == 0
+                && self.buflo_exact_release_active_wait_counter_unavailable_guards == 0
+                && self.buflo_exact_release_active_wait_counter_nonmonotonic_guards == 0
+                && self.buflo_exact_release_active_wait_counter_calibrations == 0
+                && self.buflo_exact_release_active_wait_instant_confirmations == 0
+                && self.buflo_exact_release_active_wait_early_confirmation_retries == 0
+                && self.buflo_exact_release_active_wait_authoritative_watchdog_checks == 0
+                && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches == 0
+                && self
+                    .buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards
+                    == 0
+                && self.buflo_exact_release_active_wait_counter_nanoseconds == 0
+                && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds == 0
+                && self.buflo_exact_release_max_counter_calibration_span_nanoseconds == 0
+                && self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds == 0
+                && self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds == 0
+                && self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds == 0
+                && self.buflo_exact_release_dispatch_at_or_after_deadline_guards == 0
+                && self.buflo_exact_release_dispatch_lateness_histogram.total() == 0
+                && self.buflo_exact_release_active_spin_gap_histogram.total() == 0
+                && self.buflo_exact_release_worst_guard.is_none()
+                && self.buflo_exact_release_last_failure.is_none());
         let successful_counter_guards = self
             .buflo_exact_release_active_wait_counter_guards
-            .saturating_sub(self.buflo_exact_release_counter_nonmonotonic_failure_guards)
-            .saturating_sub(self.buflo_exact_release_counter_target_error_guards);
+            .checked_sub(self.buflo_exact_release_counter_nonmonotonic_failure_guards)
+            .and_then(|value| {
+                value.checked_sub(self.buflo_exact_release_counter_target_error_guards)
+            });
         let failure_read_attempt_extra =
             self.buflo_exact_release_last_failure
                 .map_or(0, |failure| match failure.outcome {
@@ -2527,7 +3615,7 @@ impl RunnerWakeupMetrics {
                     _ => 0,
                 });
         let aarch64_counter_partitions = if self.buflo_exact_release_active_wait_poll_source
-            == "linux-aarch64-cntvct-el0-predictive-v1"
+            == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
         {
             self.buflo_exact_release_active_wait_counter_unavailable_guards
                 == self
@@ -2556,11 +3644,195 @@ impl RunnerWakeupMetrics {
         } else {
             true
         };
+        let authoritative_watchdog_cadence_partition = if self
+            .buflo_exact_release_active_wait_poll_source
+            == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+        {
+            self.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards
+                == dispatch_ready
+        } else {
+            self.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards
+                == 0
+        };
+        let zero_failure_watchdog_remainder_bound = self
+            .buflo_exact_release_active_wait_poll_source
+            != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+            || failed != 0
+            || buflo_exact_release_zero_failure_watchdog_remainder_bound(
+                self.buflo_exact_release_active_wait_iterations,
+                self.buflo_exact_release_active_wait_counter_calibrations,
+                self.buflo_exact_release_active_wait_authoritative_watchdog_checks,
+                self.buflo_exact_release_active_wait_early_confirmation_retries,
+                self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches,
+                guards,
+            );
+        let remaining_success_guard_partition = self
+            .buflo_exact_release_active_wait_poll_source
+            != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+            || dispatch_ready <= 1
+            || self.buflo_exact_release_worst_guard.is_some_and(|worst| {
+                let remaining_successes = dispatch_ready - 1;
+                let remaining_successes_validate = |failure_iterations: u64,
+                                                    failure_calibrations: u64,
+                                                    failure_checks: u64,
+                                                    failure_retries: u64,
+                                                    failure_dispatches: u64,
+                                                    failure_counter_nanoseconds: u64,
+                                                    failure_terminal_no_gap: bool| {
+                    self.buflo_exact_release_active_wait_iterations
+                        .checked_sub(worst.active_wait_iterations)
+                        .and_then(|value| value.checked_sub(failure_iterations))
+                        .zip(
+                        self.buflo_exact_release_active_wait_counter_calibrations
+                            .checked_sub(worst.active_wait_counter_calibrations)
+                            .and_then(|value| value.checked_sub(failure_calibrations)),
+                        )
+                        .zip(
+                        self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+                            .checked_sub(worst.active_wait_authoritative_watchdog_checks)
+                            .and_then(|value| value.checked_sub(failure_checks)),
+                        )
+                        .zip(
+                        self.buflo_exact_release_active_wait_early_confirmation_retries
+                            .checked_sub(worst.active_wait_early_confirmation_retries)
+                            .and_then(|value| value.checked_sub(failure_retries)),
+                        )
+                        .zip(
+                        self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                            .checked_sub(worst.active_wait_authoritative_watchdog_dispatches)
+                            .and_then(|value| value.checked_sub(failure_dispatches)),
+                        )
+                        .zip(
+                            self.buflo_exact_release_active_wait_counter_nanoseconds
+                                .checked_sub(
+                                    worst.active_wait_counter_nanoseconds.unwrap_or(0),
+                                )
+                                .and_then(|value| {
+                                    value.checked_sub(failure_counter_nanoseconds)
+                                }),
+                        )
+                        .is_some_and(
+                            |(
+                                ((((iterations, calibrations), checks), retries), dispatches),
+                                counter_nanoseconds,
+                            )| {
+                            buflo_exact_release_zero_failure_watchdog_remainder_bound(
+                                iterations,
+                                calibrations,
+                                checks,
+                                retries,
+                                dispatches,
+                                remaining_successes,
+                            )
+                                && (retries == 0 || counter_nanoseconds > 0)
+                                && (self.buflo_exact_release_active_wait_iterations == u64::MAX
+                                    || self
+                                        .buflo_exact_release_active_spin_interruptions
+                                        .checked_sub(worst.active_spin_interruptions)
+                                        .is_some_and(|residual_interruptions| {
+                                            residual_interruptions
+                                                <= iterations
+                                                    .saturating_sub(remaining_successes)
+                                                    .saturating_add(
+                                                        failure_iterations
+                                                            .saturating_sub(1)
+                                                            .saturating_sub(u64::from(
+                                                                failure_terminal_no_gap,
+                                                            )),
+                                                    )
+                                        }))
+                                    && (self
+                                        .buflo_exact_release_active_spin_interruption_nanoseconds
+                                        == u64::MAX
+                                        || self.buflo_exact_release_active_wait_counter_nanoseconds
+                                            == u64::MAX
+                                        || self
+                                            .buflo_exact_release_active_spin_interruption_nanoseconds
+                                            .checked_sub(
+                                                worst.active_spin_interruption_nanoseconds,
+                                            )
+                                            .zip(
+                                                self.buflo_exact_release_active_wait_counter_nanoseconds
+                                                    .checked_sub(
+                                                        worst.active_wait_counter_nanoseconds.unwrap_or(0),
+                                                    ),
+                                            )
+                                            .is_some_and(
+                                                |(interruption_ns, counter_ns)| {
+                                                    interruption_ns <= counter_ns
+                                                },
+                                            ))
+                                    && (self
+                                        .buflo_exact_release_active_spin_interruption_nanoseconds
+                                        == u64::MAX
+                                        || self.buflo_exact_release_active_wait_nanoseconds
+                                            == u64::MAX
+                                        || self
+                                            .buflo_exact_release_active_spin_interruption_nanoseconds
+                                            .checked_sub(
+                                                worst.active_spin_interruption_nanoseconds,
+                                            )
+                                            .zip(
+                                                self.buflo_exact_release_active_wait_nanoseconds
+                                                    .checked_sub(
+                                                        worst.active_wait_monotonic_nanoseconds,
+                                                    ),
+                                            )
+                                            .is_some_and(
+                                                |(interruption_ns, active_wait_ns)| {
+                                                    interruption_ns <= active_wait_ns
+                                                },
+                                            ))
+                        },
+                        )
+                };
+                self.buflo_exact_release_last_failure.map_or_else(
+                    || remaining_successes_validate(0, 0, 0, 0, 0, 0, false),
+                    |failure| {
+                        remaining_successes_validate(
+                            failure.active_wait_iterations,
+                            failure.counter_calibrations,
+                            failure.authoritative_watchdog_checks,
+                            failure.early_confirmation_retries,
+                            failure.authoritative_watchdog_dispatches,
+                            failure.counter_nanoseconds.unwrap_or(0),
+                            matches!(
+                                failure.outcome,
+                                "counter-unavailable" | "counter-nonmonotonic"
+                            ),
+                        )
+                    },
+                )
+            });
+        let unavailable_failure_with_anchor = u64::from(
+            self.buflo_exact_release_last_failure
+                .is_some_and(|failure| {
+                    failure.outcome == "counter-unavailable" && failure.counter_calibrations > 0
+                }),
+        );
+        let predictive_interruption_partition = self.buflo_exact_release_active_wait_poll_source
+            != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+            || (self.buflo_exact_release_active_spin_interruption_nanoseconds
+                <= self.buflo_exact_release_active_wait_counter_nanoseconds
+                && (self.buflo_exact_release_active_wait_iterations == u64::MAX
+                    || self.buflo_exact_release_active_spin_interruptions
+                        <= self
+                            .buflo_exact_release_active_wait_iterations
+                            .saturating_sub(
+                            guards
+                                .saturating_sub(
+                                    self.buflo_exact_release_invalid_counter_frequency_guards,
+                                )
+                                .saturating_add(unavailable_failure_with_anchor)
+                                .saturating_add(
+                                    self.buflo_exact_release_counter_nonmonotonic_failure_guards,
+                                ),
+                        )));
         let instant_fallback_counter_partition = if self.buflo_exact_release_active_wait_poll_source
             == "instant-authoritative-fallback-v1"
         {
             failed == 0
-                && typed_failures == 0
+                && typed_failures == Some(0)
                 && dispatch_ready == guards
                 && self
                     .buflo_exact_release_active_wait_counter_frequency_hz
@@ -2571,14 +3843,242 @@ impl RunnerWakeupMetrics {
                 && self.buflo_exact_release_active_wait_counter_calibrations == 0
                 && self.buflo_exact_release_active_wait_instant_confirmations == 0
                 && self.buflo_exact_release_active_wait_early_confirmation_retries == 0
+                && self.buflo_exact_release_active_wait_authoritative_watchdog_checks == 0
+                && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches == 0
+                && self
+                    .buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards
+                    == 0
                 && self.buflo_exact_release_active_wait_counter_nanoseconds == 0
                 && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds == 0
                 && self.buflo_exact_release_max_counter_calibration_span_nanoseconds == 0
+                && self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds == 0
+                && self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds == 0
+                && self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds == 0
         } else {
             true
         };
-        guards == dispatch_ready.saturating_add(failed)
-            && failed == typed_failures
+        let remaining_success_allocation = if dispatch_ready <= 1
+            || dispatch_ready == u64::MAX
+            || self.buflo_exact_release_active_wait_iterations == u64::MAX
+            || self.buflo_exact_release_active_spin_interruptions == u64::MAX
+            || self.buflo_exact_release_active_spin_interruption_nanoseconds == u64::MAX
+            || self.buflo_exact_release_active_wait_nanoseconds == u64::MAX
+            || self.buflo_exact_release_active_wait_counter_nanoseconds == u64::MAX
+        {
+            true
+        } else {
+            self.buflo_exact_release_worst_guard.is_some_and(|worst| {
+                let failure = self.buflo_exact_release_last_failure;
+                let failure_interruptions =
+                    failure.map_or(0, |item| item.active_spin_interruptions);
+                let failure_interruption_ns =
+                    failure.map_or(0, |item| item.active_spin_interruption_nanoseconds);
+                let failure_iterations = failure.map_or(0, |item| item.active_wait_iterations);
+                let failure_active_ns =
+                    failure.map_or(0, |item| item.active_wait_monotonic_nanoseconds);
+                let failure_counter_ns = failure
+                    .and_then(|item| item.counter_nanoseconds)
+                    .unwrap_or(0);
+                let maxima = failure.map_or_else(
+                    || vec![worst.max_active_spin_gap_nanoseconds],
+                    |item| {
+                        vec![
+                            worst.max_active_spin_gap_nanoseconds,
+                            item.max_active_spin_gap_nanoseconds,
+                        ]
+                    },
+                );
+                self.buflo_exact_release_active_spin_interruptions
+                    .checked_sub(worst.active_spin_interruptions)
+                    .and_then(|value| value.checked_sub(failure_interruptions))
+                    .zip(
+                        self.buflo_exact_release_active_spin_interruption_nanoseconds
+                            .checked_sub(worst.active_spin_interruption_nanoseconds)
+                            .and_then(|value| value.checked_sub(failure_interruption_ns)),
+                    )
+                    .zip(
+                        self.buflo_exact_release_active_wait_iterations
+                            .checked_sub(worst.active_wait_iterations)
+                            .and_then(|value| value.checked_sub(failure_iterations)),
+                    )
+                    .zip(
+                        self.buflo_exact_release_active_wait_nanoseconds
+                            .checked_sub(worst.active_wait_monotonic_nanoseconds)
+                            .and_then(|value| value.checked_sub(failure_active_ns)),
+                    )
+                    .zip(
+                        self.buflo_exact_release_active_wait_counter_nanoseconds
+                            .checked_sub(worst.active_wait_counter_nanoseconds.unwrap_or(0))
+                            .and_then(|value| value.checked_sub(failure_counter_ns)),
+                    )
+                    .is_some_and(
+                        |(
+                            (((interruptions, interruption_ns), iterations), active_ns),
+                            counter_ns,
+                        )| {
+                            let remaining_successes = dispatch_ready - 1;
+                            let count_capacity = if self.buflo_exact_release_active_wait_poll_source
+                                == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+                            {
+                                iterations.saturating_sub(remaining_successes)
+                            } else {
+                                iterations
+                            };
+                            buflo_exact_release_residual_interruption_minimum(
+                                &self.buflo_exact_release_active_spin_gap_histogram,
+                                self.buflo_exact_release_max_active_spin_gap_nanoseconds,
+                                &maxima,
+                                interruptions,
+                            )
+                            .is_some_and(|minimum| interruption_ns >= minimum)
+                                && interruption_ns <= active_ns
+                                && (self.buflo_exact_release_active_wait_poll_source
+                                    != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+                                    || interruption_ns <= counter_ns)
+                                && interruptions <= count_capacity
+                                && buflo_exact_release_residual_active_duration_minimum(
+                                    &self.buflo_exact_release_dispatch_lateness_histogram,
+                                    worst.dispatch_lateness_nanoseconds,
+                                    self.buflo_exact_release_max_guard_entry_lateness_nanoseconds,
+                                )
+                                .is_some_and(|minimum| active_ns >= minimum)
+                        },
+                    )
+            })
+        };
+        let histogram_integrity = (guards == 0
+            || self
+                .buflo_exact_release_active_spin_gap_histogram
+                .maximum_consistent(self.buflo_exact_release_max_active_spin_gap_nanoseconds))
+            && (dispatch_ready == 0
+                || self
+                    .buflo_exact_release_dispatch_lateness_histogram
+                    .maximum_consistent(
+                        self.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
+                    ))
+            && buflo_exact_release_residual_interruption_minimum(
+                &self.buflo_exact_release_active_spin_gap_histogram,
+                self.buflo_exact_release_max_active_spin_gap_nanoseconds,
+                &[],
+                self.buflo_exact_release_active_spin_interruptions,
+            )
+            .is_some_and(|minimum| {
+                self.buflo_exact_release_active_spin_interruption_nanoseconds >= minimum
+            });
+        let aggregate_guard_entry_lateness_reachable = self
+            .buflo_exact_release_max_guard_entry_lateness_nanoseconds
+            <= self
+                .buflo_exact_release_last_failure
+                .map_or(0, |failure| failure.guard_entry_lateness_nanoseconds)
+                .max(
+                    duration_as_u64_nanos(BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL).saturating_add(
+                        self.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
+                    ),
+                );
+        let maximum_success_active_wait_nanoseconds =
+            duration_as_u64_nanos(BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL)
+                .saturating_add(self.buflo_exact_release_max_guard_exit_lateness_nanoseconds);
+        let maximum_success_active_wait_is_saturated =
+            duration_as_u64_nanos(BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL)
+                .checked_add(self.buflo_exact_release_max_guard_exit_lateness_nanoseconds)
+                .is_none();
+        let retained_worst_active_wait_nanoseconds = self
+            .buflo_exact_release_worst_guard
+            .map_or(0, |worst| worst.active_wait_monotonic_nanoseconds);
+        let retained_failure_active_wait_nanoseconds = self
+            .buflo_exact_release_last_failure
+            .map_or(0, |failure| failure.active_wait_monotonic_nanoseconds);
+        let retained_entry_lateness_nanoseconds = self
+            .buflo_exact_release_worst_guard
+            .map_or(0, |worst| worst.guard_entry_lateness_nanoseconds)
+            .max(
+                self.buflo_exact_release_last_failure
+                    .map_or(0, |failure| failure.guard_entry_lateness_nanoseconds),
+            );
+        let required_hidden_success_entry_lateness_nanoseconds = if self
+            .buflo_exact_release_max_guard_entry_lateness_nanoseconds
+            > retained_entry_lateness_nanoseconds
+        {
+            self.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+        } else {
+            0
+        };
+        let unretained_successes = dispatch_ready
+            .saturating_sub(u64::from(self.buflo_exact_release_worst_guard.is_some()));
+        let aggregate_active_wait_ceiling = buflo_exact_release_aggregate_active_wait_ceiling(
+            maximum_success_active_wait_nanoseconds,
+            maximum_success_active_wait_is_saturated,
+            unretained_successes,
+            required_hidden_success_entry_lateness_nanoseconds,
+            retained_worst_active_wait_nanoseconds,
+            retained_failure_active_wait_nanoseconds,
+        );
+        let aggregate_active_wait_reachable = aggregate_active_wait_ceiling
+            .is_some_and(|ceiling| self.buflo_exact_release_active_wait_nanoseconds <= ceiling);
+        let unretained_success_active_maximum = if unretained_successes == 0 {
+            0
+        } else {
+            maximum_success_active_wait_nanoseconds
+        };
+        let active_derived_maxima_reachable = [
+            (
+                self.buflo_exact_release_max_active_spin_gap_nanoseconds,
+                self.buflo_exact_release_worst_guard
+                    .map_or(0, |worst| worst.max_active_spin_gap_nanoseconds),
+                self.buflo_exact_release_last_failure
+                    .map_or(0, |failure| failure.max_active_spin_gap_nanoseconds),
+            ),
+            (
+                self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds,
+                self.buflo_exact_release_worst_guard.map_or(0, |worst| {
+                    worst.max_active_wait_counter_gap_nanoseconds.unwrap_or(0)
+                }),
+                self.buflo_exact_release_last_failure.map_or(0, |failure| {
+                    failure.max_counter_gap_nanoseconds.unwrap_or(0)
+                }),
+            ),
+            (
+                self.buflo_exact_release_max_counter_calibration_span_nanoseconds,
+                self.buflo_exact_release_worst_guard.map_or(0, |worst| {
+                    worst.max_counter_calibration_span_nanoseconds.unwrap_or(0)
+                }),
+                self.buflo_exact_release_last_failure.map_or(0, |failure| {
+                    failure
+                        .max_counter_calibration_span_nanoseconds
+                        .unwrap_or(0)
+                }),
+            ),
+            (
+                self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds,
+                self.buflo_exact_release_worst_guard
+                    .map_or(0, |worst| worst.max_authoritative_sample_gap_nanoseconds),
+                self.buflo_exact_release_last_failure.map_or(0, |failure| {
+                    failure.max_authoritative_sample_gap_nanoseconds
+                }),
+            ),
+            (
+                self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds,
+                self.buflo_exact_release_worst_guard
+                    .map_or(0, |worst| worst.max_authoritative_counter_lag_nanoseconds),
+                self.buflo_exact_release_last_failure.map_or(0, |failure| {
+                    failure.max_authoritative_counter_lag_nanoseconds
+                }),
+            ),
+        ]
+        .into_iter()
+        .all(|(aggregate, retained_worst, retained_failure)| {
+            aggregate
+                <= retained_worst
+                    .max(retained_failure)
+                    .max(unretained_success_active_maximum)
+        });
+        let deadline_count_reachable =
+            self.buflo_exact_release_dispatch_at_or_after_deadline_guards == 0
+                || self.buflo_exact_release_max_guard_exit_lateness_nanoseconds >= 4_999_000;
+        dispatch_ready.checked_add(failed) == Some(guards)
+            && (self.buflo_exact_incoming_retry_drives != 0
+                || self.buflo_exact_incoming_retry_max_wake_lateness_nanoseconds == 0)
+            && typed_failures == Some(failed)
             && failed <= 1
             && (self.buflo_exact_release_counter_frequency_changed_guards == 0
                 || dispatch_ready > 0)
@@ -2586,16 +4086,32 @@ impl RunnerWakeupMetrics {
             && self.buflo_exact_release_dispatch_lateness_histogram.total() == dispatch_ready
             && self.buflo_exact_release_active_spin_gap_histogram.total() == guards
             && counter_partition
+            && poll_source_valid
             && counter_frequency_consistent
             && self.buflo_exact_release_active_wait_counter_nonmonotonic_guards
                 <= self.buflo_exact_release_active_wait_counter_guards
             && self.buflo_exact_release_active_wait_early_confirmation_retries
                 <= self.buflo_exact_release_active_wait_instant_confirmations
+            && (self.buflo_exact_release_active_wait_early_confirmation_retries == 0
+                || self.buflo_exact_release_active_wait_counter_nanoseconds > 0)
             && self.buflo_exact_release_active_wait_instant_confirmations
                 <= self.buflo_exact_release_active_wait_counter_calibrations
-            && self.buflo_exact_release_active_wait_instant_confirmations
-                == successful_counter_guards
-                    .saturating_add(self.buflo_exact_release_active_wait_early_confirmation_retries)
+            && successful_counter_guards.and_then(|value| {
+                value.checked_add(self.buflo_exact_release_active_wait_early_confirmation_retries)
+            }) == Some(self.buflo_exact_release_active_wait_instant_confirmations)
+            && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                <= self.buflo_exact_release_active_wait_authoritative_watchdog_checks
+            && self.buflo_exact_release_active_wait_authoritative_watchdog_dispatches
+                <= dispatch_ready
+                    .saturating_add(self.buflo_exact_release_counter_frequency_changed_guards)
+            && self
+                .buflo_exact_release_active_wait_authoritative_watchdog_checks
+                .saturating_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+                .saturating_add(
+                    self.buflo_exact_release_active_wait_counter_calibrations
+                        .saturating_mul(2),
+                )
+                <= self.buflo_exact_release_active_wait_iterations
             && self.buflo_exact_release_dispatch_at_or_after_deadline_guards <= dispatch_ready
             && self.buflo_exact_release_guard_wait_nanoseconds
                 == self.buflo_exact_release_active_wait_nanoseconds
@@ -2609,8 +4125,23 @@ impl RunnerWakeupMetrics {
             && worst_matches_max_dispatch
             && worst_counter_consistent
             && last_failure_consistent
+            && retained_failure_watchdog_cadence
+            && exact_single_success_aggregates
+            && exact_single_failure_aggregates
+            && exact_success_failure_aggregates
+            && empty_guard_projection
             && aarch64_counter_partitions
+            && authoritative_watchdog_cadence_partition
+            && zero_failure_watchdog_remainder_bound
+            && remaining_success_guard_partition
+            && predictive_interruption_partition
             && instant_fallback_counter_partition
+            && remaining_success_allocation
+            && histogram_integrity
+            && aggregate_guard_entry_lateness_reachable
+            && aggregate_active_wait_reachable
+            && active_derived_maxima_reachable
+            && deadline_count_reachable
             && self.buflo_exact_release_max_passive_sleep_overrun_nanoseconds
                 <= self.buflo_exact_release_passive_sleep_elapsed_nanoseconds
             && self.buflo_exact_release_max_active_spin_gap_nanoseconds
@@ -2619,18 +4150,54 @@ impl RunnerWakeupMetrics {
                 <= self.buflo_exact_release_active_wait_counter_nanoseconds
             && self.buflo_exact_release_max_counter_calibration_span_nanoseconds
                 <= self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds
+            && self.buflo_exact_release_max_authoritative_sample_gap_nanoseconds
+                <= self.buflo_exact_release_active_wait_nanoseconds
+            && self.buflo_exact_release_max_authoritative_counter_lag_nanoseconds
+                <= self.buflo_exact_release_active_wait_nanoseconds
+            && self.buflo_exact_release_max_counter_authoritative_lead_nanoseconds
+                <= self.buflo_exact_release_active_wait_counter_nanoseconds
+            && self.buflo_exact_release_active_spin_interruption_nanoseconds
+                >= self
+                    .buflo_exact_release_active_spin_interruptions
+                    .saturating_mul(
+                        duration_as_u64_nanos(BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD)
+                            .saturating_add(1),
+                    )
             && (self.buflo_exact_release_active_wait_counter_calibrations > 0
                 || (self.buflo_exact_release_active_wait_counter_nanoseconds == 0
                     && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds == 0
                     && self.buflo_exact_release_max_counter_calibration_span_nanoseconds == 0))
             && self.buflo_exact_release_worst_guard.is_none_or(|worst| {
-                worst.entered_at_defense_nanoseconds
+                [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+                    window
+                        .checked_add(worst.dispatch_lateness_nanoseconds)
+                        .and_then(|value| value.checked_sub(worst.guard_entry_lateness_nanoseconds))
+                        == Some(worst.active_wait_monotonic_nanoseconds)
+                }) && worst.entered_at_defense_nanoseconds
                     == worst.active_wait_started_at_defense_nanoseconds
                     && worst.passive_sleep_calls == 0
                     && worst.passive_sleep_requested_nanoseconds == 0
                     && worst.passive_sleep_elapsed_nanoseconds == 0
                     && worst.max_passive_sleep_overrun_nanoseconds == 0
                     && worst.active_spin_interruptions <= worst.active_wait_iterations
+                    && worst.active_spin_interruption_nanoseconds
+                        >= worst.active_spin_interruptions.saturating_mul(
+                            duration_as_u64_nanos(BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD)
+                                .saturating_add(1),
+                        )
+                    && (worst.active_spin_interruptions == 0
+                        || worst.active_spin_interruption_nanoseconds
+                            >= worst.max_active_spin_gap_nanoseconds.saturating_add(
+                                worst
+                                    .active_spin_interruptions
+                                    .saturating_sub(1)
+                                    .saturating_mul(50_001),
+                            ))
+                    && (worst.active_wait_poll_source != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+                        || (worst.active_spin_interruptions
+                            <= worst.active_wait_iterations.saturating_sub(1)
+                            && worst.active_spin_interruption_nanoseconds
+                                <= worst.active_wait_counter_nanoseconds.unwrap_or(0)))
                     && worst.active_wait_counter_frequency_hz.is_none_or(|_| {
                         worst.active_wait_iterations
                             >= worst.active_wait_counter_calibrations.saturating_mul(2)
@@ -2645,6 +4212,8 @@ impl RunnerWakeupMetrics {
                         || (worst.active_wait_counter_calibrations == 0
                             && worst.active_wait_instant_confirmations == 0
                             && worst.active_wait_early_confirmation_retries == 0
+                            && worst.active_wait_authoritative_watchdog_checks == 0
+                            && worst.active_wait_authoritative_watchdog_dispatches == 0
                             && worst.active_wait_counter_nanoseconds.is_none()
                             && worst.max_active_wait_counter_gap_nanoseconds.is_none()
                             && worst.max_counter_calibration_span_nanoseconds.is_none()))
@@ -2664,13 +4233,64 @@ impl RunnerWakeupMetrics {
                             >= worst.max_active_spin_gap_nanoseconds)
                     && worst.max_counter_calibration_span_nanoseconds.unwrap_or(0)
                         <= worst.max_active_wait_counter_gap_nanoseconds.unwrap_or(0)
-                    && (worst.active_wait_poll_source != "linux-aarch64-cntvct-el0-predictive-v1"
+                    && worst.active_wait_authoritative_watchdog_dispatches <= 1
+                    && worst.active_wait_authoritative_watchdog_dispatches
+                        <= worst.active_wait_authoritative_watchdog_checks
+                    && worst
+                        .active_wait_authoritative_watchdog_checks
+                        .saturating_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+                        .saturating_add(worst.active_wait_counter_calibrations.saturating_mul(2))
+                        <= worst.active_wait_iterations
+                    && (worst.active_wait_poll_source != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+                        || worst
+                            .active_wait_iterations
+                            .checked_sub(worst.active_wait_counter_calibrations.saturating_mul(2))
+                            .is_some_and(|successful_relaxed_reads| {
+                                successful_relaxed_reads
+                                    >= worst.active_wait_early_confirmation_retries
+                                    && worst.active_wait_authoritative_watchdog_checks
+                                        == successful_relaxed_reads
+                                            / BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL
+                                    && (worst.active_wait_authoritative_watchdog_dispatches == 0
+                                        || successful_relaxed_reads.is_multiple_of(
+                                            BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL,
+                                        ))
+                            }))
+                    && worst.max_authoritative_sample_gap_nanoseconds
+                        <= worst.active_wait_monotonic_nanoseconds
+                    && worst.max_authoritative_counter_lag_nanoseconds
+                        <= worst.active_wait_monotonic_nanoseconds
+                    && worst.max_counter_authoritative_lead_nanoseconds
+                        <= worst.active_wait_counter_nanoseconds.unwrap_or(0)
+                    && (worst.active_wait_poll_source != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
                         || worst.max_active_spin_gap_nanoseconds
                             == worst.max_active_wait_counter_gap_nanoseconds.unwrap_or(0))
             })
             && self.buflo_exact_release_last_failure.is_none_or(|failure| {
-                failure.entered_at_defense_nanoseconds
-                    == failure.active_wait_started_at_defense_nanoseconds
+                failure
+                    .guard_entry_lateness_nanoseconds
+                    .checked_add(failure.active_wait_monotonic_nanoseconds)
+                    .is_some_and(|elapsed_from_guard| {
+                        [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+                            failure.exit_before_release_nanoseconds
+                                == window.saturating_sub(elapsed_from_guard)
+                                && failure.exit_at_or_after_deadline
+                                    == (elapsed_from_guard >= window.saturating_mul(2))
+                        })
+                    })
+                    && failure.entered_at_defense_nanoseconds
+                        == failure.active_wait_started_at_defense_nanoseconds
+                    && match (
+                        failure.active_wait_started_at_defense_nanoseconds,
+                        failure.exited_at_defense_nanoseconds,
+                    ) {
+                        (Some(started), Some(exited)) => {
+                            exited.checked_sub(started)
+                                == Some(failure.active_wait_monotonic_nanoseconds)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
                     && failure
                         .max_counter_calibration_span_nanoseconds
                         .unwrap_or(0)
@@ -2682,6 +4302,50 @@ impl RunnerWakeupMetrics {
                                 .max_counter_calibration_span_nanoseconds
                                 .unwrap_or(0)
                                 == 0))
+                    && failure.authoritative_watchdog_dispatches <= 1
+                    && failure.authoritative_watchdog_dispatches
+                        <= failure.authoritative_watchdog_checks
+                    && failure
+                        .authoritative_watchdog_checks
+                        .saturating_mul(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+                        .saturating_add(failure.counter_calibrations.saturating_mul(2))
+                        <= self.buflo_exact_release_active_wait_iterations
+                    && failure.max_authoritative_sample_gap_nanoseconds
+                        <= self.buflo_exact_release_active_wait_nanoseconds
+                    && failure.max_authoritative_counter_lag_nanoseconds
+                        <= self.buflo_exact_release_active_wait_nanoseconds
+                    && failure.max_counter_authoritative_lead_nanoseconds
+                        <= self.buflo_exact_release_active_wait_counter_nanoseconds
+                    && ((failure.active_spin_interruptions == 0)
+                        == (failure.active_spin_interruption_nanoseconds == 0))
+                    && ((failure.active_spin_interruptions > 0)
+                        == (failure.max_active_spin_gap_nanoseconds > 50_000))
+                    && failure.max_active_spin_gap_nanoseconds
+                        <= failure.active_wait_monotonic_nanoseconds
+                    && failure.active_spin_interruption_nanoseconds
+                        <= failure.active_wait_monotonic_nanoseconds
+                    && (failure.active_spin_interruptions == 0
+                        || failure.active_spin_interruption_nanoseconds
+                            >= failure.max_active_spin_gap_nanoseconds.saturating_add(
+                                failure
+                                    .active_spin_interruptions
+                                    .saturating_sub(1)
+                                    .saturating_mul(50_001),
+                            ))
+                    && failure.active_spin_interruptions
+                        <= failure
+                            .active_wait_iterations
+                            .saturating_sub(1)
+                            .saturating_sub(u64::from(matches!(
+                                failure.outcome,
+                                "counter-unavailable" | "counter-nonmonotonic"
+                            )))
+                    && (failure.active_wait_poll_source
+                        != BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+                        || (failure.active_spin_interruption_nanoseconds
+                            <= failure.counter_nanoseconds.unwrap_or(0)
+                            && failure.max_active_spin_gap_nanoseconds
+                                == failure.max_counter_gap_nanoseconds.unwrap_or(0)))
             })
             && ((self.buflo_exact_release_active_spin_interruptions == 0)
                 == (self.buflo_exact_release_active_spin_interruption_nanoseconds == 0))
@@ -10002,6 +11666,38 @@ fn read_required_counter(
     Ok(value)
 }
 
+fn record_buflo_authoritative_sample(
+    evidence: &mut BufloExactReleaseWaitEvidence,
+    sampled_at: Instant,
+) {
+    evidence.max_authoritative_sample_gap_nanoseconds = evidence
+        .max_authoritative_sample_gap_nanoseconds
+        .max(duration_as_u64_nanos(
+            sampled_at.saturating_duration_since(evidence.exited_at),
+        ));
+    evidence.exited_at = sampled_at;
+}
+
+fn record_buflo_authoritative_counter_comparison(
+    evidence: &mut BufloExactReleaseWaitEvidence,
+    sampled_at: Instant,
+    calibrated_at: Instant,
+    counter_elapsed_ticks: u64,
+    frequency_hz: NonZeroU64,
+) {
+    record_buflo_authoritative_sample(evidence, sampled_at);
+    let authoritative_nanoseconds =
+        duration_as_u64_nanos(sampled_at.saturating_duration_since(calibrated_at));
+    let counter_nanoseconds =
+        counter_ticks_to_nanoseconds(counter_elapsed_ticks, frequency_hz.get());
+    evidence.max_authoritative_counter_lag_nanoseconds = evidence
+        .max_authoritative_counter_lag_nanoseconds
+        .max(authoritative_nanoseconds.saturating_sub(counter_nanoseconds));
+    evidence.max_counter_authoritative_lead_nanoseconds = evidence
+        .max_counter_authoritative_lead_nanoseconds
+        .max(counter_nanoseconds.saturating_sub(authoritative_nanoseconds));
+}
+
 fn calibrate_buflo_predictive_counter(
     evidence: &mut BufloExactReleaseWaitEvidence,
     authoritative_now: &mut impl FnMut() -> Instant,
@@ -10012,7 +11708,7 @@ fn calibrate_buflo_predictive_counter(
     let before_value = poll_clock.read_ordered();
     let before = read_required_counter(evidence, previous_counter, frequency_hz, before_value)?;
     let calibrated_at = authoritative_now();
-    evidence.exited_at = calibrated_at;
+    record_buflo_authoritative_sample(evidence, calibrated_at);
     let after_value = poll_clock.read_ordered();
     let after = read_required_counter(evidence, previous_counter, frequency_hz, after_value)?;
     let span = match forward_counter_delta(before, after) {
@@ -10037,6 +11733,7 @@ fn wait_with_predictive_counter(
     frequency_hz: NonZeroU64,
 ) -> Result<(), Error> {
     let mut previous_counter = None;
+    let mut successful_relaxed_reads = 0_u64;
     loop {
         let (calibrated_at, anchor_counter) = calibrate_buflo_predictive_counter(
             evidence,
@@ -10047,8 +11744,14 @@ fn wait_with_predictive_counter(
         )?;
         if calibrated_at >= guard.release {
             let confirmed_at = authoritative_now();
+            record_buflo_authoritative_counter_comparison(
+                evidence,
+                confirmed_at,
+                calibrated_at,
+                0,
+                frequency_hz,
+            );
             evidence.instant_confirmations = evidence.instant_confirmations.saturating_add(1);
-            evidence.exited_at = confirmed_at;
             if confirmed_at >= guard.release {
                 evidence.dispatch_at = Some(confirmed_at);
                 evidence.outcome = BufloExactReleaseWaitOutcome::DispatchReady;
@@ -10080,12 +11783,41 @@ fn wait_with_predictive_counter(
                     return Err(error);
                 }
             };
+            successful_relaxed_reads = successful_relaxed_reads.saturating_add(1);
+            if successful_relaxed_reads
+                .is_multiple_of(BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL)
+            {
+                let checked_at = authoritative_now();
+                evidence.authoritative_watchdog_checks =
+                    evidence.authoritative_watchdog_checks.saturating_add(1);
+                record_buflo_authoritative_counter_comparison(
+                    evidence,
+                    checked_at,
+                    calibrated_at,
+                    elapsed,
+                    frequency_hz,
+                );
+                if checked_at >= guard.release {
+                    evidence.authoritative_watchdog_dispatches = 1;
+                    evidence.instant_confirmations =
+                        evidence.instant_confirmations.saturating_add(1);
+                    evidence.dispatch_at = Some(checked_at);
+                    evidence.outcome = BufloExactReleaseWaitOutcome::DispatchReady;
+                    return Ok(());
+                }
+            }
             if elapsed < target_ticks {
                 continue;
             }
 
             let confirmed_at = authoritative_now();
-            evidence.exited_at = confirmed_at;
+            record_buflo_authoritative_counter_comparison(
+                evidence,
+                confirmed_at,
+                calibrated_at,
+                elapsed,
+                frequency_hz,
+            );
             evidence.instant_confirmations = evidence.instant_confirmations.saturating_add(1);
             if confirmed_at >= guard.release {
                 evidence.dispatch_at = Some(confirmed_at);
@@ -10103,7 +11835,8 @@ fn stamp_buflo_exact_release_failure_exit(
     evidence: &mut BufloExactReleaseWaitEvidence,
     authoritative_now: &mut impl FnMut() -> Instant,
 ) {
-    evidence.exited_at = authoritative_now();
+    let sampled_at = authoritative_now();
+    record_buflo_authoritative_sample(evidence, sampled_at);
     evidence.dispatch_at = None;
 }
 
@@ -11452,7 +13185,7 @@ async fn dispatch_due_buflo_exact_release(
         exact_release_evidence.counter_frequency_hz,
     ) && existing != observed
     {
-        exact_release_evidence.exited_at = now();
+        record_buflo_authoritative_sample(&mut exact_release_evidence, now());
         exact_release_evidence.dispatch_at = None;
         exact_release_evidence.outcome = BufloExactReleaseWaitOutcome::CounterFrequencyChanged;
         runner_wakeup_metrics.record_buflo_exact_release_guard(
@@ -11671,9 +13404,12 @@ fn attempt_socket_handoff_timestamped(
 ) -> Result<SocketHandoff, Error> {
     // No batch may enter the socket syscall after its active half-open fidelity
     // window. Check before every attempt and validate the immediate low-level
-    // timestamp after a successful handoff. Candidate production sends sample
-    // that timestamp directly beside the socket call so caller-side scheduler
-    // delay cannot create a false late receipt.
+    // timestamp after a successful handoff. A syscall that begins before the
+    // boundary can still complete at or after it; that is retained as a typed
+    // hard failure and is never accepted or retried as catch-up output.
+    // Candidate production sends sample that timestamp directly beside the
+    // socket call so caller-side scheduler delay cannot create a false late
+    // receipt.
     if let Some(deadline) = target_deadlines.iter().copied().min() {
         let attempted_at = clock();
         if attempted_at >= deadline {
@@ -12904,27 +14640,30 @@ mod tests {
 
     use super::{
         ActivityWake, ApplicationBatchLifecycle, Args, BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE,
-        BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL, BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD,
-        BufloExactReleaseCandidate, BufloExactReleaseGuard, BufloExactReleasePhase,
-        BufloExactReleasePollClock, BufloExactReleaseTimingHistogram,
-        BufloExactReleaseWaitEvidence, BufloExactReleaseWaitOutcome, BufloExactReleaseWaitStep,
-        ChaffRequestHeaderModeArg, CsExactIncomingRetry, CsExactIncomingRetryPhase, DefenseArg,
-        Error, ExpectedChaffIdentity, OutputDriveCardinality, OutputWorkBoundary,
-        PostOutputRollingBarrier, PrefixBurst, PrefixNumericProfile, PrefixPackSpec,
-        PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg, QcsdRequestRole,
-        QualificationAcknowledgement, QualifierStream, RUNNER_WAKEUP_METRICS_SCHEMA_VERSION,
-        RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg, ResourceRunState,
-        ResponseQualificationMode, ResponseQualificationRequest, RunCompletion, RunSpec,
-        RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
-        SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
-        StreamRecord, StreamType, SustainedResponseQualificationRequest, TerminalActionSemantics,
-        TestOutputDrive, TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
-        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
-        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
-        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
-        bounded_qualification_wait, buflo_exact_incoming_identities,
-        buflo_exact_incoming_identity_is_pending, buflo_exact_release_guard_excluding_candidates,
-        buflo_exact_release_guard_from_candidates, buflo_exact_release_wait_step,
+        BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL, BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE,
+        BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+        BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD, BufloExactReleaseCandidate,
+        BufloExactReleaseGuard, BufloExactReleasePhase, BufloExactReleasePollClock,
+        BufloExactReleaseTimingHistogram, BufloExactReleaseWaitEvidence,
+        BufloExactReleaseWaitOutcome, BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg,
+        CsExactIncomingRetry, CsExactIncomingRetryPhase, DefenseArg, Error, ExpectedChaffIdentity,
+        OutputDriveCardinality, OutputWorkBoundary, PostOutputRollingBarrier, PrefixBurst,
+        PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse,
+        Preset, ProfileArg, QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
+        RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg,
+        ResourceRunState, ResponseQualificationMode, ResponseQualificationRequest, RunCompletion,
+        RunSpec, RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket,
+        SocketHandoff, SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg,
+        StreamActivationStage, StreamRecord, StreamType, SustainedResponseQualificationRequest,
+        TerminalActionSemantics, TestOutputDrive, TrafficMorphingActivation, absolute_wakeup,
+        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
+        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
+        attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
+        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
+        buflo_exact_incoming_identities, buflo_exact_incoming_identity_is_pending,
+        buflo_exact_release_failure_watchdog_cadence_validated,
+        buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
+        buflo_exact_release_wait_step, buflo_exact_release_zero_failure_watchdog_remainder_bound,
         buflo_run_summary, buflo_unadvertised_scheduled_receive_credit_endpoints,
         cancel_uncommitted_prearms_on_abort, chaff_send_halves_peer_confirmed, create_endpoints,
         cs_buflo_run_summary, cs_exact_incoming_identity_is_pending,
@@ -12948,7 +14687,7 @@ mod tests {
         prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
         reconcile_buflo_exact_incoming_output_error, record_adapter_action_error,
-        record_receive_limit_error, record_terminal_action,
+        record_buflo_authoritative_sample, record_receive_limit_error, record_terminal_action,
         refresh_buflo_exact_incoming_identities, register_action_batch, remaining_wakeup_delay,
         resolve_rolling_output_interrupt, resolve_run_config, resolve_run_config_with_workload,
         response_qualification_mode, rolling_output_lifecycle_active, run_error_class,
@@ -13027,6 +14766,7 @@ mod tests {
             evidence.counter_unavailable = false;
             evidence.counter_calibrations = 1;
             evidence.instant_confirmations = 1;
+            evidence.max_authoritative_sample_gap_nanoseconds = active_wait_nanoseconds;
             evidence.counter_elapsed_ticks = active_wait_nanoseconds;
             evidence.max_counter_gap_ticks = active_wait_nanoseconds;
             evidence.max_counter_calibration_span_ticks = 0;
@@ -14050,7 +15790,7 @@ mod tests {
     #[expect(
         clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "the canonical schema-9 producer golden intentionally binds every serialized field and cross-field invariant"
+        reason = "the canonical schema-10 producer golden intentionally binds every serialized field and cross-field invariant"
     )]
     fn assert_runner_wakeup_receipt(metrics: &serde_json::Value) {
         let mut actual_fields: Vec<_> = metrics
@@ -14097,9 +15837,15 @@ mod tests {
             "buflo_exact_release_active_wait_counter_calibrations",
             "buflo_exact_release_active_wait_instant_confirmations",
             "buflo_exact_release_active_wait_early_confirmation_retries",
+            "buflo_exact_release_active_wait_authoritative_watchdog_checks",
+            "buflo_exact_release_active_wait_authoritative_watchdog_dispatches",
+            "buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards",
             "buflo_exact_release_active_wait_counter_nanoseconds",
             "buflo_exact_release_max_active_wait_counter_gap_nanoseconds",
             "buflo_exact_release_max_counter_calibration_span_nanoseconds",
+            "buflo_exact_release_max_authoritative_sample_gap_nanoseconds",
+            "buflo_exact_release_max_authoritative_counter_lag_nanoseconds",
+            "buflo_exact_release_max_counter_authoritative_lead_nanoseconds",
             "buflo_exact_release_dispatch_at_or_after_deadline_guards",
             "buflo_exact_release_dispatch_lateness_histogram",
             "buflo_exact_release_active_spin_gap_histogram",
@@ -14118,7 +15864,7 @@ mod tests {
             metrics["schema_version"],
             RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         );
-        assert_eq!(RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 9);
+        assert_eq!(RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 10);
         assert_eq!(metrics["semantics"], RUNNER_WAKEUP_METRICS_SEMANTICS);
         assert_eq!(metrics["timer_wakeups"], 2);
         assert_eq!(metrics["buflo_exact_release_guard_entries"], 1);
@@ -14210,9 +15956,14 @@ mod tests {
             "active_wait_counter_calibrations",
             "active_wait_instant_confirmations",
             "active_wait_early_confirmation_retries",
+            "active_wait_authoritative_watchdog_checks",
+            "active_wait_authoritative_watchdog_dispatches",
             "active_wait_counter_nanoseconds",
             "max_active_wait_counter_gap_nanoseconds",
             "max_counter_calibration_span_nanoseconds",
+            "max_authoritative_sample_gap_nanoseconds",
+            "max_authoritative_counter_lag_nanoseconds",
+            "max_counter_authoritative_lead_nanoseconds",
             "active_spin_interruptions",
             "active_spin_interruption_nanoseconds",
             "max_active_spin_gap_nanoseconds",
@@ -14249,6 +16000,28 @@ mod tests {
             }
         );
         assert_eq!(worst["active_wait_monotonic_nanoseconds"], 5_000_001);
+        assert_eq!(worst["active_wait_authoritative_watchdog_checks"], 0);
+        assert_eq!(worst["active_wait_authoritative_watchdog_dispatches"], 0);
+        assert_eq!(
+            metrics["buflo_exact_release_active_wait_authoritative_watchdog_checks"],
+            0
+        );
+        assert_eq!(
+            metrics["buflo_exact_release_active_wait_authoritative_watchdog_dispatches"],
+            0
+        );
+        assert_eq!(
+            metrics["buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards"],
+            u64::from(cfg!(all(target_os = "linux", target_arch = "aarch64")))
+        );
+        assert_eq!(
+            metrics["buflo_exact_release_max_authoritative_counter_lag_nanoseconds"],
+            0
+        );
+        assert_eq!(
+            metrics["buflo_exact_release_max_counter_authoritative_lead_nanoseconds"],
+            0
+        );
         assert_eq!(
             worst["active_wait_poll_source"],
             BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE
@@ -14289,6 +16062,13 @@ mod tests {
             assert_eq!(worst["active_wait_counter_frequency_hz"], 1_000_000_000);
             assert_eq!(worst["active_wait_counter_calibrations"], 1);
             assert_eq!(worst["active_wait_instant_confirmations"], 1);
+            assert_eq!(
+                metrics["buflo_exact_release_max_authoritative_sample_gap_nanoseconds"],
+                5_000_001
+            );
+            assert_eq!(worst["max_authoritative_sample_gap_nanoseconds"], 5_000_001);
+            assert_eq!(worst["max_authoritative_counter_lag_nanoseconds"], 0);
+            assert_eq!(worst["max_counter_authoritative_lead_nanoseconds"], 0);
         }
         #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
         {
@@ -14300,6 +16080,10 @@ mod tests {
             assert_eq!(
                 metrics["buflo_exact_release_active_wait_counter_unavailable_guards"],
                 1
+            );
+            assert_eq!(
+                metrics["buflo_exact_release_max_authoritative_sample_gap_nanoseconds"],
+                0
             );
         }
         assert_eq!(metrics["buflo_exact_incoming_retry_drives"], 2);
@@ -24051,7 +25835,8 @@ mod tests {
     )]
     fn runner_wakeup_metrics_partition_actual_select_returns() {
         let mut metrics = RunnerWakeupMetrics::new();
-        metrics.buflo_exact_release_active_wait_poll_source = "test-predictive-counter-v1";
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
         metrics.record(ActivityWake::SocketReady, true);
         metrics.record(ActivityWake::Timer, false);
         metrics.record(ActivityWake::Timer, true);
@@ -24098,7 +25883,7 @@ mod tests {
                     active_spin_interruptions: 1,
                     active_spin_interruption_nanoseconds: 4_000_000,
                     max_active_spin_gap_nanoseconds: 4_000_000,
-                    active_wait_poll_source: "test-predictive-counter-v1",
+                    active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
                     counter_frequency_hz: Some(1_000_000_000),
                     counter_backed: true,
                     counter_unavailable: false,
@@ -24106,6 +25891,11 @@ mod tests {
                     counter_calibrations: 2,
                     instant_confirmations: 2,
                     early_confirmation_retries: 1,
+                    authoritative_watchdog_checks: 0,
+                    authoritative_watchdog_dispatches: 0,
+                    max_authoritative_sample_gap_nanoseconds: 5_000_007,
+                    max_authoritative_counter_lag_nanoseconds: 0,
+                    max_counter_authoritative_lead_nanoseconds: 3,
                     counter_elapsed_ticks: 5_000_010,
                     max_counter_gap_ticks: 4_000_000,
                     max_counter_calibration_span_ticks: 10,
@@ -24186,7 +25976,7 @@ mod tests {
         assert_eq!(metrics.buflo_exact_release_active_wait_counter_guards, 1);
         assert_eq!(
             metrics.buflo_exact_release_active_wait_poll_source,
-            "test-predictive-counter-v1"
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
         );
         assert_eq!(
             metrics.buflo_exact_release_active_wait_counter_unavailable_guards,
@@ -24285,11 +26075,9 @@ mod tests {
         assert!(metrics.semantics.contains(
             "buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true"
         ));
-        assert!(
-            metrics
-                .semantics
-                .contains("buflo_exact_release_counter_is_predictive_only=true")
-        );
+        assert!(metrics.semantics.contains(
+            "buflo_exact_release_counter_is_predictive_with_periodic_authoritative_watchdog=true"
+        ));
     }
 
     #[test]
@@ -24324,7 +26112,8 @@ mod tests {
             deadline,
         };
         let mut metrics = RunnerWakeupMetrics::new();
-        metrics.buflo_exact_release_active_wait_poll_source = "test-predictive-counter-v1";
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
         metrics
             .record_buflo_exact_release_guard(
                 &guard,
@@ -24343,7 +26132,7 @@ mod tests {
                     active_spin_interruptions: 1,
                     active_spin_interruption_nanoseconds: 6_000_000,
                     max_active_spin_gap_nanoseconds: 6_000_000,
-                    active_wait_poll_source: "test-predictive-counter-v1",
+                    active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
                     counter_frequency_hz: Some(1_000_000_000),
                     counter_backed: true,
                     counter_unavailable: false,
@@ -24351,6 +26140,11 @@ mod tests {
                     counter_calibrations: 1,
                     instant_confirmations: 1,
                     early_confirmation_retries: 0,
+                    authoritative_watchdog_checks: 124,
+                    authoritative_watchdog_dispatches: 0,
+                    max_authoritative_sample_gap_nanoseconds: 9_000_000,
+                    max_authoritative_counter_lag_nanoseconds: 0,
+                    max_counter_authoritative_lead_nanoseconds: 0,
                     counter_elapsed_ticks: 9_000_000,
                     max_counter_gap_ticks: 6_000_000,
                     max_counter_calibration_span_ticks: 10_000,
@@ -24412,6 +26206,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_release_active_wait_ceiling_subtracts_before_final_saturation() {
+        let per_success_capacity = u64::MAX / 2 + 1;
+        assert_eq!(
+            super::buflo_exact_release_aggregate_active_wait_ceiling(
+                per_success_capacity,
+                false,
+                2,
+                per_success_capacity - 1,
+                2,
+                0,
+            ),
+            Some(per_success_capacity + 3),
+            "the hidden-entry deduction precedes final u64 saturation"
+        );
+        assert_eq!(
+            super::buflo_exact_release_aggregate_active_wait_ceiling(
+                u64::MAX,
+                true,
+                1,
+                u64::MAX,
+                1_000,
+                0,
+            ),
+            Some(u64::MAX),
+            "a saturated per-success sum cannot safely deduct saturated entry lateness"
+        );
+        assert_eq!(
+            super::buflo_exact_release_aggregate_active_wait_ceiling(5_000_007, false, 0, 1, 0, 0),
+            None,
+            "hidden entry evidence needs at least one unretained success capacity"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the mixed-window regression mutates each independent aggregate reachability bound"
+    )]
     fn mixed_adapter_windows_do_not_project_aggregate_deadline_status_onto_worst_guard() {
         let defense_start = now();
         let fractional_packet =
@@ -24494,6 +26326,82 @@ mod tests {
         assert_eq!(worst.dispatch_lateness_nanoseconds, 4_999_800);
         assert!(!worst.dispatch_at_or_after_deadline);
         assert_eq!(worst.dispatch_after_deadline_nanoseconds, 0);
+
+        let seven_nanoseconds = Duration::from_nanos(7);
+        let mut early_metrics = RunnerWakeupMetrics::new();
+        early_metrics
+            .record_buflo_exact_release_guard(
+                &fractional_guard,
+                Some(defense_start),
+                &evidence(
+                    &fractional_guard,
+                    fractional_guard.release + seven_nanoseconds,
+                ),
+            )
+            .expect("record early fractional guard");
+        early_metrics
+            .record_buflo_exact_release_guard(
+                &aligned_guard,
+                Some(defense_start),
+                &evidence(&aligned_guard, aligned_guard.release + seven_nanoseconds),
+            )
+            .expect("record early aligned guard");
+        assert!(early_metrics.buflo_exact_release_invariants_hold());
+
+        let mut inflated_active_duration = early_metrics;
+        inflated_active_duration.buflo_exact_release_guard_wait_nanoseconds += 1;
+        inflated_active_duration.buflo_exact_release_active_wait_nanoseconds += 1;
+        assert!(
+            !inflated_active_duration.buflo_exact_release_invariants_hold(),
+            "unretained successes cannot exceed their canonical window-plus-dispatch ceiling"
+        );
+
+        let mut hidden_entry_without_duration_reduction = early_metrics;
+        hidden_entry_without_duration_reduction
+            .buflo_exact_release_max_guard_entry_lateness_nanoseconds = 1;
+        hidden_entry_without_duration_reduction
+            .buflo_exact_release_max_passive_wake_lateness_nanoseconds = 1;
+        assert!(
+            !hidden_entry_without_duration_reduction.buflo_exact_release_invariants_hold(),
+            "a hidden maximum entry lateness must reduce the unretained active-time capacity"
+        );
+
+        let mut impossible_deadline_count = early_metrics;
+        impossible_deadline_count.buflo_exact_release_dispatch_at_or_after_deadline_guards = 1;
+        assert!(
+            !impossible_deadline_count.buflo_exact_release_invariants_hold(),
+            "no dispatch below the 4.999 ms minimum adapter window can be outside"
+        );
+
+        let active_maximum_ceiling = 5_000_000 + 7;
+        let mut impossible_spin_maximum = early_metrics;
+        impossible_spin_maximum.buflo_exact_release_max_active_spin_gap_nanoseconds =
+            active_maximum_ceiling + 1;
+        if impossible_spin_maximum.buflo_exact_release_active_wait_poll_source
+            == BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE
+        {
+            impossible_spin_maximum.buflo_exact_release_max_active_wait_counter_gap_nanoseconds =
+                active_maximum_ceiling + 1;
+        }
+        assert!(
+            !impossible_spin_maximum.buflo_exact_release_invariants_hold(),
+            "a per-guard spin maximum cannot exceed every reachable active duration"
+        );
+
+        let mut impossible_sample_gap = early_metrics;
+        impossible_sample_gap.buflo_exact_release_max_authoritative_sample_gap_nanoseconds =
+            active_maximum_ceiling + 1;
+        assert!(
+            !impossible_sample_gap.buflo_exact_release_invariants_hold(),
+            "an authoritative sample gap cannot exceed every reachable active duration"
+        );
+        let mut impossible_counter_lag = early_metrics;
+        impossible_counter_lag.buflo_exact_release_max_authoritative_counter_lag_nanoseconds =
+            active_maximum_ceiling + 1;
+        assert!(
+            !impossible_counter_lag.buflo_exact_release_invariants_hold(),
+            "an authoritative counter lag cannot exceed every reachable active duration"
+        );
     }
 
     #[test]
@@ -24523,7 +26431,7 @@ mod tests {
         };
         let mut metrics = RunnerWakeupMetrics::new();
         metrics.buflo_exact_release_active_wait_poll_source =
-            "test-instant-authoritative-fallback-v1";
+            BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE;
         let fallback_evidence = BufloExactReleaseWaitEvidence {
             entered_at: guard_at,
             active_wait_started_at: guard_at,
@@ -24536,7 +26444,7 @@ mod tests {
             max_active_spin_gap_nanoseconds: 10_000_000,
             ..BufloExactReleaseWaitEvidence::new(
                 guard_at,
-                "test-instant-authoritative-fallback-v1",
+                BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE,
                 true,
             )
         };
@@ -24600,7 +26508,7 @@ mod tests {
             exited_at: guard.release,
             dispatch_at: Some(guard.release),
             outcome: BufloExactReleaseWaitOutcome::DispatchReady,
-            active_wait_poll_source: "test-predictive-counter-v1",
+            active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
             counter_frequency_hz: Some(frequency_hz),
             counter_backed: true,
             counter_unavailable: false,
@@ -24609,18 +26517,19 @@ mod tests {
             instant_confirmations: 1,
             ..BufloExactReleaseWaitEvidence::new(
                 guard.guard_at,
-                "test-predictive-counter-v1",
+                BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
                 false,
             )
         };
         let mut metrics = RunnerWakeupMetrics::new();
-        metrics.buflo_exact_release_active_wait_poll_source = "test-predictive-counter-v1";
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
         metrics
             .record_buflo_exact_release_guard(&guard, Some(base), &evidence(1_000_000))
             .expect("first counter frequency");
         let worst_success = metrics.buflo_exact_release_worst_guard;
         let mut changed = evidence(2_000_000);
-        changed.exited_at = guard.release + Duration::from_nanos(1);
+        record_buflo_authoritative_sample(&mut changed, guard.release + Duration::from_nanos(1));
         changed.dispatch_at = None;
         changed.outcome = BufloExactReleaseWaitOutcome::CounterFrequencyChanged;
         metrics
@@ -24661,6 +26570,11 @@ mod tests {
         assert_eq!(last_failure.dispatch_at_defense_nanoseconds, None);
         assert_eq!(last_failure.guard_entry_lateness_nanoseconds, 0);
         assert_eq!(last_failure.counter_frequency_hz, Some(2_000_000));
+        assert_eq!(last_failure.max_authoritative_sample_gap_nanoseconds, 1);
+        assert_eq!(
+            metrics.buflo_exact_release_max_authoritative_sample_gap_nanoseconds,
+            1
+        );
         assert!(metrics.buflo_exact_release_invariants_hold());
         let mut missing_success_predecessor = metrics;
         missing_success_predecessor.buflo_exact_release_dispatch_ready_guards = 0;
@@ -24680,7 +26594,7 @@ mod tests {
             exited_at: guard.release,
             dispatch_at: Some(guard.release),
             outcome: BufloExactReleaseWaitOutcome::DispatchReady,
-            active_wait_poll_source: "linux-aarch64-cntvct-el0-predictive-v1",
+            active_wait_poll_source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
             counter_frequency_hz: Some(1_000_000),
             counter_backed: true,
             counter_unavailable: false,
@@ -24689,13 +26603,13 @@ mod tests {
             instant_confirmations: 1,
             ..BufloExactReleaseWaitEvidence::new(
                 guard.guard_at,
-                "linux-aarch64-cntvct-el0-predictive-v1",
+                "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
                 false,
             )
         };
         let mut metrics = RunnerWakeupMetrics::new();
         metrics.buflo_exact_release_active_wait_poll_source =
-            "linux-aarch64-cntvct-el0-predictive-v1";
+            "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
         metrics
             .record_buflo_exact_release_guard(&guard, Some(base), &first_dispatch)
             .expect("first guard establishes the counter frequency");
@@ -24713,7 +26627,7 @@ mod tests {
         };
         let mut no_sleep = |_| {};
         let mut changed_then_unavailable = ScriptedBufloPollClock {
-            source: "linux-aarch64-cntvct-el0-predictive-v1",
+            source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
             required: true,
             frequency_hz: Some(2_000_000),
             ordered: VecDeque::from([Some(100), Some(102), None]),
@@ -24762,7 +26676,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the schema fixture binds every terminal wait reason to its serialized flags, counters, and nullable dispatch"
     )]
-    fn exact_release_typed_wait_failures_round_trip_through_schema_nine() {
+    fn exact_release_typed_wait_failures_round_trip_through_schema_ten() {
         let base = now();
         let guard = scripted_buflo_guard(base);
         let exit = guard.guard_at + Duration::from_micros(1);
@@ -24835,7 +26749,7 @@ mod tests {
                 exited_at: exit,
                 dispatch_at: None,
                 outcome,
-                active_wait_poll_source: "test-predictive-counter-v1",
+                active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
                 counter_frequency_hz: frequency_hz,
                 counter_backed,
                 counter_unavailable,
@@ -24847,17 +26761,25 @@ mod tests {
                 counter_elapsed_ticks: u64::from(counter_calibrations > 0),
                 max_counter_gap_ticks: u64::from(counter_calibrations > 0),
                 max_counter_calibration_span_ticks: u64::from(counter_calibrations > 0),
+                max_authoritative_sample_gap_nanoseconds: if outcome
+                    == BufloExactReleaseWaitOutcome::InvalidCounterFrequency
+                {
+                    1_000
+                } else {
+                    0
+                },
                 ..BufloExactReleaseWaitEvidence::new(
                     guard.guard_at,
-                    "test-predictive-counter-v1",
+                    BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
                     counter_unavailable,
                 )
             };
             let mut metrics = RunnerWakeupMetrics::new();
-            metrics.buflo_exact_release_active_wait_poll_source = "test-predictive-counter-v1";
+            metrics.buflo_exact_release_active_wait_poll_source =
+                BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
             metrics
                 .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
-                .expect("typed terminal failure is valid schema-9 evidence");
+                .expect("typed terminal failure is valid schema-10 evidence");
             assert!(metrics.buflo_exact_release_invariants_hold());
 
             let serialized = serde_json::to_value(metrics).expect("serialize failure metrics");
@@ -24899,9 +26821,19 @@ mod tests {
                 "counter_backed",
                 "counter_unavailable",
                 "counter_nonmonotonic",
+                "active_wait_iterations",
+                "active_wait_monotonic_nanoseconds",
+                "active_spin_interruptions",
+                "active_spin_interruption_nanoseconds",
+                "max_active_spin_gap_nanoseconds",
                 "counter_calibrations",
                 "instant_confirmations",
                 "early_confirmation_retries",
+                "authoritative_watchdog_checks",
+                "authoritative_watchdog_dispatches",
+                "max_authoritative_sample_gap_nanoseconds",
+                "max_authoritative_counter_lag_nanoseconds",
+                "max_counter_authoritative_lead_nanoseconds",
                 "counter_nanoseconds",
                 "max_counter_gap_nanoseconds",
                 "max_counter_calibration_span_nanoseconds",
@@ -24929,11 +26861,57 @@ mod tests {
             assert_eq!(last_failure["counter_backed"], counter_backed);
             assert_eq!(last_failure["counter_unavailable"], counter_unavailable);
             assert_eq!(last_failure["counter_nonmonotonic"], counter_nonmonotonic);
+            assert_eq!(last_failure["authoritative_watchdog_checks"], 0);
+            assert_eq!(last_failure["authoritative_watchdog_dispatches"], 0);
+            assert_eq!(
+                last_failure["max_authoritative_sample_gap_nanoseconds"],
+                if outcome == BufloExactReleaseWaitOutcome::InvalidCounterFrequency {
+                    1_000
+                } else {
+                    0
+                }
+            );
+            assert_eq!(last_failure["max_authoritative_counter_lag_nanoseconds"], 0);
+            assert_eq!(
+                last_failure["max_counter_authoritative_lead_nanoseconds"],
+                0
+            );
+            if outcome == BufloExactReleaseWaitOutcome::CounterTargetError {
+                let mut target_error_validator = RunnerWakeupMetrics::new();
+                target_error_validator.buflo_exact_release_active_wait_poll_source =
+                    BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+                let mut impossible_post_calibration_watchdog = evidence;
+                impossible_post_calibration_watchdog.active_wait_iterations = 66;
+                impossible_post_calibration_watchdog.authoritative_watchdog_checks = 1;
+                assert!(
+                    target_error_validator
+                        .validate_buflo_exact_release_guard_evidence(
+                            &guard,
+                            &impossible_post_calibration_watchdog,
+                        )
+                        .is_err(),
+                    "a first-calibration target error cannot contain relaxed-read watchdog evidence"
+                );
+
+                let mut impossible_post_calibration_divergence = evidence;
+                impossible_post_calibration_divergence.max_authoritative_counter_lag_nanoseconds =
+                    1;
+                assert!(
+                    target_error_validator
+                        .validate_buflo_exact_release_guard_evidence(
+                            &guard,
+                            &impossible_post_calibration_divergence,
+                        )
+                        .is_err(),
+                    "a first-calibration target error cannot contain counter/authoritative comparison evidence"
+                );
+            }
         }
     }
 
     #[test]
     #[expect(
+        clippy::cognitive_complexity,
         clippy::too_many_lines,
         reason = "the aggregate invariant fixture covers producer, nested, and rollback failures together"
     )]
@@ -24982,7 +26960,7 @@ mod tests {
             active_spin_interruptions: 1,
             active_spin_interruption_nanoseconds: 5_000_000,
             max_active_spin_gap_nanoseconds: 5_000_000,
-            active_wait_poll_source: "linux-aarch64-cntvct-el0-predictive-v1",
+            active_wait_poll_source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
             counter_frequency_hz: Some(1_000_000_000),
             counter_backed: true,
             counter_unavailable: false,
@@ -24994,17 +26972,82 @@ mod tests {
             max_counter_calibration_span_ticks: 1,
             ..BufloExactReleaseWaitEvidence::new(
                 guard.guard_at,
-                "linux-aarch64-cntvct-el0-predictive-v1",
+                "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
                 false,
             )
         };
+        let oversized_window = Duration::from_nanos(5_000_001);
+        let oversized_guard = BufloExactReleaseGuard {
+            guard_at: guard
+                .release
+                .checked_sub(oversized_window)
+                .expect("oversized guard predecessor"),
+            active_wait_at: guard
+                .release
+                .checked_sub(oversized_window)
+                .expect("oversized active-wait predecessor"),
+            deadline: guard.release + oversized_window,
+            ..guard
+        };
+        let oversized_evidence = production_shaped_dispatch_ready_evidence(
+            oversized_guard.guard_at,
+            oversized_guard.release,
+        );
+        let mut oversized_metrics = RunnerWakeupMetrics::new();
+        oversized_metrics.buflo_exact_release_active_wait_poll_source =
+            oversized_evidence.active_wait_poll_source;
+        assert!(
+            oversized_metrics
+                .record_buflo_exact_release_guard(
+                    &oversized_guard,
+                    Some(base),
+                    &oversized_evidence,
+                )
+                .is_err(),
+            "schema ten accepts only the live 4.999/5.000 ms adapter windows"
+        );
         let mut counter_metrics = RunnerWakeupMetrics::new();
         counter_metrics.buflo_exact_release_active_wait_poll_source =
-            "linux-aarch64-cntvct-el0-predictive-v1";
+            "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
         counter_metrics
             .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
             .expect("producer-shaped counter guard");
         assert!(counter_metrics.buflo_exact_release_invariants_hold());
+        let mut forged_singleton_chronology = counter_metrics;
+        let forged_worst = forged_singleton_chronology
+            .buflo_exact_release_worst_guard
+            .as_mut()
+            .expect("singleton success retains its chronology");
+        forged_worst.release_at_defense_nanoseconds = forged_worst
+            .release_at_defense_nanoseconds
+            .map(|release| release + 1);
+        assert!(
+            !forged_singleton_chronology.buflo_exact_release_invariants_hold(),
+            "relative worst-guard boundaries must match the scalar adapter geometry"
+        );
+        assert_eq!(
+            counter_metrics
+                .buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards,
+            1
+        );
+
+        let mut missing_cadence_validation = counter_metrics;
+        missing_cadence_validation
+            .buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards = 0;
+        assert!(!missing_cadence_validation.buflo_exact_release_invariants_hold());
+
+        let mut impossible_aggregate_remainder = counter_metrics;
+        impossible_aggregate_remainder.buflo_exact_release_active_wait_iterations +=
+            super::BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL;
+        assert!(!impossible_aggregate_remainder.buflo_exact_release_invariants_hold());
+
+        let mut inflated_singleton_duration = counter_metrics;
+        inflated_singleton_duration.buflo_exact_release_guard_wait_nanoseconds += 1;
+        inflated_singleton_duration.buflo_exact_release_active_wait_nanoseconds += 1;
+        assert!(
+            !inflated_singleton_duration.buflo_exact_release_invariants_hold(),
+            "one retained successful guard exactly binds aggregate active duration"
+        );
 
         let mut invalid_source_partition = counter_metrics;
         invalid_source_partition.buflo_exact_release_active_wait_counter_unavailable_guards = 1;
@@ -25024,7 +27067,7 @@ mod tests {
         unreachable_ticks.instant_confirmations = 0;
         let mut rejected_metrics = RunnerWakeupMetrics::new();
         rejected_metrics.buflo_exact_release_active_wait_poll_source =
-            "linux-aarch64-cntvct-el0-predictive-v1";
+            "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
         assert!(
             rejected_metrics
                 .record_buflo_exact_release_guard(&guard, Some(base), &unreachable_ticks)
@@ -25072,9 +27115,781 @@ mod tests {
         impossible_confirmation.instant_confirmations = 0;
         assert!(rejects(&impossible_confirmation));
 
+        let mut impossible_zero_progress_retry = evidence;
+        impossible_zero_progress_retry.active_wait_iterations = 5;
+        impossible_zero_progress_retry.active_spin_interruptions = 0;
+        impossible_zero_progress_retry.active_spin_interruption_nanoseconds = 0;
+        impossible_zero_progress_retry.max_active_spin_gap_nanoseconds = 0;
+        impossible_zero_progress_retry.counter_calibrations = 2;
+        impossible_zero_progress_retry.instant_confirmations = 2;
+        impossible_zero_progress_retry.early_confirmation_retries = 1;
+        impossible_zero_progress_retry.counter_elapsed_ticks = 0;
+        impossible_zero_progress_retry.max_counter_gap_ticks = 0;
+        impossible_zero_progress_retry.max_counter_calibration_span_ticks = 0;
+        assert!(
+            rejects(&impossible_zero_progress_retry),
+            "an early-confirmation retry requires positive counter-observed progress before transport"
+        );
+
         let mut impossible_iterations = evidence;
         impossible_iterations.active_wait_iterations = 1;
         assert!(rejects(&impossible_iterations));
+
+        let mut impossible_watchdog_dispatch = evidence;
+        impossible_watchdog_dispatch.authoritative_watchdog_dispatches = 1;
+        assert!(rejects(&impossible_watchdog_dispatch));
+
+        let mut impossible_watchdog_cadence = evidence;
+        impossible_watchdog_cadence.authoritative_watchdog_checks = 1;
+        assert!(rejects(&impossible_watchdog_cadence));
+
+        let mut impossible_missing_watchdog_check = evidence;
+        impossible_missing_watchdog_check.active_wait_iterations +=
+            super::BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL;
+        assert!(rejects(&impossible_missing_watchdog_check));
+
+        let mut impossible_authoritative_gap = evidence;
+        impossible_authoritative_gap.max_authoritative_sample_gap_nanoseconds = 5_000_001;
+        assert!(rejects(&impossible_authoritative_gap));
+
+        let mut impossible_authoritative_lag = evidence;
+        impossible_authoritative_lag.max_authoritative_counter_lag_nanoseconds = 5_000_001;
+        assert!(rejects(&impossible_authoritative_lag));
+
+        let mut impossible_counter_lead = evidence;
+        impossible_counter_lead.max_counter_authoritative_lead_nanoseconds = 5_000_001;
+        assert!(rejects(&impossible_counter_lead));
+    }
+
+    #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "the schema-10 reachability oracle mutates each isolated failure and sole-pair aggregate family"
+    )]
+    fn exact_release_failure_and_sole_pair_reachability_reject_forged_aggregates() {
+        let base = now();
+        let packet = Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
+            .expect("schema-10 reachability packet");
+        let (guard, success) = v46_clock_divergence_evidence(
+            base,
+            0,
+            QcsdEndpointId(0),
+            QcsdSlotId(10),
+            packet,
+            BufloExactReleasePhase::Committed,
+        );
+        let base = guard
+            .release
+            .checked_sub(guard.packet.timestamp())
+            .and_then(|start| start.checked_sub(Duration::from_nanos(500)))
+            .expect("v46 receipt has a nominal defense-start predecessor");
+        let unavailable = watchdog_then_unavailable_failure(&guard);
+
+        let mut validator = RunnerWakeupMetrics::new();
+        validator.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        let mut forged_second_terminal_read = unavailable;
+        forged_second_terminal_read.authoritative_watchdog_checks = 0;
+        forged_second_terminal_read.max_authoritative_counter_lag_nanoseconds = 0;
+        forged_second_terminal_read.max_counter_authoritative_lead_nanoseconds = 0;
+        assert!(
+            validator
+                .validate_buflo_exact_release_guard_evidence(&guard, &forged_second_terminal_read,)
+                .is_err(),
+            "treating C=confirmations+1 as two terminal reads cannot erase the required R=64 watchdog check"
+        );
+
+        let mut forged_failed_read_interruption = unavailable;
+        forged_failed_read_interruption.active_wait_iterations = 3;
+        forged_failed_read_interruption.authoritative_watchdog_checks = 0;
+        forged_failed_read_interruption.max_authoritative_counter_lag_nanoseconds = 0;
+        forged_failed_read_interruption.max_counter_authoritative_lead_nanoseconds = 0;
+        forged_failed_read_interruption.counter_elapsed_ticks = 100_000;
+        forged_failed_read_interruption.max_counter_gap_ticks = 100_000;
+        forged_failed_read_interruption.max_counter_calibration_span_ticks = 100_000;
+        forged_failed_read_interruption.active_spin_interruptions = 2;
+        forged_failed_read_interruption.active_spin_interruption_nanoseconds = 100_000;
+        forged_failed_read_interruption.max_active_spin_gap_nanoseconds = 100_000;
+        assert!(
+            validator
+                .validate_buflo_exact_release_guard_evidence(
+                    &guard,
+                    &forged_failed_read_interruption,
+                )
+                .is_err(),
+            "C=1/I=3 cannot classify both the anchor and failed read as interruption gaps"
+        );
+
+        let mut forged_interruption_count = success;
+        forged_interruption_count.active_spin_interruptions =
+            forged_interruption_count.active_wait_iterations;
+        assert!(
+            validator
+                .validate_buflo_exact_release_guard_evidence(&guard, &forged_interruption_count)
+                .is_err(),
+            "the first predictive counter read establishes an anchor and cannot be an interruption"
+        );
+        let mut forged_interruption_duration = success;
+        forged_interruption_duration.active_spin_interruption_nanoseconds += 1;
+        assert!(
+            validator
+                .validate_buflo_exact_release_guard_evidence(&guard, &forged_interruption_duration,)
+                .is_err(),
+            "predictive interruption time cannot exceed counter-observed time"
+        );
+
+        let mut singleton = RunnerWakeupMetrics::new();
+        singleton.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        singleton
+            .record_buflo_exact_release_guard(&guard, Some(base), &unavailable)
+            .expect("producer-reachable watchdog then unavailable failure");
+        assert!(singleton.buflo_exact_release_invariants_hold());
+
+        let mut forged_singleton_failure_chronology = singleton;
+        let forged_failure = forged_singleton_failure_chronology
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("singleton failure retains its chronology");
+        forged_failure.release_at_defense_nanoseconds = forged_failure
+            .release_at_defense_nanoseconds
+            .map(|release| release + 1);
+        assert!(
+            !forged_singleton_failure_chronology.buflo_exact_release_invariants_hold(),
+            "relative failure boundaries must match the scalar adapter geometry"
+        );
+
+        let mut forged_singleton_iterations = singleton;
+        forged_singleton_iterations.buflo_exact_release_active_wait_iterations = 132;
+        assert!(
+            !forged_singleton_iterations.buflo_exact_release_invariants_hold(),
+            "one failure cannot hide relaxed reads outside its floor(R/64) cadence range"
+        );
+
+        let mut forged_comparison_without_source = singleton;
+        forged_comparison_without_source
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("singleton failure receipt")
+            .authoritative_watchdog_checks = 0;
+        forged_comparison_without_source
+            .buflo_exact_release_active_wait_authoritative_watchdog_checks = 0;
+        assert!(
+            !forged_comparison_without_source.buflo_exact_release_invariants_hold(),
+            "counter-comparison maxima cannot survive removal of every comparison source"
+        );
+
+        let nonmonotonic = BufloExactReleaseWaitEvidence {
+            entered_at: guard.guard_at,
+            active_wait_started_at: guard.guard_at,
+            exited_at: guard.guard_at + Duration::from_micros(1),
+            dispatch_at: None,
+            outcome: BufloExactReleaseWaitOutcome::CounterNonmonotonic,
+            active_wait_iterations: 2,
+            active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            counter_frequency_hz: Some(1_000_000_000),
+            counter_backed: true,
+            counter_unavailable: false,
+            counter_nonmonotonic: true,
+            ..BufloExactReleaseWaitEvidence::new(
+                guard.guard_at,
+                BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+                false,
+            )
+        };
+        let mut nonmonotonic_singleton = RunnerWakeupMetrics::new();
+        nonmonotonic_singleton.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        nonmonotonic_singleton
+            .record_buflo_exact_release_guard(&guard, Some(base), &nonmonotonic)
+            .expect("first-calibration second-read regression is reachable");
+        assert!(nonmonotonic_singleton.buflo_exact_release_invariants_hold());
+        nonmonotonic_singleton.buflo_exact_release_active_wait_iterations = 3;
+        assert!(
+            !nonmonotonic_singleton.buflo_exact_release_invariants_hold(),
+            "a zero-calibration regression has exactly two terminal ordered reads"
+        );
+
+        let mut pair = RunnerWakeupMetrics::new();
+        pair.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        pair.record_buflo_exact_release_guard(&guard, Some(base), &success)
+            .expect("sole successful predecessor");
+        pair.record_buflo_exact_release_guard(&guard, Some(base), &unavailable)
+            .expect("sole terminal failure");
+        assert!(pair.buflo_exact_release_invariants_hold());
+
+        let mut forged_dispatch_deadline_count = pair;
+        let retained_dispatch_is_late = pair
+            .buflo_exact_release_worst_guard
+            .expect("sole-pair worst guard")
+            .dispatch_at_or_after_deadline;
+        forged_dispatch_deadline_count.buflo_exact_release_dispatch_at_or_after_deadline_guards =
+            u64::from(!retained_dispatch_is_late);
+        assert!(
+            !forged_dispatch_deadline_count.buflo_exact_release_invariants_hold(),
+            "a sole successful predecessor exactly determines the paired late-dispatch count"
+        );
+
+        let mut forged_failure_source = pair;
+        forged_failure_source
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .active_wait_poll_source = BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE;
+        assert!(
+            !forged_failure_source.buflo_exact_release_invariants_hold(),
+            "a retained typed counter failure must use the aggregate predictive source"
+        );
+
+        let mut forged_worst_phase = pair;
+        forged_worst_phase
+            .buflo_exact_release_worst_guard
+            .as_mut()
+            .expect("sole-pair worst guard")
+            .phase = "forged-phase";
+        assert!(
+            !forged_worst_phase.buflo_exact_release_invariants_hold(),
+            "the retained worst-guard phase remains in the adapter phase domain"
+        );
+        let mut forged_failure_phase = pair;
+        forged_failure_phase
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .phase = "forged-phase";
+        assert!(
+            !forged_failure_phase.buflo_exact_release_invariants_hold(),
+            "the retained failure phase remains in the adapter phase domain"
+        );
+
+        let mut forged_failure_counter_tuple = pair;
+        let forged_tuple = forged_failure_counter_tuple
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure");
+        forged_tuple.counter_nanoseconds = None;
+        forged_tuple.max_counter_gap_nanoseconds = None;
+        forged_tuple.max_counter_calibration_span_nanoseconds = None;
+        assert!(
+            !forged_failure_counter_tuple.buflo_exact_release_invariants_hold(),
+            "a retained failure counter tuple is wholly present or wholly absent"
+        );
+
+        let mut forged_failure_state = pair;
+        forged_failure_state
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .counter_calibrations += 1;
+        forged_failure_state
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .active_wait_iterations += 2;
+        forged_failure_state.buflo_exact_release_active_wait_counter_calibrations += 1;
+        forged_failure_state.buflo_exact_release_active_wait_iterations += 2;
+        assert!(
+            !forged_failure_state.buflo_exact_release_invariants_hold(),
+            "aggregate sums cannot mask an impossible retained-failure counter state"
+        );
+
+        let mut forged_zero_progress_retry = pair;
+        forged_zero_progress_retry
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .instant_confirmations += 1;
+        forged_zero_progress_retry
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .early_confirmation_retries += 1;
+        forged_zero_progress_retry.buflo_exact_release_active_wait_instant_confirmations += 1;
+        forged_zero_progress_retry.buflo_exact_release_active_wait_early_confirmation_retries += 1;
+        assert!(
+            !forged_zero_progress_retry.buflo_exact_release_invariants_hold(),
+            "an early confirmation retry requires positive counter progress"
+        );
+
+        let failure_active_wait = pair
+            .buflo_exact_release_last_failure
+            .expect("sole-pair failure")
+            .active_wait_monotonic_nanoseconds;
+        let mut forged_failure_sample_gap = pair;
+        forged_failure_sample_gap
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .max_authoritative_sample_gap_nanoseconds = failure_active_wait.saturating_add(1);
+        assert!(
+            !forged_failure_sample_gap.buflo_exact_release_invariants_hold(),
+            "a retained failure sample gap cannot exceed that failure's active wait"
+        );
+        let mut forged_failure_counter_lag = pair;
+        forged_failure_counter_lag
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .max_authoritative_counter_lag_nanoseconds = failure_active_wait.saturating_add(1);
+        assert!(
+            !forged_failure_counter_lag.buflo_exact_release_invariants_hold(),
+            "a retained failure counter lag cannot exceed that failure's active wait"
+        );
+        let failure_counter_wait = pair
+            .buflo_exact_release_last_failure
+            .expect("sole-pair failure")
+            .counter_nanoseconds
+            .unwrap_or(0);
+        let mut forged_failure_counter_lead = pair;
+        forged_failure_counter_lead
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("sole-pair failure")
+            .max_counter_authoritative_lead_nanoseconds = failure_counter_wait.saturating_add(1);
+        forged_failure_counter_lead
+            .buflo_exact_release_worst_guard
+            .as_mut()
+            .expect("sole-pair worst guard")
+            .max_counter_authoritative_lead_nanoseconds = failure_counter_wait.saturating_add(1);
+        forged_failure_counter_lead
+            .buflo_exact_release_max_counter_authoritative_lead_nanoseconds =
+            failure_counter_wait.saturating_add(1);
+        assert!(
+            !forged_failure_counter_lead.buflo_exact_release_invariants_hold(),
+            "a retained failure counter lead cannot exceed its counter-observed duration"
+        );
+
+        let mut forged_worst_retry_partition = pair;
+        let worst = forged_worst_retry_partition
+            .buflo_exact_release_worst_guard
+            .as_mut()
+            .expect("sole-pair worst guard");
+        let relaxed_reads = worst
+            .active_wait_iterations
+            .checked_sub(worst.active_wait_counter_calibrations.saturating_mul(2))
+            .expect("producer-shaped worst guard has its calibration reads");
+        let retry_delta = relaxed_reads
+            .saturating_add(1)
+            .saturating_sub(worst.active_wait_early_confirmation_retries);
+        worst.active_wait_counter_calibrations = worst
+            .active_wait_counter_calibrations
+            .saturating_add(retry_delta);
+        worst.active_wait_instant_confirmations = worst
+            .active_wait_instant_confirmations
+            .saturating_add(retry_delta);
+        worst.active_wait_early_confirmation_retries = worst
+            .active_wait_early_confirmation_retries
+            .saturating_add(retry_delta);
+        worst.active_wait_iterations = worst
+            .active_wait_iterations
+            .saturating_add(retry_delta.saturating_mul(2));
+        forged_worst_retry_partition.buflo_exact_release_active_wait_counter_calibrations =
+            forged_worst_retry_partition
+                .buflo_exact_release_active_wait_counter_calibrations
+                .saturating_add(retry_delta);
+        forged_worst_retry_partition.buflo_exact_release_active_wait_instant_confirmations =
+            forged_worst_retry_partition
+                .buflo_exact_release_active_wait_instant_confirmations
+                .saturating_add(retry_delta);
+        forged_worst_retry_partition.buflo_exact_release_active_wait_early_confirmation_retries =
+            forged_worst_retry_partition
+                .buflo_exact_release_active_wait_early_confirmation_retries
+                .saturating_add(retry_delta);
+        forged_worst_retry_partition.buflo_exact_release_active_wait_iterations =
+            forged_worst_retry_partition
+                .buflo_exact_release_active_wait_iterations
+                .saturating_add(retry_delta.saturating_mul(2));
+        assert!(
+            !forged_worst_retry_partition.buflo_exact_release_invariants_hold(),
+            "a retained success cannot claim more early retries than successful relaxed reads"
+        );
+
+        let mut two_successes_then_failure = RunnerWakeupMetrics::new();
+        two_successes_then_failure.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        two_successes_then_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &success)
+            .expect("first producer-shaped success");
+        two_successes_then_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &success)
+            .expect("second producer-shaped success");
+        two_successes_then_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &unavailable)
+            .expect("producer-shaped mixed failure");
+        assert!(two_successes_then_failure.buflo_exact_release_invariants_hold());
+
+        let retained_worst = two_successes_then_failure
+            .buflo_exact_release_worst_guard
+            .expect("mixed aggregate retains its worst success");
+        let retained_failure = two_successes_then_failure
+            .buflo_exact_release_last_failure
+            .expect("mixed aggregate retains its failure");
+        let retained_entry_lateness = retained_worst
+            .guard_entry_lateness_nanoseconds
+            .max(retained_failure.guard_entry_lateness_nanoseconds);
+        let required_hidden_entry_lateness = if two_successes_then_failure
+            .buflo_exact_release_max_guard_entry_lateness_nanoseconds
+            > retained_entry_lateness
+        {
+            two_successes_then_failure.buflo_exact_release_max_guard_entry_lateness_nanoseconds
+        } else {
+            0
+        };
+        let maximum_success_active_wait = 5_000_000u64.saturating_add(
+            two_successes_then_failure.buflo_exact_release_max_guard_exit_lateness_nanoseconds,
+        );
+        let mixed_active_wait_ceiling = super::buflo_exact_release_aggregate_active_wait_ceiling(
+            maximum_success_active_wait,
+            5_000_000u64
+                .checked_add(
+                    two_successes_then_failure
+                        .buflo_exact_release_max_guard_exit_lateness_nanoseconds,
+                )
+                .is_none(),
+            two_successes_then_failure
+                .buflo_exact_release_dispatch_ready_guards
+                .saturating_sub(1),
+            required_hidden_entry_lateness,
+            retained_worst.active_wait_monotonic_nanoseconds,
+            retained_failure.active_wait_monotonic_nanoseconds,
+        )
+        .expect("producer-shaped mixed receipt has a finite active-wait ceiling");
+        assert!(mixed_active_wait_ceiling < u64::MAX);
+        let mut forged_mixed_active_wait = two_successes_then_failure;
+        forged_mixed_active_wait.buflo_exact_release_guard_wait_nanoseconds =
+            mixed_active_wait_ceiling.saturating_add(1);
+        forged_mixed_active_wait.buflo_exact_release_active_wait_nanoseconds =
+            mixed_active_wait_ceiling.saturating_add(1);
+        assert!(
+            !forged_mixed_active_wait.buflo_exact_release_invariants_hold(),
+            "two successes and one retained failure cannot hide extra aggregate active-wait time"
+        );
+
+        let retained_sample_gap = retained_worst.max_authoritative_sample_gap_nanoseconds;
+        let retained_failure_sample_gap = retained_failure.max_authoritative_sample_gap_nanoseconds;
+        let impossible_sample_gap = maximum_success_active_wait
+            .max(retained_sample_gap)
+            .max(retained_failure_sample_gap)
+            .saturating_add(1);
+        let mut forged_mixed_sample_gap = two_successes_then_failure;
+        forged_mixed_sample_gap.buflo_exact_release_max_authoritative_sample_gap_nanoseconds =
+            impossible_sample_gap;
+        assert!(
+            !forged_mixed_sample_gap.buflo_exact_release_invariants_hold(),
+            "a hidden success cannot authorise an aggregate sample gap beyond its active-wait ceiling"
+        );
+
+        let retained_counter_lag = retained_worst.max_authoritative_counter_lag_nanoseconds;
+        let retained_failure_counter_lag =
+            retained_failure.max_authoritative_counter_lag_nanoseconds;
+        let impossible_counter_lag = maximum_success_active_wait
+            .max(retained_counter_lag)
+            .max(retained_failure_counter_lag)
+            .saturating_add(1);
+        let mut forged_mixed_counter_lag = two_successes_then_failure;
+        forged_mixed_counter_lag.buflo_exact_release_max_authoritative_counter_lag_nanoseconds =
+            impossible_counter_lag;
+        assert!(
+            !forged_mixed_counter_lag.buflo_exact_release_invariants_hold(),
+            "a hidden success cannot authorise an aggregate counter lag beyond its active-wait ceiling"
+        );
+
+        let late_failure_entry = guard.deadline + Duration::from_millis(10);
+        let late_unavailable = BufloExactReleaseWaitEvidence {
+            entered_at: late_failure_entry,
+            active_wait_started_at: late_failure_entry,
+            exited_at: late_failure_entry + Duration::from_millis(2),
+            ..unavailable
+        };
+        let mut two_successes_then_late_failure = RunnerWakeupMetrics::new();
+        two_successes_then_late_failure.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        two_successes_then_late_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &success)
+            .expect("first success before retained late failure");
+        two_successes_then_late_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &success)
+            .expect("second success before retained late failure");
+        two_successes_then_late_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &late_unavailable)
+            .expect("a typed failure may enter after the successful-guard timing bound");
+        assert!(
+            two_successes_then_late_failure.buflo_exact_release_invariants_hold(),
+            "the retained typed failure itself authorises its later aggregate entry maximum"
+        );
+        let mut forged_retained_failure_iterations = two_successes_then_failure;
+        forged_retained_failure_iterations
+            .buflo_exact_release_last_failure
+            .as_mut()
+            .expect("mixed aggregate retains its failure")
+            .active_wait_iterations += 1;
+        assert!(
+            !forged_retained_failure_iterations.buflo_exact_release_invariants_hold(),
+            "hidden successes cannot absorb a forged retained-failure iteration count"
+        );
+        let mut forged_erased_remaining_success = two_successes_then_failure;
+        forged_erased_remaining_success.buflo_exact_release_active_wait_iterations =
+            pair.buflo_exact_release_active_wait_iterations;
+        assert!(
+            !forged_erased_remaining_success.buflo_exact_release_invariants_hold(),
+            "a mixed aggregate cannot retain a second success's counters while erasing all of its relaxed reads"
+        );
+
+        let mut null_chronology_pair = RunnerWakeupMetrics::new();
+        null_chronology_pair.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        null_chronology_pair
+            .record_buflo_exact_release_guard(&guard, None, &success)
+            .expect("sole success with null relative chronology");
+        null_chronology_pair
+            .record_buflo_exact_release_guard(&guard, None, &unavailable)
+            .expect("sole failure with null relative chronology");
+        assert!(
+            null_chronology_pair.buflo_exact_release_invariants_hold(),
+            "all-none relative chronology remains schema-10 reachable"
+        );
+
+        let max_interruption_success = BufloExactReleaseWaitEvidence {
+            entered_at: guard.guard_at,
+            active_wait_started_at: guard.guard_at,
+            exited_at: guard.release,
+            dispatch_at: Some(guard.release),
+            outcome: BufloExactReleaseWaitOutcome::DispatchReady,
+            active_wait_iterations: 2,
+            active_spin_interruptions: 1,
+            active_spin_interruption_nanoseconds: 100_000,
+            max_active_spin_gap_nanoseconds: 100_000,
+            active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            counter_frequency_hz: Some(1_000_000_000),
+            counter_backed: true,
+            counter_unavailable: false,
+            counter_calibrations: 1,
+            instant_confirmations: 1,
+            counter_elapsed_ticks: 100_000,
+            max_counter_gap_ticks: 100_000,
+            max_counter_calibration_span_ticks: 100_000,
+            ..BufloExactReleaseWaitEvidence::new(
+                guard.guard_at,
+                BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+                false,
+            )
+        };
+        let unavailable_first_read = BufloExactReleaseWaitEvidence {
+            entered_at: guard.guard_at,
+            active_wait_started_at: guard.guard_at,
+            exited_at: guard.guard_at + Duration::from_micros(1),
+            dispatch_at: None,
+            outcome: BufloExactReleaseWaitOutcome::CounterUnavailable,
+            active_wait_iterations: 1,
+            active_wait_poll_source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            counter_frequency_hz: Some(1_000_000_000),
+            counter_backed: false,
+            counter_unavailable: true,
+            max_authoritative_sample_gap_nanoseconds: 1_000,
+            ..BufloExactReleaseWaitEvidence::new(
+                guard.guard_at,
+                BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+                true,
+            )
+        };
+        let mut mixed_first_read_failure = RunnerWakeupMetrics::new();
+        mixed_first_read_failure.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        mixed_first_read_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &max_interruption_success)
+            .expect("success realizes its maximum one interruption from two reads");
+        mixed_first_read_failure
+            .record_buflo_exact_release_guard(&guard, Some(base), &unavailable_first_read)
+            .expect("unavailable first read has no separate anchor gap");
+        assert!(
+            mixed_first_read_failure.buflo_exact_release_invariants_hold(),
+            "the global subtraction must not double-count an unavailable first read"
+        );
+
+        let rejects = |candidate: RunnerWakeupMetrics| {
+            assert!(!candidate.buflo_exact_release_invariants_hold());
+        };
+        let mut forged_calibration_sum = pair;
+        forged_calibration_sum.buflo_exact_release_active_wait_counter_calibrations += 1;
+        rejects(forged_calibration_sum);
+
+        let mut forged_confirmation_retry_sum = pair;
+        forged_confirmation_retry_sum.buflo_exact_release_active_wait_instant_confirmations += 1;
+        forged_confirmation_retry_sum.buflo_exact_release_active_wait_early_confirmation_retries +=
+            1;
+        rejects(forged_confirmation_retry_sum);
+
+        let mut forged_watchdog_sum = pair;
+        forged_watchdog_sum.buflo_exact_release_active_wait_iterations += 64;
+        forged_watchdog_sum.buflo_exact_release_active_wait_authoritative_watchdog_checks += 1;
+        rejects(forged_watchdog_sum);
+
+        let mut forged_counter_sum = pair;
+        forged_counter_sum.buflo_exact_release_active_wait_counter_nanoseconds += 1;
+        rejects(forged_counter_sum);
+
+        let mut forged_chronology_sum = pair;
+        forged_chronology_sum.buflo_exact_release_guard_wait_nanoseconds += 1;
+        forged_chronology_sum.buflo_exact_release_active_wait_nanoseconds += 1;
+        rejects(forged_chronology_sum);
+
+        let mut forged_entry_max = pair;
+        forged_entry_max.buflo_exact_release_max_guard_entry_lateness_nanoseconds += 1;
+        forged_entry_max.buflo_exact_release_max_passive_wake_lateness_nanoseconds += 1;
+        rejects(forged_entry_max);
+
+        let mut forged_span_max = pair;
+        forged_span_max.buflo_exact_release_max_counter_calibration_span_nanoseconds += 1;
+        rejects(forged_span_max);
+
+        let mut forged_sample_max = pair;
+        forged_sample_max.buflo_exact_release_max_authoritative_sample_gap_nanoseconds += 1;
+        rejects(forged_sample_max);
+
+        let mut forged_lag_max = pair;
+        forged_lag_max.buflo_exact_release_max_authoritative_counter_lag_nanoseconds += 1;
+        rejects(forged_lag_max);
+
+        let mut forged_lead_max = pair;
+        forged_lead_max.buflo_exact_release_max_counter_authoritative_lead_nanoseconds += 1;
+        rejects(forged_lead_max);
+
+        let mut forged_aggregate_interruptions = pair;
+        let non_anchor_reads = forged_aggregate_interruptions
+            .buflo_exact_release_active_wait_iterations
+            .saturating_sub(forged_aggregate_interruptions.buflo_exact_release_guard_entries);
+        forged_aggregate_interruptions.buflo_exact_release_active_spin_interruptions =
+            non_anchor_reads + 1;
+        rejects(forged_aggregate_interruptions);
+
+        let mut forged_failure_residual_interruptions = pair;
+        forged_failure_residual_interruptions.buflo_exact_release_active_spin_interruptions = pair
+            .buflo_exact_release_worst_guard
+            .expect("sole-pair worst guard")
+            .active_spin_interruptions
+            + 66;
+        rejects(forged_failure_residual_interruptions);
+
+        let mut forged_failure_residual_interruption_ns = pair;
+        forged_failure_residual_interruption_ns
+            .buflo_exact_release_active_spin_interruption_nanoseconds = pair
+            .buflo_exact_release_worst_guard
+            .expect("sole-pair worst guard")
+            .active_spin_interruption_nanoseconds
+            .saturating_add(
+                pair.buflo_exact_release_last_failure
+                    .expect("sole-pair failure")
+                    .counter_nanoseconds
+                    .unwrap_or(0),
+            )
+            .saturating_add(1);
+        rejects(forged_failure_residual_interruption_ns);
+    }
+
+    #[test]
+    fn zero_failure_watchdog_remainder_bound_covers_v46_shaped_counts() {
+        let iterations = 61_615_986;
+        let calibrations = 5_072;
+        let guards = 5_072;
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            iterations,
+            calibrations,
+            957_599,
+            0,
+            0,
+            guards,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            iterations,
+            calibrations,
+            962_591,
+            0,
+            0,
+            guards,
+        ));
+        assert!(
+            !buflo_exact_release_zero_failure_watchdog_remainder_bound(
+                iterations,
+                calibrations,
+                957_598,
+                0,
+                0,
+                guards,
+            ),
+            "one fewer check breaches the modular non-dispatch-guard residue bound"
+        );
+        assert!(
+            !buflo_exact_release_zero_failure_watchdog_remainder_bound(
+                iterations,
+                calibrations,
+                962_592,
+                0,
+                0,
+                guards,
+            ),
+            "one extra check breaches the lower successful-read bound"
+        );
+        assert!(!buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            6, 3, 0, 1, 0, 2,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            7, 3, 0, 1, 0, 2,
+        ));
+        assert!(!buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            8, 3, 0, 0, 0, 2,
+        ));
+        assert!(!buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            133, 2, 2, 0, 2, 2,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            132, 2, 2, 0, 2, 2,
+        ));
+        assert!(!buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            68, 2, 1, 0, 2, 2,
+        ));
+        assert!(!buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            2, 1, 0, 0, 0, 0,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            0, 0, 0, 0, 0, 0,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            65, 2, 0, 0, 0, 2,
+        ));
+        assert!(!buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            0, 1, 0, 0, 0, 1,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            6, 2, 0, 0, 0, 2,
+        ));
+        assert!(buflo_exact_release_zero_failure_watchdog_remainder_bound(
+            3, 1, 0, 0, 0, 1,
+        ));
+    }
+
+    #[test]
+    fn typed_failure_watchdog_cadence_closes_ordered_read_only_paths() {
+        let validates = |outcome, iterations, calibrations, confirmations, retries| {
+            buflo_exact_release_failure_watchdog_cadence_validated(
+                outcome,
+                iterations,
+                calibrations,
+                confirmations,
+                retries,
+                0,
+                0,
+            )
+        };
+
+        assert!(validates("counter-target-error", 2, 1, 0, 0));
+        assert!(!validates("counter-target-error", 3, 1, 0, 0));
+        assert!(validates("counter-unavailable", 1, 0, 0, 0));
+        assert!(validates("counter-unavailable", 2, 0, 0, 0));
+        assert!(!validates("counter-unavailable", 3, 0, 0, 0));
+        assert!(validates("counter-nonmonotonic", 2, 0, 0, 0));
+        assert!(!validates("counter-nonmonotonic", 3, 0, 0, 0));
     }
 
     #[test]
@@ -25498,6 +28313,106 @@ mod tests {
         }
     }
 
+    fn v46_clock_divergence_evidence(
+        guard_at: Instant,
+        endpoint_index: usize,
+        endpoint: QcsdEndpointId,
+        slot: QcsdSlotId,
+        packet: Packet,
+        phase: BufloExactReleasePhase,
+    ) -> (BufloExactReleaseGuard, BufloExactReleaseWaitEvidence) {
+        const ADAPTER_WINDOW: Duration = Duration::from_micros(4_999);
+        const GUARD_ENTRY_LATENESS: Duration = Duration::from_nanos(420_791);
+        const ACTIVE_INSTANT_ELAPSED: Duration = Duration::from_nanos(10_321_797);
+        const CNTVCT_ELAPSED: u64 = 4_577_864;
+
+        let release = guard_at + ADAPTER_WINDOW;
+        let deadline = release + ADAPTER_WINDOW;
+        let entered_at = guard_at + GUARD_ENTRY_LATENESS;
+        let dispatch_at = entered_at + ACTIVE_INSTANT_ELAPSED;
+        let guard = BufloExactReleaseGuard {
+            endpoint_index,
+            endpoint,
+            slot,
+            packet,
+            phase,
+            output_admission_at: guard_at
+                .checked_sub(ADAPTER_WINDOW)
+                .expect("v46 guard has an output-admission predecessor"),
+            guard_at,
+            active_wait_at: guard_at,
+            release,
+            deadline,
+        };
+
+        let mut instants = VecDeque::from([entered_at, entered_at, dispatch_at]);
+        let mut authoritative_now = || {
+            instants
+                .pop_front()
+                .expect("v46 authoritative Instant sample")
+        };
+        let mut no_sleep = |_| {};
+        let mut relaxed = VecDeque::from(vec![Some(100); 63]);
+        relaxed.push_back(Some(100 + CNTVCT_ELAPSED));
+        let mut stalled = ScriptedBufloPollClock {
+            source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            required: true,
+            frequency_hz: Some(1_000_000_000),
+            ordered: VecDeque::from([Some(100), Some(100)]),
+            relaxed,
+        };
+        let evidence = wait_for_buflo_exact_release_with_clocks(
+            &guard,
+            &mut authoritative_now,
+            &mut no_sleep,
+            &mut stalled,
+        )
+        .expect("the authoritative watchdog exposes the v46 divergence");
+        assert!(instants.is_empty());
+        assert!(stalled.relaxed.is_empty());
+        (guard, evidence)
+    }
+
+    fn watchdog_then_unavailable_failure(
+        guard: &BufloExactReleaseGuard,
+    ) -> BufloExactReleaseWaitEvidence {
+        let watchdog_at = guard.guard_at + Duration::from_millis(1);
+        let failure_exit = guard.guard_at + Duration::from_millis(2);
+        let mut instants =
+            VecDeque::from([guard.guard_at, guard.guard_at, watchdog_at, failure_exit]);
+        let mut authoritative_now = || {
+            instants
+                .pop_front()
+                .expect("failure authoritative Instant sample")
+        };
+        let mut no_sleep = |_| {};
+        let mut relaxed = VecDeque::from(vec![Some(100); 64]);
+        relaxed.push_back(None);
+        let mut clock = ScriptedBufloPollClock {
+            source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            required: true,
+            frequency_hz: Some(1_000_000_000),
+            ordered: VecDeque::from([Some(100), Some(100)]),
+            relaxed,
+        };
+        let failure = wait_for_buflo_exact_release_with_clocks(
+            guard,
+            &mut authoritative_now,
+            &mut no_sleep,
+            &mut clock,
+        )
+        .expect_err("the post-watchdog unavailable read is terminal");
+        assert!(instants.is_empty());
+        assert!(clock.relaxed.is_empty());
+        assert_eq!(
+            failure.evidence.outcome,
+            BufloExactReleaseWaitOutcome::CounterUnavailable
+        );
+        assert_eq!(failure.evidence.active_wait_iterations, 67);
+        assert_eq!(failure.evidence.authoritative_watchdog_checks, 1);
+        failure.evidence
+    }
+
     #[test]
     fn buflo_counter_target_conversion_uses_exact_ceiling() {
         let frequency = NonZeroU64::new(19_200_000).expect("positive frequency");
@@ -25554,6 +28469,382 @@ mod tests {
     }
 
     #[test]
+    fn predictive_counter_watchdog_dispatches_a_stalled_counter_before_deadline() {
+        let base = now();
+        let guard = scripted_buflo_guard(base);
+        let watchdog_dispatch = guard.release + Duration::from_millis(1);
+        assert!(watchdog_dispatch < guard.deadline);
+        let mut instants = VecDeque::from([guard.guard_at, guard.guard_at, watchdog_dispatch]);
+        let mut authoritative_now = || {
+            instants
+                .pop_front()
+                .expect("watchdog authoritative Instant")
+        };
+        let mut no_sleep = |_| {};
+        let mut stalled = ScriptedBufloPollClock {
+            source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            required: true,
+            frequency_hz: Some(1_000_000),
+            ordered: VecDeque::from([Some(100), Some(101)]),
+            relaxed: VecDeque::from(vec![Some(101); 64]),
+        };
+
+        let evidence = wait_for_buflo_exact_release_with_clocks(
+            &guard,
+            &mut authoritative_now,
+            &mut no_sleep,
+            &mut stalled,
+        )
+        .expect("authoritative watchdog recovers the stalled predictive counter");
+
+        assert_eq!(evidence.dispatch_at, Some(watchdog_dispatch));
+        assert_eq!(evidence.authoritative_watchdog_checks, 1);
+        assert_eq!(evidence.authoritative_watchdog_dispatches, 1);
+        assert_eq!(evidence.counter_calibrations, 1);
+        assert_eq!(evidence.instant_confirmations, 1);
+        assert_eq!(evidence.active_wait_iterations, 66);
+        assert_eq!(evidence.counter_elapsed_ticks, 1);
+        assert_eq!(evidence.max_authoritative_sample_gap_nanoseconds, 6_000_000);
+        assert_eq!(
+            evidence.max_authoritative_counter_lag_nanoseconds,
+            6_000_000
+        );
+        assert_eq!(evidence.max_counter_authoritative_lead_nanoseconds, 0);
+        assert!(instants.is_empty());
+        assert!(stalled.relaxed.is_empty());
+
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        metrics
+            .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
+            .expect("watchdog dispatch records as schema-10 evidence");
+        assert!(metrics.buflo_exact_release_invariants_hold());
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_authoritative_watchdog_checks,
+            1
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_authoritative_watchdog_dispatches,
+            1
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards,
+            1,
+            "the exact production source activates the schema-10 watchdog cadence gate"
+        );
+        let worst = metrics
+            .buflo_exact_release_worst_guard
+            .expect("watchdog guard is retained");
+        assert_eq!(worst.active_wait_authoritative_watchdog_checks, 1);
+        assert_eq!(worst.active_wait_authoritative_watchdog_dispatches, 1);
+        assert_eq!(worst.max_authoritative_counter_lag_nanoseconds, 6_000_000);
+        assert!(!worst.dispatch_at_or_after_deadline);
+    }
+
+    #[test]
+    fn predictive_watchdog_reproduces_immutable_v46_clock_divergence() {
+        let base = now();
+        let packet = Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
+            .expect("v46 outgoing packet");
+        let (guard, evidence) = v46_clock_divergence_evidence(
+            base,
+            0,
+            QcsdEndpointId(0),
+            QcsdSlotId(46),
+            packet,
+            BufloExactReleasePhase::Committed,
+        );
+        let base = guard
+            .release
+            .checked_sub(guard.packet.timestamp())
+            .and_then(|start| start.checked_sub(Duration::from_nanos(500)))
+            .expect("v46 receipt has a nominal defense-start predecessor");
+        let dispatch_at = evidence
+            .dispatch_at
+            .expect("the authoritative watchdog dispatches the v46 guard");
+
+        assert_eq!(
+            duration_as_u64_nanos(evidence.entered_at.duration_since(guard.guard_at)),
+            420_791
+        );
+        assert_eq!(
+            duration_as_u64_nanos(
+                evidence
+                    .exited_at
+                    .duration_since(evidence.active_wait_started_at)
+            ),
+            10_321_797,
+            "immutable v46 Instant elapsed time"
+        );
+        assert_eq!(evidence.counter_elapsed_ticks, 4_577_864);
+        assert_eq!(
+            evidence.max_authoritative_counter_lag_nanoseconds, 5_743_933,
+            "immutable v46 Instant/CNTVCT divergence"
+        );
+        assert_eq!(evidence.max_counter_authoritative_lead_nanoseconds, 0);
+        assert_eq!(
+            duration_as_u64_nanos(dispatch_at.duration_since(guard.release)),
+            5_743_588,
+            "immutable v46 release lateness"
+        );
+        assert_eq!(
+            duration_as_u64_nanos(dispatch_at.duration_since(guard.deadline)),
+            744_588,
+            "immutable v46 strict-deadline excess"
+        );
+        assert_eq!(evidence.authoritative_watchdog_checks, 1);
+        assert_eq!(evidence.authoritative_watchdog_dispatches, 1);
+        assert_eq!(evidence.counter_calibrations, 1);
+        assert_eq!(evidence.instant_confirmations, 1);
+        assert_eq!(evidence.active_wait_iterations, 66);
+        assert!(dispatch_at >= guard.deadline);
+
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        metrics
+            .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
+            .expect("v46 timing evidence satisfies every schema-10 identity");
+        assert!(metrics.buflo_exact_release_invariants_hold());
+        assert_eq!(
+            metrics.buflo_exact_release_dispatch_at_or_after_deadline_guards, 1,
+            "schema 10 detects the immutable half-open-window breach"
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards,
+            1
+        );
+        let worst = metrics
+            .buflo_exact_release_worst_guard
+            .expect("v46 guard is retained as the authoritative worst sample");
+        assert_eq!(worst.dispatch_lateness_nanoseconds, 5_743_588);
+        assert_eq!(worst.dispatch_after_deadline_nanoseconds, 744_588);
+        assert!(worst.dispatch_at_or_after_deadline);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression binds immutable watchdog evidence, committed runner ownership, transport non-entry, and terminal traces"
+    )]
+    async fn expired_v46_watchdog_dispatch_hard_fails_without_transport_or_catch_up() {
+        let output = trace_output_dir("expired-v46-watchdog-dispatch");
+        let setup_now = now();
+        let started = setup_now
+            .checked_sub(Duration::from_millis(50))
+            .expect("the committed fixture has a defense-start predecessor");
+        let observation_clock = QcsdObservationClock::new(started);
+        let packet = Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
+            .expect("v46 outgoing packet");
+        let mut controller = rolling_abort_controller(packet);
+        let preview = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("rolling preview");
+        let slot = match &preview {
+            QcsdAction::PrearmPacket { slot, .. } => *slot,
+            _ => unreachable!("selected rolling preview"),
+        };
+        let mut endpoints = vec![connected_runner_endpoint(
+            &output,
+            started,
+            &observation_clock,
+        )];
+        endpoints[0].test_force_socket_handoff_success = true;
+        drop(endpoints[0].client.qcsd_timestamped_observations());
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            vec![preview],
+        )
+        .expect("apply rolling preview");
+
+        let nominal_release = endpoints[0].prearmed_outgoing[0].not_before;
+        controller
+            .reconcile_due_rolling(packet.timestamp())
+            .expect("commit the v46 outgoing target");
+        let commit_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(commit_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::CommitPrearmedPacket {
+                slot: committed_slot,
+                packet: committed_packet,
+                ..
+            } if *committed_slot == slot && *committed_packet == packet
+        )));
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            nominal_release,
+            packet.timestamp(),
+            commit_actions,
+        )
+        .expect("apply outgoing commit");
+        let scheduled = endpoints[0]
+            .scheduled_outgoing
+            .front()
+            .copied()
+            .expect("committed outgoing owner");
+        assert_eq!((scheduled.slot, scheduled.packet), (slot, packet));
+
+        let guard_at = now()
+            .checked_sub(Duration::from_millis(20))
+            .expect("v46 guard is deterministically expired");
+        let (guard, evidence) = v46_clock_divergence_evidence(
+            guard_at,
+            0,
+            endpoints[0].id,
+            scheduled.slot,
+            scheduled.packet,
+            BufloExactReleasePhase::Committed,
+        );
+        let receipt_start = guard
+            .release
+            .checked_sub(guard.packet.timestamp())
+            .and_then(|start| start.checked_sub(Duration::from_nanos(500)))
+            .expect("v46 receipt has a nominal defense-start predecessor");
+        let committed = endpoints[0]
+            .scheduled_outgoing
+            .front_mut()
+            .expect("committed owner remains queued");
+        committed.not_before = guard.release;
+        committed.deadline = guard.deadline;
+        assert!(now() >= guard.deadline);
+
+        endpoints[0]
+            .test_output_drives
+            .push_back(TestOutputDrive::ProductionPath);
+        endpoints[0].test_observation_on_next_output =
+            Some(observation_clock.record(QcsdObservation::EgressBacklog { pending: true }));
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        let dispatch_error = dispatch_buflo_exact_release(
+            &guard,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(started),
+            &mut metrics,
+        )
+        .await
+        .expect_err("an expired v46 watchdog dispatch is a hard fidelity failure");
+        metrics
+            .record_buflo_exact_release_guard(&guard, Some(receipt_start), &evidence)
+            .expect("the immutable late-watchdog sample remains authoritative");
+
+        assert!(matches!(
+            dispatch_error,
+            Error::DefenseExecution(message)
+                if message == format!(
+                    "BuFLO exact-release slot {} expired before transport dispatch",
+                    slot.0
+                )
+        ));
+        assert_eq!(
+            endpoints[0].test_output_drives,
+            VecDeque::from([TestOutputDrive::ProductionPath]),
+            "the expired branch never enters the transport output driver"
+        );
+        assert!(endpoints[0].test_observation_on_next_output.is_some());
+        assert!(endpoints[0].test_output_observations.is_empty());
+        assert!(endpoints[0].scheduled_outgoing.is_empty());
+        assert!(controller.pending_slots().is_empty());
+        assert!(traces.is_slot_terminal(slot));
+        assert_eq!(
+            metrics.buflo_exact_release_dispatch_at_or_after_deadline_guards,
+            1
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards,
+            1
+        );
+        assert!(metrics.buflo_exact_release_invariants_hold());
+
+        controller.poll(now().saturating_duration_since(started));
+        assert!(controller.drain_actions().all(|action| !matches!(
+            action,
+            QcsdAction::SendPacket { .. }
+                | QcsdAction::PrearmPacket { .. }
+                | QcsdAction::CommitPrearmedPacket { .. }
+        )));
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(
+            packets.lines().count(),
+            1,
+            "late watchdog dispatch emits no packet row or catch-up datagram"
+        );
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule trace");
+        assert_eq!(schedule.lines().count(), 2);
+        assert!(schedule.contains("DeadlineExpired"));
+        assert!(schedule.contains(",missed,"));
+
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    fn predictive_counter_watchdog_exposes_resume_after_the_strict_deadline() {
+        let base = now();
+        let guard = scripted_buflo_guard(base);
+        let resumed_at = guard.deadline + Duration::from_micros(1);
+        let mut instants = VecDeque::from([guard.guard_at, guard.guard_at, resumed_at]);
+        let mut authoritative_now = || {
+            instants
+                .pop_front()
+                .expect("late watchdog authoritative Instant")
+        };
+        let mut no_sleep = |_| {};
+        let mut stalled = ScriptedBufloPollClock {
+            source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+            required: true,
+            frequency_hz: Some(1_000_000),
+            ordered: VecDeque::from([Some(100), Some(101)]),
+            relaxed: VecDeque::from(vec![Some(101); 64]),
+        };
+
+        let evidence = wait_for_buflo_exact_release_with_clocks(
+            &guard,
+            &mut authoritative_now,
+            &mut no_sleep,
+            &mut stalled,
+        )
+        .expect("wait exposes the authoritative dispatch instant");
+
+        assert_eq!(evidence.dispatch_at, Some(resumed_at));
+        assert!(evidence.dispatch_at.is_some_and(|at| at >= guard.deadline));
+        assert_eq!(evidence.authoritative_watchdog_checks, 1);
+        assert_eq!(evidence.authoritative_watchdog_dispatches, 1);
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
+        metrics
+            .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
+            .expect("late watchdog remains valid timing evidence");
+        assert_eq!(
+            metrics.buflo_exact_release_dispatch_at_or_after_deadline_guards, 1,
+            "the existing dispatch path must reject this strict half-open-window breach"
+        );
+        let worst = metrics
+            .buflo_exact_release_worst_guard
+            .expect("late watchdog guard is retained");
+        assert!(worst.dispatch_at_or_after_deadline);
+        assert_eq!(worst.dispatch_after_deadline_nanoseconds, 1_000);
+        assert!(metrics.buflo_exact_release_invariants_hold());
+    }
+
+    #[test]
     fn predictive_counter_recalibrates_after_early_authoritative_confirmation() {
         let base = now();
         let guard = scripted_buflo_guard(base);
@@ -25572,7 +28863,7 @@ mod tests {
         let mut slept = Vec::new();
         let mut passive_sleep = |duration| slept.push(duration);
         let mut poll_clock = ScriptedBufloPollClock {
-            source: "test-predictive-counter-v1",
+            source: BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
             required: true,
             frequency_hz: Some(1_000_000),
             ordered: VecDeque::from([Some(100), Some(102), Some(5_103), Some(5_104)]),
@@ -25604,6 +28895,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "typed frequency and regression exits share one final-sample invariant fixture"
+    )]
     fn predictive_counter_bad_frequency_and_regression_fail_closed() {
         let base = now();
         let guard = scripted_buflo_guard(base);
@@ -25618,7 +28914,7 @@ mod tests {
                     .expect("bad-frequency authoritative Instant")
             };
             let mut bad_frequency = ScriptedBufloPollClock {
-                source: "linux-aarch64-cntvct-el0-predictive-v1",
+                source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
                 required: true,
                 frequency_hz: invalid_frequency,
                 ordered: VecDeque::new(),
@@ -25639,16 +28935,31 @@ mod tests {
             );
             assert_eq!(failure.evidence.exited_at, failure_exit);
             assert_eq!(failure.evidence.dispatch_at, None);
+            assert_eq!(
+                failure.evidence.max_authoritative_sample_gap_nanoseconds, 1_000,
+                "the typed invalid-frequency exit is a final authoritative sample"
+            );
             assert!(bad_frequency_instants.is_empty());
             assert!(matches!(failure.error, Error::DefenseExecution(_)));
             let mut metrics = RunnerWakeupMetrics::new();
             metrics.buflo_exact_release_active_wait_poll_source =
-                "linux-aarch64-cntvct-el0-predictive-v1";
+                "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
             metrics
                 .record_buflo_exact_release_guard(&guard, Some(base), &failure.evidence)
                 .expect(
                     "producer invalid-frequency failure records under the production partition",
                 );
+            assert_eq!(
+                metrics.buflo_exact_release_max_authoritative_sample_gap_nanoseconds,
+                1_000
+            );
+            assert_eq!(
+                metrics
+                    .buflo_exact_release_last_failure
+                    .expect("invalid-frequency failure receipt")
+                    .max_authoritative_sample_gap_nanoseconds,
+                1_000
+            );
             assert!(metrics.buflo_exact_release_invariants_hold());
         }
 
@@ -25664,7 +28975,7 @@ mod tests {
                 .expect("regression authoritative Instant")
         };
         let mut regression = ScriptedBufloPollClock {
-            source: "linux-aarch64-cntvct-el0-predictive-v1",
+            source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
             required: true,
             frequency_hz: Some(1_000_000),
             ordered: VecDeque::from([Some(100), Some(99)]),
@@ -25686,12 +28997,16 @@ mod tests {
         );
         assert_eq!(failure.evidence.exited_at, regression_exit);
         assert_eq!(failure.evidence.dispatch_at, None);
+        assert_eq!(
+            failure.evidence.max_authoritative_sample_gap_nanoseconds,
+            1_000
+        );
         assert!(regression_instants.is_empty());
         assert!(forward_counter_delta(100, 99).is_err());
         assert!(matches!(failure.error, Error::DefenseExecution(_)));
         let mut metrics = RunnerWakeupMetrics::new();
         metrics.buflo_exact_release_active_wait_poll_source =
-            "linux-aarch64-cntvct-el0-predictive-v1";
+            "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
         metrics
             .record_buflo_exact_release_guard(&guard, Some(base), &failure.evidence)
             .expect("producer ordered-regression failure records under the production partition");
@@ -25699,10 +29014,56 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "ordered and relaxed counter failures share one authoritative-exit fixture"
+    )]
     fn predictive_counter_relaxed_read_failures_stamp_fresh_authoritative_exits() {
         let base = now();
         let guard = scripted_buflo_guard(base);
         let mut no_sleep = |_| {};
+        let first_read_failure_exit = guard.guard_at + Duration::from_micros(2);
+        let mut first_read_instants = VecDeque::from([guard.guard_at, first_read_failure_exit]);
+        let mut first_read_now = || {
+            first_read_instants
+                .pop_front()
+                .expect("first-read authoritative Instant")
+        };
+        let mut unavailable_before_calibration = ScriptedBufloPollClock {
+            source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
+            required: true,
+            frequency_hz: Some(1_000_000),
+            ordered: VecDeque::from([None]),
+            relaxed: VecDeque::new(),
+        };
+        let first_read_failure = wait_for_buflo_exact_release_with_clocks(
+            &guard,
+            &mut first_read_now,
+            &mut no_sleep,
+            &mut unavailable_before_calibration,
+        )
+        .expect_err("an unavailable first ordered read is terminal");
+        assert_eq!(
+            first_read_failure.evidence.outcome,
+            BufloExactReleaseWaitOutcome::CounterUnavailable
+        );
+        assert_eq!(first_read_failure.evidence.counter_calibrations, 0);
+        assert_eq!(first_read_failure.evidence.active_wait_iterations, 1);
+        assert_eq!(
+            first_read_failure
+                .evidence
+                .max_authoritative_sample_gap_nanoseconds,
+            2_000
+        );
+        let mut first_read_metrics = RunnerWakeupMetrics::new();
+        first_read_metrics.buflo_exact_release_active_wait_poll_source =
+            "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
+        first_read_metrics
+            .record_buflo_exact_release_guard(&guard, Some(base), &first_read_failure.evidence)
+            .expect("pre-calibration unavailable failure retains its final sample");
+        assert!(first_read_metrics.buflo_exact_release_invariants_hold());
+        assert!(first_read_instants.is_empty());
+
         for (relaxed, expected_outcome) in [
             (None, BufloExactReleaseWaitOutcome::CounterUnavailable),
             (Some(99), BufloExactReleaseWaitOutcome::CounterNonmonotonic),
@@ -25717,7 +29078,7 @@ mod tests {
                     .expect("relaxed-failure authoritative Instant")
             };
             let mut poll_clock = ScriptedBufloPollClock {
-                source: "linux-aarch64-cntvct-el0-predictive-v1",
+                source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
                 required: true,
                 frequency_hz: Some(1_000_000),
                 ordered: VecDeque::from([Some(100), Some(101)]),
@@ -25737,6 +29098,10 @@ mod tests {
             assert_ne!(failure.evidence.exited_at, calibrated_at);
             assert_eq!(failure.evidence.dispatch_at, None);
             assert_eq!(failure.evidence.instant_confirmations, 0);
+            assert_eq!(
+                failure.evidence.max_authoritative_sample_gap_nanoseconds,
+                1_000
+            );
             assert!(instants.is_empty());
             match expected_outcome {
                 BufloExactReleaseWaitOutcome::CounterUnavailable => {
@@ -25753,7 +29118,7 @@ mod tests {
             }
             let mut metrics = RunnerWakeupMetrics::new();
             metrics.buflo_exact_release_active_wait_poll_source =
-                "linux-aarch64-cntvct-el0-predictive-v1";
+                "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
             metrics
                 .record_buflo_exact_release_guard(&guard, Some(base), &failure.evidence)
                 .expect("producer relaxed-read failure records under the production partition");
@@ -25785,7 +29150,7 @@ mod tests {
                     .expect("early-failure authoritative Instant")
             };
             let mut poll_clock = ScriptedBufloPollClock {
-                source: "linux-aarch64-cntvct-el0-predictive-v1",
+                source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
                 required: true,
                 frequency_hz: Some(1_000_000),
                 ordered: VecDeque::from([Some(100), Some(102), failed_read]),
@@ -25809,7 +29174,7 @@ mod tests {
             assert!(instants.is_empty());
             let mut metrics = RunnerWakeupMetrics::new();
             metrics.buflo_exact_release_active_wait_poll_source =
-                "linux-aarch64-cntvct-el0-predictive-v1";
+                "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
             metrics
                 .record_buflo_exact_release_guard(&guard, Some(base), &failure.evidence)
                 .expect(
@@ -25824,7 +29189,29 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "the fallback fixture covers producer evidence, aggregate reachability, saturation, and source-domain mutations"
+    )]
     fn instant_fallback_remains_authoritative_and_declares_counter_unavailable() {
+        let empty = RunnerWakeupMetrics::new();
+        assert!(empty.buflo_exact_release_invariants_hold());
+        let mut forged_empty_duration = empty;
+        forged_empty_duration.buflo_exact_release_guard_wait_nanoseconds = 1;
+        forged_empty_duration.buflo_exact_release_active_wait_nanoseconds = 1;
+        assert!(
+            !forged_empty_duration.buflo_exact_release_invariants_hold(),
+            "an empty guard partition cannot carry forged timing duration"
+        );
+        let mut forged_empty_frequency = empty;
+        forged_empty_frequency.buflo_exact_release_active_wait_counter_frequency_hz =
+            Some(1_000_000_000);
+        assert!(
+            !forged_empty_frequency.buflo_exact_release_invariants_hold(),
+            "an empty guard partition cannot retain a counter frequency"
+        );
+
         let base = now();
         let guard = scripted_buflo_guard(base);
         let mut instants = VecDeque::from([
@@ -25868,8 +29255,58 @@ mod tests {
         metrics.buflo_exact_release_active_wait_poll_source = "instant-authoritative-fallback-v1";
         metrics
             .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
-            .expect("active Instant-fallback wait records as schema-9 evidence");
+            .expect("active Instant-fallback wait records as schema-10 evidence");
         assert!(metrics.buflo_exact_release_invariants_hold());
+        let mut forged_source = metrics;
+        forged_source.buflo_exact_release_active_wait_poll_source = "forged-source";
+        forged_source
+            .buflo_exact_release_worst_guard
+            .as_mut()
+            .expect("fallback success retains its worst guard")
+            .active_wait_poll_source = "forged-source";
+        assert!(
+            !forged_source.buflo_exact_release_invariants_hold(),
+            "aggregate and nested source labels remain restricted to the schema-10 domain"
+        );
+
+        let mut two_fallback_guards = metrics;
+        two_fallback_guards
+            .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
+            .expect("second fallback guard records in the same histogram bucket");
+        assert!(two_fallback_guards.buflo_exact_release_invariants_hold());
+        let mut forged_unretained_entry_max = two_fallback_guards;
+        forged_unretained_entry_max.buflo_exact_release_max_guard_entry_lateness_nanoseconds =
+            duration_as_u64_nanos(BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL) + 1;
+        forged_unretained_entry_max.buflo_exact_release_max_passive_wake_lateness_nanoseconds =
+            duration_as_u64_nanos(BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL) + 1;
+        assert!(
+            !forged_unretained_entry_max.buflo_exact_release_invariants_hold(),
+            "an unretained successful guard cannot enter later than one adapter window plus the aggregate dispatch lateness"
+        );
+        let retained_active_wait = two_fallback_guards
+            .buflo_exact_release_worst_guard
+            .expect("fallback aggregate retains its worst guard")
+            .active_wait_monotonic_nanoseconds;
+        assert!(
+            retained_active_wait
+                > two_fallback_guards.buflo_exact_release_max_active_spin_gap_nanoseconds
+        );
+        let mut forged_saturated_fallback = two_fallback_guards;
+        forged_saturated_fallback.buflo_exact_release_active_wait_iterations = u64::MAX;
+        forged_saturated_fallback.buflo_exact_release_active_wait_nanoseconds =
+            retained_active_wait - 1;
+        forged_saturated_fallback.buflo_exact_release_guard_wait_nanoseconds =
+            retained_active_wait - 1;
+        assert!(
+            !forged_saturated_fallback.buflo_exact_release_invariants_hold(),
+            "saturated aggregate allocation cannot hide a duration below the retained guard"
+        );
+        let mut forged_fallback_maximum = two_fallback_guards;
+        forged_fallback_maximum.buflo_exact_release_max_active_spin_gap_nanoseconds = 1_000_001;
+        assert!(
+            !forged_fallback_maximum.buflo_exact_release_invariants_hold(),
+            "a shared histogram bucket cannot hide a retained fallback guard's exact maximum"
+        );
 
         let failure_exit = guard.guard_at + Duration::from_micros(1);
         let impossible_fallback_failure = BufloExactReleaseWaitEvidence {
@@ -25914,7 +29351,7 @@ mod tests {
             "instant-authoritative-fallback-v1";
         already_due_metrics
             .record_buflo_exact_release_guard(&guard, Some(base), &already_due)
-            .expect("already-due Instant-fallback wait records as schema-9 evidence");
+            .expect("already-due Instant-fallback wait records as schema-10 evidence");
         assert!(already_due_metrics.buflo_exact_release_invariants_hold());
     }
 
@@ -25932,7 +29369,7 @@ mod tests {
             };
             let mut no_sleep = |_| {};
             let mut counter = ScriptedBufloPollClock {
-                source: "linux-aarch64-cntvct-el0-predictive-v1",
+                source: "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2",
                 required: true,
                 frequency_hz: Some(1_000_000),
                 ordered: VecDeque::from([Some(100), Some(101)]),
@@ -25953,7 +29390,7 @@ mod tests {
             assert!(instants.is_empty());
             let mut metrics = RunnerWakeupMetrics::new();
             metrics.buflo_exact_release_active_wait_poll_source =
-                "linux-aarch64-cntvct-el0-predictive-v1";
+                "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
             metrics
                 .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
                 .expect("already-due producer evidence records without self-rejection");
@@ -25965,6 +29402,25 @@ mod tests {
             assert_eq!(
                 metrics.buflo_exact_release_max_active_wait_counter_gap_nanoseconds,
                 1_000
+            );
+            let mut forged_nullable_counter_tuple = metrics;
+            let forged_worst = forged_nullable_counter_tuple
+                .buflo_exact_release_worst_guard
+                .as_mut()
+                .expect("already-due success retains its worst guard");
+            forged_worst.active_wait_counter_nanoseconds = None;
+            forged_worst.max_active_wait_counter_gap_nanoseconds = None;
+            forged_worst.max_counter_calibration_span_nanoseconds = None;
+            forged_worst.max_active_spin_gap_nanoseconds = 0;
+            forged_nullable_counter_tuple.buflo_exact_release_active_wait_counter_nanoseconds = 0;
+            forged_nullable_counter_tuple
+                .buflo_exact_release_max_active_wait_counter_gap_nanoseconds = 0;
+            forged_nullable_counter_tuple
+                .buflo_exact_release_max_counter_calibration_span_nanoseconds = 0;
+            forged_nullable_counter_tuple.buflo_exact_release_max_active_spin_gap_nanoseconds = 0;
+            assert!(
+                !forged_nullable_counter_tuple.buflo_exact_release_invariants_hold(),
+                "a predictive worst-guard counter tuple is wholly present or wholly absent"
             );
         }
     }
