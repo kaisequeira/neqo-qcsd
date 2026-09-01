@@ -9875,10 +9875,44 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
     defense_start: Instant,
     runner_wakeup_metrics: &mut RunnerWakeupMetrics,
 ) -> Result<(), Error> {
+    // The outgoing datagram's adapter observations were forwarded before its
+    // post-output rolling barrier was deferred. Flush just that controller
+    // evidence now: a partial, missed, or otherwise invalid outgoing cell must
+    // fail before its paired receiver-credit datagram can reach the socket.
+    // The global observation/action reduction remains deferred until after
+    // the direct incoming owner turn below.
+    controller.flush_defense_observations();
+    if let Err(source) = ensure_defense_realizable(controller) {
+        return match reduce_buflo_exact_pair_barrier(
+            guard,
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            defense_start,
+        ) {
+            Ok(()) => Err(source),
+            Err(reduction) => Err(Error::SlotInvariant(format!(
+                "BuFLO outgoing slot {} failed before paired incoming output ({source}); its deferred post-output barrier also failed ({reduction})",
+                guard.slot.0
+            ))),
+        };
+    }
     let mut captured =
         buflo_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
     if captured.is_empty() {
-        return Ok(());
+        reduce_buflo_exact_pair_output(
+            guard,
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            defense_start,
+            &mut captured,
+        )?;
+        if captured.is_empty() {
+            return Ok(());
+        }
     }
     let phases = exact_incoming_retry_times(guard.release, guard.deadline).ok_or_else(|| {
         Error::SlotInvariant(format!(
@@ -9944,18 +9978,15 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
                 continue;
             }
             let planned_wake_at = retry_wake_at.unwrap_or(attempted_at);
-            let drive_result = drive_endpoint_output_until(
+            let drive_result = drive_buflo_exact_incoming_output(
                 endpoint_index,
+                endpoint,
                 endpoints,
                 controller,
-                chaff_manifest,
                 traces,
                 observation_clock,
-                Some(defense_start),
-                Some(OutputWorkBoundary::new(guard.deadline, guard.deadline)),
-                Some(guard.deadline),
-                Some(guard.deadline),
-                OutputDriveCardinality::OneDatagram,
+                defense_start,
+                guard.deadline,
             )
             .await;
             let drive_completed_at = now();
@@ -9993,29 +10024,15 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
             };
             retained_callback = retained_callback.into_iter().chain(callback).min();
 
-            let reduced_at = now();
-            let reduced_elapsed = reduced_at.saturating_duration_since(defense_start);
-            let reduction = (|| -> Result<bool, Error> {
-                handle_all_qcsd_observations(endpoints, controller, traces, reduced_elapsed)?;
-                controller.flush_defense_observations();
-                ensure_defense_realizable(controller)?;
-                apply_queued_actions(
-                    endpoints,
-                    controller,
-                    chaff_manifest,
-                    traces,
-                    reduced_at,
-                    reduced_elapsed,
-                )?;
-                ensure_defense_realizable(controller)?;
-                refresh_buflo_exact_incoming_identities(
-                    guard,
-                    endpoints,
-                    controller,
-                    defense_start,
-                    &mut captured,
-                )
-            })();
+            let reduction = reduce_buflo_exact_pair_output(
+                guard,
+                endpoints,
+                controller,
+                chaff_manifest,
+                traces,
+                defense_start,
+                &mut captured,
+            );
             let cleared_slots: BTreeSet<_> = pending_before
                 .iter()
                 .filter(|candidate| !buflo_exact_incoming_identity_is_pending(endpoints, candidate))
@@ -10403,6 +10420,16 @@ enum OutputDriveCardinality {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostOutputRollingBarrier {
+    Apply,
+    /// The selected `BuFLO` outgoing cell and its already-staged incoming
+    /// opportunity share one strict adapter window. Defer only the outgoing
+    /// datagram's global post-output reduction until the captured incoming
+    /// owner has received its one direct output turn.
+    DeferBufloExactPair,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SocketHandoff {
     Sent(Instant),
     SentLate {
@@ -10598,6 +10625,54 @@ fn reduce_post_output_rolling_barrier(
         .any(|scheduled| !due_slots_before_output.contains(&scheduled.slot)))
 }
 
+fn reduce_buflo_exact_pair_output(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    defense_start: Instant,
+    captured: &mut Vec<BufloExactIncomingIdentity>,
+) -> Result<bool, Error> {
+    reduce_buflo_exact_pair_barrier(
+        guard,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        defense_start,
+    )?;
+    refresh_buflo_exact_incoming_identities(guard, endpoints, controller, defense_start, captured)
+}
+
+fn reduce_buflo_exact_pair_barrier(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    defense_start: Instant,
+) -> Result<(), Error> {
+    let reduced_at = now();
+    let reduced_elapsed = reduced_at.saturating_duration_since(defense_start);
+    let due_slots_before_output = BTreeSet::from([guard.slot]);
+    if reduce_post_output_rolling_barrier(
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        reduced_at,
+        reduced_elapsed,
+        &due_slots_before_output,
+    )? {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO exact pair for outgoing slot {} exposed a new same-tick rolling target during its deferred post-output barrier",
+            guard.slot.0
+        )));
+    }
+    ensure_defense_realizable(controller)
+}
+
 fn resolve_rolling_output_interrupt(
     defense_start: Option<Instant>,
     relative_deadlines: impl IntoIterator<Item = Duration>,
@@ -10688,6 +10763,7 @@ async fn drive_endpoint_output(
         None,
         false,
         OutputDriveCardinality::DrainAvailable,
+        PostOutputRollingBarrier::Apply,
         &mut monotonic_clock,
     )
     .await
@@ -10726,9 +10802,105 @@ async fn drive_buflo_exact_release_output(
         Some(deadline),
         false,
         OutputDriveCardinality::OneDatagram,
+        PostOutputRollingBarrier::DeferBufloExactPair,
         &mut monotonic_clock,
     )
     .await
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "the current-thread runner directly owns the captured incoming endpoint and unchanged exact deadline"
+)]
+async fn drive_buflo_exact_incoming_output(
+    endpoint_index: usize,
+    owner: QcsdEndpointId,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Instant,
+    deadline: Instant,
+) -> Result<Option<Instant>, Error> {
+    let mut monotonic_clock = now;
+    drive_buflo_exact_incoming_output_with_clock(
+        endpoint_index,
+        owner,
+        endpoints,
+        controller,
+        traces,
+        observation_clock,
+        defense_start,
+        deadline,
+        &mut monotonic_clock,
+    )
+    .await
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "the deterministic clock seam preserves direct exact-pair socket causality"
+)]
+async fn drive_buflo_exact_incoming_output_with_clock(
+    endpoint_index: usize,
+    owner: QcsdEndpointId,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Instant,
+    deadline: Instant,
+    monotonic_clock: &mut impl FnMut() -> Instant,
+) -> Result<Option<Instant>, Error> {
+    if controller.has_due_rolling_reconciliation() {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO exact incoming owner {} reached its direct turn with due rolling reconciliation",
+            owner.0
+        )));
+    }
+    let endpoint = endpoints.get_mut(endpoint_index).ok_or_else(|| {
+        Error::SlotInvariant(format!(
+            "BuFLO exact incoming owner {} had missing endpoint index {endpoint_index}",
+            owner.0
+        ))
+    })?;
+    if endpoint.id != owner {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO exact incoming owner {} resolved to endpoint {} at index {endpoint_index}",
+            owner.0, endpoint.id.0
+        )));
+    }
+    if let Some(scheduled) = endpoint.scheduled_outgoing.front() {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO exact incoming owner {} retained committed outgoing slot {} before its direct receiver-credit turn",
+            owner.0, scheduled.slot.0
+        )));
+    }
+    let drive_now = monotonic_clock();
+    if drive_now >= deadline {
+        return Err(Error::AdapterDeadlinePreHandoff {
+            attempted_at: drive_now,
+            deadline,
+        });
+    }
+    match process_output_once_with_clock(
+        endpoint,
+        controller,
+        traces,
+        observation_clock,
+        drive_now,
+        Some(defense_start),
+        Some(deadline),
+        Some(deadline),
+        monotonic_clock,
+    )
+    .await?
+    {
+        OutputDrive::Callback(wakeup) => Ok(Some(wakeup)),
+        OutputDrive::Datagram | OutputDrive::None => Ok(None),
+    }
 }
 
 #[expect(
@@ -10763,6 +10935,7 @@ async fn drive_endpoint_output_until(
         absolute_handoff_deadline,
         true,
         cardinality,
+        PostOutputRollingBarrier::Apply,
         &mut monotonic_clock,
     )
     .await
@@ -10800,6 +10973,7 @@ async fn drive_endpoint_output_with_clock(
         None,
         false,
         OutputDriveCardinality::DrainAvailable,
+        PostOutputRollingBarrier::Apply,
         monotonic_clock,
     )
     .await
@@ -10830,6 +11004,7 @@ async fn drive_endpoint_output_with_clock_until(
     absolute_handoff_deadline: Option<Instant>,
     interrupt_new_buflo_guards: bool,
     cardinality: OutputDriveCardinality,
+    post_output_rolling_barrier: PostOutputRollingBarrier,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<Option<Instant>, Error> {
     let mut work_boundary = work_boundary;
@@ -10970,7 +11145,22 @@ async fn drive_endpoint_output_with_clock_until(
             monotonic_clock,
         )
         .await?;
-        if let Some(started) = defense_start
+        let exact_due_slots_are_terminal = !due_rolling_slots_before_output.is_empty()
+            && due_rolling_slots_before_output.iter().all(|slot| {
+                controller.terminal_slot_resolution_at(*slot).is_some()
+                    && endpoints.iter().all(|endpoint| {
+                        endpoint
+                            .scheduled_outgoing
+                            .iter()
+                            .all(|scheduled| scheduled.slot != *slot)
+                    })
+            });
+        let defer_post_output_rolling_barrier = post_output_rolling_barrier
+            == PostOutputRollingBarrier::DeferBufloExactPair
+            && output == OutputDrive::Datagram
+            && exact_due_slots_are_terminal;
+        if !defer_post_output_rolling_barrier
+            && let Some(started) = defense_start
             && (rolling_lifecycle_before_output
                 || rolling_output_lifecycle_active(controller, endpoints))
         {
@@ -11530,9 +11720,9 @@ mod tests {
         BufloExactReleasePhase, BufloExactReleaseTimingHistogram, BufloExactReleaseWaitEvidence,
         BufloExactReleaseWaitStep, ChaffRequestHeaderModeArg, CsExactIncomingRetry,
         CsExactIncomingRetryPhase, DefenseArg, Error, ExpectedChaffIdentity,
-        OutputDriveCardinality, OutputWorkBoundary, PrefixBurst, PrefixNumericProfile,
-        PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse, Preset, ProfileArg,
-        QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
+        OutputDriveCardinality, OutputWorkBoundary, PostOutputRollingBarrier, PrefixBurst,
+        PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse,
+        Preset, ProfileArg, QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
         RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg,
         ResourceRunState, ResponseQualificationMode, ResponseQualificationRequest, RunCompletion,
         RunSpec, RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket,
@@ -11552,17 +11742,18 @@ mod tests {
         cs_exact_incoming_retry_is_due, datagram_observation, deadline_error,
         defense_parameter_provenance, dispatch_buflo_exact_release,
         dispatch_due_cs_exact_incoming_retry, dispatch_ready_requests, drain_qualifier_stream_data,
+        drive_buflo_exact_incoming_output_with_clock,
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_until, drive_endpoint_output_with_clock,
         drive_endpoint_output_with_clock_until, due_rolling_output_target,
-        endpoint_candidate_egress_backlog, endpoint_egress_backlog_pending, endpoint_send_terminal,
-        ensure_defense_realizable, exact_incoming_retry_times,
-        expected_application_response_length, expire_buflo_exact_incoming_credit,
-        finish_application_record, finish_chaff_record, finish_stream, forward_qcsd_observation,
-        handle_all_qcsd_observations, handle_http_events, has_in_flight_application_stream,
-        is_candidate_defense, is_public_network_address, late_socket_handoff_error,
-        next_buflo_exact_release_guard, normalize_rolling_prearm_window, now,
-        pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
+        duration_as_trace_micros, endpoint_candidate_egress_backlog,
+        endpoint_egress_backlog_pending, endpoint_send_terminal, ensure_defense_realizable,
+        exact_incoming_retry_times, expected_application_response_length,
+        expire_buflo_exact_incoming_credit, finish_application_record, finish_chaff_record,
+        finish_stream, forward_qcsd_observation, handle_all_qcsd_observations, handle_http_events,
+        has_in_flight_application_stream, is_candidate_defense, is_public_network_address,
+        late_socket_handoff_error, next_buflo_exact_release_guard, normalize_rolling_prearm_window,
+        now, pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
         prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
         prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
         qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
@@ -15392,6 +15583,81 @@ mod tests {
         .0
     }
 
+    fn staged_exact_incoming_credit_fixture(
+        output: &Path,
+        started: std::time::Instant,
+        observation_clock: &QcsdObservationClock,
+    ) -> (
+        Vec<super::Endpoint>,
+        neqo_http3::Http3Server,
+        QcsdController,
+        QcsdSlotId,
+        TraceFiles,
+    ) {
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server(
+            output,
+            started,
+            observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            20_000,
+        );
+        let stream =
+            open_controlled_runner_stream(&mut endpoint, &mut server, started, 4_433, 10_000);
+        let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("incoming");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 20_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([incoming]),
+                exact_incoming_window: true,
+            }),
+        )
+        .expect("incoming controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(0),
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let incoming_slot = actions
+            .iter()
+            .find_map(|action| action.receive_identity()?.slot())
+            .expect("incoming slot");
+        let mut endpoints = vec![endpoint];
+        endpoints[0].test_force_socket_handoff_success = true;
+        let mut traces = TraceFiles::new(output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("apply receive credit");
+        (endpoints, server, controller, incoming_slot, traces)
+    }
+
     fn open_controlled_runner_stream(
         endpoint: &mut super::Endpoint,
         server: &mut neqo_http3::Http3Server,
@@ -17396,6 +17662,460 @@ mod tests {
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
+        reason = "the connected two-origin oracle spans paired controller ordering, two socket handoffs, deferred reduction, and trace evidence"
+    )]
+    async fn exact_release_dispatch_orders_cross_endpoint_pair_inside_one_window() {
+        let output = trace_output_dir("exact-release-cross-endpoint-pair");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut credit_endpoint, mut credit_server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        let (outgoing_endpoint, outgoing_server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(1),
+            4_434,
+            5_000,
+        );
+        credit_endpoint.client.qcsd_enable_send_shaping(false);
+        let stream = open_controlled_runner_stream(
+            &mut credit_endpoint,
+            &mut credit_server,
+            started,
+            4_433,
+            10_000,
+        );
+        assert!(!credit_endpoint.client.qcsd_has_pending_stream_send());
+        credit_endpoint.client.qcsd_enable_send_shaping(true);
+        drop(credit_endpoint.client.qcsd_timestamped_observations());
+
+        let tick = Duration::from_millis(20);
+        let outgoing = Packet::new(tick, Direction::Outgoing, 1_200).expect("outgoing");
+        let incoming = Packet::new(tick, Direction::Incoming, 1_200).expect("incoming");
+        let next = Packet::new(tick * 2, Direction::Outgoing, 1_200).expect("next outgoing");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([outgoing, incoming, next]),
+                exact_incoming_window: true,
+            }),
+        )
+        .expect("paired rolling controller");
+        // Independent direction cursors start from the first eligible origin.
+        // Endpoint 1 is ready first for outgoing selection, while only the
+        // endpoint-0 application stream is eligible for incoming credit.
+        for endpoint in [QcsdEndpointId(1), QcsdEndpointId(0)] {
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: format!("https://127.0.0.1:{}", 4_433_u64 + endpoint.0),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let setup_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(setup_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket {
+                endpoint: QcsdEndpointId(1),
+                packet,
+                ..
+            } if *packet == outgoing
+        )));
+
+        let defense_start = now();
+        let mut endpoints = vec![credit_endpoint, outgoing_endpoint];
+        endpoints[0].test_force_socket_handoff_success = true;
+        endpoints[1].test_force_socket_handoff_success = true;
+        let mut traces = TraceFiles::new(&output, defense_start).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            defense_start,
+            Duration::ZERO,
+            setup_actions,
+        )
+        .expect("apply paired setup and outgoing prearm");
+        assert_eq!(endpoints[1].prearmed_outgoing.len(), 1);
+        let release = endpoints[1].prearmed_outgoing[0].not_before;
+
+        controller
+            .reconcile_due_rolling(tick)
+            .expect("commit paired tick");
+        let tick_actions: Vec<_> = controller.drain_actions().collect();
+        let outgoing_action_index = tick_actions
+            .iter()
+            .position(|action| {
+                matches!(
+                    action,
+                    QcsdAction::CommitPrearmedPacket {
+                        endpoint: QcsdEndpointId(1),
+                        packet,
+                        ..
+                    } if *packet == outgoing
+                )
+            })
+            .expect("outgoing commit");
+        let incoming_action_index = tick_actions
+            .iter()
+            .position(|action| {
+                matches!(
+                    action,
+                    QcsdAction::IncreaseReceiveLimit {
+                        endpoint: QcsdEndpointId(0),
+                        packet,
+                        ..
+                    } if *packet == incoming
+                )
+            })
+            .expect("cross-endpoint incoming opportunity");
+        assert!(
+            outgoing_action_index < incoming_action_index,
+            "controller action order remains outgoing before incoming"
+        );
+        assert!(tick_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket { packet, .. } if *packet == next
+        )));
+        let incoming_slot = tick_actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .expect("incoming slot");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            release,
+            tick,
+            tick_actions,
+        )
+        .expect("apply outgoing-first paired tick");
+        let scheduled = endpoints[1]
+            .scheduled_outgoing
+            .front()
+            .copied()
+            .expect("committed outgoing owner");
+        let guard = BufloExactReleaseGuard {
+            endpoint_index: 1,
+            endpoint: QcsdEndpointId(1),
+            slot: scheduled.slot,
+            packet: scheduled.packet,
+            phase: BufloExactReleasePhase::Committed,
+            output_admission_at: scheduled.not_before,
+            guard_at: scheduled.not_before,
+            active_wait_at: scheduled.not_before,
+            release: scheduled.not_before,
+            deadline: scheduled.deadline,
+        };
+        assert_eq!(guard.release, release);
+        assert_eq!(guard.deadline, release + Duration::from_millis(5));
+
+        tokio::time::sleep_until(tokio::time::Instant::from_std(release)).await;
+        let mut metrics = RunnerWakeupMetrics::new();
+        dispatch_buflo_exact_release(
+            &guard,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(defense_start),
+            &mut metrics,
+        )
+        .await
+        .expect("outgoing owner then incoming owner fit the same exact window");
+        assert_eq!(metrics.buflo_exact_incoming_retry_drives, 1);
+        assert_eq!(metrics.buflo_exact_incoming_retry_resolutions, 1);
+        assert_eq!(metrics.wait_returns, 0);
+        assert_eq!(metrics.timer_wakeups, 0);
+        assert!(controller.incoming_slot_is_locally_realized(incoming_slot));
+        assert!(!controller.has_due_rolling_reconciliation());
+        assert!(controller.drain_actions().next().is_none());
+        assert!(endpoints[1].scheduled_outgoing.is_empty());
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.prearmed_outgoing.len())
+                .sum::<usize>(),
+            1,
+            "the next outgoing opportunity remains prearmed, not sent"
+        );
+
+        terminalize_pending_slots(
+            &mut controller,
+            &mut traces,
+            now(),
+            now().saturating_duration_since(defense_start),
+            MissedSlotReason::RunAborted,
+        )
+        .expect("terminalize unconsumed incoming credit");
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        let mut packet_lines = packets.lines();
+        let header: Vec<_> = packet_lines
+            .next()
+            .expect("packet header")
+            .split(',')
+            .collect();
+        let rows: Vec<Vec<_>> = packet_lines.map(|line| line.split(',').collect()).collect();
+        assert_eq!(rows.len(), 2, "one outgoing cell and one credit datagram");
+        let column = |name: &str| {
+            header
+                .iter()
+                .position(|column| *column == name)
+                .unwrap_or_else(|| panic!("missing packet column {name}"))
+        };
+        assert_eq!(rows[0][column("connection")], "1");
+        assert_eq!(rows[0][column("scheduled_target")], "1200");
+        assert_eq!(rows[1][column("connection")], "0");
+        assert_eq!(rows[1][column("satisfaction")], "unshaped");
+        let release_us = duration_as_trace_micros(release.saturating_duration_since(defense_start));
+        let deadline_us =
+            duration_as_trace_micros(guard.deadline.saturating_duration_since(defense_start));
+        for row in &rows {
+            let sent_us = row[column("monotonic_us")]
+                .parse::<u64>()
+                .expect("packet monotonic time");
+            assert!(sent_us >= release_us && sent_us < deadline_us);
+        }
+
+        drop(endpoints);
+        drop(credit_server);
+        drop(outgoing_server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    async fn exact_pair_direct_incoming_handoff_uses_remaining_margin_before_reduction() {
+        let output = trace_output_dir("exact-pair-direct-margin");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, incoming_slot, mut traces) =
+            staged_exact_incoming_credit_fixture(&output, started, &observation_clock);
+        assert_eq!(
+            buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints),
+            [0]
+        );
+        endpoints[0]
+            .test_output_observations
+            .push(observation_clock.record(QcsdObservation::EgressBacklog { pending: true }));
+
+        let defense_start = now();
+        let deadline = defense_start + Duration::from_millis(5);
+        let mut clock_samples = VecDeque::from([
+            deadline
+                .checked_sub(Duration::from_micros(750))
+                .expect("deadline has 750 microseconds of remaining margin"),
+            deadline
+                .checked_sub(Duration::from_micros(500))
+                .expect("deadline has 500 microseconds of remaining margin"),
+            deadline
+                .checked_sub(Duration::from_micros(250))
+                .expect("deadline has 250 microseconds of remaining margin"),
+        ]);
+        let mut monotonic_clock = || {
+            clock_samples
+                .pop_front()
+                .expect("direct owner handoff uses exactly three clock samples")
+        };
+        let callback = drive_buflo_exact_incoming_output_with_clock(
+            0,
+            QcsdEndpointId(0),
+            &mut endpoints,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            defense_start,
+            deadline,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect("direct handoff fits in the unchanged remaining adapter window");
+
+        assert_eq!(callback, None);
+        assert!(clock_samples.is_empty());
+        assert!(buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints).is_empty());
+        assert_eq!(
+            endpoints[0].test_output_observations.len(),
+            1,
+            "the direct owner turn performs no intervening global rolling reduction"
+        );
+        controller.flush_defense_observations();
+        ensure_defense_realizable(&controller).expect("exact incoming datagram remains valid");
+        assert!(controller.incoming_slot_is_locally_realized(incoming_slot));
+
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 2, "one direct credit datagram");
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    async fn exact_pair_direct_incoming_handoff_rejects_cross_endpoint_identity() {
+        let output = trace_output_dir("exact-pair-owner-identity");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, _incoming_slot, mut traces) =
+            staged_exact_incoming_credit_fixture(&output, started, &observation_clock);
+        let defense_start = now();
+        let deadline = defense_start + Duration::from_millis(5);
+        let mut clock_calls = 0_u8;
+        let mut monotonic_clock = || {
+            clock_calls = clock_calls.saturating_add(1);
+            defense_start
+        };
+
+        let error = drive_buflo_exact_incoming_output_with_clock(
+            0,
+            QcsdEndpointId(1),
+            &mut endpoints,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            defense_start,
+            deadline,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect_err("a captured owner cannot borrow another endpoint index");
+        assert!(matches!(
+            error,
+            Error::SlotInvariant(message)
+                if message.contains("owner 1 resolved to endpoint 0 at index 0")
+        ));
+        assert_eq!(
+            clock_calls, 0,
+            "identity rejection precedes transport and time"
+        );
+        assert_eq!(
+            buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints),
+            [0],
+            "the true owner retains its staged credit"
+        );
+
+        let committed = ScheduledOutgoing {
+            slot: QcsdSlotId(700),
+            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
+                .expect("committed outgoing"),
+            not_before: defense_start,
+            deadline,
+            rolling_prearmed: true,
+        };
+        endpoints[0].scheduled_outgoing.push_back(committed);
+        let mut monotonic_clock = || defense_start;
+        let error = drive_buflo_exact_incoming_output_with_clock(
+            0,
+            QcsdEndpointId(0),
+            &mut endpoints,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            defense_start,
+            deadline,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect_err("a committed outgoing target retains output priority");
+        assert!(matches!(
+            error,
+            Error::SlotInvariant(message)
+                if message.contains("retained committed outgoing slot 700")
+        ));
+        assert_eq!(
+            buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints),
+            [0],
+            "outgoing-priority rejection also leaves the incoming identity staged"
+        );
+        _ = endpoints[0].scheduled_outgoing.pop_back();
+
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 1, "identity failure sends nothing");
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    async fn exact_pair_direct_incoming_handoff_keeps_half_open_deadline() {
+        let output = trace_output_dir("exact-pair-direct-deadline");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, _incoming_slot, mut traces) =
+            staged_exact_incoming_credit_fixture(&output, started, &observation_clock);
+        let defense_start = now();
+        let deadline = defense_start + Duration::from_millis(5);
+        let mut monotonic_clock = || deadline;
+
+        let error = drive_buflo_exact_incoming_output_with_clock(
+            0,
+            QcsdEndpointId(0),
+            &mut endpoints,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            defense_start,
+            deadline,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect_err("the unchanged exclusive deadline rejects entry at its boundary");
+        assert!(matches!(
+            error,
+            Error::AdapterDeadlinePreHandoff {
+                attempted_at,
+                deadline: observed_deadline,
+            } if attempted_at == deadline && observed_deadline == deadline
+        ));
+        assert_eq!(
+            buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints),
+            [0],
+            "deadline rejection leaves the identity for typed outer reconciliation"
+        );
+
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 1, "deadline failure sends nothing");
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "the connected two-endpoint oracle proves selective post-handoff credit output"
     )]
     async fn exact_handoff_drives_only_the_cross_endpoint_with_unadvertised_credit() {
@@ -19336,11 +20056,11 @@ mod tests {
         );
         assert_eq!(
             deadline.saturating_duration_since(release),
-            Duration::from_nanos(4_999_000)
+            Duration::from_micros(4_999)
         );
         assert_eq!(
             release.saturating_duration_since(guard.guard_at),
-            Duration::from_nanos(9_998_000)
+            Duration::from_micros(9_998)
         );
         assert_eq!(guard.guard_at, guard.active_wait_at);
         assert_eq!(guard.guard_at, guard.output_admission_at);
@@ -22919,6 +23639,7 @@ mod tests {
             None,
             true,
             OutputDriveCardinality::DrainAvailable,
+            PostOutputRollingBarrier::Apply,
             &mut monotonic_clock,
         )
         .await
