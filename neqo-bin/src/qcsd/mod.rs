@@ -54,6 +54,8 @@ use thiserror::Error;
 
 use crate::udp::Socket;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod timed_egress;
 mod trace_files;
 
 use trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles};
@@ -134,6 +136,11 @@ pub enum Error {
     Timeout(u64),
     #[error("run aborted: {0}")]
     RunAborted(String),
+    #[error("terminal run artifact persistence failed after `{primary}`: {persistence}")]
+    TerminalArtifactPersistence {
+        primary: String,
+        persistence: String,
+    },
     #[error("client defence execution failed: {0}")]
     DefenseExecution(String),
     #[error("QCSD slot accounting invariant failed: {0}")]
@@ -1198,6 +1205,66 @@ struct RunCompletion<'a> {
     runner_wakeup_metrics: Option<RunnerWakeupMetrics>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedTerminalRunArtifact {
+    bytes: Vec<u8>,
+    persisted: bool,
+}
+
+fn stage_and_persist_terminal_with(
+    staged: &mut Option<StagedTerminalRunArtifact>,
+    output_dir: &Path,
+    bytes: Vec<u8>,
+    writer: &mut impl FnMut(&Path, &[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    *staged = Some(StagedTerminalRunArtifact {
+        bytes,
+        persisted: false,
+    });
+    let result = {
+        let artifact = staged.as_ref().expect("terminal artifact was just staged");
+        writer(&output_dir.join("run.json"), &artifact.bytes)
+    };
+    if result.is_ok() {
+        staged
+            .as_mut()
+            .expect("terminal artifact remained staged")
+            .persisted = true;
+    }
+    result
+}
+
+fn retry_staged_terminal_with(
+    staged: &mut Option<StagedTerminalRunArtifact>,
+    output_dir: &Path,
+    writer: &mut impl FnMut(&Path, &[u8]) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let Some(artifact) = staged.as_ref() else {
+        return Ok(false);
+    };
+    if artifact.persisted {
+        return Ok(false);
+    }
+    let result = writer(&output_dir.join("run.json"), &artifact.bytes);
+    if result.is_ok() {
+        staged
+            .as_mut()
+            .expect("terminal artifact remained staged")
+            .persisted = true;
+    }
+    result.map(|()| true)
+}
+
+fn terminal_artifact_persistence_error(primary: Option<&Error>, persistence: &Error) -> Error {
+    Error::TerminalArtifactPersistence {
+        primary: primary.map_or_else(
+            || "terminalisation followed an otherwise successful in-memory run".into(),
+            ToString::to_string,
+        ),
+        persistence: persistence.to_string(),
+    }
+}
+
 const fn run_error_class(error: &Error) -> &'static str {
     match error {
         Error::Timeout(_) => "timeout-v1",
@@ -1214,10 +1281,12 @@ const fn run_error_class(error: &Error) -> &'static str {
         | Error::Nss(_)
         | Error::RunAborted(_)
         | Error::Transport(_) => "runner-execution-v1",
+        Error::TerminalArtifactPersistence { .. } => "run-artifact-persistence-v1",
     }
 }
 
 const QCSD_CLIENT_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-cpu10-v1";
+const QCSD_CLIENT_ETF_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-cpu10-etf-helper-cpu11-v1";
 
 fn requested_scheduler_contract() -> Result<Option<String>, Error> {
     match std::env::var("QCSD_CAPTURE_SCHEDULER_CONTRACT") {
@@ -1229,13 +1298,13 @@ fn requested_scheduler_contract() -> Result<Option<String>, Error> {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct RealtimePriorityLimit {
     soft: u64,
     hard: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ProcessSchedulerEvidence {
     schema_version: u32,
     source: &'static str,
@@ -1251,17 +1320,3005 @@ struct ProcessSchedulerEvidence {
     contract_valid: bool,
 }
 
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_ARM_LEAD: Duration = Duration::from_millis(100);
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_SELECTION_CUTOFF: Duration = Duration::from_millis(5);
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_ETF_DELTA: Duration = Duration::from_millis(4);
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v1; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_or_single_threaded_serialized_SO_PRIORITY; serialized_SO_PRIORITY_requires_observed_zero_one_zero_reset; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; tx_sched_and_tx_software_are_linux_error_queue_timestamps; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelClockSample {
+    schema_version: u32,
+    tai_before_ns: u64,
+    clock_ns: u64,
+    tai_after_ns: u64,
+    bracket_width_ns: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelClockPhase {
+    monotonic: BufloKernelClockSample,
+    realtime: BufloKernelClockSample,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelClockMapping {
+    schema_version: u32,
+    tai_clock_id: &'static str,
+    monotonic_clock_id: &'static str,
+    realtime_clock_id: &'static str,
+    start: BufloKernelClockPhase,
+    end: BufloKernelClockPhase,
+    instant_alignment: BufloKernelInstantAlignmentReceipt,
+    max_observed_bracket_width_ns: u64,
+    max_observed_offset_drift_ns: u64,
+    effective_monotonic_offset_lower_ns: i128,
+    effective_monotonic_offset_upper_ns: i128,
+    effective_realtime_offset_lower_ns: i128,
+    effective_realtime_offset_upper_ns: i128,
+    per_item_monotonic_evidence_count: usize,
+    per_item_realtime_evidence_count: usize,
+    effective_envelope_semantics: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelInstantAlignmentReceipt {
+    schema_version: u32,
+    monotonic_clock_ns: u64,
+    instant_bracket_width_ns: u64,
+    selected_upper_offset_ns: u64,
+    semantics: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct BufloKernelInstantAnchor {
+    instant: Instant,
+    monotonic_ns: u64,
+    receipt: BufloKernelInstantAlignmentReceipt,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelRuntimeContract {
+    schema_version: u32,
+    scheduler_contract: &'static str,
+    scheduler_initial: ProcessSchedulerEvidence,
+    socket_setup: Vec<timed_egress::TimedEgressSetupReceipt>,
+    privilege_drop: timed_egress::PrivilegeDropReceipt,
+    helper_thread: timed_egress::HelperThreadReceipt,
+    helper_lifecycle: Option<timed_egress::HelperLifecycleReceipt>,
+    helper_shutdown: Option<timed_egress::HelperShutdownReceipt>,
+    socket_count: usize,
+    single_threaded_sender_control_flow_enforced: bool,
+    prebuild_selection_cutoff_lead_ns: u64,
+    prebuild_selection_semantics: &'static str,
+    post_main_inventory_semantics: &'static str,
+    max_post_main_datagrams: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the serialized qdisc contract retains each independently audited kernel and socket flag"
+)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelQdiscContract {
+    schema_version: u32,
+    interface: String,
+    root_kind: &'static str,
+    root_handle: &'static str,
+    bands: u8,
+    priomap: [u8; 16],
+    timed_kind: &'static str,
+    timed_parent: &'static str,
+    timed_handle: &'static str,
+    ordinary_kind: &'static str,
+    ordinary_parent: &'static str,
+    ordinary_handle: &'static str,
+    clock_id: &'static str,
+    delta_ns: u64,
+    deadline_mode: bool,
+    offload: bool,
+    skip_socket_check: bool,
+    timed_socket_priority: i32,
+    ordinary_socket_priority: i32,
+    priority_method: timed_egress::TimedPriorityMethod,
+    scm_priority_supported: bool,
+    single_threaded_sender_control_flow_enforced: bool,
+    so_priority_before: i32,
+    so_priority_during: i32,
+    so_priority_after: i32,
+    so_priority_reset_valid: bool,
+    so_txtime_enabled: bool,
+    tx_sched_timestamping_enabled: bool,
+    tx_software_timestamping_enabled: bool,
+    tx_timestamp_opt_id_enabled: bool,
+    txtime_errors_enabled: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct BufloKernelRawItem {
+    item_id: u64,
+    job_id: u64,
+    order_index: u64,
+    event_id: u64,
+    role: &'static str,
+    endpoint_index: usize,
+    endpoint: QcsdEndpointId,
+    send_path: &'static str,
+    datagram_sha256: String,
+    source_address: SocketAddr,
+    destination_address: SocketAddr,
+    udp_payload_bytes: usize,
+    target_tai_ns: u64,
+    scm_txtime_tai_ns: Option<u64>,
+    enqueue_monotonic_ns: Option<u64>,
+    enqueue_tai_lower_ns: Option<u64>,
+    enqueue_tai_upper_ns: Option<u64>,
+    socket_timestamp_id: Option<u32>,
+    tx_sched_realtime_ns: Option<u64>,
+    tx_software_realtime_ns: Option<u64>,
+    provisional_tx_software_tai_lower_ns: Option<u64>,
+    provisional_tx_software_tai_upper_ns: Option<u64>,
+    send_attempt: Option<timed_egress::SendAttemptReceipt>,
+    txtime_error: Option<timed_egress::TxtimeDropDiagnostic>,
+    terminal_error: Option<String>,
+    terminal_error_detail: Option<String>,
+    finalization_state: String,
+    terminal_outcome: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct BufloKernelRawJob {
+    job_id: u64,
+    tick: u64,
+    release_monotonic_ns: u64,
+    release_tai_ns: u64,
+    deadline_monotonic_ns: u64,
+    deadline_tai_ns: u64,
+    items: Vec<BufloKernelRawItem>,
+    credit_identities: Vec<BufloKernelCreditIdentityReceipt>,
+    prepared_output_failure: Option<BufloKernelPreparedOutputFailureReceipt>,
+    helper_job_close: Option<timed_egress::HelperJobCloseReceipt>,
+    helper_job_abort: Option<timed_egress::HelperJobAbortReceipt>,
+    terminal_error: Option<String>,
+    terminal_outcome: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelCreditIdentityReceipt {
+    schema_version: u32,
+    slot: u64,
+    endpoint_index: usize,
+    endpoint: u64,
+    stream_id: u64,
+    absolute_limit: u64,
+    identity_kind: &'static str,
+    identity_detail: u64,
+    resolution: String,
+    carrier_item_id: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufloKernelValidatedCarrier {
+    item_id: u64,
+    endpoint_index: usize,
+    endpoint: u64,
+    role: &'static str,
+    transmitted: bool,
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_credit_identity_key(
+    identity: &BufloKernelCreditIdentityReceipt,
+) -> (u64, usize, u64, u64, u64, &'static str, u64) {
+    (
+        identity.slot,
+        identity.endpoint_index,
+        identity.endpoint,
+        identity.stream_id,
+        identity.absolute_limit,
+        identity.identity_kind,
+        identity.identity_detail,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_credit_inventory_complete(
+    tick: u64,
+    identities: &[BufloKernelCreditIdentityReceipt],
+    carriers: &[BufloKernelValidatedCarrier],
+    endpoint_count: usize,
+) -> bool {
+    let ordered_unique = identities.windows(2).all(|pair| {
+        let [left, right] = pair else {
+            return false;
+        };
+        buflo_kernel_credit_identity_key(left) < buflo_kernel_credit_identity_key(right)
+    });
+    let main_endpoint = carriers
+        .first()
+        .filter(|carrier| carrier.role == "exact-outgoing" && carrier.transmitted)
+        .map(|carrier| (carrier.endpoint_index, carrier.endpoint));
+    ordered_unique
+        && identities.iter().all(|identity| {
+            identity.schema_version == 1
+                && matches!(
+                    (identity.identity_kind, identity.identity_detail),
+                    ("scheduled", 0) | ("parser-lease", 1..)
+                )
+                && identity.slot == tick.saturating_mul(2).saturating_add(1)
+                && identity.endpoint_index < endpoint_count
+                && u64::try_from(identity.endpoint_index)
+                    .is_ok_and(|index| index == identity.endpoint)
+                && match identity.resolution.as_str() {
+                    "coalesced-in-main-finalized" => {
+                        identity.carrier_item_id.is_none()
+                            && main_endpoint == Some((identity.endpoint_index, identity.endpoint))
+                    }
+                    "post-main-carrier-finalized" => {
+                        identity.carrier_item_id.is_some_and(|carrier_item_id| {
+                            carriers.iter().any(|carrier| {
+                                carrier.item_id == carrier_item_id
+                                    && carrier.role == "incoming-credit"
+                                    && carrier.endpoint_index == identity.endpoint_index
+                                    && carrier.endpoint == identity.endpoint
+                                    && carrier.transmitted
+                            })
+                        })
+                    }
+                    _ => false,
+                }
+        })
+        && carriers
+            .iter()
+            .filter(|carrier| carrier.role == "incoming-credit")
+            .all(|carrier| {
+                identities.iter().any(|identity| {
+                    identity.carrier_item_id == Some(carrier.item_id)
+                        && identity.endpoint_index == carrier.endpoint_index
+                        && identity.endpoint == carrier.endpoint
+                        && identity.resolution == "post-main-carrier-finalized"
+                })
+            })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelPreparedOutputFailureReceipt {
+    schema_version: u32,
+    job_id: u64,
+    endpoint_index: usize,
+    endpoint: u64,
+    failure: PreparedOutputFailureReceipt,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelItemReceipt {
+    schema_version: u32,
+    item_id: u64,
+    job_id: u64,
+    order_index: u64,
+    event_id: u64,
+    role: &'static str,
+    endpoint_index: usize,
+    endpoint: u64,
+    send_path: &'static str,
+    datagram_sha256: String,
+    source_address: String,
+    destination_address: String,
+    socket_timestamp_id: Option<u32>,
+    udp_payload_bytes: usize,
+    target_tai_ns: u64,
+    scm_txtime_tai_ns: Option<u64>,
+    enqueue_monotonic_ns: Option<u64>,
+    enqueue_tai_ns: Option<u64>,
+    enqueue_tai_lower_ns: Option<u64>,
+    enqueue_tai_upper_ns: Option<u64>,
+    tx_sched_realtime_ns: Option<u64>,
+    tx_sched_tai_ns: Option<u64>,
+    tx_sched_tai_lower_ns: Option<u64>,
+    tx_sched_tai_upper_ns: Option<u64>,
+    tx_software_realtime_ns: Option<u64>,
+    provisional_tx_software_tai_lower_ns: Option<u64>,
+    provisional_tx_software_tai_upper_ns: Option<u64>,
+    tx_software_tai_ns: Option<u64>,
+    tx_software_tai_lower_ns: Option<u64>,
+    tx_software_tai_upper_ns: Option<u64>,
+    send_attempt: Option<timed_egress::SendAttemptReceipt>,
+    txtime_error: Option<timed_egress::TxtimeDropDiagnostic>,
+    terminal_error: Option<String>,
+    terminal_error_detail: Option<String>,
+    finalization_state: String,
+    terminal_outcome: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelJobReceipt {
+    schema_version: u32,
+    job_id: u64,
+    tick: u64,
+    release_monotonic_ns: u64,
+    release_tai_ns: u64,
+    deadline_monotonic_ns: u64,
+    deadline_tai_ns: u64,
+    items: Vec<BufloKernelItemReceipt>,
+    credit_identities: Vec<BufloKernelCreditIdentityReceipt>,
+    prepared_output_failure: Option<BufloKernelPreparedOutputFailureReceipt>,
+    helper_job_close: Option<timed_egress::HelperJobCloseReceipt>,
+    helper_job_abort: Option<timed_egress::HelperJobAbortReceipt>,
+    terminal_error: Option<String>,
+    terminal_outcome: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelAggregateReceipt {
+    schema_version: u32,
+    job_count: usize,
+    item_count: usize,
+    etf_item_count: usize,
+    ordered_item_count: usize,
+    captured_credit_identity_count: usize,
+    prepared_output_failure_count: usize,
+    main_coalesced_credit_identity_count: usize,
+    carrier_credit_identity_count: usize,
+    unresolved_credit_identity_count: usize,
+    transmitted_item_count: usize,
+    failed_item_count: usize,
+    tx_sched_timestamp_count: usize,
+    tx_software_timestamp_count: usize,
+    txtime_error_count: usize,
+    timestamp_evidence_missing_count: usize,
+    window_violation_count: usize,
+    unresolved_item_count: usize,
+    max_tx_software_lateness_ns: u64,
+    terminal_outcome: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelTxReceipt {
+    schema_version: u32,
+    semantics: &'static str,
+    terminal_outcome: String,
+    primary_error: Option<String>,
+    cleanup_errors: Vec<String>,
+    defense_start_monotonic_ns: Option<u64>,
+    defense_start_tai_ns: Option<u64>,
+    clock_start: BufloKernelClockPhase,
+    clock_end: Option<BufloKernelClockPhase>,
+    clock_mapping_valid: bool,
+    clock_mapping_error: Option<String>,
+    clock_mapping: Option<BufloKernelClockMapping>,
+    runtime_contract: BufloKernelRuntimeContract,
+    qdisc_contract: BufloKernelQdiscContract,
+    jobs: Vec<BufloKernelJobReceipt>,
+    aggregate: BufloKernelAggregateReceipt,
+    terminal_errors: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct BufloKernelEpoch {
+    start: Instant,
+    start_monotonic_ns: u64,
+    start_tai_ns: u64,
+    instant_anchor: BufloKernelInstantAnchor,
+    tick_zero_application_ready: bool,
+    tick_zero_staged: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct BufloKernelTxRuntime {
+    helper: Option<timed_egress::TimedEgressHelper>,
+    runtime_contract: BufloKernelRuntimeContract,
+    qdisc_contract: BufloKernelQdiscContract,
+    endpoint_tuples: Vec<(SocketAddr, SocketAddr)>,
+    clock_start: BufloKernelClockPhase,
+    epoch: Option<BufloKernelEpoch>,
+    jobs: Vec<BufloKernelRawJob>,
+    next_item_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn mark_buflo_kernel_item_controller_and_trace_finalized(
+    job: &mut BufloKernelRawJob,
+    item_id: u64,
+) -> Result<(), Error> {
+    let item = job
+        .items
+        .iter_mut()
+        .find(|item| item.item_id == item_id && item.job_id == job.job_id)
+        .ok_or_else(|| {
+            Error::SlotInvariant(format!(
+                "BuFLO kernel job {} could not finalize unknown item {item_id}",
+                job.job_id
+            ))
+        })?;
+    if item.finalization_state != "physical-transmit-proven"
+        || item.terminal_outcome != "transmitted"
+        || item.terminal_error.is_some()
+    {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO kernel job {} item {item_id} was not eligible for controller/trace finalization",
+            job.job_id
+        )));
+    }
+    item.finalization_state = "controller-and-trace-finalized".into();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_job_ready_to_close(job: &BufloKernelRawJob, endpoint_count: usize) -> bool {
+    let mut incoming_owners = BTreeSet::new();
+    let item_structure_complete = job.items.iter().enumerate().all(|(index, item)| {
+        let expected_order = u64::try_from(index).unwrap_or(u64::MAX);
+        let common = item.job_id == job.job_id
+            && item.order_index == expected_order
+            && item.endpoint_index < endpoint_count
+            && u64::try_from(item.endpoint_index).is_ok_and(|value| value == item.endpoint.0)
+            && item.terminal_outcome == "transmitted"
+            && item.terminal_error.is_none()
+            && item.finalization_state == "controller-and-trace-finalized";
+        common
+            && if index == 0 {
+                item.role == "exact-outgoing"
+                    && item.send_path == "etf"
+                    && item.event_id == job.tick.saturating_mul(2)
+            } else {
+                item.role == "incoming-credit"
+                    && item.send_path == "ordered-after-exact"
+                    && item.event_id == job.tick.saturating_mul(2).saturating_add(1)
+                    && incoming_owners.insert((item.endpoint_index, item.endpoint.0))
+            }
+    });
+    let carriers: Vec<_> = job
+        .items
+        .iter()
+        .map(|item| BufloKernelValidatedCarrier {
+            item_id: item.item_id,
+            endpoint_index: item.endpoint_index,
+            endpoint: item.endpoint.0,
+            role: item.role,
+            transmitted: item.terminal_outcome == "transmitted",
+        })
+        .collect();
+    !job.items.is_empty()
+        && item_structure_complete
+        && job.terminal_error.is_none()
+        && job.helper_job_close.is_none()
+        && job.helper_job_abort.is_none()
+        && job.prepared_output_failure.is_none()
+        && buflo_kernel_credit_inventory_complete(
+            job.tick,
+            &job.credit_identities,
+            &carriers,
+            endpoint_count,
+        )
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_close_receipt_valid(
+    close: &timed_egress::HelperJobCloseReceipt,
+    job_id: u64,
+    expected_unused_post_main_datagrams: usize,
+) -> bool {
+    close.schema_version == 1
+        && close.complete
+        && close.job_id == job_id
+        && close.unused_post_main_datagrams == expected_unused_post_main_datagrams
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_abort_receipt_valid(
+    abort: &timed_egress::HelperJobAbortReceipt,
+    job_id: u64,
+    reason: &str,
+    expected_unused_post_main_datagrams: usize,
+    expected_failed_commands: u64,
+) -> bool {
+    abort.schema_version == 1
+        && abort.job_id == job_id
+        && !reason.trim().is_empty()
+        && abort.reason == reason
+        && abort.unused_post_main_datagrams == expected_unused_post_main_datagrams
+        && !abort.complete
+        && abort.aborted
+        && abort.global_poisoned
+        && abort.failed_commands == expected_failed_commands
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_consumed_post_main_datagram_count(items: &[BufloKernelRawItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            item.role == "incoming-credit"
+                && matches!(
+                    item.finalization_state.as_str(),
+                    "physical-transmit-proven" | "controller-and-trace-finalized"
+                )
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the mutation-tested item predicate retains each independent attestation condition"
+)]
+#[derive(Clone, Debug)]
+struct BufloKernelItemValidation {
+    enqueue_interval_complete: bool,
+    enqueue_clock_consistent: bool,
+    timestamp_evidence_complete: bool,
+    tx_order_valid: bool,
+    physical_window_valid: bool,
+    provisional_interval_valid: bool,
+    endpoint_tuple_valid: bool,
+    item_sequence_valid: bool,
+    job_identity_and_timing_valid: bool,
+    controller_and_trace_finalized: bool,
+    structural_and_order_valid: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_item_validation_complete(
+    raw: &BufloKernelRawItem,
+    validation: &BufloKernelItemValidation,
+) -> bool {
+    raw.terminal_outcome == "transmitted"
+        && raw.terminal_error.is_none()
+        && raw.txtime_error.is_none()
+        && validation.enqueue_interval_complete
+        && validation.enqueue_clock_consistent
+        && validation.timestamp_evidence_complete
+        && validation.tx_order_valid
+        && validation.physical_window_valid
+        && validation.provisional_interval_valid
+        && validation.endpoint_tuple_valid
+        && validation.item_sequence_valid
+        && validation.job_identity_and_timing_valid
+        && validation.controller_and_trace_finalized
+        && validation.structural_and_order_valid
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "the pure job predicate exposes every independent attestation condition for mutation tests"
+)]
+fn buflo_kernel_job_validation_complete(
+    raw_terminal_outcome: &str,
+    raw_terminal_error_present: bool,
+    item_count: usize,
+    all_items_transmitted: bool,
+    credit_identity_complete: bool,
+    helper_job_close: Option<&timed_egress::HelperJobCloseReceipt>,
+    job_id: u64,
+    expected_unused_post_main_datagrams: usize,
+    prepared_output_failure_present: bool,
+    helper_job_abort_present: bool,
+) -> bool {
+    raw_terminal_outcome == "complete"
+        && !raw_terminal_error_present
+        && item_count > 0
+        && all_items_transmitted
+        && credit_identity_complete
+        && helper_job_close.is_some_and(|close| {
+            buflo_kernel_close_receipt_valid(close, job_id, expected_unused_post_main_datagrams)
+        })
+        && !prepared_output_failure_present
+        && !helper_job_abort_present
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "the pure aggregate predicate exposes every independent attestation condition for mutation tests"
+)]
+const fn buflo_kernel_aggregate_validation_complete(
+    failed_item_count: usize,
+    job_count: usize,
+    every_job_complete: bool,
+    helper_evidence_success: bool,
+    mapping_present: bool,
+    primary_error_present: bool,
+    cleanup_error_count: usize,
+    terminal_error_count: usize,
+) -> bool {
+    failed_item_count == 0
+        && job_count > 0
+        && every_job_complete
+        && helper_evidence_success
+        && mapping_present
+        && !primary_error_present
+        && cleanup_error_count == 0
+        && terminal_error_count == 0
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_socket_setup_complete(
+    runtime: &BufloKernelRuntimeContract,
+    qdisc: &BufloKernelQdiscContract,
+    endpoint_tuples: &[(SocketAddr, SocketAddr)],
+) -> bool {
+    let expected_report_flags = (libc::SOF_TIMESTAMPING_SOFTWARE
+        | libc::SOF_TIMESTAMPING_OPT_ID
+        | libc::SOF_TIMESTAMPING_OPT_TSONLY)
+        .cast_signed();
+    let Some(first_setup) = runtime.socket_setup.first() else {
+        return false;
+    };
+    let priority_method = first_setup.priority_method;
+    let per_datagram_priority = matches!(
+        priority_method,
+        timed_egress::TimedPriorityMethod::PerDatagramScmPriority
+    );
+    let setup_addresses: BTreeSet<_> = runtime
+        .socket_setup
+        .iter()
+        .map(|setup| setup.local_address)
+        .collect();
+    let setup_valid = runtime.socket_setup.len() == endpoint_tuples.len()
+        && setup_addresses.len() == endpoint_tuples.len()
+        && runtime.socket_setup.iter().zip(endpoint_tuples).all(
+            |(setup, (source, _destination))| {
+                let family_matches = matches!(
+                    (setup.family, setup.local_address),
+                    (timed_egress::SocketFamily::Ipv4, SocketAddr::V4(_))
+                        | (timed_egress::SocketFamily::Ipv6, SocketAddr::V6(_))
+                );
+                let priority_probe_valid = setup.priority_method == priority_method
+                    && setup.scm_priority_supported == per_datagram_priority
+                    && setup.scm_priority_probe_family == setup.family
+                    && if per_datagram_priority {
+                        setup.scm_priority_probe_errno.is_none()
+                    } else {
+                        setup.scm_priority_probe_errno == Some(libc::EINVAL)
+                    };
+                setup.schema_version == 1
+                    && family_matches
+                    && setup.local_address == *source
+                    && setup.duplicated_fd_cloexec
+                    && setup.nonblocking
+                    && setup.socket_type == libc::SOCK_DGRAM
+                    && setup.txtime_clock_id == libc::CLOCK_TAI
+                    && setup.txtime_flags == libc::SOF_TXTIME_REPORT_ERRORS
+                    && setup.timestamping_report_flags == expected_report_flags
+                    && setup.timed_priority == 6
+                    && setup.priority_before_probe == 0
+                    && setup.priority_after_probe == 0
+                    && setup.corresponding_error_queue_enabled
+                    && !setup.etf_deadline_mode
+                    && !setup.etf_skip_socket_check
+                    && priority_probe_valid
+                    && setup.exclusive_socket_sender_required
+                    && setup.per_datagram_timestamp_requests
+            },
+        );
+    let qdisc_priority_valid = qdisc.priority_method == priority_method
+        && qdisc.scm_priority_supported == per_datagram_priority
+        && qdisc.so_priority_before == 0
+        && qdisc.so_priority_after == 0
+        && qdisc.so_priority_reset_valid
+        && qdisc.so_priority_during == if per_datagram_priority { 0 } else { 6 };
+    setup_valid
+        && qdisc.schema_version == 1
+        && !qdisc.interface.is_empty()
+        && qdisc.interface.trim() == qdisc.interface
+        && qdisc.root_kind == "prio"
+        && qdisc.root_handle == "1:"
+        && qdisc.bands == 2
+        && qdisc.priomap == [1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        && qdisc.timed_kind == "etf"
+        && qdisc.timed_parent == "1:1"
+        && qdisc.timed_handle == "20:"
+        && qdisc.ordinary_kind == "pfifo"
+        && qdisc.ordinary_parent == "1:2"
+        && qdisc.ordinary_handle == "10:"
+        && qdisc.clock_id == "CLOCK_TAI"
+        && qdisc.delta_ns == duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA)
+        && !qdisc.deadline_mode
+        && !qdisc.offload
+        && !qdisc.skip_socket_check
+        && qdisc.timed_socket_priority == 6
+        && qdisc.ordinary_socket_priority == 0
+        && qdisc.single_threaded_sender_control_flow_enforced
+        && qdisc_priority_valid
+        && qdisc.so_txtime_enabled
+        && qdisc.tx_sched_timestamping_enabled
+        && qdisc.tx_software_timestamping_enabled
+        && qdisc.tx_timestamp_opt_id_enabled
+        && qdisc.txtime_errors_enabled
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_helper_evidence_complete(
+    runtime: &BufloKernelRuntimeContract,
+    qdisc: &BufloKernelQdiscContract,
+    endpoint_tuples: &[(SocketAddr, SocketAddr)],
+    job_count: usize,
+    last_job_id: Option<u64>,
+    immediate_datagram_count: usize,
+) -> bool {
+    let endpoint_count = endpoint_tuples.len();
+    let thread = &runtime.helper_thread;
+    let Some(lifecycle) = runtime.helper_lifecycle.as_ref() else {
+        return false;
+    };
+    let Some(shutdown) = runtime.helper_shutdown.as_ref() else {
+        return false;
+    };
+    let Some(socket) = shutdown.socket_state.as_ref() else {
+        return false;
+    };
+    let privilege = &runtime.privilege_drop;
+    let privilege_valid = privilege.schema_version == 1
+        && privilege.uid[0] != 0
+        && privilege.uid.iter().all(|value| *value == privilege.uid[0])
+        && privilege.gid[0] != 0
+        && privilege.gid.iter().all(|value| *value == privilege.gid[0])
+        && privilege.supplementary_groups.is_empty()
+        && [
+            &privilege.cap_inheritable,
+            &privilege.cap_permitted,
+            &privilege.cap_effective,
+            &privilege.cap_bounding,
+            &privilege.cap_ambient,
+        ]
+        .into_iter()
+        .all(|value| value.len() == 16 && value.bytes().all(|byte| byte == b'0'))
+        && privilege.no_new_privileges;
+    runtime.schema_version == 1
+        && runtime.scheduler_contract == QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
+        && runtime.scheduler_initial.schema_version == 1
+        && runtime.scheduler_initial.contract.as_deref() == Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT)
+        && runtime.scheduler_initial.contract_valid
+        && scheduler_contract_matches(&runtime.scheduler_initial)
+        && runtime
+            .scheduler_initial
+            .effective_capabilities_hex
+            .as_deref()
+            == Some("0000000000001100")
+        && buflo_kernel_socket_setup_complete(runtime, qdisc, endpoint_tuples)
+        && runtime.single_threaded_sender_control_flow_enforced
+        && runtime.socket_count == endpoint_count
+        && endpoint_count > 0
+        && runtime.prebuild_selection_cutoff_lead_ns
+            == duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+        && runtime.prebuild_selection_semantics
+            == "application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; client_only_adaptation; paper_equivalent=false"
+        && runtime.post_main_inventory_semantics
+            == "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram"
+        && runtime.max_post_main_datagrams == endpoint_count
+        && thread.schema_version == 1
+        && thread.contract_name == QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
+        && thread.target_cpu == 11
+        && thread.observed_affinity == [11]
+        && thread.scheduler_policy == libc::SCHED_RR
+        && thread.scheduler_policy_name == "SCHED_RR"
+        && thread.scheduler_priority == 1
+        && thread.thread_id > 0
+        && privilege_valid
+        && thread.privilege == *privilege
+        && thread.endpoint_socket_count == endpoint_count
+        && thread.credit_owner_capacity == endpoint_count
+        && thread.max_datagrams_per_owner == 1
+        && thread.max_post_main_datagrams == endpoint_count
+        && lifecycle.schema_version == 1
+        && !lifecycle.globally_poisoned
+        && lifecycle.poison_reason.is_none()
+        && lifecycle.completed_main_jobs == u64::try_from(job_count).unwrap_or(u64::MAX)
+        && lifecycle.completed_immediate_datagrams
+            == u64::try_from(immediate_datagram_count).unwrap_or(u64::MAX)
+        && lifecycle.aborted_jobs == 0
+        && lifecycle.failed_commands == 0
+        && !lifecycle.causal_main_proven
+        && lifecycle.active_job_id.is_none()
+        && lifecycle.last_main_job_id == last_job_id
+        && lifecycle.remaining_post_main_datagrams == 0
+        && shutdown.schema_version == 1
+        && shutdown.shutdown_command_sent
+        && shutdown.shutdown_received
+        && shutdown.worker_joined
+        && shutdown.shutdown_complete
+        && shutdown.clean_socket_state
+        && !shutdown.global_poisoned
+        && shutdown.failed_commands == Some(0)
+        && shutdown.remaining_post_main_datagrams == Some(0)
+        && shutdown.lifecycle.as_ref() == Some(lifecycle)
+        && shutdown.errors.is_empty()
+        && socket.schema_version == 1
+        && socket.socket_count == endpoint_count
+        && socket.active_job_id.is_none()
+        && socket.pending_socket_count == 0
+        && socket.stale_error_queue_socket_count == 0
+        && socket.nonzero_priority_socket_count == 0
+        && socket.inspection_errors.is_empty()
+        && socket.clean
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_timed_error(context: &str, error: impl std::fmt::Display) -> Error {
+    Error::DefenseExecution(format!("BuFLO kernel-timed egress {context}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn sample_buflo_kernel_clock(
+    clock: impl FnOnce() -> Result<u64, timed_egress::TimedEgressError>,
+) -> Result<BufloKernelClockSample, Error> {
+    let tai_before_ns = timed_egress::clock_tai_ns()
+        .map_err(|error| buflo_kernel_timed_error("clock sample", error))?;
+    let clock_ns = clock().map_err(|error| buflo_kernel_timed_error("clock sample", error))?;
+    let tai_after_ns = timed_egress::clock_tai_ns()
+        .map_err(|error| buflo_kernel_timed_error("clock sample", error))?;
+    let bracket_width_ns = tai_after_ns.checked_sub(tai_before_ns).ok_or_else(|| {
+        Error::DefenseExecution("BuFLO kernel clock TAI bracket regressed".into())
+    })?;
+    if bracket_width_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel clock bracket {bracket_width_ns} ns exceeded 250000 ns"
+        )));
+    }
+    Ok(BufloKernelClockSample {
+        schema_version: 1,
+        tai_before_ns,
+        clock_ns,
+        tai_after_ns,
+        bracket_width_ns,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn sample_buflo_kernel_clock_phase() -> Result<BufloKernelClockPhase, Error> {
+    Ok(BufloKernelClockPhase {
+        monotonic: sample_buflo_kernel_clock(timed_egress::clock_monotonic_ns)?,
+        realtime: sample_buflo_kernel_clock(timed_egress::clock_realtime_ns)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn sample_buflo_kernel_instant_anchor() -> Result<BufloKernelInstantAnchor, Error> {
+    let instant_before = now();
+    let monotonic_ns = timed_egress::clock_monotonic_ns()
+        .map_err(|error| buflo_kernel_timed_error("Instant alignment", error))?;
+    let instant_after = now();
+    let bracket_width_ns = duration_as_u64_nanos(
+        instant_after
+            .checked_duration_since(instant_before)
+            .ok_or_else(|| {
+                Error::DefenseExecution("BuFLO Instant alignment bracket regressed".into())
+            })?,
+    );
+    if bracket_width_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO Instant alignment bracket {bracket_width_ns} ns exceeded 250000 ns"
+        )));
+    }
+    // Select the upper edge of the bracket. Any absolute CLOCK_MONOTONIC
+    // timestamp translated through this anchor is therefore an upper-bound
+    // Instant, never an instant earlier than the physical event it receipts.
+    let selected_upper_offset_ns = bracket_width_ns;
+    let instant = instant_after;
+    Ok(BufloKernelInstantAnchor {
+        instant,
+        monotonic_ns,
+        receipt: BufloKernelInstantAlignmentReceipt {
+            schema_version: 1,
+            monotonic_clock_ns: monotonic_ns,
+            instant_bracket_width_ns: bracket_width_ns,
+            selected_upper_offset_ns,
+            semantics: BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS,
+        },
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn clock_offset_bounds(sample: &BufloKernelClockSample) -> (i128, i128) {
+    (
+        i128::from(sample.tai_before_ns) - i128::from(sample.clock_ns),
+        i128::from(sample.tai_after_ns) - i128::from(sample.clock_ns),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_clock_sample_valid(sample: &BufloKernelClockSample) -> bool {
+    sample.schema_version == 1
+        && sample
+            .tai_after_ns
+            .checked_sub(sample.tai_before_ns)
+            .is_some_and(|width| {
+                width == sample.bracket_width_ns
+                    && width <= duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
+            })
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::suspicious_operation_groupings,
+    reason = "the phase samples CLOCK_MONOTONIC before CLOCK_REALTIME and intentionally compares their bracketing CLOCK_TAI readings"
+)]
+fn buflo_kernel_clock_phase_valid(phase: &BufloKernelClockPhase) -> bool {
+    buflo_kernel_clock_sample_valid(&phase.monotonic)
+        && buflo_kernel_clock_sample_valid(&phase.realtime)
+        && phase.monotonic.tai_after_ns <= phase.realtime.tai_before_ns
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_instant_alignment_valid(alignment: &BufloKernelInstantAlignmentReceipt) -> bool {
+    alignment.schema_version == 1
+        && alignment.instant_bracket_width_ns
+            <= duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
+        && alignment.selected_upper_offset_ns == alignment.instant_bracket_width_ns
+        && alignment.semantics == BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_clock_chronology_valid(
+    start: &BufloKernelClockPhase,
+    end: &BufloKernelClockPhase,
+    alignment: &BufloKernelInstantAlignmentReceipt,
+) -> bool {
+    start.realtime.tai_after_ns <= end.monotonic.tai_before_ns
+        && start.monotonic.clock_ns <= end.monotonic.clock_ns
+        && start.realtime.clock_ns <= end.realtime.clock_ns
+        && (start.monotonic.clock_ns..=end.monotonic.clock_ns)
+            .contains(&alignment.monotonic_clock_ns)
+}
+
+#[cfg(target_os = "linux")]
+const fn clock_mapping_offset_bounds(
+    mapping: &BufloKernelClockMapping,
+    realtime: bool,
+) -> (i128, i128) {
+    if realtime {
+        (
+            mapping.effective_realtime_offset_lower_ns,
+            mapping.effective_realtime_offset_upper_ns,
+        )
+    } else {
+        (
+            mapping.effective_monotonic_offset_lower_ns,
+            mapping.effective_monotonic_offset_upper_ns,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_buflo_kernel_clock_mapping(
+    start: &BufloKernelClockPhase,
+    end: Option<&BufloKernelClockPhase>,
+    instant_alignment: Option<&BufloKernelInstantAlignmentReceipt>,
+    end_sample_error: Option<&str>,
+) -> Result<BufloKernelClockMapping, String> {
+    let end = end.ok_or_else(|| {
+        end_sample_error
+            .unwrap_or("BuFLO final clock sample was unavailable")
+            .to_string()
+    })?;
+    if !buflo_kernel_clock_phase_valid(start) {
+        return Err("BuFLO kernel start clock phase retained an invalid raw sample".into());
+    }
+    if !buflo_kernel_clock_phase_valid(end) {
+        return Err("BuFLO kernel end clock phase retained an invalid raw sample".into());
+    }
+    let instant_alignment =
+        instant_alignment.ok_or_else(|| "BuFLO kernel epoch was never armed".to_string())?;
+    if !buflo_kernel_instant_alignment_valid(instant_alignment) {
+        return Err("BuFLO kernel Instant alignment receipt was invalid".into());
+    }
+    if !buflo_kernel_clock_chronology_valid(start, end, instant_alignment) {
+        return Err(
+            "BuFLO kernel clock phases and Instant anchor were not temporally ordered".into(),
+        );
+    }
+    let max_observed_bracket_width_ns = [
+        start.monotonic.bracket_width_ns,
+        start.realtime.bracket_width_ns,
+        end.monotonic.bracket_width_ns,
+        end.realtime.bracket_width_ns,
+        instant_alignment.instant_bracket_width_ns,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let max_observed_offset_drift_ns =
+        clock_offset_midpoint_drift(&start.monotonic, &end.monotonic)
+            .max(clock_offset_midpoint_drift(&start.realtime, &end.realtime));
+    if max_observed_offset_drift_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
+        return Err(format!(
+            "BuFLO kernel clock offset drift {max_observed_offset_drift_ns} ns exceeded 250000 ns"
+        ));
+    }
+    let start_monotonic = clock_offset_bounds(&start.monotonic);
+    let end_monotonic = clock_offset_bounds(&end.monotonic);
+    let start_realtime = clock_offset_bounds(&start.realtime);
+    let end_realtime = clock_offset_bounds(&end.realtime);
+    Ok(BufloKernelClockMapping {
+        schema_version: 1,
+        tai_clock_id: "CLOCK_TAI",
+        monotonic_clock_id: "CLOCK_MONOTONIC",
+        realtime_clock_id: "CLOCK_REALTIME",
+        start: start.clone(),
+        end: end.clone(),
+        instant_alignment: *instant_alignment,
+        max_observed_bracket_width_ns,
+        max_observed_offset_drift_ns,
+        effective_monotonic_offset_lower_ns: start_monotonic.0.min(end_monotonic.0),
+        effective_monotonic_offset_upper_ns: start_monotonic.1.max(end_monotonic.1),
+        effective_realtime_offset_lower_ns: start_realtime.0.min(end_realtime.0),
+        effective_realtime_offset_upper_ns: start_realtime.1.max(end_realtime.1),
+        per_item_monotonic_evidence_count: 0,
+        per_item_realtime_evidence_count: 0,
+        effective_envelope_semantics: "start_and_end_clock_phases_plus_every_retained_per_item_post_tx_realtime_bracket_and_enqueue_monotonic_direct_tai_bracket; final_interval_is_conservative_union; widened_interval_must_still_fit_half_open_realization_window",
+    })
+}
+
+#[cfg(target_os = "linux")]
+const fn offset_interval_midpoint(bounds: (i128, i128)) -> i128 {
+    bounds.0 + (bounds.1 - bounds.0) / 2
+}
+
+#[cfg(target_os = "linux")]
+fn offset_midpoint_drift(reference: i128, bounds: (i128, i128)) -> u64 {
+    u64::try_from((reference - offset_interval_midpoint(bounds)).unsigned_abs()).unwrap_or(u64::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn widen_buflo_kernel_clock_mapping_with_items(
+    mapping: &mut BufloKernelClockMapping,
+    jobs: &[BufloKernelRawJob],
+) -> Result<(), String> {
+    let realtime_reference = offset_interval_midpoint(clock_offset_bounds(&mapping.start.realtime));
+    let monotonic_reference =
+        offset_interval_midpoint(clock_offset_bounds(&mapping.start.monotonic));
+    for item in jobs.iter().flat_map(|job| &job.items) {
+        if let Some((raw, (lower, upper))) = item.tx_software_realtime_ns.zip(
+            item.provisional_tx_software_tai_lower_ns
+                .zip(item.provisional_tx_software_tai_upper_ns),
+        ) {
+            let bounds = (
+                i128::from(lower) - i128::from(raw),
+                i128::from(upper) - i128::from(raw),
+            );
+            if bounds.0 > bounds.1 {
+                return Err(format!(
+                    "BuFLO kernel item {} retained a reversed realtime offset interval",
+                    item.item_id
+                ));
+            }
+            mapping.effective_realtime_offset_lower_ns =
+                mapping.effective_realtime_offset_lower_ns.min(bounds.0);
+            mapping.effective_realtime_offset_upper_ns =
+                mapping.effective_realtime_offset_upper_ns.max(bounds.1);
+            mapping.per_item_realtime_evidence_count =
+                mapping.per_item_realtime_evidence_count.saturating_add(1);
+            mapping.max_observed_bracket_width_ns = mapping
+                .max_observed_bracket_width_ns
+                .max(u64::try_from(bounds.1 - bounds.0).unwrap_or(u64::MAX));
+            mapping.max_observed_offset_drift_ns = mapping
+                .max_observed_offset_drift_ns
+                .max(offset_midpoint_drift(realtime_reference, bounds));
+        }
+        if let Some((raw, (lower, upper))) = item
+            .enqueue_monotonic_ns
+            .zip(item.enqueue_tai_lower_ns.zip(item.enqueue_tai_upper_ns))
+        {
+            let bounds = (
+                i128::from(lower) - i128::from(raw),
+                i128::from(upper) - i128::from(raw),
+            );
+            if bounds.0 > bounds.1 {
+                return Err(format!(
+                    "BuFLO kernel item {} retained a reversed monotonic offset interval",
+                    item.item_id
+                ));
+            }
+            mapping.effective_monotonic_offset_lower_ns =
+                mapping.effective_monotonic_offset_lower_ns.min(bounds.0);
+            mapping.effective_monotonic_offset_upper_ns =
+                mapping.effective_monotonic_offset_upper_ns.max(bounds.1);
+            mapping.per_item_monotonic_evidence_count =
+                mapping.per_item_monotonic_evidence_count.saturating_add(1);
+            mapping.max_observed_bracket_width_ns = mapping
+                .max_observed_bracket_width_ns
+                .max(u64::try_from(bounds.1 - bounds.0).unwrap_or(u64::MAX));
+            mapping.max_observed_offset_drift_ns = mapping
+                .max_observed_offset_drift_ns
+                .max(offset_midpoint_drift(monotonic_reference, bounds));
+        }
+    }
+    if mapping.max_observed_bracket_width_ns
+        > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
+    {
+        return Err(format!(
+            "BuFLO kernel clock bracket {} ns exceeded 250000 ns",
+            mapping.max_observed_bracket_width_ns
+        ));
+    }
+    if mapping.max_observed_offset_drift_ns
+        > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
+    {
+        return Err(format!(
+            "BuFLO kernel clock offset drift {} ns exceeded 250000 ns",
+            mapping.max_observed_offset_drift_ns
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn translate_clock_interval(raw_ns: u64, bounds: (i128, i128)) -> Result<(u64, u64), Error> {
+    let translate = |offset: i128| {
+        (i128::from(raw_ns) + offset)
+            .try_into()
+            .map_err(|_| Error::DefenseExecution("BuFLO kernel clock translation overflow".into()))
+    };
+    let lower = translate(bounds.0)?;
+    let upper = translate(bounds.1)?;
+    if lower > upper {
+        return Err(Error::DefenseExecution(
+            "BuFLO kernel clock translation interval was reversed".into(),
+        ));
+    }
+    Ok((lower, upper))
+}
+
+#[cfg(target_os = "linux")]
+const fn interval_midpoint(lower: u64, upper: u64) -> u64 {
+    lower.saturating_add(upper.saturating_sub(lower) / 2)
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_interval_within_half_open_window(
+    lower: u64,
+    upper: u64,
+    release: u64,
+    deadline: u64,
+) -> bool {
+    lower <= upper && lower >= release && upper < deadline
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_final_envelope_contains_provisional(
+    provisional_lower: u64,
+    provisional_upper: u64,
+    final_lower: u64,
+    final_upper: u64,
+) -> bool {
+    provisional_lower <= provisional_upper
+        && final_lower <= final_upper
+        && final_lower <= provisional_lower
+        && final_upper >= provisional_upper
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_credit_intervals_are_causally_ordered(
+    prior_tx_upper: u64,
+    enqueue_lower: u64,
+    enqueue_upper: u64,
+    tx_lower: u64,
+    deadline: u64,
+) -> bool {
+    enqueue_lower <= enqueue_upper
+        && enqueue_lower >= prior_tx_upper
+        && enqueue_upper < deadline
+        && tx_lower >= prior_tx_upper
+}
+
+#[cfg(target_os = "linux")]
+fn clock_offset_midpoint_drift(
+    start: &BufloKernelClockSample,
+    end: &BufloKernelClockSample,
+) -> u64 {
+    let start_twice = i128::from(start.tai_before_ns) + i128::from(start.tai_after_ns)
+        - 2 * i128::from(start.clock_ns);
+    let end_twice =
+        i128::from(end.tai_before_ns) + i128::from(end.tai_after_ns) - 2 * i128::from(end.clock_ns);
+    u64::try_from((start_twice - end_twice).unsigned_abs().div_ceil(2)).unwrap_or(u64::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn current_unprivileged_target() -> Result<timed_egress::PrivilegeDropTarget, Error> {
+    let uid = unsafe {
+        // SAFETY: credential getter has no preconditions.
+        libc::getuid()
+    };
+    let gid = unsafe {
+        // SAFETY: credential getter has no preconditions.
+        libc::getgid()
+    };
+    if uid == 0 || gid == 0 {
+        return Err(Error::RunAborted(
+            "ETF measured client must enter Rust under a non-root UID/GID".into(),
+        ));
+    }
+    Ok(timed_egress::PrivilegeDropTarget { uid, gid })
+}
+
+#[cfg(target_os = "linux")]
+fn drop_etf_setup_privileges() -> Result<timed_egress::PrivilegeDropReceipt, Error> {
+    timed_egress::drop_process_privileges_permanently(current_unprivileged_target()?)
+        .map_err(|error| buflo_kernel_timed_error("privilege drop", error))
+}
+
+const fn defense_retains_etf_setup_privileges(defense: &DefenseConfig) -> bool {
+    matches!(defense, DefenseConfig::Buflo(_))
+}
+
+fn process_scheduler_ready_for_network_execution(
+    evidence: &ProcessSchedulerEvidence,
+    defense: &DefenseConfig,
+) -> bool {
+    evidence.contract_valid
+        && scheduler_contract_matches(evidence)
+        && match evidence.contract.as_deref() {
+            Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT)
+                if defense_retains_etf_setup_privileges(defense) =>
+            {
+                evidence.effective_capabilities_hex.as_deref() == Some("0000000000001100")
+            }
+            Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT) => {
+                evidence.effective_capabilities_hex.as_deref() == Some("0000000000000000")
+            }
+            _ => true,
+        }
+}
+
+fn prepare_process_scheduler_for_network_execution(
+    defense: &DefenseConfig,
+    initial: ProcessSchedulerEvidence,
+) -> Result<ProcessSchedulerEvidence, Error> {
+    let etf_requested = initial.contract.as_deref() == Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT);
+    if !etf_requested || defense_retains_etf_setup_privileges(defense) {
+        if !process_scheduler_ready_for_network_execution(&initial, defense) {
+            return Err(Error::RunAborted(
+                "initial client scheduler evidence is not valid for network execution".into(),
+            ));
+        }
+        return Ok(initial);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // The launcher-side scheduler receipt retains the bounded setup phase.
+        // Modes other than BuFLO do not configure timed endpoint sockets, so
+        // discard those capabilities before even the running run.json is
+        // rendered and serialize a fresh post-drop process observation.
+        let privilege_drop = drop_etf_setup_privileges()?;
+        let completed = process_scheduler_evidence()?;
+        if privilege_drop.cap_effective != "0000000000000000"
+            || completed.effective_capabilities_hex.as_deref()
+                != Some(privilege_drop.cap_effective.as_str())
+            || completed.no_new_privileges != Some(privilege_drop.no_new_privileges)
+            || !process_scheduler_ready_for_network_execution(&completed, defense)
+        {
+            return Err(Error::RunAborted(
+                "post-drop client scheduler evidence is not valid for network execution".into(),
+            ));
+        }
+        Ok(completed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = initial;
+        Err(Error::RunAborted(
+            "the ETF scheduler contract is supported only on Linux".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BufloKernelTxRuntime {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "kernel socket setup, privilege retirement, helper startup, and their receipts form one fail-closed initialisation transaction"
+    )]
+    fn initialise(
+        endpoints: &[Endpoint],
+        scheduler_initial: ProcessSchedulerEvidence,
+    ) -> Result<Self, Error> {
+        if scheduler_initial.contract.as_deref() != Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT) {
+            return Err(Error::RunAborted(
+                "BuFLO kernel timing requires the ETF scheduler contract".into(),
+            ));
+        }
+        let interface = std::env::var("QCSD_CAPTURE_ETF_INTERFACE").map_err(|_| {
+            Error::RunAborted(
+                "QCSD_CAPTURE_ETF_INTERFACE is required by the ETF scheduler contract".into(),
+            )
+        })?;
+        if interface.is_empty() || interface.trim() != interface {
+            return Err(Error::RunAborted(
+                "QCSD_CAPTURE_ETF_INTERFACE must be a non-empty canonical interface name".into(),
+            ));
+        }
+        let mut prepared = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            prepared.push(
+                timed_egress::PreparedTimedEgressSocket::configure(
+                    &endpoint.socket,
+                    timed_egress::EtfContract::STRICT,
+                )
+                .map_err(|error| buflo_kernel_timed_error("socket setup", error))?,
+            );
+        }
+        if prepared.is_empty() {
+            return Err(Error::RunAborted(
+                "BuFLO kernel timing requires at least one endpoint socket".into(),
+            ));
+        }
+        let socket_setup: Vec<_> = prepared
+            .iter()
+            .map(|socket| socket.receipt().clone())
+            .collect();
+        let priority_method = socket_setup[0].priority_method;
+        if socket_setup
+            .iter()
+            .zip(endpoints)
+            .any(|(receipt, endpoint)| {
+                receipt.priority_method != priority_method
+                    || receipt.local_address != endpoint.local_addr
+            })
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO endpoint socket setup receipts were not homogeneous and ordered".into(),
+            ));
+        }
+        let privilege_drop = drop_etf_setup_privileges()?;
+        let active = prepared
+            .into_iter()
+            .map(|socket| {
+                socket
+                    .activate_after_privilege_drop()
+                    .map_err(|error| buflo_kernel_timed_error("socket activation", error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let socket_count = active.len();
+        let inventory = timed_egress::PostMainInventoryContract {
+            expected_endpoint_sockets: socket_count,
+            credit_owner_capacity: socket_count,
+            max_datagrams_per_owner: 1,
+            max_post_main_datagrams: socket_count,
+        };
+        // No fallible runner operation may follow helper creation unless a
+        // `BufloKernelTxRuntime` exists to close and serialize it. Arm takes a
+        // fresh authoritative phase, so this pre-spawn phase is only the
+        // initial retained evidence value.
+        let clock_start = sample_buflo_kernel_clock_phase()?;
+        let helper = timed_egress::TimedEgressHelper::spawn_after_privilege_drop(
+            active,
+            timed_egress::HelperThreadContract::RR1_CPU11_V1,
+            inventory,
+        )
+        .map_err(|error| buflo_kernel_timed_error("helper setup", error))?;
+        let helper_thread = helper.receipt().clone();
+        let priority_receipt = &socket_setup[0];
+        let serialized = matches!(
+            priority_method,
+            timed_egress::TimedPriorityMethod::SerializedSocketSoPriority
+        );
+        let qdisc_contract = BufloKernelQdiscContract {
+            schema_version: 1,
+            interface,
+            root_kind: "prio",
+            root_handle: "1:",
+            bands: 2,
+            priomap: [1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            timed_kind: "etf",
+            timed_parent: "1:1",
+            timed_handle: "20:",
+            ordinary_kind: "pfifo",
+            ordinary_parent: "1:2",
+            ordinary_handle: "10:",
+            clock_id: "CLOCK_TAI",
+            delta_ns: duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA),
+            deadline_mode: false,
+            offload: false,
+            skip_socket_check: false,
+            timed_socket_priority: 6,
+            ordinary_socket_priority: 0,
+            priority_method,
+            scm_priority_supported: priority_receipt.scm_priority_supported,
+            single_threaded_sender_control_flow_enforced: true,
+            so_priority_before: priority_receipt.priority_before_probe,
+            so_priority_during: if serialized { 6 } else { 0 },
+            so_priority_after: priority_receipt.priority_after_probe,
+            so_priority_reset_valid: priority_receipt.priority_before_probe == 0
+                && priority_receipt.priority_after_probe == 0,
+            so_txtime_enabled: true,
+            tx_sched_timestamping_enabled: true,
+            tx_software_timestamping_enabled: true,
+            tx_timestamp_opt_id_enabled: true,
+            txtime_errors_enabled: true,
+        };
+        let runtime_contract = BufloKernelRuntimeContract {
+            schema_version: 1,
+            scheduler_contract: QCSD_CLIENT_ETF_SCHEDULER_CONTRACT,
+            scheduler_initial,
+            socket_setup,
+            privilege_drop,
+            helper_thread,
+            helper_lifecycle: None,
+            helper_shutdown: None,
+            socket_count,
+            single_threaded_sender_control_flow_enforced: true,
+            prebuild_selection_cutoff_lead_ns: duration_as_u64_nanos(
+                BUFLO_KERNEL_TX_SELECTION_CUTOFF,
+            ),
+            prebuild_selection_semantics: "application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; client_only_adaptation; paper_equivalent=false",
+            post_main_inventory_semantics: "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram",
+            max_post_main_datagrams: helper.max_post_main_datagrams(),
+        };
+        Ok(Self {
+            helper: Some(helper),
+            runtime_contract,
+            qdisc_contract,
+            endpoint_tuples: endpoints
+                .iter()
+                .map(|endpoint| (endpoint.local_addr, endpoint.remote_addr))
+                .collect(),
+            clock_start,
+            epoch: None,
+            jobs: Vec::new(),
+            next_item_id: 0,
+        })
+    }
+
+    fn arm(&mut self) -> Result<Instant, Error> {
+        if self.epoch.is_some() {
+            return Err(Error::SlotInvariant(
+                "BuFLO kernel epoch was armed more than once".into(),
+            ));
+        }
+        self.clock_start = sample_buflo_kernel_clock_phase()?;
+        let offset = clock_offset_bounds(&self.clock_start.monotonic);
+        let offset_midpoint = offset.0 + (offset.1 - offset.0) / 2;
+        let base_tai_ns = self.clock_start.monotonic.tai_after_ns;
+        let start_tai_ns = base_tai_ns
+            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ARM_LEAD))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO kernel TAI epoch overflow".into()))?;
+        let start_monotonic_ns: u64 = (i128::from(start_tai_ns) - offset_midpoint)
+            .try_into()
+            .map_err(|_| Error::DefenseExecution("BuFLO kernel monotonic epoch overflow".into()))?;
+        let instant_anchor = sample_buflo_kernel_instant_anchor()?;
+        let current_tai_ns = timed_egress::clock_tai_ns()
+            .map_err(|error| buflo_kernel_timed_error("epoch arm", error))?;
+        _ = start_tai_ns.checked_sub(current_tai_ns).ok_or_else(|| {
+            Error::DefenseExecution("BuFLO kernel epoch elapsed while it was armed".into())
+        })?;
+        let remaining_monotonic_ns = start_monotonic_ns
+            .checked_sub(instant_anchor.monotonic_ns)
+            .ok_or_else(|| {
+                Error::DefenseExecution(
+                    "BuFLO kernel monotonic epoch preceded its Instant anchor".into(),
+                )
+            })?;
+        let start = instant_anchor
+            .instant
+            .checked_add(Duration::from_nanos(remaining_monotonic_ns))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO Instant epoch overflow".into()))?;
+        self.epoch = Some(BufloKernelEpoch {
+            start,
+            start_monotonic_ns,
+            start_tai_ns,
+            instant_anchor,
+            tick_zero_application_ready: false,
+            tick_zero_staged: false,
+        });
+        Ok(start)
+    }
+
+    fn epoch(&self) -> Result<BufloKernelEpoch, Error> {
+        self.epoch.ok_or_else(|| {
+            Error::SlotInvariant("BuFLO kernel runtime was used before epoch arm".into())
+        })
+    }
+
+    fn tick_zero_stage_at(&self) -> Result<Instant, Error> {
+        let epoch = self.epoch()?;
+        epoch
+            .start
+            .checked_sub(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+            .ok_or_else(|| Error::DefenseExecution("BuFLO tick-zero cutoff underflow".into()))
+    }
+
+    fn tick_zero_staged(&self) -> Result<bool, Error> {
+        Ok(self.epoch()?.tick_zero_staged)
+    }
+
+    fn tick_zero_application_ready(&self) -> Result<bool, Error> {
+        Ok(self.epoch()?.tick_zero_application_ready)
+    }
+
+    fn mark_tick_zero_application_ready(&mut self, started_requests: usize) -> Result<(), Error> {
+        let epoch = self.epoch.as_mut().ok_or_else(|| {
+            Error::SlotInvariant("BuFLO application readiness preceded epoch arm".into())
+        })?;
+        if epoch.tick_zero_application_ready {
+            return Ok(());
+        }
+        if started_requests == 0 {
+            return Err(Error::DefenseExecution(
+                "BuFLO tick zero had no eligible application request before its selection cutoff"
+                    .into(),
+            ));
+        }
+        epoch.tick_zero_application_ready = true;
+        Ok(())
+    }
+
+    fn mark_tick_zero_staged(&mut self) -> Result<(), Error> {
+        let epoch = self.epoch.as_mut().ok_or_else(|| {
+            Error::SlotInvariant("BuFLO tick zero was staged before epoch arm".into())
+        })?;
+        if epoch.tick_zero_staged {
+            return Err(Error::SlotInvariant(
+                "BuFLO tick zero was staged more than once".into(),
+            ));
+        }
+        epoch.tick_zero_staged = true;
+        Ok(())
+    }
+
+    fn job_times(&self, tick: u64) -> Result<(u64, u64, u64, u64), Error> {
+        let epoch = self.epoch()?;
+        let offset = tick
+            .checked_mul(duration_as_u64_nanos(Duration::from_millis(20)))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO job cadence overflow".into()))?;
+        let release_monotonic_ns = epoch
+            .start_monotonic_ns
+            .checked_add(offset)
+            .ok_or_else(|| Error::DefenseExecution("BuFLO release monotonic overflow".into()))?;
+        let release_tai_ns = epoch
+            .start_tai_ns
+            .checked_add(offset)
+            .ok_or_else(|| Error::DefenseExecution("BuFLO release TAI overflow".into()))?;
+        let window = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
+        Ok((
+            release_monotonic_ns,
+            release_tai_ns,
+            release_monotonic_ns.checked_add(window).ok_or_else(|| {
+                Error::DefenseExecution("BuFLO deadline monotonic overflow".into())
+            })?,
+            release_tai_ns
+                .checked_add(window)
+                .ok_or_else(|| Error::DefenseExecution("BuFLO deadline TAI overflow".into()))?,
+        ))
+    }
+
+    fn begin_job(&mut self, guard: &BufloExactReleaseGuard) -> Result<u64, Error> {
+        let cadence_ns = duration_as_u64_nanos(Duration::from_millis(20));
+        let timestamp_ns = duration_as_u64_nanos(guard.packet.timestamp());
+        if !timestamp_ns.is_multiple_of(cadence_ns) {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel slot {} timestamp was not on the 20 ms cadence",
+                guard.slot.0
+            )));
+        }
+        let tick = timestamp_ns / cadence_ns;
+        let job_id = u64::try_from(self.jobs.len()).unwrap_or(u64::MAX);
+        if tick != job_id || guard.slot.0 != tick.saturating_mul(2) {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job identity diverged: job={job_id} tick={tick} slot={}",
+                guard.slot.0
+            )));
+        }
+        let (release_monotonic_ns, release_tai_ns, deadline_monotonic_ns, deadline_tai_ns) =
+            self.job_times(tick)?;
+        self.jobs.push(BufloKernelRawJob {
+            job_id,
+            tick,
+            release_monotonic_ns,
+            release_tai_ns,
+            deadline_monotonic_ns,
+            deadline_tai_ns,
+            items: Vec::new(),
+            credit_identities: Vec::new(),
+            prepared_output_failure: None,
+            helper_job_close: None,
+            helper_job_abort: None,
+            terminal_error: None,
+            terminal_outcome: "failed".into(),
+        });
+        Ok(job_id)
+    }
+
+    fn current_job(&self, job_id: u64) -> Result<&BufloKernelRawJob, Error> {
+        self.jobs
+            .last()
+            .filter(|job| job.job_id == job_id)
+            .ok_or_else(|| Error::SlotInvariant(format!("missing BuFLO kernel job {job_id}")))
+    }
+
+    fn retain_credit_identities(
+        &mut self,
+        job_id: u64,
+        captured: &[BufloExactIncomingIdentity],
+    ) -> Result<(), Error> {
+        let job = self.current_job_mut(job_id)?;
+        for candidate in captured {
+            let (identity_kind, identity_detail) = match candidate.identity {
+                QcsdReceiveActionIdentity::Scheduled { .. } => ("scheduled", 0),
+                QcsdReceiveActionIdentity::ParserLease { increase, .. } => {
+                    ("parser-lease", increase)
+                }
+            };
+            let candidate_key = buflo_exact_incoming_identity_key(candidate);
+            let already_retained = job.credit_identities.iter().any(|retained| {
+                (
+                    retained.slot,
+                    retained.endpoint_index,
+                    retained.endpoint,
+                    retained.stream_id,
+                    retained.absolute_limit,
+                    match retained.identity_kind {
+                        "scheduled" => 0,
+                        "parser-lease" => 1,
+                        _ => u8::MAX,
+                    },
+                    retained.identity_detail,
+                ) == candidate_key
+            });
+            if !already_retained {
+                job.credit_identities
+                    .push(BufloKernelCreditIdentityReceipt {
+                        schema_version: 1,
+                        slot: candidate.slot.0,
+                        endpoint_index: candidate.endpoint_index,
+                        endpoint: candidate.endpoint.0,
+                        stream_id: candidate.identity.stream().0,
+                        absolute_limit: candidate.identity.absolute_limit(),
+                        identity_kind,
+                        identity_detail,
+                        resolution: "pending".into(),
+                        carrier_item_id: None,
+                    });
+            }
+        }
+        job.credit_identities.sort_unstable_by_key(|identity| {
+            (
+                identity.slot,
+                identity.endpoint_index,
+                identity.endpoint,
+                identity.stream_id,
+                identity.absolute_limit,
+                identity.identity_kind,
+                identity.identity_detail,
+            )
+        });
+        Ok(())
+    }
+
+    fn resolve_credit_identity(
+        &mut self,
+        job_id: u64,
+        candidate: &BufloExactIncomingIdentity,
+        resolution: &'static str,
+        carrier_item_id: Option<u64>,
+    ) -> Result<(), Error> {
+        let key = buflo_exact_incoming_identity_key(candidate);
+        let retained = self
+            .current_job_mut(job_id)?
+            .credit_identities
+            .iter_mut()
+            .find(|retained| {
+                (
+                    retained.slot,
+                    retained.endpoint_index,
+                    retained.endpoint,
+                    retained.stream_id,
+                    retained.absolute_limit,
+                    match retained.identity_kind {
+                        "scheduled" => 0,
+                        "parser-lease" => 1,
+                        _ => u8::MAX,
+                    },
+                    retained.identity_detail,
+                ) == key
+            })
+            .ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "BuFLO kernel job {job_id} resolved an unretained incoming-credit identity"
+                ))
+            })?;
+        if retained.resolution != "pending" {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} resolved one incoming-credit identity more than once"
+            )));
+        }
+        retained.resolution = resolution.into();
+        retained.carrier_item_id = carrier_item_id;
+        Ok(())
+    }
+
+    fn finalize_carried_credit_identity(
+        &mut self,
+        job_id: u64,
+        candidate: &BufloExactIncomingIdentity,
+        carrier_item_id: u64,
+    ) -> Result<(), Error> {
+        let key = buflo_exact_incoming_identity_key(candidate);
+        let retained = self
+            .current_job_mut(job_id)?
+            .credit_identities
+            .iter_mut()
+            .find(|retained| {
+                (
+                    retained.slot,
+                    retained.endpoint_index,
+                    retained.endpoint,
+                    retained.stream_id,
+                    retained.absolute_limit,
+                    match retained.identity_kind {
+                        "scheduled" => 0,
+                        "parser-lease" => 1,
+                        _ => u8::MAX,
+                    },
+                    retained.identity_detail,
+                ) == key
+            })
+            .ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "BuFLO kernel job {job_id} finalized an unretained incoming-credit identity"
+                ))
+            })?;
+        if retained.resolution != "post-main-carrier-physical"
+            || retained.carrier_item_id != Some(carrier_item_id)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} finalized incoming credit without its matching physical carrier"
+            )));
+        }
+        retained.resolution = "post-main-carrier-finalized".into();
+        Ok(())
+    }
+
+    fn mark_item_controller_and_trace_finalized(
+        &mut self,
+        job_id: u64,
+        item_id: u64,
+    ) -> Result<(), Error> {
+        mark_buflo_kernel_item_controller_and_trace_finalized(
+            self.current_job_mut(job_id)?,
+            item_id,
+        )
+    }
+
+    fn record_prepared_output_failure(
+        &mut self,
+        job_id: u64,
+        endpoint_index: usize,
+        endpoint: QcsdEndpointId,
+        failure: PreparedOutputFailureReceipt,
+    ) -> Result<(), Error> {
+        let job = self.current_job_mut(job_id)?;
+        if job.prepared_output_failure.is_some() {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} recorded more than one terminal prepared-output failure"
+            )));
+        }
+        let detail = format!(
+            "prepared output failed at {} after transport_mutated={}: {}",
+            failure.stage, failure.transport_output_mutated, failure.error
+        );
+        job.prepared_output_failure = Some(BufloKernelPreparedOutputFailureReceipt {
+            schema_version: 1,
+            job_id,
+            endpoint_index,
+            endpoint: endpoint.0,
+            failure,
+        });
+        job.terminal_error = Some(detail);
+        job.terminal_outcome = "failed".into();
+        Ok(())
+    }
+
+    fn record_item_finalization_failure(
+        &mut self,
+        job_id: u64,
+        item_id: u64,
+        detail: &str,
+    ) -> Result<(), Error> {
+        let job = self.current_job_mut(job_id)?;
+        let item = job
+            .items
+            .iter_mut()
+            .find(|item| item.item_id == item_id && item.job_id == job_id)
+            .ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "BuFLO kernel job {job_id} could not fail unknown finalization item {item_id}"
+                ))
+            })?;
+        if item.finalization_state != "physical-transmit-proven" {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} item {item_id} finalization failure was recorded from invalid state {}",
+                item.finalization_state
+            )));
+        }
+        item.terminal_error = Some("controller_or_trace_finalization_failed".into());
+        item.terminal_error_detail = Some(detail.to_string());
+        item.terminal_outcome = "controller-trace-finalization-failed".into();
+        job.terminal_error = Some(format!(
+            "item {item_id} failed controller/trace finalization: {detail}"
+        ));
+        job.terminal_outcome = "failed".into();
+        Ok(())
+    }
+
+    fn current_job_mut(&mut self, job_id: u64) -> Result<&mut BufloKernelRawJob, Error> {
+        self.jobs
+            .last_mut()
+            .filter(|job| job.job_id == job_id)
+            .ok_or_else(|| Error::SlotInvariant(format!("missing BuFLO kernel job {job_id}")))
+    }
+
+    fn physical_instant_from_monotonic(&self, monotonic_ns: u64) -> Result<Instant, Error> {
+        let epoch = self.epoch()?;
+        if monotonic_ns >= epoch.instant_anchor.monotonic_ns {
+            epoch
+                .instant_anchor
+                .instant
+                .checked_add(Duration::from_nanos(
+                    monotonic_ns - epoch.instant_anchor.monotonic_ns,
+                ))
+                .ok_or_else(|| Error::DefenseExecution("BuFLO physical Instant overflow".into()))
+        } else {
+            epoch
+                .instant_anchor
+                .instant
+                .checked_sub(Duration::from_nanos(
+                    epoch.instant_anchor.monotonic_ns - monotonic_ns,
+                ))
+                .ok_or_else(|| Error::DefenseExecution("BuFLO physical Instant underflow".into()))
+        }
+    }
+
+    fn check_physical_window(
+        &self,
+        job_id: u64,
+        tx_realtime_ns: u64,
+        phase: &BufloKernelClockPhase,
+    ) -> Result<(u64, u64, Instant), Error> {
+        let job = self.current_job(job_id)?;
+        let (lower, upper) =
+            translate_clock_interval(tx_realtime_ns, clock_offset_bounds(&phase.realtime))?;
+        if !buflo_kernel_interval_within_half_open_window(
+            lower,
+            upper,
+            job.release_tai_ns,
+            job.deadline_tai_ns,
+        ) {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} physical TX interval [{lower},{upper}] fell outside [{},{})",
+                job.release_tai_ns, job.deadline_tai_ns
+            )));
+        }
+        let monotonic_offset_lower = clock_offset_bounds(&phase.monotonic).0;
+        let monotonic_upper_ns: u64 = (i128::from(upper) - monotonic_offset_lower)
+            .try_into()
+            .map_err(|_| {
+                Error::DefenseExecution("BuFLO physical monotonic translation overflowed".into())
+            })?;
+        // Finalise at the latest clock-consistent physical instant. This can
+        // never stamp controller evidence earlier than the proven TX boundary.
+        Ok((
+            lower,
+            upper,
+            self.physical_instant_from_monotonic(monotonic_upper_ns)?,
+        ))
+    }
+
+    fn validate_batch_tuple(
+        &self,
+        endpoint_index: usize,
+        batch: &datagram::Batch,
+    ) -> Result<(), Error> {
+        let expected = self.endpoint_tuples.get(endpoint_index).ok_or_else(|| {
+            Error::SlotInvariant(format!(
+                "BuFLO kernel endpoint index {endpoint_index} exceeded socket inventory"
+            ))
+        })?;
+        if (batch.source(), batch.destination()) != *expected {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel batch tuple {}/{} did not match endpoint {}/{}",
+                batch.source(),
+                batch.destination(),
+                expected.0,
+                expected.1
+            )));
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a failed attempt retains every identity and nullable helper evidence field"
+    )]
+    fn record_failed_attempt(
+        &mut self,
+        job_id: u64,
+        order_index: u64,
+        event_id: u64,
+        role: &'static str,
+        endpoint_index: usize,
+        endpoint: QcsdEndpointId,
+        send_path: &'static str,
+        datagram_sha256: String,
+        source_address: SocketAddr,
+        destination_address: SocketAddr,
+        udp_payload_bytes: usize,
+        target_tai_ns: u64,
+        scm_txtime_tai_ns: Option<u64>,
+        failure: timed_egress::TimedEgressFailureReceipt,
+    ) -> Result<(), Error> {
+        let timed_enqueue = failure.timed_enqueue.as_ref();
+        let immediate_enqueue = failure.immediate_enqueue.as_ref();
+        let send_attempt = failure.send_attempt.as_ref();
+        let enqueue_monotonic_ns = timed_enqueue
+            .map(|enqueue| enqueue.enqueue_monotonic_ns)
+            .or_else(|| immediate_enqueue.map(|enqueue| enqueue.enqueue_monotonic_ns))
+            .or_else(|| send_attempt?.enqueue_monotonic_ns);
+        let enqueue_tai_lower_ns = timed_enqueue
+            .map(|enqueue| enqueue.enqueue_before_tai_ns)
+            .or_else(|| immediate_enqueue.map(|enqueue| enqueue.enqueue_before_tai_ns))
+            .or_else(|| send_attempt.map(|attempt| attempt.enqueue_before_tai_ns));
+        let enqueue_tai_upper_ns = timed_enqueue
+            .map(|enqueue| enqueue.enqueue_after_tai_ns)
+            .or_else(|| immediate_enqueue.map(|enqueue| enqueue.enqueue_after_tai_ns))
+            .or_else(|| send_attempt?.enqueue_after_tai_ns);
+        let item_id = self.next_item_id;
+        self.next_item_id = self.next_item_id.saturating_add(1);
+        let terminal_outcome = if failure.txtime_error.is_some() {
+            "txtime-error"
+        } else {
+            "timestamp-evidence-missing"
+        };
+        let detail = failure.terminal_error_detail.clone();
+        let terminal_error = failure.terminal_error.clone();
+        self.current_job_mut(job_id)?
+            .items
+            .push(BufloKernelRawItem {
+                item_id,
+                job_id,
+                order_index,
+                event_id,
+                role,
+                endpoint_index,
+                endpoint,
+                send_path,
+                datagram_sha256,
+                source_address,
+                destination_address,
+                udp_payload_bytes,
+                target_tai_ns,
+                scm_txtime_tai_ns,
+                enqueue_monotonic_ns,
+                enqueue_tai_lower_ns,
+                enqueue_tai_upper_ns,
+                socket_timestamp_id: failure.socket_timestamp_id,
+                tx_sched_realtime_ns: failure.tx_sched_realtime_ns,
+                tx_software_realtime_ns: failure.tx_software_realtime_ns,
+                provisional_tx_software_tai_lower_ns: None,
+                provisional_tx_software_tai_upper_ns: None,
+                send_attempt: failure.send_attempt,
+                txtime_error: failure.txtime_error,
+                terminal_error: Some(terminal_error.clone()),
+                terminal_error_detail: Some(detail.clone()),
+                finalization_state: "helper-terminal-failure".into(),
+                terminal_outcome: terminal_outcome.into(),
+            });
+        let job = self.current_job_mut(job_id)?;
+        job.terminal_error = Some(format!(
+            "{role} item {item_id} failed with {terminal_error}: {detail}"
+        ));
+        job.terminal_outcome = "failed".into();
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exact main send retains one linear, auditable failure receipt for every stage of the timed transmission"
+    )]
+    fn transmit_exact_main(
+        &mut self,
+        job_id: u64,
+        endpoint_index: usize,
+        endpoint: QcsdEndpointId,
+        event_id: u64,
+        batch: datagram::Batch,
+    ) -> Result<(Instant, u64), Error> {
+        let job = self.current_job(job_id)?;
+        if !job.items.is_empty() || event_id != job.tick.saturating_mul(2) {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} main item order or event identity was invalid"
+            )));
+        }
+        let target_tai_ns = job.release_tai_ns;
+        let scm_txtime_tai_ns = target_tai_ns
+            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO SCM_TXTIME overflow".into()))?;
+        self.validate_batch_tuple(endpoint_index, &batch)?;
+        let datagram_sha256 = sha256(batch.data())?;
+        let source_address = batch.source();
+        let destination_address = batch.destination();
+        let udp_payload_bytes = batch.data().len();
+        let result = self
+            .helper
+            .as_mut()
+            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?
+            .transmit_main(
+                job_id,
+                endpoint_index,
+                batch,
+                scm_txtime_tai_ns,
+                target_tai_ns,
+                BUFLO_KERNEL_TX_REPORT_ALLOWANCE,
+            );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let failure = error.failure_receipt();
+                self.record_failed_attempt(
+                    job_id,
+                    0,
+                    event_id,
+                    "exact-outgoing",
+                    endpoint_index,
+                    endpoint,
+                    "etf",
+                    datagram_sha256,
+                    source_address,
+                    destination_address,
+                    udp_payload_bytes,
+                    target_tai_ns,
+                    Some(scm_txtime_tai_ns),
+                    failure,
+                )?;
+                return Err(buflo_kernel_timed_error("exact transmit", error));
+            }
+        };
+        let unexpected_post_main = !result.post_main.is_empty();
+        let phase = match sample_buflo_kernel_clock_phase() {
+            Ok(phase) => phase,
+            Err(error) => {
+                let item_id = self.next_item_id;
+                self.next_item_id = self.next_item_id.saturating_add(1);
+                let detail = format!("post-transmit clock sample failed: {error}");
+                self.current_job_mut(job_id)?
+                    .items
+                    .push(BufloKernelRawItem {
+                        item_id,
+                        job_id,
+                        order_index: 0,
+                        event_id,
+                        role: "exact-outgoing",
+                        endpoint_index,
+                        endpoint,
+                        send_path: "etf",
+                        datagram_sha256,
+                        source_address,
+                        destination_address,
+                        udp_payload_bytes,
+                        target_tai_ns,
+                        scm_txtime_tai_ns: Some(scm_txtime_tai_ns),
+                        enqueue_monotonic_ns: Some(result.enqueue.enqueue_monotonic_ns),
+                        enqueue_tai_lower_ns: Some(result.enqueue.enqueue_before_tai_ns),
+                        enqueue_tai_upper_ns: Some(result.enqueue.enqueue_after_tai_ns),
+                        socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
+                        tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
+                        tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
+                        provisional_tx_software_tai_lower_ns: None,
+                        provisional_tx_software_tai_upper_ns: None,
+                        send_attempt: None,
+                        txtime_error: None,
+                        terminal_error: Some("clock_sample_failed".into()),
+                        terminal_error_detail: Some(detail.clone()),
+                        finalization_state: "physical-transmit-proven".into(),
+                        terminal_outcome: "timestamp-evidence-missing".into(),
+                    });
+                self.current_job_mut(job_id)?.terminal_error = Some(detail);
+                return Err(error);
+            }
+        };
+        let window =
+            self.check_physical_window(job_id, result.outcome.tx_software_realtime_ns, &phase);
+        let enqueued_before_release = result.enqueue.enqueue_before_tai_ns
+            <= result.enqueue.enqueue_after_tai_ns
+            && result.enqueue.enqueue_after_tai_ns < target_tai_ns;
+        let terminal_outcome = if window.is_ok() && enqueued_before_release {
+            "transmitted"
+        } else {
+            "window-violation"
+        };
+        let item_id = self.next_item_id;
+        self.next_item_id = self.next_item_id.saturating_add(1);
+        self.current_job_mut(job_id)?
+            .items
+            .push(BufloKernelRawItem {
+                item_id,
+                job_id,
+                order_index: 0,
+                event_id,
+                role: "exact-outgoing",
+                endpoint_index,
+                endpoint,
+                send_path: "etf",
+                datagram_sha256,
+                source_address,
+                destination_address,
+                udp_payload_bytes,
+                target_tai_ns,
+                scm_txtime_tai_ns: Some(scm_txtime_tai_ns),
+                enqueue_monotonic_ns: Some(result.enqueue.enqueue_monotonic_ns),
+                enqueue_tai_lower_ns: Some(result.enqueue.enqueue_before_tai_ns),
+                enqueue_tai_upper_ns: Some(result.enqueue.enqueue_after_tai_ns),
+                socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
+                tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
+                tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
+                provisional_tx_software_tai_lower_ns: window.as_ref().ok().map(|value| value.0),
+                provisional_tx_software_tai_upper_ns: window.as_ref().ok().map(|value| value.1),
+                send_attempt: None,
+                txtime_error: None,
+                terminal_error: None,
+                terminal_error_detail: None,
+                finalization_state: "physical-transmit-proven".into(),
+                terminal_outcome: terminal_outcome.into(),
+            });
+        if unexpected_post_main {
+            self.current_job_mut(job_id)?.terminal_error =
+                Some("exact-only helper command returned unexpected post-main outcomes".into());
+            return Err(Error::SlotInvariant(
+                "BuFLO exact-only helper command returned post-main outcomes".into(),
+            ));
+        }
+        if !enqueued_before_release {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} exact datagram was not fully enqueued before release"
+            )));
+        }
+        window.map(|(_, _, instant)| (instant, item_id))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the ordered credit send retains one linear, auditable failure receipt for every stage of the timed transmission"
+    )]
+    fn transmit_incoming_credit(
+        &mut self,
+        job_id: u64,
+        endpoint_index: usize,
+        endpoint: QcsdEndpointId,
+        event_id: u64,
+        batch: datagram::Batch,
+        timeout: Duration,
+    ) -> Result<(Instant, u64), Error> {
+        let job = self.current_job(job_id)?;
+        if job.items.is_empty() || event_id != job.tick.saturating_mul(2).saturating_add(1) {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} incoming item order or event identity was invalid"
+            )));
+        }
+        if job.items.len().saturating_sub(1) >= self.runtime_contract.max_post_main_datagrams {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} exceeded its receipted incoming-credit datagram bound"
+            )));
+        }
+        let target_tai_ns = job.release_tai_ns;
+        let deadline_tai_ns = job.deadline_tai_ns;
+        let prior_tx_upper_tai_ns = job
+            .items
+            .last()
+            .and_then(|item| item.provisional_tx_software_tai_upper_ns)
+            .ok_or_else(|| {
+                Error::DefenseExecution(format!(
+                    "BuFLO kernel job {job_id} lacked conservative prior TX evidence before incoming credit"
+                ))
+            })?;
+        let order_index = u64::try_from(job.items.len()).unwrap_or(u64::MAX);
+        self.validate_batch_tuple(endpoint_index, &batch)?;
+        let datagram_sha256 = sha256(batch.data())?;
+        let source_address = batch.source();
+        let destination_address = batch.destination();
+        let udp_payload_bytes = batch.data().len();
+        let result = self
+            .helper
+            .as_mut()
+            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?
+            .transmit_immediate(job_id, endpoint_index, batch, deadline_tai_ns, timeout);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let failure = error.failure_receipt();
+                self.record_failed_attempt(
+                    job_id,
+                    order_index,
+                    event_id,
+                    "incoming-credit",
+                    endpoint_index,
+                    endpoint,
+                    "ordered-after-exact",
+                    datagram_sha256,
+                    source_address,
+                    destination_address,
+                    udp_payload_bytes,
+                    target_tai_ns,
+                    None,
+                    failure,
+                )?;
+                return Err(buflo_kernel_timed_error("incoming-credit transmit", error));
+            }
+        };
+        let phase = match sample_buflo_kernel_clock_phase() {
+            Ok(phase) => phase,
+            Err(error) => {
+                let item_id = self.next_item_id;
+                self.next_item_id = self.next_item_id.saturating_add(1);
+                let detail = format!("post-transmit clock sample failed: {error}");
+                self.current_job_mut(job_id)?
+                    .items
+                    .push(BufloKernelRawItem {
+                        item_id,
+                        job_id,
+                        order_index,
+                        event_id,
+                        role: "incoming-credit",
+                        endpoint_index,
+                        endpoint,
+                        send_path: "ordered-after-exact",
+                        datagram_sha256,
+                        source_address,
+                        destination_address,
+                        udp_payload_bytes,
+                        target_tai_ns,
+                        scm_txtime_tai_ns: None,
+                        enqueue_monotonic_ns: Some(result.enqueue_monotonic_ns),
+                        enqueue_tai_lower_ns: Some(result.enqueue_before_tai_ns),
+                        enqueue_tai_upper_ns: Some(result.enqueue_after_tai_ns),
+                        socket_timestamp_id: Some(result.kernel_timestamp_id),
+                        tx_sched_realtime_ns: Some(result.tx_sched_realtime_ns),
+                        tx_software_realtime_ns: Some(result.tx_software_realtime_ns),
+                        provisional_tx_software_tai_lower_ns: None,
+                        provisional_tx_software_tai_upper_ns: None,
+                        send_attempt: None,
+                        txtime_error: None,
+                        terminal_error: Some("clock_sample_failed".into()),
+                        terminal_error_detail: Some(detail.clone()),
+                        finalization_state: "physical-transmit-proven".into(),
+                        terminal_outcome: "timestamp-evidence-missing".into(),
+                    });
+                self.current_job_mut(job_id)?.terminal_error = Some(detail);
+                return Err(error);
+            }
+        };
+        let window = self.check_physical_window(job_id, result.tx_software_realtime_ns, &phase);
+        let causally_ordered = window.as_ref().is_ok_and(|(lower, _, _)| {
+            buflo_kernel_credit_intervals_are_causally_ordered(
+                prior_tx_upper_tai_ns,
+                result.enqueue_before_tai_ns,
+                result.enqueue_after_tai_ns,
+                *lower,
+                deadline_tai_ns,
+            )
+        });
+        let terminal_outcome = if window.is_ok() && causally_ordered {
+            "transmitted"
+        } else {
+            "window-violation"
+        };
+        let item_id = self.next_item_id;
+        self.next_item_id = self.next_item_id.saturating_add(1);
+        self.current_job_mut(job_id)?
+            .items
+            .push(BufloKernelRawItem {
+                item_id,
+                job_id,
+                order_index,
+                event_id,
+                role: "incoming-credit",
+                endpoint_index,
+                endpoint,
+                send_path: "ordered-after-exact",
+                datagram_sha256,
+                source_address,
+                destination_address,
+                udp_payload_bytes,
+                target_tai_ns,
+                scm_txtime_tai_ns: None,
+                enqueue_monotonic_ns: Some(result.enqueue_monotonic_ns),
+                enqueue_tai_lower_ns: Some(result.enqueue_before_tai_ns),
+                enqueue_tai_upper_ns: Some(result.enqueue_after_tai_ns),
+                socket_timestamp_id: Some(result.kernel_timestamp_id),
+                tx_sched_realtime_ns: Some(result.tx_sched_realtime_ns),
+                tx_software_realtime_ns: Some(result.tx_software_realtime_ns),
+                provisional_tx_software_tai_lower_ns: window.as_ref().ok().map(|value| value.0),
+                provisional_tx_software_tai_upper_ns: window.as_ref().ok().map(|value| value.1),
+                send_attempt: None,
+                txtime_error: None,
+                terminal_error: None,
+                terminal_error_detail: None,
+                finalization_state: "physical-transmit-proven".into(),
+                terminal_outcome: terminal_outcome.into(),
+            });
+        if !causally_ordered {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} incoming-credit intervals did not prove strict ordering and deadline admission"
+            )));
+        }
+        window.map(|(_, _, instant)| (instant, item_id))
+    }
+
+    fn complete_job(&mut self, job_id: u64) -> Result<(), Error> {
+        let ready =
+            buflo_kernel_job_ready_to_close(self.current_job(job_id)?, self.endpoint_tuples.len());
+        if !ready {
+            let detail = format!(
+                "BuFLO kernel job {job_id} reached close before all physical items and incoming-credit identities were finalised"
+            );
+            let job = self.current_job_mut(job_id)?;
+            job.terminal_error = Some(detail.clone());
+            job.terminal_outcome = "failed".into();
+            return Err(Error::DefenseExecution(detail));
+        }
+
+        let close = match self
+            .helper
+            .as_mut()
+            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?
+            .finish_job(job_id)
+        {
+            Ok(close) => close,
+            Err(error) => {
+                let detail = format!("BuFLO kernel helper job close failed: {error}");
+                let job = self.current_job_mut(job_id)?;
+                job.terminal_error = Some(detail);
+                job.terminal_outcome = "failed".into();
+                return Err(buflo_kernel_timed_error("job close", error));
+            }
+        };
+        let expected_unused_post_main_datagrams = self
+            .runtime_contract
+            .max_post_main_datagrams
+            .saturating_sub(buflo_kernel_consumed_post_main_datagram_count(
+                &self.current_job(job_id)?.items,
+            ));
+        let close_valid =
+            buflo_kernel_close_receipt_valid(&close, job_id, expected_unused_post_main_datagrams);
+        let job = self.current_job_mut(job_id)?;
+        job.helper_job_close = Some(close);
+        if !close_valid {
+            let detail =
+                format!("BuFLO kernel helper returned an invalid close receipt for job {job_id}");
+            job.terminal_error = Some(detail.clone());
+            job.terminal_outcome = "failed".into();
+            return Err(Error::DefenseExecution(detail));
+        }
+        job.terminal_outcome = "complete".into();
+        Ok(())
+    }
+
+    fn remaining_job_window(&self, job_id: u64) -> Result<Duration, Error> {
+        let deadline_tai_ns = self.current_job(job_id)?.deadline_tai_ns;
+        let current_tai_ns = timed_egress::clock_tai_ns()
+            .map_err(|error| buflo_kernel_timed_error("deadline sample", error))?;
+        deadline_tai_ns
+            .checked_sub(current_tai_ns)
+            .filter(|remaining| *remaining != 0)
+            .map(Duration::from_nanos)
+            .ok_or_else(|| {
+                Error::DefenseExecution(format!(
+                    "BuFLO kernel job {job_id} exhausted its strict physical window"
+                ))
+            })
+    }
+
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "total kernel-runtime finalisation deliberately audits every item, job, clock, helper, and cleanup condition in one receipt-producing transaction"
+    )]
+    fn finish(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
+        let mut cleanup_errors = Vec::new();
+        let mut terminal_errors = Vec::new();
+        let epoch = self.epoch;
+        if epoch.is_none() {
+            cleanup_errors.push("BuFLO kernel epoch was never armed".into());
+        }
+
+        if let Some(mut helper) = self.helper.take() {
+            let lifecycle_before_shutdown = match helper.lifecycle_receipt() {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(error) => {
+                    cleanup_errors.push(format!(
+                        "BuFLO helper lifecycle snapshot before shutdown failed: {error}"
+                    ));
+                    None
+                }
+            };
+            if let Some((active_job_id, expected_failed_commands)) =
+                lifecycle_before_shutdown.as_ref().and_then(|lifecycle| {
+                    lifecycle
+                        .active_job_id
+                        .map(|active_job_id| (active_job_id, lifecycle.failed_commands))
+                })
+            {
+                let abort_reason = "runner finalisation reached an incomplete kernel-timed job";
+                let expected_unused_post_main_datagrams = self
+                    .runtime_contract
+                    .max_post_main_datagrams
+                    .saturating_sub(
+                        self.current_job(active_job_id)
+                            .map(|job| buflo_kernel_consumed_post_main_datagram_count(&job.items))
+                            .unwrap_or(0),
+                    );
+                match helper.abort_job(active_job_id, abort_reason) {
+                    Ok(abort) => match self.current_job_mut(active_job_id) {
+                        Ok(job) => {
+                            let abort_valid = buflo_kernel_abort_receipt_valid(
+                                &abort,
+                                active_job_id,
+                                abort_reason,
+                                expected_unused_post_main_datagrams,
+                                expected_failed_commands,
+                            );
+                            job.helper_job_abort = Some(abort);
+                            let abort_detail = if abort_valid {
+                                "helper job aborted during runner finalisation"
+                            } else {
+                                "helper returned an invalid abort receipt during runner finalisation"
+                            };
+                            job.terminal_error
+                                .get_or_insert_with(|| abort_detail.into());
+                            job.terminal_outcome = "failed".into();
+                            if !abort_valid {
+                                cleanup_errors.push(format!(
+                                    "BuFLO helper returned an invalid abort receipt for job {active_job_id}"
+                                ));
+                            }
+                        }
+                        Err(error) => cleanup_errors.push(format!(
+                            "BuFLO helper aborted unknown raw job {active_job_id}: {error}"
+                        )),
+                    },
+                    Err(error) => cleanup_errors.push(format!(
+                        "BuFLO helper could not abort active job {active_job_id}: {error}"
+                    )),
+                }
+            }
+            match helper.lifecycle_receipt() {
+                Ok(lifecycle) => self.runtime_contract.helper_lifecycle = Some(lifecycle),
+                Err(error) => cleanup_errors.push(format!(
+                    "BuFLO helper lifecycle snapshot before join failed: {error}"
+                )),
+            }
+            let helper_shutdown = helper.shutdown();
+            cleanup_errors.extend(
+                helper_shutdown
+                    .errors
+                    .iter()
+                    .map(|error| format!("BuFLO helper shutdown: {error}")),
+            );
+            if self.runtime_contract.helper_lifecycle.is_none() {
+                self.runtime_contract
+                    .helper_lifecycle
+                    .clone_from(&helper_shutdown.lifecycle);
+            }
+            self.runtime_contract.helper_shutdown = Some(helper_shutdown);
+        } else {
+            cleanup_errors.push("BuFLO kernel helper was absent during finalisation".into());
+        }
+
+        let mut clock_end_error = None;
+        let clock_end = match sample_buflo_kernel_clock_phase() {
+            Ok(phase) => Some(phase),
+            Err(error) => {
+                let detail = format!("BuFLO final clock sample failed: {error}");
+                cleanup_errors.push(detail.clone());
+                clock_end_error = Some(detail);
+                None
+            }
+        };
+        let mut mapping_result = build_buflo_kernel_clock_mapping(
+            &self.clock_start,
+            clock_end.as_ref(),
+            epoch.as_ref().map(|epoch| &epoch.instant_anchor.receipt),
+            clock_end_error.as_deref(),
+        );
+        if let Ok(mapping) = &mut mapping_result
+            && let Err(error) = widen_buflo_kernel_clock_mapping_with_items(mapping, &self.jobs)
+        {
+            mapping_result = Err(error);
+        }
+        let (mapping, clock_mapping_error) = match mapping_result {
+            Ok(mapping) => (Some(mapping), None),
+            Err(error) => {
+                if !cleanup_errors.iter().any(|existing| existing == &error) {
+                    cleanup_errors.push(error.clone());
+                }
+                (None, Some(error))
+            }
+        };
+        let realtime_bounds = mapping
+            .as_ref()
+            .map(|mapping| clock_mapping_offset_bounds(mapping, true));
+        let monotonic_bounds = mapping
+            .as_ref()
+            .map(|mapping| clock_mapping_offset_bounds(mapping, false));
+        let mut jobs = Vec::with_capacity(self.jobs.len());
+        let endpoint_tuples = self.endpoint_tuples;
+        let mut expected_item_id = 0_u64;
+        for (expected_job_index, raw_job) in self.jobs.into_iter().enumerate() {
+            let expected_job_id = u64::try_from(expected_job_index).unwrap_or(u64::MAX);
+            let expected_offset =
+                expected_job_id.checked_mul(duration_as_u64_nanos(Duration::from_millis(20)));
+            let job_identity_and_timing_valid =
+                expected_offset.zip(epoch).is_some_and(|(offset, epoch)| {
+                    raw_job.job_id == expected_job_id
+                        && raw_job.tick == expected_job_id
+                        && epoch.start_monotonic_ns.checked_add(offset)
+                            == Some(raw_job.release_monotonic_ns)
+                        && epoch.start_tai_ns.checked_add(offset) == Some(raw_job.release_tai_ns)
+                        && raw_job
+                            .release_monotonic_ns
+                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+                            == Some(raw_job.deadline_monotonic_ns)
+                        && raw_job
+                            .release_tai_ns
+                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+                            == Some(raw_job.deadline_tai_ns)
+                });
+            if !job_identity_and_timing_valid {
+                terminal_errors.push(format!(
+                    "BuFLO kernel job {} failed contiguous epoch/cadence identity validation",
+                    raw_job.job_id
+                ));
+            }
+            let mut items = Vec::with_capacity(raw_job.items.len());
+            let mut previous_tx_software_upper_ns = None;
+            let mut carrier_owners = BTreeSet::new();
+            for (expected_order_index, raw) in raw_job.items.into_iter().enumerate() {
+                let expected_order_index = u64::try_from(expected_order_index).unwrap_or(u64::MAX);
+                let item_sequence_valid = raw.item_id == expected_item_id
+                    && raw.job_id == raw_job.job_id
+                    && raw.order_index == expected_order_index;
+                expected_item_id = expected_item_id.saturating_add(1);
+                let translate = |raw_ns: Option<u64>| -> Option<(u64, u64)> {
+                    let raw_ns = raw_ns?;
+                    let bounds = realtime_bounds?;
+                    translate_clock_interval(raw_ns, bounds).ok()
+                };
+                let tx_sched = translate(raw.tx_sched_realtime_ns);
+                let tx_software = translate(raw.tx_software_realtime_ns);
+                let enqueue_from_monotonic = raw.enqueue_monotonic_ns.and_then(|raw_ns| {
+                    let bounds = monotonic_bounds?;
+                    translate_clock_interval(raw_ns, bounds).ok()
+                });
+                let enqueue_interval_complete = raw
+                    .enqueue_tai_lower_ns
+                    .zip(raw.enqueue_tai_upper_ns)
+                    .is_some_and(|(lower, upper)| lower <= upper);
+                let enqueue_clock_consistent = enqueue_from_monotonic
+                    .zip(raw.enqueue_tai_lower_ns.zip(raw.enqueue_tai_upper_ns))
+                    .is_some_and(
+                        |((mapped_lower, mapped_upper), (direct_lower, direct_upper))| {
+                            mapped_lower <= direct_upper && direct_lower <= mapped_upper
+                        },
+                    );
+                let timestamp_evidence_complete = raw.socket_timestamp_id.is_some()
+                    && tx_sched.is_some()
+                    && tx_software.is_some();
+                let tx_order_valid = raw
+                    .tx_sched_realtime_ns
+                    .zip(raw.tx_software_realtime_ns)
+                    .is_some_and(|(scheduled, software)| scheduled <= software);
+                let physical_window_valid = tx_software.is_some_and(|(lower, upper)| {
+                    buflo_kernel_interval_within_half_open_window(
+                        lower,
+                        upper,
+                        raw_job.release_tai_ns,
+                        raw_job.deadline_tai_ns,
+                    )
+                });
+                let provisional_interval_valid = raw
+                    .provisional_tx_software_tai_lower_ns
+                    .zip(raw.provisional_tx_software_tai_upper_ns)
+                    .zip(tx_software)
+                    .is_some_and(|((provisional_lower, provisional_upper), final_interval)| {
+                        buflo_kernel_final_envelope_contains_provisional(
+                            provisional_lower,
+                            provisional_upper,
+                            final_interval.0,
+                            final_interval.1,
+                        )
+                    });
+                let endpoint_tuple_valid = u64::try_from(raw.endpoint_index)
+                    .is_ok_and(|index| index == raw.endpoint.0)
+                    && endpoint_tuples
+                        .get(raw.endpoint_index)
+                        .is_some_and(|expected| {
+                            *expected == (raw.source_address, raw.destination_address)
+                        });
+                let controller_and_trace_finalized =
+                    raw.finalization_state == "controller-and-trace-finalized";
+                let structural_and_order_valid = if expected_order_index == 0 {
+                    raw.role == "exact-outgoing"
+                        && raw.send_path == "etf"
+                        && raw.event_id == raw_job.tick.saturating_mul(2)
+                        && raw.udp_payload_bytes == 1_200
+                        && raw.target_tai_ns == raw_job.release_tai_ns
+                        && raw.scm_txtime_tai_ns
+                            == raw_job
+                                .release_tai_ns
+                                .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
+                        && raw
+                            .enqueue_tai_upper_ns
+                            .is_some_and(|upper| upper < raw_job.release_tai_ns)
+                } else if let Some(previous_upper) = previous_tx_software_upper_ns {
+                    let credit_intervals_valid = raw
+                        .enqueue_tai_lower_ns
+                        .zip(raw.enqueue_tai_upper_ns)
+                        .zip(tx_software)
+                        .is_some_and(|((enqueue_lower, enqueue_upper), (tx_lower, _))| {
+                            buflo_kernel_credit_intervals_are_causally_ordered(
+                                previous_upper,
+                                enqueue_lower,
+                                enqueue_upper,
+                                tx_lower,
+                                raw_job.deadline_tai_ns,
+                            )
+                        });
+                    raw.role == "incoming-credit"
+                        && raw.send_path == "ordered-after-exact"
+                        && raw.event_id == raw_job.tick.saturating_mul(2).saturating_add(1)
+                        && raw.scm_txtime_tai_ns.is_none()
+                        && (1..=1_200).contains(&raw.udp_payload_bytes)
+                        && carrier_owners.insert((raw.endpoint_index, raw.endpoint.0))
+                        && credit_intervals_valid
+                } else {
+                    terminal_errors.push(format!(
+                        "BuFLO kernel job {} item {} lacked prior conservative TX evidence",
+                        raw_job.job_id, raw.item_id
+                    ));
+                    false
+                };
+                let validation = BufloKernelItemValidation {
+                    enqueue_interval_complete,
+                    enqueue_clock_consistent,
+                    timestamp_evidence_complete,
+                    tx_order_valid,
+                    physical_window_valid,
+                    provisional_interval_valid,
+                    endpoint_tuple_valid,
+                    item_sequence_valid,
+                    job_identity_and_timing_valid,
+                    controller_and_trace_finalized,
+                    structural_and_order_valid,
+                };
+                let final_success = buflo_kernel_item_validation_complete(&raw, &validation);
+                let terminal_outcome = if final_success {
+                    "transmitted".to_string()
+                } else if raw.txtime_error.is_some() {
+                    "txtime-error".to_string()
+                } else if raw.terminal_outcome == "controller-trace-finalization-failed" {
+                    "controller-trace-finalization-failed".to_string()
+                } else if !timestamp_evidence_complete || !enqueue_interval_complete {
+                    "timestamp-evidence-missing".to_string()
+                } else {
+                    "window-violation".to_string()
+                };
+                let terminal_error = raw.terminal_error.clone().or_else(|| {
+                    (!final_success)
+                        .then(|| "final_conservative_envelope_validation_failed".to_string())
+                });
+                let terminal_error_detail = raw.terminal_error_detail.clone().or_else(|| {
+                    (!final_success).then(|| {
+                        format!(
+                            "item {} failed final mapping: enqueue_complete={enqueue_interval_complete}, enqueue_clock_consistent={enqueue_clock_consistent}, timestamp_complete={timestamp_evidence_complete}, tx_order={tx_order_valid}, physical_window={physical_window_valid}, provisional_interval={provisional_interval_valid}, endpoint_tuple={endpoint_tuple_valid}, item_sequence={item_sequence_valid}, job_identity={job_identity_and_timing_valid}, controller_trace_finalized={controller_and_trace_finalized}, structural_order={structural_and_order_valid}",
+                            raw.item_id
+                        )
+                    })
+                });
+                if let Some(detail) = &terminal_error_detail {
+                    terminal_errors.push(format!(
+                        "BuFLO kernel job {} item {}: {detail}",
+                        raw_job.job_id, raw.item_id
+                    ));
+                }
+                previous_tx_software_upper_ns = final_success
+                    .then(|| tx_software.map(|(_, upper)| upper))
+                    .flatten();
+                items.push(BufloKernelItemReceipt {
+                    schema_version: 1,
+                    item_id: raw.item_id,
+                    job_id: raw.job_id,
+                    order_index: raw.order_index,
+                    event_id: raw.event_id,
+                    role: raw.role,
+                    endpoint_index: raw.endpoint_index,
+                    endpoint: raw.endpoint.0,
+                    send_path: raw.send_path,
+                    datagram_sha256: raw.datagram_sha256,
+                    source_address: raw.source_address.to_string(),
+                    destination_address: raw.destination_address.to_string(),
+                    socket_timestamp_id: raw.socket_timestamp_id,
+                    udp_payload_bytes: raw.udp_payload_bytes,
+                    target_tai_ns: raw.target_tai_ns,
+                    scm_txtime_tai_ns: raw.scm_txtime_tai_ns,
+                    enqueue_monotonic_ns: raw.enqueue_monotonic_ns,
+                    enqueue_tai_ns: raw
+                        .enqueue_tai_lower_ns
+                        .zip(raw.enqueue_tai_upper_ns)
+                        .map(|(lower, upper)| interval_midpoint(lower, upper)),
+                    enqueue_tai_lower_ns: raw.enqueue_tai_lower_ns,
+                    enqueue_tai_upper_ns: raw.enqueue_tai_upper_ns,
+                    tx_sched_realtime_ns: raw.tx_sched_realtime_ns,
+                    tx_sched_tai_ns: tx_sched.map(|(lower, upper)| interval_midpoint(lower, upper)),
+                    tx_sched_tai_lower_ns: tx_sched.map(|value| value.0),
+                    tx_sched_tai_upper_ns: tx_sched.map(|value| value.1),
+                    tx_software_realtime_ns: raw.tx_software_realtime_ns,
+                    provisional_tx_software_tai_lower_ns: raw.provisional_tx_software_tai_lower_ns,
+                    provisional_tx_software_tai_upper_ns: raw.provisional_tx_software_tai_upper_ns,
+                    tx_software_tai_ns: tx_software
+                        .map(|(lower, upper)| interval_midpoint(lower, upper)),
+                    tx_software_tai_lower_ns: tx_software.map(|value| value.0),
+                    tx_software_tai_upper_ns: tx_software.map(|value| value.1),
+                    send_attempt: raw.send_attempt,
+                    txtime_error: raw.txtime_error,
+                    terminal_error,
+                    terminal_error_detail,
+                    finalization_state: raw.finalization_state,
+                    terminal_outcome,
+                });
+            }
+            let validated_carriers: Vec<_> = items
+                .iter()
+                .map(|item| BufloKernelValidatedCarrier {
+                    item_id: item.item_id,
+                    endpoint_index: item.endpoint_index,
+                    endpoint: item.endpoint,
+                    role: item.role,
+                    transmitted: item.terminal_outcome == "transmitted",
+                })
+                .collect();
+            let credit_identity_complete = buflo_kernel_credit_inventory_complete(
+                raw_job.tick,
+                &raw_job.credit_identities,
+                &validated_carriers,
+                endpoint_tuples.len(),
+            );
+            let expected_unused_post_main_datagrams = self
+                .runtime_contract
+                .max_post_main_datagrams
+                .saturating_sub(
+                    items
+                        .iter()
+                        .filter(|item| item.role == "incoming-credit")
+                        .count(),
+                );
+            let job_complete = buflo_kernel_job_validation_complete(
+                &raw_job.terminal_outcome,
+                raw_job.terminal_error.is_some(),
+                items.len(),
+                items
+                    .iter()
+                    .all(|item| item.terminal_outcome == "transmitted"),
+                credit_identity_complete,
+                raw_job.helper_job_close.as_ref(),
+                raw_job.job_id,
+                expected_unused_post_main_datagrams,
+                raw_job.prepared_output_failure.is_some(),
+                raw_job.helper_job_abort.is_some(),
+            );
+            let job_terminal_error = raw_job.terminal_error.or_else(|| {
+                (!job_complete).then(|| {
+                    "job did not retain complete conservative kernel timing evidence".to_string()
+                })
+            });
+            if let Some(error) = &job_terminal_error {
+                terminal_errors.push(format!("BuFLO kernel job {}: {error}", raw_job.job_id));
+            }
+            jobs.push(BufloKernelJobReceipt {
+                schema_version: 1,
+                job_id: raw_job.job_id,
+                tick: raw_job.tick,
+                release_monotonic_ns: raw_job.release_monotonic_ns,
+                release_tai_ns: raw_job.release_tai_ns,
+                deadline_monotonic_ns: raw_job.deadline_monotonic_ns,
+                deadline_tai_ns: raw_job.deadline_tai_ns,
+                items,
+                credit_identities: raw_job.credit_identities,
+                prepared_output_failure: raw_job.prepared_output_failure,
+                helper_job_close: raw_job.helper_job_close,
+                helper_job_abort: raw_job.helper_job_abort,
+                terminal_error: job_terminal_error,
+                terminal_outcome: if job_complete { "complete" } else { "failed" }.into(),
+            });
+        }
+        let flat_items: Vec<_> = jobs.iter().flat_map(|job| job.items.iter()).collect();
+        let transmitted_item_count = flat_items
+            .iter()
+            .filter(|item| item.terminal_outcome == "transmitted")
+            .count();
+        let failed_item_count = flat_items.len().saturating_sub(transmitted_item_count);
+        let max_tx_software_lateness_ns = flat_items
+            .iter()
+            .filter_map(|item| {
+                item.tx_software_tai_upper_ns
+                    .map(|tx| tx.saturating_sub(item.target_tai_ns))
+            })
+            .max()
+            .unwrap_or(0);
+        let helper_evidence_success = buflo_kernel_helper_evidence_complete(
+            &self.runtime_contract,
+            &self.qdisc_contract,
+            &endpoint_tuples,
+            jobs.len(),
+            jobs.last().map(|job| job.job_id),
+            flat_items
+                .iter()
+                .filter(|item| item.send_path == "ordered-after-exact")
+                .count(),
+        );
+        if !helper_evidence_success {
+            terminal_errors.push(
+                "BuFLO timed-egress helper lifecycle or shutdown evidence was not clean".into(),
+            );
+        }
+        let aggregate = BufloKernelAggregateReceipt {
+            schema_version: 1,
+            job_count: jobs.len(),
+            item_count: flat_items.len(),
+            etf_item_count: flat_items
+                .iter()
+                .filter(|item| item.send_path == "etf")
+                .count(),
+            ordered_item_count: flat_items
+                .iter()
+                .filter(|item| item.send_path == "ordered-after-exact")
+                .count(),
+            captured_credit_identity_count: jobs
+                .iter()
+                .map(|job| job.credit_identities.len())
+                .sum(),
+            prepared_output_failure_count: jobs
+                .iter()
+                .filter(|job| job.prepared_output_failure.is_some())
+                .count(),
+            main_coalesced_credit_identity_count: jobs
+                .iter()
+                .flat_map(|job| &job.credit_identities)
+                .filter(|identity| identity.resolution == "coalesced-in-main-finalized")
+                .count(),
+            carrier_credit_identity_count: jobs
+                .iter()
+                .flat_map(|job| &job.credit_identities)
+                .filter(|identity| identity.resolution == "post-main-carrier-finalized")
+                .count(),
+            unresolved_credit_identity_count: jobs
+                .iter()
+                .flat_map(|job| &job.credit_identities)
+                .filter(|identity| {
+                    !matches!(
+                        identity.resolution.as_str(),
+                        "coalesced-in-main-finalized" | "post-main-carrier-finalized"
+                    )
+                })
+                .count(),
+            transmitted_item_count,
+            failed_item_count,
+            tx_sched_timestamp_count: flat_items
+                .iter()
+                .filter(|item| item.tx_sched_tai_ns.is_some())
+                .count(),
+            tx_software_timestamp_count: flat_items
+                .iter()
+                .filter(|item| item.tx_software_tai_ns.is_some())
+                .count(),
+            txtime_error_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "txtime-error")
+                .count(),
+            timestamp_evidence_missing_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "timestamp-evidence-missing")
+                .count(),
+            window_violation_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "window-violation")
+                .count(),
+            unresolved_item_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "unresolved")
+                .count(),
+            max_tx_software_lateness_ns,
+            terminal_outcome: if buflo_kernel_aggregate_validation_complete(
+                failed_item_count,
+                jobs.len(),
+                jobs.iter().all(|job| job.terminal_outcome == "complete"),
+                helper_evidence_success,
+                mapping.is_some(),
+                primary_error.is_some(),
+                cleanup_errors.len(),
+                terminal_errors.len(),
+            ) {
+                "complete"
+            } else {
+                "failed"
+            },
+        };
+        let terminal_outcome = aggregate.terminal_outcome.to_string();
+        BufloKernelTxReceipt {
+            schema_version: 1,
+            semantics: BUFLO_KERNEL_TX_SEMANTICS,
+            terminal_outcome,
+            primary_error,
+            cleanup_errors,
+            defense_start_monotonic_ns: epoch.map(|epoch| epoch.start_monotonic_ns),
+            defense_start_tai_ns: epoch.map(|epoch| epoch.start_tai_ns),
+            clock_start: self.clock_start,
+            clock_end,
+            clock_mapping_valid: mapping.is_some(),
+            clock_mapping_error,
+            clock_mapping: mapping,
+            runtime_contract: self.runtime_contract,
+            qdisc_contract: self.qdisc_contract,
+            jobs,
+            aggregate,
+            terminal_errors,
+        }
+    }
+}
+
 fn scheduler_contract_matches(evidence: &ProcessSchedulerEvidence) -> bool {
     evidence.contract.as_deref().is_none_or(|value| {
-        value == QCSD_CLIENT_SCHEDULER_CONTRACT
-            && evidence.source == "linux-sched-and-procfs-v1"
+        let capability_phase_valid = match value {
+            QCSD_CLIENT_SCHEDULER_CONTRACT => {
+                evidence.effective_capabilities_hex.as_deref() == Some("0000000000000000")
+            }
+            QCSD_CLIENT_ETF_SCHEDULER_CONTRACT => matches!(
+                evidence.effective_capabilities_hex.as_deref(),
+                // The first observation precedes socket setup.  The completed
+                // run is rewritten only after the timed-egress lifecycle has
+                // validated an irrevocable all-set/bounding/ambient drop.
+                Some("0000000000001100" | "0000000000000000")
+            ),
+            _ => false,
+        };
+        matches!(
+            value,
+            QCSD_CLIENT_SCHEDULER_CONTRACT | QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
+        ) && evidence.source == "linux-sched-and-procfs-v1"
             && evidence.policy == "SCHED_RR"
             && evidence.priority == 1
             && evidence.affinity_cpus == [10]
             && evidence.rlimit_rtprio.soft == 1
             && evidence.rlimit_rtprio.hard == 1
             && evidence.no_new_privileges == Some(true)
-            && evidence.effective_capabilities_hex.as_deref() == Some("0000000000000000")
+            && capability_phase_valid
             && evidence.cgroup_effective_cpuset.as_deref() == Some("10-11")
             && evidence.affinity_scope
                 == "qcsd_container_affinity_partition_not_physical_cpu_isolation"
@@ -2047,10 +5104,12 @@ fn buflo_exact_release_failure_chronology_valid(failure: &BufloExactReleaseLastF
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct RunnerWakeupMetrics {
     schema_version: u32,
-    semantics: &'static str,
+    semantics: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buflo_kernel_tx: Option<serde_json::Value>,
     wait_returns: u64,
     socket_readiness_wakeups: u64,
     timer_wakeups: u64,
@@ -2108,10 +5167,11 @@ struct RunnerWakeupMetrics {
 }
 
 impl RunnerWakeupMetrics {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             schema_version: RUNNER_WAKEUP_METRICS_SCHEMA_VERSION,
-            semantics: RUNNER_WAKEUP_METRICS_SEMANTICS,
+            semantics: RUNNER_WAKEUP_METRICS_SEMANTICS.into(),
+            buflo_kernel_tx: None,
             wait_returns: 0,
             socket_readiness_wakeups: 0,
             timer_wakeups: 0,
@@ -2169,6 +5229,83 @@ impl RunnerWakeupMetrics {
             cs_exact_incoming_retry_resolutions: 0,
             cs_exact_incoming_retry_max_phase_lateness_nanoseconds: 0,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn attach_buflo_kernel_tx(&mut self, receipt: &BufloKernelTxReceipt) -> Result<(), Error> {
+        self.attach_buflo_kernel_tx_value(serde_json::to_value(receipt)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn attach_buflo_kernel_tx_value(&mut self, receipt: serde_json::Value) -> Result<(), Error> {
+        if self.buflo_kernel_tx.is_some() {
+            return Err(Error::SlotInvariant(
+                "BuFLO kernel-tx receipt was attached more than once".into(),
+            ));
+        }
+        // Serialise and retain the total raw receipt before validating the
+        // legacy-metric exclusion. A validation failure must not erase the
+        // helper/clock/packet evidence that explains the failed attempt.
+        self.buflo_kernel_tx = Some(receipt);
+        self.schema_version = 11;
+        self.semantics = format!(
+            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema10_layout_is_retained_for_non_kernel_metrics; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
+        );
+        if self.buflo_exact_release_guard_entries != 0
+            || self.buflo_exact_release_dispatch_ready_guards != 0
+            || self.buflo_exact_release_failed_guards != 0
+            || self.buflo_exact_release_guard_wait_nanoseconds != 0
+            || self.buflo_exact_release_active_wait_nanoseconds != 0
+            || self.buflo_exact_incoming_retry_drives != 0
+            || self.buflo_exact_incoming_retry_resolutions != 0
+        {
+            let detail =
+                "BuFLO kernel timing cannot coexist with legacy exact-release metrics".to_string();
+            self.append_buflo_kernel_cleanup_errors(std::slice::from_ref(&detail))
+                .map_err(|mark_error| {
+                    Error::SlotInvariant(format!(
+                        "{detail}; raw kernel receipt could not be marked failed: {mark_error}"
+                    ))
+                })?;
+            return Err(Error::SlotInvariant(detail));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn append_buflo_kernel_cleanup_errors(&mut self, errors: &[String]) -> Result<(), Error> {
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let receipt = self.buflo_kernel_tx.as_mut().ok_or_else(|| {
+            Error::SlotInvariant(
+                "BuFLO kernel cleanup errors lacked an attached raw receipt".into(),
+            )
+        })?;
+        let object = receipt.as_object_mut().ok_or_else(|| {
+            Error::SlotInvariant("BuFLO kernel raw receipt was not an object".into())
+        })?;
+        let cleanup = object
+            .get_mut("cleanup_errors")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| {
+                Error::SlotInvariant("BuFLO kernel raw receipt lacked cleanup_errors array".into())
+            })?;
+        cleanup.extend(errors.iter().cloned().map(serde_json::Value::String));
+        object.insert(
+            "terminal_outcome".into(),
+            serde_json::Value::String("failed".into()),
+        );
+        if let Some(aggregate) = object
+            .get_mut("aggregate")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            aggregate.insert(
+                "terminal_outcome".into(),
+                serde_json::Value::String("failed".into()),
+            );
+        }
+        Ok(())
     }
 
     const fn record(&mut self, wake: ActivityWake, controller_deadline_selected: bool) {
@@ -2621,7 +5758,7 @@ impl RunnerWakeupMetrics {
         evidence: &BufloExactReleaseWaitEvidence,
     ) -> Result<(), Error> {
         self.validate_buflo_exact_release_guard_evidence(guard, evidence)?;
-        let before = *self;
+        let before = self.clone();
         let BufloExactReleaseWaitEvidence {
             entered_at,
             active_wait_started_at,
@@ -2976,7 +6113,7 @@ impl RunnerWakeupMetrics {
         clippy::too_many_lines,
         reason = "schema-10 aggregate identities remain colocated for fail-closed evidence auditing"
     )]
-    fn buflo_exact_release_invariants_hold(self) -> bool {
+    fn buflo_exact_release_invariants_hold(&self) -> bool {
         let guards = self.buflo_exact_release_guard_entries;
         let dispatch_ready = self.buflo_exact_release_dispatch_ready_guards;
         let failed = self.buflo_exact_release_failed_guards;
@@ -7300,12 +10437,13 @@ fn sha256(bytes: &[u8]) -> Result<String, Error> {
 
 #[expect(
     clippy::future_not_send,
-    reason = "the current-thread runner keeps the connection and controller lifecycle in one event loop"
+    clippy::too_many_lines,
+    reason = "the current-thread runner keeps the connection, terminal artifact, and exact persistence-retry lifecycle in one transaction"
 )]
 async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     // Capture campaigns bind a least-privilege scheduling contract. Direct
     // developer invocations still serialize their unconstrained observation.
-    _ = process_scheduler_evidence()?;
+    let initial_process_scheduler = process_scheduler_evidence()?;
     spec.workload.validate()?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
@@ -7320,11 +10458,18 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
         )));
     }
     fs::create_dir_all(&spec.output_dir)?;
+    let process_scheduler = prepare_process_scheduler_for_network_execution(
+        &spec.config.defense,
+        initial_process_scheduler,
+    )?;
     let wall_start = unix_nanos();
     let process_start = now();
-    write_run_json(
+    let running_bytes = render_run_json(
         &spec,
         &[],
+        &[],
+        &[],
+        &process_scheduler,
         &[],
         wall_start,
         &RunCompletion {
@@ -7337,16 +10482,42 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
             defense_diagnostics: None,
             runner_wakeup_metrics: None,
         },
-    )?;
-    let result = execute_run_inner(&spec, wall_start, process_start).await;
-    if let Err(error) = &result
+    );
+    atomic_write(&spec.output_dir.join("run.json"), &running_bytes)?;
+    let mut terminal_artifact = None;
+    let result = execute_run_inner(
+        &spec,
+        wall_start,
+        process_start,
+        &process_scheduler,
+        &mut terminal_artifact,
+    )
+    .await;
+    if terminal_artifact
+        .as_ref()
+        .is_some_and(|artifact| !artifact.persisted)
+    {
+        let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
+        if let Err(persistence_error) =
+            retry_staged_terminal_with(&mut terminal_artifact, &spec.output_dir, &mut writer)
+        {
+            return Err(terminal_artifact_persistence_error(
+                result.as_ref().err(),
+                &persistence_error,
+            ));
+        }
+    } else if let Err(error) = &result
         && !matches!(error, Error::Timeout(_))
+        && terminal_artifact.is_none()
         && !run_artifact_is_terminal(&spec.output_dir)
     {
         let message = error.to_string();
-        write_run_json(
+        let bytes = render_run_json(
             &spec,
             &[],
+            &[],
+            &[],
+            &process_scheduler,
             &[],
             wall_start,
             &RunCompletion {
@@ -7359,7 +10530,23 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
                 defense_diagnostics: None,
                 runner_wakeup_metrics: None,
             },
-        )?;
+        );
+        let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
+        if let Err(first_persistence_error) = stage_and_persist_terminal_with(
+            &mut terminal_artifact,
+            &spec.output_dir,
+            bytes,
+            &mut writer,
+        ) && let Err(retry_error) =
+            retry_staged_terminal_with(&mut terminal_artifact, &spec.output_dir, &mut writer)
+        {
+            return Err(terminal_artifact_persistence_error(
+                Some(error),
+                &Error::RunAborted(format!(
+                    "first terminal write failed: {first_persistence_error}; exact retry failed: {retry_error}"
+                )),
+            ));
+        }
     }
     result
 }
@@ -7708,6 +10895,7 @@ fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
 }
 
 #[expect(
+    clippy::cognitive_complexity,
     clippy::future_not_send,
     clippy::too_many_lines,
     reason = "the current-thread runner keeps the connection and controller lifecycle in one event loop"
@@ -7716,10 +10904,15 @@ async fn execute_run_inner(
     spec: &RunSpec,
     wall_start: u128,
     process_start: Instant,
+    process_scheduler: &ProcessSchedulerEvidence,
+    terminal_artifact: &mut Option<StagedTerminalRunArtifact>,
 ) -> Result<Vec<ResponseResult>, Error> {
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
     let observation_clock = QcsdObservationClock::new(process_start);
     let mut endpoints = create_endpoints(spec, process_start, &observation_clock)?;
+    // Complete all fallible controller/workload construction before creating
+    // the privileged-setup kernel runtime. Once that runtime exists, every
+    // later error must pass through `finish` and retain its total receipt.
     let mut controller = QcsdController::new(
         spec.config.clone(),
         spec.seed,
@@ -7728,6 +10921,25 @@ async fn execute_run_inner(
             .map(RuntimeChaffManifest::resource_manifest),
     )?;
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
+    let scheduler_initial = process_scheduler.clone();
+    let etf_scheduler_requested =
+        scheduler_initial.contract.as_deref() == Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT);
+    if !process_scheduler_ready_for_network_execution(&scheduler_initial, &spec.config.defense) {
+        return Err(Error::RunAborted(
+            "client scheduler evidence changed before network execution".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let mut buflo_kernel_tx = (etf_scheduler_requested
+        && matches!(&spec.config.defense, DefenseConfig::Buflo(_)))
+    .then(|| BufloKernelTxRuntime::initialise(&endpoints, scheduler_initial.clone()))
+    .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if etf_scheduler_requested {
+        return Err(Error::RunAborted(
+            "the ETF scheduler contract is supported only on Linux".into(),
+        ));
+    }
     let mut defense_start = None;
     let mut application_completion = None;
     let mut application_complete_observed = false;
@@ -7740,10 +10952,30 @@ async fn execute_run_inner(
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
     let bound_ordinary_work = matches!(&spec.config.defense, DefenseConfig::Buflo(_));
 
-    let loop_result: Result<(), Error> = async {
+    let mut loop_result: Result<(), Error> = async {
         macro_rules! yield_to_exact_boundaries {
             ($runner:lifetime) => {
-                if dispatch_due_buflo_exact_release(
+                #[cfg(target_os = "linux")]
+                if let Some(runtime) = buflo_kernel_tx.as_mut()
+                    && dispatch_due_buflo_kernel_release(
+                        &spec.config.defense,
+                        &mut endpoints,
+                        &mut controller,
+                        spec.chaff_manifest.as_ref(),
+                        &mut traces,
+                        &observation_clock,
+                        defense_start,
+                        runtime,
+                    )
+                    .await?
+                {
+                    continue $runner;
+                }
+                #[cfg(target_os = "linux")]
+                let legacy_buflo_release = buflo_kernel_tx.is_none();
+                #[cfg(not(target_os = "linux"))]
+                let legacy_buflo_release = true;
+                if legacy_buflo_release && dispatch_due_buflo_exact_release(
                     &spec.config.defense,
                     &mut endpoints,
                     &mut controller,
@@ -7852,11 +11084,25 @@ async fn execute_run_inner(
                     &mut controller,
                     &mut traces,
                 )?;
-                if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
+                #[cfg(target_os = "linux")]
+                if let Some(runtime) = buflo_kernel_tx.as_mut() {
+                    // The application batch is opened below before tick zero is
+                    // selected. The explicit 100 ms arm lead leaves bounded
+                    // setup headroom followed by the receipted 5 ms immutable
+                    // selection cutoff.
+                    defense_start = Some(runtime.arm()?);
+                } else if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
                     // Direct capture already includes every handshake packet.
                     // Start only the morpher at the global defense boundary so
                     // an origin that connected early cannot contribute a
                     // pre-defense 1-RTT bootstrap bypass at elapsed time zero.
+                    activate_traffic_morphing(&mut endpoints, &spec.config, spec.seed)?;
+                    defense_start = Some(now());
+                } else {
+                    defense_start = Some(loop_now);
+                }
+                #[cfg(not(target_os = "linux"))]
+                if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
                     activate_traffic_morphing(&mut endpoints, &spec.config, spec.seed)?;
                     defense_start = Some(now());
                 } else {
@@ -7933,6 +11179,13 @@ async fn execute_run_inner(
                     controller.can_start_application_batch(),
                     request_work_interrupt,
                 )?;
+                #[cfg(target_os = "linux")]
+                if defense_start.is_some()
+                    && let Some(runtime) = buflo_kernel_tx.as_mut()
+                    && !runtime.tick_zero_application_ready()?
+                {
+                    runtime.mark_tick_zero_application_ready(started_requests)?;
+                }
                 yield_to_exact_boundaries!('runner);
                 let batch_started = application_batches.after_dispatch(started_requests)?;
                 handle_all_qcsd_observations(
@@ -8071,16 +11324,25 @@ async fn execute_run_inner(
                     ensure_defense_realizable(&controller)?;
                     yield_to_exact_boundaries!('runner);
                 }
-                controller.poll(defense_elapsed);
-                ensure_defense_realizable(&controller)?;
-                apply_queued_actions(
-                    &mut endpoints,
-                    &mut controller,
-                    spec.chaff_manifest.as_ref(),
-                    &mut traces,
-                    control_now,
-                    defense_elapsed,
-                )?;
+                #[cfg(target_os = "linux")]
+                let kernel_tick_zero_pending = match buflo_kernel_tx.as_ref() {
+                    Some(runtime) => !runtime.tick_zero_staged()?,
+                    None => false,
+                };
+                #[cfg(not(target_os = "linux"))]
+                let kernel_tick_zero_pending = false;
+                if !kernel_tick_zero_pending {
+                    controller.poll(defense_elapsed);
+                    ensure_defense_realizable(&controller)?;
+                    apply_queued_actions(
+                        &mut endpoints,
+                        &mut controller,
+                        spec.chaff_manifest.as_ref(),
+                        &mut traces,
+                        control_now,
+                        defense_elapsed,
+                    )?;
+                }
                 yield_to_exact_boundaries!('runner);
             }
 
@@ -8167,6 +11429,16 @@ async fn execute_run_inner(
                 next_wakeup = guard.guard_at;
                 controller_deadline_selected = false;
             }
+            #[cfg(target_os = "linux")]
+            if let Some(runtime) = buflo_kernel_tx.as_ref()
+                && !runtime.tick_zero_staged()?
+            {
+                let stage_at = runtime.tick_zero_stage_at()?;
+                if stage_at <= next_wakeup {
+                    next_wakeup = stage_at;
+                    controller_deadline_selected = false;
+                }
+            }
             let cs_retry_inventory = cs_exact_incoming_retry_inventory(
                 &spec.config.defense,
                 &endpoints,
@@ -8204,7 +11476,73 @@ async fn execute_run_inner(
     }
     .await;
 
+    #[cfg(target_os = "linux")]
+    if let Some(runtime) = buflo_kernel_tx.take() {
+        let receipt = runtime.finish(loop_result.as_ref().err().map(ToString::to_string));
+        let receipt_complete = receipt.terminal_outcome == "complete";
+        let receipt_failure = (!receipt_complete).then(|| {
+            format!(
+                "BuFLO kernel timing finalisation failed: cleanup={:?}; terminal={:?}",
+                receipt.cleanup_errors, receipt.terminal_errors
+            )
+        });
+        if let Err(attach_error) = runner_wakeup_metrics.attach_buflo_kernel_tx(&receipt) {
+            if loop_result.is_ok() {
+                loop_result = Err(attach_error);
+            }
+        } else if loop_result.is_ok()
+            && let Some(receipt_failure) = receipt_failure
+        {
+            loop_result = Err(Error::DefenseExecution(receipt_failure));
+        }
+    }
+
+    // Final response hashing and trace persistence are part of the run's
+    // evidence boundary. Convert either failure into the same total terminal
+    // path as an event-loop failure so the already-attached kernel receipt is
+    // retained in run.json instead of being replaced by execute_run's generic
+    // pre-inner fallback.
+    let mut finalized_responses = None;
+    let mut trace_events_flushed = false;
+    let mut post_loop_finalization_error = false;
+    if loop_result.is_ok() {
+        match collect_responses(&mut endpoints) {
+            Ok(responses) => finalized_responses = Some(responses),
+            Err(error) => {
+                post_loop_finalization_error = true;
+                loop_result = Err(error);
+            }
+        }
+    }
+    if loop_result.is_ok() {
+        match traces.flush_events() {
+            Ok(()) => trace_events_flushed = true,
+            Err(error) => {
+                post_loop_finalization_error = true;
+                loop_result = Err(error);
+            }
+        }
+    }
+    if loop_result.is_ok() && finalized_responses.is_none() {
+        post_loop_finalization_error = true;
+        loop_result = Err(Error::SlotInvariant(
+            "successful event loop lacked finalised response evidence".into(),
+        ));
+    }
+    if loop_result.is_ok() && !trace_events_flushed {
+        post_loop_finalization_error = true;
+        loop_result = Err(Error::SlotInvariant(
+            "successful event loop lacked flushed trace evidence".into(),
+        ));
+    }
+
     if let Err(error) = loop_result {
+        let mut cleanup_errors = Vec::new();
+        if post_loop_finalization_error {
+            cleanup_errors.push(format!(
+                "post-loop evidence finalisation failed after kernel receipt closure: {error}"
+            ));
+        }
         let (status, miss_reason) = if matches!(&error, Error::Timeout(_)) {
             ("timeout", MissedSlotReason::DeadlineExpired)
         } else {
@@ -8214,30 +11552,69 @@ async fn execute_run_inner(
         let terminal_elapsed = defense_start.map_or(Duration::ZERO, |started| {
             ended_at.saturating_duration_since(started)
         });
-        cancel_uncommitted_prearms_on_abort(
+        if let Err(cleanup_error) = cancel_uncommitted_prearms_on_abort(
             &mut endpoints,
             &mut controller,
             &mut traces,
             ended_at,
-        )?;
-        terminalize_pending_slots(
+        ) {
+            cleanup_errors.push(format!(
+                "cancel uncommitted prearms failed: {cleanup_error}"
+            ));
+        }
+        if let Err(cleanup_error) = terminalize_pending_slots(
             &mut controller,
             &mut traces,
             ended_at,
             terminal_elapsed,
             miss_reason,
-        )?;
+        ) {
+            cleanup_errors.push(format!("terminalize pending slots failed: {cleanup_error}"));
+        }
         for endpoint in &mut endpoints {
             endpoint.scheduled_outgoing.clear();
             endpoint.prearmed_outgoing.clear();
         }
-        let responses = collect_responses(&mut endpoints)?;
-        let message = error.to_string();
-        traces.flush_events()?;
-        write_run_json(
+        let responses = finalized_responses.take().map_or_else(
+            || match collect_responses(&mut endpoints) {
+                Ok(responses) => responses,
+                Err(cleanup_error) => {
+                    cleanup_errors.push(format!("collect responses failed: {cleanup_error}"));
+                    Vec::new()
+                }
+            },
+            std::convert::identity,
+        );
+        if !trace_events_flushed && let Err(cleanup_error) = traces.flush_events() {
+            cleanup_errors.push(format!("flush trace events failed: {cleanup_error}"));
+        }
+        let (chaff_responses, evidence_render_errors) = collect_chaff_responses_total(&endpoints);
+        cleanup_errors.extend(evidence_render_errors.iter().cloned());
+        #[cfg(target_os = "linux")]
+        if runner_wakeup_metrics.buflo_kernel_tx.is_some()
+            && let Err(cleanup_error) =
+                runner_wakeup_metrics.append_buflo_kernel_cleanup_errors(&cleanup_errors)
+        {
+            cleanup_errors.push(format!(
+                "append kernel cleanup evidence failed: {cleanup_error}"
+            ));
+        }
+        let primary_message = error.to_string();
+        let message = if cleanup_errors.is_empty() {
+            primary_message
+        } else {
+            format!(
+                "{primary_message}; cleanup failures: {}",
+                cleanup_errors.join(" | ")
+            )
+        };
+        let bytes = render_run_json(
             spec,
             &endpoints,
             &responses,
+            &chaff_responses,
+            process_scheduler,
+            &evidence_render_errors,
             wall_start,
             &RunCompletion {
                 ended_unix_ns: Some(unix_nanos()),
@@ -8251,21 +11628,78 @@ async fn execute_run_inner(
                 defense_diagnostics: Some(controller.defense_diagnostics()),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
             },
-        )?;
+        );
+        let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
+        let write_result = stage_and_persist_terminal_with(
+            terminal_artifact,
+            &spec.output_dir,
+            bytes,
+            &mut writer,
+        );
+        if let Err(write_error) = write_result {
+            eprintln!(
+                "QCSD failed to write terminal run.json after primary error `{error}`: {write_error}"
+            );
+        }
         return Err(error);
     }
 
-    let responses = collect_responses(&mut endpoints)?;
+    let responses = finalized_responses.unwrap_or_default();
+    debug_assert!(trace_events_flushed);
+    let (chaff_responses, evidence_render_errors) = collect_chaff_responses_total(&endpoints);
+    if !evidence_render_errors.is_empty() {
+        let error = Error::RunAborted(evidence_render_errors.join(" | "));
+        #[cfg(target_os = "linux")]
+        if runner_wakeup_metrics.buflo_kernel_tx.is_some()
+            && let Err(append_error) =
+                runner_wakeup_metrics.append_buflo_kernel_cleanup_errors(&evidence_render_errors)
+        {
+            eprintln!(
+                "QCSD could not append terminal render failure to BuFLO kernel evidence: {append_error}"
+            );
+        }
+        let message = error.to_string();
+        let bytes = render_run_json(
+            spec,
+            &endpoints,
+            &responses,
+            &chaff_responses,
+            process_scheduler,
+            &evidence_render_errors,
+            wall_start,
+            &RunCompletion {
+                ended_unix_ns: Some(unix_nanos()),
+                status: "error",
+                error: Some(&message),
+                error_class: Some(run_error_class(&error)),
+                defense_start_monotonic_ns: defense_start
+                    .map(|instant| elapsed_ns(process_start, instant)),
+                application_completion_monotonic_ns: application_completion
+                    .map(|instant| elapsed_ns(process_start, instant)),
+                defense_diagnostics: Some(controller.defense_diagnostics()),
+                runner_wakeup_metrics: Some(runner_wakeup_metrics),
+            },
+        );
+        let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
+        if let Err(write_error) =
+            stage_and_persist_terminal_with(terminal_artifact, &spec.output_dir, bytes, &mut writer)
+        {
+            eprintln!("QCSD failed to write terminal evidence-render error receipt: {write_error}");
+        }
+        return Err(error);
+    }
     let completion_status = if dependencies.is_successful() {
         "complete"
     } else {
         "partial"
     };
-    traces.flush_events()?;
-    write_run_json(
+    let bytes = render_run_json(
         spec,
         &endpoints,
         &responses,
+        &chaff_responses,
+        process_scheduler,
+        &[],
         wall_start,
         &RunCompletion {
             ended_unix_ns: Some(unix_nanos()),
@@ -8277,9 +11711,68 @@ async fn execute_run_inner(
             application_completion_monotonic_ns: application_completion
                 .map(|instant| elapsed_ns(process_start, instant)),
             defense_diagnostics: Some(controller.defense_diagnostics()),
-            runner_wakeup_metrics: Some(runner_wakeup_metrics),
+            runner_wakeup_metrics: Some(runner_wakeup_metrics.clone()),
         },
-    )?;
+    );
+    let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
+    let write_result =
+        stage_and_persist_terminal_with(terminal_artifact, &spec.output_dir, bytes, &mut writer);
+    if let Err(error) = write_result {
+        let persistence_error = terminal_artifact_persistence_error(None, &error);
+        let cleanup_errors = vec![format!(
+            "write successful terminal run.json failed after all in-memory evidence finalised: {error}"
+        )];
+        #[cfg(target_os = "linux")]
+        if runner_wakeup_metrics.buflo_kernel_tx.is_some()
+            && let Err(append_error) =
+                runner_wakeup_metrics.append_buflo_kernel_cleanup_errors(&cleanup_errors)
+        {
+            eprintln!(
+                "QCSD could not append terminal write failure to BuFLO kernel evidence: {append_error}"
+            );
+        }
+        let message = format!(
+            "{persistence_error}; evidence cleanup: {}",
+            cleanup_errors.join(" | ")
+        );
+        // The successful receipt is no longer a truthful terminal artifact
+        // once its persistence failed. Staging the newer error bytes replaces
+        // it before the next write, so an outer retry cannot persist success.
+        let bytes = render_run_json(
+            spec,
+            &endpoints,
+            &responses,
+            &chaff_responses,
+            process_scheduler,
+            &[],
+            wall_start,
+            &RunCompletion {
+                ended_unix_ns: Some(unix_nanos()),
+                status: "error",
+                error: Some(&message),
+                error_class: Some(run_error_class(&persistence_error)),
+                defense_start_monotonic_ns: defense_start
+                    .map(|instant| elapsed_ns(process_start, instant)),
+                application_completion_monotonic_ns: application_completion
+                    .map(|instant| elapsed_ns(process_start, instant)),
+                defense_diagnostics: Some(controller.defense_diagnostics()),
+                runner_wakeup_metrics: Some(runner_wakeup_metrics),
+            },
+        );
+        let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
+        let retry_result = stage_and_persist_terminal_with(
+            terminal_artifact,
+            &spec.output_dir,
+            bytes,
+            &mut writer,
+        );
+        if let Err(retry_error) = retry_result {
+            eprintln!(
+                "QCSD failed to write error run.json after terminal write failure `{persistence_error}`: {retry_error}"
+            );
+        }
+        return Err(persistence_error);
+    }
     Ok(responses)
 }
 
@@ -12394,6 +15887,12 @@ fn buflo_exact_incoming_identities(
                     guard.packet.timestamp()
                 )));
             }
+            if slot.0 != guard.slot.0.saturating_add(1) {
+                return Err(Error::SlotInvariant(format!(
+                    "BuFLO incoming slot {} was not the exact pair of outgoing slot {}",
+                    slot.0, guard.slot.0
+                )));
+            }
             let nominal_release =
                 defense_start
                     .checked_add(packet.timestamp())
@@ -12772,6 +16271,7 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
             chaff_manifest,
             traces,
             defense_start,
+            now(),
         ) {
             Ok(()) => Err(source),
             Err(reduction) => Err(Error::SlotInvariant(format!(
@@ -12790,6 +16290,7 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
             chaff_manifest,
             traces,
             defense_start,
+            now(),
             &mut captured,
         )?;
         if captured.is_empty() {
@@ -12913,6 +16414,7 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
                 chaff_manifest,
                 traces,
                 defense_start,
+                now(),
                 &mut captured,
             );
             let cleared_slots: BTreeSet<_> = pending_before
@@ -12989,6 +16491,886 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
         runner_wakeup_metrics.record(wake, false);
         retry_wake_at = Some(wake_at);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn stage_buflo_kernel_tick_zero(
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    defense_start: Instant,
+    runtime: &mut BufloKernelTxRuntime,
+) -> Result<(), Error> {
+    if !runtime.tick_zero_application_ready()? {
+        return Err(Error::DefenseExecution(
+            "BuFLO tick-zero selection cutoff arrived before application request eligibility"
+                .into(),
+        ));
+    }
+    if now() >= defense_start {
+        return Err(Error::DefenseExecution(
+            "BuFLO tick-zero staging reached or crossed its future defense epoch".into(),
+        ));
+    }
+    handle_all_qcsd_observations(endpoints, controller, traces, Duration::ZERO)?;
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    if controller.has_rolling_outgoing_prearm()
+        || controller.has_due_rolling_reconciliation()
+        || endpoints.iter().any(|endpoint| {
+            !endpoint.prearmed_outgoing.is_empty() || !endpoint.scheduled_outgoing.is_empty()
+        })
+    {
+        return Err(Error::SlotInvariant(
+            "BuFLO tick zero found pre-existing rolling or scheduled adapter work".into(),
+        ));
+    }
+    controller.poll(Duration::ZERO);
+    ensure_defense_realizable(controller)?;
+    // Passing the exact future epoch as action time is intentional: tick zero
+    // and the next preview are anchored exactly, then the runner performs no
+    // transport operation until the staged main datagram has physically sent.
+    apply_queued_actions(
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        defense_start,
+        Duration::ZERO,
+    )?;
+    let mut candidates = endpoints
+        .iter()
+        .enumerate()
+        .flat_map(|(endpoint_index, endpoint)| {
+            endpoint
+                .scheduled_outgoing
+                .iter()
+                .enumerate()
+                .filter(|(_, scheduled)| {
+                    scheduled.packet.direction() == Direction::Outgoing
+                        && scheduled.packet.timestamp().is_zero()
+                })
+                .map(move |(scheduled_index, scheduled)| {
+                    (endpoint_index, scheduled_index, *scheduled)
+                })
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO tick zero produced {} outgoing adapter candidates, expected one",
+            candidates.len()
+        )));
+    }
+    let (endpoint_index, scheduled_index, candidate) = candidates.pop().expect("one candidate");
+    if candidate.slot.0 != 0
+        || candidate.packet.length() != 1_200
+        || candidate.rolling_prearmed
+        || candidate.not_before != defense_start
+        || candidate.deadline
+            != defense_start
+                .checked_add(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+                .ok_or_else(|| {
+                    Error::DefenseExecution("BuFLO tick-zero deadline overflow".into())
+                })?
+    {
+        return Err(Error::SlotInvariant(
+            "BuFLO tick-zero candidate did not match the exact 1200-byte future-epoch contract"
+                .into(),
+        ));
+    }
+    if !controller
+        .pending_slots()
+        .iter()
+        .any(|(slot, packet)| *slot == candidate.slot && *packet == candidate.packet)
+    {
+        return Err(Error::SlotInvariant(
+            "BuFLO tick-zero candidate lacked controller ownership".into(),
+        ));
+    }
+    endpoints[endpoint_index].scheduled_outgoing[scheduled_index].rolling_prearmed = true;
+    runtime.mark_tick_zero_staged()
+}
+
+#[cfg(target_os = "linux")]
+fn next_buflo_kernel_guard(
+    defense: &DefenseConfig,
+    controller: &QcsdController,
+    endpoints: &[Endpoint],
+    runtime: &BufloKernelTxRuntime,
+) -> Result<Option<BufloExactReleaseGuard>, Error> {
+    let Some(mut guard) = next_buflo_exact_release_guard(defense, controller, endpoints)? else {
+        return Ok(None);
+    };
+    let epoch = runtime.epoch()?;
+    let release = epoch
+        .start
+        .checked_add(guard.packet.timestamp())
+        .ok_or_else(|| Error::DefenseExecution("BuFLO kernel release overflow".into()))?;
+    let deadline = release
+        .checked_add(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+        .ok_or_else(|| Error::DefenseExecution("BuFLO kernel deadline overflow".into()))?;
+    if guard.release != release || guard.deadline != deadline {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} adapter window was not exactly anchored to the future epoch",
+            guard.slot.0
+        )));
+    }
+    guard.output_admission_at = release
+        .checked_sub(BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2))
+        .ok_or_else(|| Error::DefenseExecution("BuFLO output-admission underflow".into()))?;
+    guard.guard_at = release
+        .checked_sub(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+        .ok_or_else(|| Error::DefenseExecution("BuFLO selection-cutoff underflow".into()))?;
+    guard.active_wait_at = guard.guard_at;
+    Ok(Some(guard))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_buflo_kernel_main(
+    guard: &BufloExactReleaseGuard,
+    prepared: &PreparedOutputMicrostep,
+) -> Result<(), Error> {
+    if prepared.batch.iter().count() != 1
+        || prepared.batch.data().len() != 1_200
+        || prepared.attributed_datagrams.len() != 1
+    {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} did not build one exact 1200-byte UDP datagram",
+            guard.slot.0
+        )));
+    }
+    let attribution = &prepared.attributed_datagrams[0];
+    let Some(satisfied) = attribution.satisfied else {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} built an unattributed datagram",
+            guard.slot.0
+        )));
+    };
+    if satisfied.slot != guard.slot
+        || satisfied.observed_size != 1_200
+        || attribution.observed != 1_200
+        || attribution.composition.lateness_us != 0
+        || !qcsd_composition_exact_wire_accounting(&attribution.composition, 1_200)
+    {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} built a mismatched target attribution",
+            guard.slot.0
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_buflo_kernel_credit(
+    guard: &BufloExactReleaseGuard,
+    prepared: &PreparedOutputMicrostep,
+) -> Result<(), Error> {
+    let attribution = prepared.attributed_datagrams.first();
+    if prepared.batch.iter().count() != 1
+        || prepared.batch.data().is_empty()
+        || prepared.batch.data().len() > 1_200
+        || prepared.attributed_datagrams.len() != 1
+        || attribution.is_some_and(|attribution| attribution.satisfied.is_some())
+        || attribution.is_none_or(|attribution| {
+            !buflo_kernel_credit_composition_valid(
+                &attribution.composition,
+                prepared.batch.data().len(),
+            )
+        })
+    {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} incoming-credit turn built an invalid or outgoing-target-bearing datagram",
+            guard.slot.0
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_credit_composition_valid(
+    composition: &QcsdSlotComposition,
+    datagram_len: usize,
+) -> bool {
+    qcsd_composition_exact_wire_accounting(composition, datagram_len)
+        && composition.application_stream_bytes == 0
+        && composition.retransmission_stream_bytes == 0
+        && composition.chaff_stream_bytes == 0
+        && composition.defense_control_bytes > 0
+}
+
+fn qcsd_composition_exact_wire_accounting(
+    composition: &QcsdSlotComposition,
+    datagram_len: usize,
+) -> bool {
+    let Ok(datagram_len) = u16::try_from(datagram_len) else {
+        return false;
+    };
+    let classified_sum = [
+        composition.application_stream_bytes,
+        composition.retransmission_stream_bytes,
+        composition.chaff_stream_bytes,
+        composition.defense_control_bytes,
+        composition.quic_padding_bytes,
+        composition.other_quic_bytes,
+    ]
+    .into_iter()
+    .map(u32::from)
+    .sum::<u32>();
+    composition.desired_udp_bytes == datagram_len
+        && composition.observed_udp_bytes == datagram_len
+        && classified_sum == u32::from(datagram_len)
+}
+
+#[cfg(target_os = "linux")]
+fn retain_buflo_prepared_output_failure(
+    runtime: &mut BufloKernelTxRuntime,
+    job_id: u64,
+    endpoint_index: usize,
+    endpoint: QcsdEndpointId,
+    failure: PreparedOutputFailure,
+) -> Error {
+    let (error, receipt) = failure.into_parts();
+    match runtime.record_prepared_output_failure(job_id, endpoint_index, endpoint, receipt) {
+        Ok(()) => error,
+        Err(record_error) => Error::DefenseExecution(format!(
+            "{error}; prepared-output failure receipt could not be retained: {record_error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the kernel path preserves one exact job and its owner-deduplicated credit boundary"
+)]
+async fn drive_buflo_kernel_incoming_credit(
+    job_id: u64,
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Instant,
+    main_sent_at: Instant,
+    mut captured: Vec<BufloExactIncomingIdentity>,
+    runtime: &mut BufloKernelTxRuntime,
+) -> Result<(), Error> {
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    runtime.retain_credit_identities(job_id, &captured)?;
+    for candidate in captured
+        .iter()
+        .filter(|candidate| !buflo_exact_incoming_identity_is_pending(endpoints, candidate))
+    {
+        if candidate.endpoint != guard.endpoint {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} exact main unexpectedly cleared cross-endpoint incoming credit for endpoint {}",
+                candidate.endpoint.0
+            )));
+        }
+        runtime.resolve_credit_identity(job_id, candidate, "coalesced-in-main-finalized", None)?;
+    }
+    if captured.is_empty() {
+        reduce_buflo_exact_pair_output(
+            guard,
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            defense_start,
+            main_sent_at,
+            &mut captured,
+        )?;
+        runtime.retain_credit_identities(job_id, &captured)?;
+        if captured.is_empty() {
+            runtime.complete_job(job_id)?;
+            return Ok(());
+        }
+    }
+    let phases = exact_incoming_retry_times(guard.release, guard.deadline).ok_or_else(|| {
+        Error::SlotInvariant(format!(
+            "BuFLO kernel slot {} lacked strict incoming retry phases",
+            guard.slot.0
+        ))
+    })?;
+    let mut sent_owners = BTreeSet::new();
+    let mut retained_callback = None;
+    loop {
+        refresh_buflo_exact_incoming_identities(
+            guard,
+            endpoints,
+            controller,
+            defense_start,
+            &mut captured,
+        )?;
+        runtime.retain_credit_identities(job_id, &captured)?;
+        if buflo_exact_incoming_inventory_is_complete(controller, &captured)? {
+            runtime.complete_job(job_id)?;
+            return Ok(());
+        }
+        let owners: BTreeSet<_> = captured
+            .iter()
+            .filter(|candidate| buflo_exact_incoming_identity_is_pending(endpoints, candidate))
+            .map(|candidate| (candidate.endpoint_index, candidate.endpoint))
+            .collect();
+        let mut progressed = false;
+        for (endpoint_index, owner) in owners {
+            if sent_owners.contains(&owner) {
+                return Err(Error::DefenseExecution(format!(
+                    "BuFLO kernel job {job_id} required a second incoming-credit datagram for endpoint {} beyond the one-datagram-per-owner contract",
+                    owner.0
+                )));
+            }
+            let pending_before: Vec<_> = captured
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    candidate.endpoint == owner
+                        && buflo_exact_incoming_identity_is_pending(endpoints, candidate)
+                })
+                .collect();
+            if pending_before.is_empty() {
+                continue;
+            }
+            let timeout = runtime.remaining_job_window(job_id)?;
+            let drive_now = now();
+            let prepared =
+                match prepare_output_once_with_evidence(&mut endpoints[endpoint_index], drive_now)
+                    .await
+                {
+                    Err(failure) => {
+                        return Err(retain_buflo_prepared_output_failure(
+                            runtime,
+                            job_id,
+                            endpoint_index,
+                            owner,
+                            failure,
+                        ));
+                    }
+                    Ok(PreparedOutputDrive::Datagram(prepared)) => prepared,
+                    Ok(PreparedOutputDrive::Callback(wakeup)) => {
+                        retained_callback = retained_callback.into_iter().chain([wakeup]).min();
+                        continue;
+                    }
+                    Ok(PreparedOutputDrive::None) => continue,
+                };
+            if let Err(error) = validate_buflo_kernel_credit(guard, &prepared) {
+                return Err(retain_buflo_prepared_output_failure(
+                    runtime,
+                    job_id,
+                    endpoint_index,
+                    owner,
+                    PreparedOutputFailure::from_prepared(
+                        "incoming-credit-validation",
+                        error,
+                        &prepared,
+                    ),
+                ));
+            }
+            let cleared: BTreeSet<_> = pending_before
+                .iter()
+                .filter(|candidate| !buflo_exact_incoming_identity_is_pending(endpoints, candidate))
+                .map(|candidate| candidate.slot)
+                .collect();
+            if cleared.is_empty() {
+                let error = Error::DefenseExecution(format!(
+                    "BuFLO kernel job {job_id} built a datagram that cleared no scheduled incoming-credit identity"
+                ));
+                return Err(retain_buflo_prepared_output_failure(
+                    runtime,
+                    job_id,
+                    endpoint_index,
+                    owner,
+                    PreparedOutputFailure::from_prepared(
+                        "incoming-credit-cleared-no-identity",
+                        error,
+                        &prepared,
+                    ),
+                ));
+            }
+            if cleared.iter().any(|slot| {
+                captured
+                    .iter()
+                    .filter(|candidate| candidate.slot == *slot)
+                    .any(|candidate| candidate.packet.timestamp() != guard.packet.timestamp())
+            }) {
+                let error = Error::SlotInvariant(
+                    "BuFLO kernel incoming-credit build cleared a foreign-tick identity".into(),
+                );
+                return Err(retain_buflo_prepared_output_failure(
+                    runtime,
+                    job_id,
+                    endpoint_index,
+                    owner,
+                    PreparedOutputFailure::from_prepared(
+                        "incoming-credit-foreign-identity",
+                        error,
+                        &prepared,
+                    ),
+                ));
+            }
+            let (sent_at, carrier_item_id) = match runtime.transmit_incoming_credit(
+                job_id,
+                endpoint_index,
+                owner,
+                guard.slot.0.saturating_add(1),
+                prepared.batch.clone(),
+                timeout,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(retain_buflo_prepared_output_failure(
+                        runtime,
+                        job_id,
+                        endpoint_index,
+                        owner,
+                        PreparedOutputFailure::from_prepared(
+                            "incoming-credit-transmit",
+                            error,
+                            &prepared,
+                        ),
+                    ));
+                }
+            };
+            let cleared_candidates: Vec<_> = pending_before
+                .iter()
+                .copied()
+                .filter(|candidate| !buflo_exact_incoming_identity_is_pending(endpoints, candidate))
+                .collect();
+            for candidate in &cleared_candidates {
+                if let Err(error) = runtime.resolve_credit_identity(
+                    job_id,
+                    candidate,
+                    "post-main-carrier-physical",
+                    Some(carrier_item_id),
+                ) {
+                    let detail = error.to_string();
+                    let error = retain_buflo_prepared_output_failure(
+                        runtime,
+                        job_id,
+                        endpoint_index,
+                        owner,
+                        PreparedOutputFailure::from_prepared(
+                            "incoming-credit-physical-identity-linkage",
+                            error,
+                            &prepared,
+                        ),
+                    );
+                    if let Err(record_error) =
+                        runtime.record_item_finalization_failure(job_id, carrier_item_id, &detail)
+                    {
+                        return Err(Error::DefenseExecution(format!(
+                            "{error}; physical incoming-credit identity-linkage failure could not be retained: {record_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+            if let Err(error) = finalize_prepared_output(
+                &mut endpoints[endpoint_index],
+                controller,
+                traces,
+                observation_clock,
+                &prepared,
+                Some(defense_start),
+                sent_at,
+            ) {
+                let detail = error.to_string();
+                let error = retain_buflo_prepared_output_failure(
+                    runtime,
+                    job_id,
+                    endpoint_index,
+                    owner,
+                    PreparedOutputFailure::from_prepared(
+                        "incoming-credit-controller-trace-finalization",
+                        error,
+                        &prepared,
+                    ),
+                );
+                if let Err(record_error) =
+                    runtime.record_item_finalization_failure(job_id, carrier_item_id, &detail)
+                {
+                    return Err(Error::DefenseExecution(format!(
+                        "{error}; physical incoming-credit finalization failure could not be retained: {record_error}"
+                    )));
+                }
+                return Err(error);
+            }
+            if let Err(error) =
+                runtime.mark_item_controller_and_trace_finalized(job_id, carrier_item_id)
+            {
+                let detail = error.to_string();
+                let error = retain_buflo_prepared_output_failure(
+                    runtime,
+                    job_id,
+                    endpoint_index,
+                    owner,
+                    PreparedOutputFailure::from_prepared(
+                        "incoming-credit-item-finalization-state",
+                        error,
+                        &prepared,
+                    ),
+                );
+                if let Err(record_error) =
+                    runtime.record_item_finalization_failure(job_id, carrier_item_id, &detail)
+                {
+                    return Err(Error::DefenseExecution(format!(
+                        "{error}; incoming-credit item-state failure could not be retained: {record_error}"
+                    )));
+                }
+                return Err(error);
+            }
+            for candidate in &cleared_candidates {
+                if let Err(error) =
+                    runtime.finalize_carried_credit_identity(job_id, candidate, carrier_item_id)
+                {
+                    return Err(retain_buflo_prepared_output_failure(
+                        runtime,
+                        job_id,
+                        endpoint_index,
+                        owner,
+                        PreparedOutputFailure::from_prepared(
+                            "incoming-credit-final-identity-linkage",
+                            error,
+                            &prepared,
+                        ),
+                    ));
+                }
+            }
+            sent_owners.insert(owner);
+            reduce_buflo_exact_pair_output(
+                guard,
+                endpoints,
+                controller,
+                chaff_manifest,
+                traces,
+                defense_start,
+                sent_at,
+                &mut captured,
+            )?;
+            progressed = true;
+        }
+        if buflo_exact_incoming_inventory_is_complete(controller, &captured)? {
+            runtime.complete_job(job_id)?;
+            return Ok(());
+        }
+        if progressed {
+            continue;
+        }
+        let current = now();
+        let fallback = phases
+            .into_iter()
+            .find(|phase| *phase > current)
+            .unwrap_or(guard.deadline);
+        let wake_at = retained_callback
+            .take()
+            .into_iter()
+            .chain([fallback, guard.deadline])
+            .min()
+            .unwrap_or(guard.deadline);
+        if wake_at >= guard.deadline {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} incoming credit exhausted its strict window"
+            )));
+        }
+        tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one kernel job freezes logical selection through physical finalisation"
+)]
+async fn dispatch_buflo_kernel_release(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Instant,
+    runtime: &mut BufloKernelTxRuntime,
+) -> Result<(), Error> {
+    let current = now();
+    if current >= guard.release {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} reached its release before immutable packet construction",
+            guard.slot.0
+        )));
+    }
+    let logical_elapsed = guard.packet.timestamp();
+    handle_all_qcsd_observations(endpoints, controller, traces, logical_elapsed)?;
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    if guard.phase == BufloExactReleasePhase::Prearmed {
+        controller.reconcile_due_rolling(logical_elapsed)?;
+        controller.flush_defense_observations();
+        ensure_defense_realizable(controller)?;
+        apply_queued_actions(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            guard.release,
+            logical_elapsed,
+        )?;
+    }
+    if !buflo_guard_identity_matches_runner(guard, endpoints, BufloExactReleasePhase::Committed) {
+        return Err(Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} did not commit at its logical selection boundary",
+            guard.slot.0
+        )));
+    }
+    let job_id = runtime.begin_job(guard)?;
+    let captured_incoming_credit =
+        buflo_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
+    runtime.retain_credit_identities(job_id, &captured_incoming_credit)?;
+    let prepared = match prepare_output_once_with_evidence(
+        &mut endpoints[guard.endpoint_index],
+        guard.release,
+    )
+    .await
+    {
+        Err(failure) => {
+            return Err(retain_buflo_prepared_output_failure(
+                runtime,
+                job_id,
+                guard.endpoint_index,
+                guard.endpoint,
+                failure,
+            ));
+        }
+        Ok(PreparedOutputDrive::Datagram(prepared)) => prepared,
+        Ok(PreparedOutputDrive::Callback(wakeup)) => {
+            let failure = PreparedOutputFailure::new(
+                "unexpected-main-callback",
+                Error::DefenseExecution(format!(
+                    "BuFLO kernel slot {} encountered transport pacing callback {wakeup:?} at its one-shot selection boundary",
+                    guard.slot.0
+                )),
+                true,
+                false,
+                None,
+                0,
+                0,
+                0,
+                0,
+            );
+            return Err(retain_buflo_prepared_output_failure(
+                runtime,
+                job_id,
+                guard.endpoint_index,
+                guard.endpoint,
+                failure,
+            ));
+        }
+        Ok(PreparedOutputDrive::None) => {
+            let failure = PreparedOutputFailure::new(
+                "unexpected-main-none",
+                Error::DefenseExecution(format!(
+                    "BuFLO kernel slot {} produced no exact transport datagram",
+                    guard.slot.0
+                )),
+                true,
+                false,
+                None,
+                0,
+                0,
+                0,
+                0,
+            );
+            return Err(retain_buflo_prepared_output_failure(
+                runtime,
+                job_id,
+                guard.endpoint_index,
+                guard.endpoint,
+                failure,
+            ));
+        }
+    };
+    if let Err(error) = validate_buflo_kernel_main(guard, &prepared) {
+        return Err(retain_buflo_prepared_output_failure(
+            runtime,
+            job_id,
+            guard.endpoint_index,
+            guard.endpoint,
+            PreparedOutputFailure::from_prepared("main-validation", error, &prepared),
+        ));
+    }
+    let (sent_at, main_item_id) = match runtime.transmit_exact_main(
+        job_id,
+        guard.endpoint_index,
+        guard.endpoint,
+        guard.slot.0,
+        prepared.batch.clone(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(retain_buflo_prepared_output_failure(
+                runtime,
+                job_id,
+                guard.endpoint_index,
+                guard.endpoint,
+                PreparedOutputFailure::from_prepared("main-transmit", error, &prepared),
+            ));
+        }
+    };
+    if let Err(error) = finalize_prepared_output(
+        &mut endpoints[guard.endpoint_index],
+        controller,
+        traces,
+        observation_clock,
+        &prepared,
+        Some(defense_start),
+        sent_at,
+    ) {
+        let detail = error.to_string();
+        let error = retain_buflo_prepared_output_failure(
+            runtime,
+            job_id,
+            guard.endpoint_index,
+            guard.endpoint,
+            PreparedOutputFailure::from_prepared(
+                "main-controller-trace-finalization",
+                error,
+                &prepared,
+            ),
+        );
+        if let Err(record_error) =
+            runtime.record_item_finalization_failure(job_id, main_item_id, &detail)
+        {
+            return Err(Error::DefenseExecution(format!(
+                "{error}; physical exact-output finalization failure could not be retained: {record_error}"
+            )));
+        }
+        return Err(error);
+    }
+    if controller.terminal_slot_resolution_at(guard.slot).is_none()
+        || endpoints.iter().any(|endpoint| {
+            endpoint
+                .scheduled_outgoing
+                .iter()
+                .any(|scheduled| scheduled.slot == guard.slot)
+        })
+    {
+        let error = Error::DefenseExecution(format!(
+            "BuFLO kernel slot {} was not terminal after proven physical TX",
+            guard.slot.0
+        ));
+        let detail = error.to_string();
+        let error = retain_buflo_prepared_output_failure(
+            runtime,
+            job_id,
+            guard.endpoint_index,
+            guard.endpoint,
+            PreparedOutputFailure::from_prepared("main-terminal-resolution", error, &prepared),
+        );
+        if let Err(record_error) =
+            runtime.record_item_finalization_failure(job_id, main_item_id, &detail)
+        {
+            return Err(Error::DefenseExecution(format!(
+                "{error}; nonterminal physical exact-output failure could not be retained: {record_error}"
+            )));
+        }
+        return Err(error);
+    }
+    if let Err(error) = runtime.mark_item_controller_and_trace_finalized(job_id, main_item_id) {
+        let detail = error.to_string();
+        let error = retain_buflo_prepared_output_failure(
+            runtime,
+            job_id,
+            guard.endpoint_index,
+            guard.endpoint,
+            PreparedOutputFailure::from_prepared("main-item-finalization-state", error, &prepared),
+        );
+        if let Err(record_error) =
+            runtime.record_item_finalization_failure(job_id, main_item_id, &detail)
+        {
+            return Err(Error::DefenseExecution(format!(
+                "{error}; main item-state failure could not be retained: {record_error}"
+            )));
+        }
+        return Err(error);
+    }
+    drive_buflo_kernel_incoming_credit(
+        job_id,
+        guard,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        defense_start,
+        sent_at,
+        captured_incoming_credit,
+        runtime,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "the current-thread runner owns kernel staging and exact job dispatch"
+)]
+async fn dispatch_due_buflo_kernel_release(
+    defense: &DefenseConfig,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Option<Instant>,
+    runtime: &mut BufloKernelTxRuntime,
+) -> Result<bool, Error> {
+    if !matches!(defense, DefenseConfig::Buflo(_)) {
+        return Err(Error::SlotInvariant(
+            "BuFLO kernel runtime was active for a non-BuFLO defense".into(),
+        ));
+    }
+    let started = defense_start.ok_or_else(|| {
+        Error::SlotInvariant("BuFLO kernel runtime was active before defense arm".into())
+    })?;
+    if !runtime.tick_zero_staged()? {
+        let stage_at = runtime.tick_zero_stage_at()?;
+        if now() < stage_at {
+            return Ok(false);
+        }
+        stage_buflo_kernel_tick_zero(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            started,
+            runtime,
+        )?;
+    }
+    let Some(guard) = next_buflo_kernel_guard(defense, controller, endpoints, runtime)? else {
+        return Ok(false);
+    };
+    if now() < guard.guard_at {
+        return Ok(false);
+    }
+    dispatch_buflo_kernel_release(
+        &guard,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        started,
+        runtime,
+    )
+    .await?;
+    Ok(true)
 }
 
 #[expect(
@@ -13330,6 +17712,132 @@ enum OutputDrive {
     None,
 }
 
+/// One encrypted transport output microstep whose adapter observations have
+/// been drained, but whose physical socket outcome has not yet been applied to
+/// the controller or trace.  Keeping this boundary explicit lets the ordinary
+/// path finalise immediately while a fidelity-sensitive path can hand the
+/// exact same, already-built bytes to an independently evidenced egress
+/// mechanism.  A prepared microstep is never rebuilt or retried.
+struct PreparedOutputMicrostep {
+    batch: datagram::Batch,
+    observations: Vec<TimestampedQcsdObservation>,
+    attributed_datagrams: Vec<PreparedDatagramAttribution>,
+}
+
+struct PreparedDatagramAttribution {
+    observed: usize,
+    satisfied: Option<SatisfiedDatagram>,
+    composition: QcsdSlotComposition,
+}
+
+enum PreparedOutputDrive {
+    Datagram(PreparedOutputMicrostep),
+    Callback(Instant),
+    None,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct PreparedOutputFailureReceipt {
+    schema_version: u32,
+    stage: &'static str,
+    transport_output_mutated: bool,
+    observations_drained: bool,
+    batch_source_address: Option<String>,
+    batch_destination_address: Option<String>,
+    batch_datagram_count: usize,
+    batch_datagram_lengths: Vec<usize>,
+    batch_sha256: Option<String>,
+    batch_hash_error: Option<String>,
+    observation_count: usize,
+    built_composition_count: usize,
+    satisfied_datagram_count: usize,
+    attributed_datagram_count: usize,
+    error: String,
+}
+
+struct PreparedOutputFailure {
+    error: Error,
+    receipt: PreparedOutputFailureReceipt,
+}
+
+impl PreparedOutputFailure {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the failure receipt captures each completed preparation stage without retrying mutated transport output"
+    )]
+    fn new(
+        stage: &'static str,
+        error: Error,
+        transport_output_mutated: bool,
+        observations_drained: bool,
+        batch: Option<&datagram::Batch>,
+        observation_count: usize,
+        built_composition_count: usize,
+        satisfied_datagram_count: usize,
+        attributed_datagram_count: usize,
+    ) -> Self {
+        let (batch_sha256, batch_hash_error) =
+            batch.map_or((None, None), |batch| match sha256(batch.data()) {
+                Ok(hash) => (Some(hash), None),
+                Err(error) => (None, Some(error.to_string())),
+            });
+        Self {
+            receipt: PreparedOutputFailureReceipt {
+                schema_version: 1,
+                stage,
+                transport_output_mutated,
+                observations_drained,
+                batch_source_address: batch.map(|batch| batch.source().to_string()),
+                batch_destination_address: batch.map(|batch| batch.destination().to_string()),
+                batch_datagram_count: batch.map_or(0, datagram::Batch::num_datagrams),
+                batch_datagram_lengths: batch
+                    .into_iter()
+                    .flat_map(datagram::Batch::iter)
+                    .map(|datagram| datagram.len())
+                    .collect(),
+                batch_sha256,
+                batch_hash_error,
+                observation_count,
+                built_composition_count,
+                satisfied_datagram_count,
+                attributed_datagram_count,
+                error: error.to_string(),
+            },
+            error,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        self.error
+    }
+
+    fn from_prepared(
+        stage: &'static str,
+        error: Error,
+        prepared: &PreparedOutputMicrostep,
+    ) -> Self {
+        Self::new(
+            stage,
+            error,
+            true,
+            true,
+            Some(&prepared.batch),
+            prepared.observations.len(),
+            prepared.attributed_datagrams.len(),
+            prepared
+                .attributed_datagrams
+                .iter()
+                .filter(|attribution| attribution.satisfied.is_some())
+                .count(),
+            prepared.attributed_datagrams.len(),
+        )
+    }
+
+    fn into_parts(self) -> (Error, PreparedOutputFailureReceipt) {
+        (self.error, self.receipt)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputDriveCardinality {
     /// Drain transport output until it returns a callback or no work.
@@ -13548,6 +18056,10 @@ fn reduce_post_output_rolling_barrier(
         .any(|scheduled| !due_slots_before_output.contains(&scheduled.slot)))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact-pair reduction boundary keeps each controller, trace, timing, and captured-identity participant explicit"
+)]
 fn reduce_buflo_exact_pair_output(
     guard: &BufloExactReleaseGuard,
     endpoints: &mut [Endpoint],
@@ -13555,6 +18067,7 @@ fn reduce_buflo_exact_pair_output(
     chaff_manifest: Option<&RuntimeChaffManifest>,
     traces: &mut TraceFiles,
     defense_start: Instant,
+    reduced_at: Instant,
     captured: &mut Vec<BufloExactIncomingIdentity>,
 ) -> Result<bool, Error> {
     reduce_buflo_exact_pair_barrier(
@@ -13564,6 +18077,7 @@ fn reduce_buflo_exact_pair_output(
         chaff_manifest,
         traces,
         defense_start,
+        reduced_at,
     )?;
     refresh_buflo_exact_incoming_identities(guard, endpoints, controller, defense_start, captured)
 }
@@ -13575,8 +18089,8 @@ fn reduce_buflo_exact_pair_barrier(
     chaff_manifest: Option<&RuntimeChaffManifest>,
     traces: &mut TraceFiles,
     defense_start: Instant,
+    reduced_at: Instant,
 ) -> Result<(), Error> {
-    let reduced_at = now();
     let reduced_elapsed = reduced_at.saturating_duration_since(defense_start);
     let due_slots_before_output = BTreeSet::from([guard.slot]);
     if reduce_post_output_rolling_barrier(
@@ -14154,12 +18668,269 @@ fn due_rolling_output_target<'a>(
     reason = "the binary deliberately uses Tokio's current-thread runtime"
 )]
 #[expect(
-    clippy::too_many_arguments,
-    reason = "the deterministic handoff clock is an explicit output-causality seam"
-)]
-#[expect(
     clippy::too_many_lines,
     reason = "one output microstep keeps packet-build, slot-resolution, and trace evidence atomic"
+)]
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::unused_async,
+        reason = "test fault injection waits at an exact boundary while production preparation remains one shared async seam"
+    )
+)]
+async fn prepare_output_once_with_evidence(
+    endpoint: &mut Endpoint,
+    drive_now: Instant,
+) -> Result<PreparedOutputDrive, PreparedOutputFailure> {
+    #[cfg(test)]
+    if let Some(output) = endpoint.test_output_drives.pop_front() {
+        match output {
+            TestOutputDrive::ProductionPath => {}
+            TestOutputDrive::Callback(delay) => {
+                let Some(wakeup) = absolute_wakeup(drive_now, delay) else {
+                    return Err(PreparedOutputFailure::new(
+                        "test-callback-deadline",
+                        Error::RunAborted("test transport callback overflow".into()),
+                        false,
+                        false,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ));
+                };
+                return Ok(PreparedOutputDrive::Callback(wakeup));
+            }
+            TestOutputDrive::CallbackAt(wakeup) => {
+                return Ok(PreparedOutputDrive::Callback(wakeup));
+            }
+            TestOutputDrive::ErrorAt(at) => {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                return Err(PreparedOutputFailure::new(
+                    "test-output",
+                    Error::SlotInvariant(
+                        "test output failed at the exact incoming deadline".into(),
+                    ),
+                    false,
+                    false,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                ));
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(observation) = endpoint.test_observation_on_next_output.take() {
+        endpoint.test_output_observations.push(observation);
+        return Ok(PreparedOutputDrive::None);
+    }
+    let output = endpoint
+        .client
+        .process_multiple_output(drive_now, NonZeroUsize::MIN);
+    let batch = match output {
+        OutputBatch::DatagramBatch(batch) => batch,
+        OutputBatch::Callback(delay) => {
+            let Some(wakeup) = absolute_wakeup(drive_now, delay) else {
+                return Err(PreparedOutputFailure::new(
+                    "transport-callback-deadline",
+                    Error::RunAborted("transport callback deadline overflow".into()),
+                    true,
+                    false,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                ));
+            };
+            return Ok(PreparedOutputDrive::Callback(wakeup));
+        }
+        OutputBatch::None => return Ok(PreparedOutputDrive::None),
+    };
+    let observations = endpoint.client.qcsd_timestamped_observations();
+    let built_datagrams = built_outgoing_datagrams_for(&observations);
+    let built_composition_count = built_datagrams.len();
+    let mut satisfied_datagrams = match satisfied_datagrams_for(endpoint, &observations) {
+        Ok(satisfied) => satisfied,
+        Err(error) => {
+            return Err(PreparedOutputFailure::new(
+                "satisfied-datagram-attribution",
+                error,
+                true,
+                true,
+                Some(&batch),
+                observations.len(),
+                built_composition_count,
+                0,
+                0,
+            ));
+        }
+    };
+    let satisfied_datagram_count = satisfied_datagrams.len();
+    let batch_datagrams = batch.iter().count();
+    if built_datagrams.len() != batch_datagrams {
+        return Err(PreparedOutputFailure::new(
+            "packet-build-cardinality",
+            Error::SlotInvariant(format!(
+                "transport reported {} packet-build compositions for {batch_datagrams} outgoing datagrams",
+                built_datagrams.len()
+            )),
+            true,
+            true,
+            Some(&batch),
+            observations.len(),
+            built_composition_count,
+            satisfied_datagram_count,
+            0,
+        ));
+    }
+    let mut attributed_datagrams = Vec::new();
+    for (datagram, (built_length, composition)) in batch.iter().zip(built_datagrams) {
+        if datagram.len() != built_length
+            || composition.observed_udp_bytes != u16::try_from(datagram.len()).unwrap_or(u16::MAX)
+        {
+            return Err(PreparedOutputFailure::new(
+                "packet-build-length",
+                Error::SlotInvariant(format!(
+                    "packet-build composition length {built_length}/{} did not match raw outgoing datagram {}",
+                    composition.observed_udp_bytes,
+                    datagram.len()
+                )),
+                true,
+                true,
+                Some(&batch),
+                observations.len(),
+                built_composition_count,
+                satisfied_datagram_count,
+                attributed_datagrams.len(),
+            ));
+        }
+        let satisfied = satisfied_datagrams
+            .iter()
+            .position(|candidate| candidate.observed_size == datagram.len())
+            .map(|index| satisfied_datagrams.remove(index));
+        attributed_datagrams.push(PreparedDatagramAttribution {
+            observed: datagram.len(),
+            satisfied,
+            composition,
+        });
+    }
+    if let Some(satisfied) = satisfied_datagrams.first() {
+        return Err(PreparedOutputFailure::new(
+            "unmatched-satisfied-datagram",
+            Error::SlotInvariant(format!(
+                "satisfied outgoing slot {} had no matching datagram",
+                satisfied.slot.0
+            )),
+            true,
+            true,
+            Some(&batch),
+            observations.len(),
+            built_composition_count,
+            satisfied_datagram_count,
+            attributed_datagrams.len(),
+        ));
+    }
+
+    Ok(PreparedOutputDrive::Datagram(PreparedOutputMicrostep {
+        batch,
+        observations,
+        attributed_datagrams,
+    }))
+}
+
+#[expect(
+    clippy::future_not_send,
+    reason = "the binary deliberately uses Tokio's current-thread runtime"
+)]
+async fn prepare_output_once_with_clock(
+    endpoint: &mut Endpoint,
+    drive_now: Instant,
+) -> Result<PreparedOutputDrive, Error> {
+    prepare_output_once_with_evidence(endpoint, drive_now)
+        .await
+        .map_err(PreparedOutputFailure::into_error)
+}
+
+fn finalize_prepared_output(
+    endpoint: &mut Endpoint,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    prepared: &PreparedOutputMicrostep,
+    defense_start: Option<Instant>,
+    sent_at: Instant,
+) -> Result<(), Error> {
+    let wire_elapsed = defense_start.map(|started| sent_at.saturating_duration_since(started));
+    for observation in &prepared.observations {
+        let terminal = terminal_observation_slot(observation.observation());
+        let terminal_us = match (terminal, wire_elapsed) {
+            (Some(_), Some(at)) => Some(duration_as_trace_micros(at)),
+            (Some(slot), None) => {
+                return Err(Error::SlotInvariant(format!(
+                    "slot {} reached a terminal adapter state before defense activation",
+                    slot.0
+                )));
+            }
+            (None, _) => None,
+        };
+        forward_qcsd_observation(controller, observation, wire_elapsed);
+        record_qcsd_observation(
+            endpoint,
+            controller,
+            traces,
+            observation,
+            terminal_us,
+            Some(sent_at),
+        )?;
+        if let (Some(slot), Some(at)) = (terminal, wire_elapsed) {
+            require_controller_terminal_resolution(controller, slot, at)?;
+        }
+    }
+    for attribution in &prepared.attributed_datagrams {
+        let qcsd = attribution
+            .satisfied
+            .map_or_else(QcsdTraceColumns::default, |target| target.qcsd)
+            .with_built_composition(attribution.composition);
+        traces.packet(&PacketTraceRow {
+            now: sent_at,
+            endpoint: endpoint.id,
+            direction: "outgoing",
+            observed: attribution.observed,
+            scheduled: attribution
+                .satisfied
+                .map(|target| u16::try_from(target.observed_size).unwrap_or(u16::MAX)),
+            satisfaction: attribution
+                .satisfied
+                .map_or("unshaped", |target| target.status),
+            slot: attribution.satisfied.map(|target| target.slot),
+            qcsd,
+        })?;
+        if let Some((observation, at)) = datagram_observation(
+            endpoint.id,
+            Direction::Outgoing,
+            u16::try_from(attribution.observed).unwrap_or(u16::MAX),
+            wire_elapsed,
+        ) {
+            let record = observation_clock.record_at(observation, sent_at);
+            traces.observation(Some(endpoint.id), &record)?;
+            controller.observe(record.into_observation(), at);
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::future_not_send,
+    reason = "the binary deliberately uses Tokio's current-thread runtime"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the deterministic handoff clock is an explicit output-causality seam"
 )]
 async fn process_output_once_with_clock(
     endpoint: &mut Endpoint,
@@ -14172,78 +18943,15 @@ async fn process_output_once_with_clock(
     absolute_handoff_deadline: Option<Instant>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
-    #[cfg(test)]
-    if let Some(output) = endpoint.test_output_drives.pop_front() {
-        match output {
-            TestOutputDrive::ProductionPath => {}
-            TestOutputDrive::Callback(delay) => {
-                return absolute_wakeup(drive_now, delay)
-                    .map(OutputDrive::Callback)
-                    .ok_or_else(|| Error::RunAborted("test transport callback overflow".into()));
-            }
-            TestOutputDrive::CallbackAt(wakeup) => return Ok(OutputDrive::Callback(wakeup)),
-            TestOutputDrive::ErrorAt(at) => {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
-                return Err(Error::SlotInvariant(
-                    "test output failed at the exact incoming deadline".into(),
-                ));
-            }
-        }
-    }
-    #[cfg(test)]
-    if let Some(observation) = endpoint.test_observation_on_next_output.take() {
-        endpoint.test_output_observations.push(observation);
-        return Ok(OutputDrive::None);
-    }
-    let output = endpoint
-        .client
-        .process_multiple_output(drive_now, NonZeroUsize::MIN);
-    let batch = match output {
-        OutputBatch::DatagramBatch(batch) => batch,
-        OutputBatch::Callback(delay) => {
-            let wakeup = absolute_wakeup(drive_now, delay)
-                .ok_or_else(|| Error::RunAborted("transport callback deadline overflow".into()))?;
-            return Ok(OutputDrive::Callback(wakeup));
-        }
-        OutputBatch::None => return Ok(OutputDrive::None),
+    let prepared = match prepare_output_once_with_clock(endpoint, drive_now).await? {
+        PreparedOutputDrive::Datagram(prepared) => prepared,
+        PreparedOutputDrive::Callback(wakeup) => return Ok(OutputDrive::Callback(wakeup)),
+        PreparedOutputDrive::None => return Ok(OutputDrive::None),
     };
-    let observations = endpoint.client.qcsd_timestamped_observations();
-    let mut satisfied_datagrams = satisfied_datagrams_for(endpoint, &observations)?;
-    let built_datagrams = built_outgoing_datagrams_for(&observations);
-    let batch_datagrams = batch.iter().count();
-    if built_datagrams.len() != batch_datagrams {
-        return Err(Error::SlotInvariant(format!(
-            "transport reported {} packet-build compositions for {batch_datagrams} outgoing datagrams",
-            built_datagrams.len()
-        )));
-    }
-    let mut attributed_datagrams = Vec::new();
-    for (datagram, (built_length, composition)) in batch.iter().zip(built_datagrams) {
-        if datagram.len() != built_length
-            || composition.observed_udp_bytes != u16::try_from(datagram.len()).unwrap_or(u16::MAX)
-        {
-            return Err(Error::SlotInvariant(format!(
-                "packet-build composition length {built_length}/{} did not match raw outgoing datagram {}",
-                composition.observed_udp_bytes,
-                datagram.len()
-            )));
-        }
-        let satisfied = satisfied_datagrams
-            .iter()
-            .position(|candidate| candidate.observed_size == datagram.len())
-            .map(|index| satisfied_datagrams.remove(index));
-        attributed_datagrams.push((datagram.len(), satisfied, composition));
-    }
-    if let Some(satisfied) = satisfied_datagrams.first() {
-        return Err(Error::SlotInvariant(format!(
-            "satisfied outgoing slot {} had no matching datagram",
-            satisfied.slot.0
-        )));
-    }
-
-    let mut target_deadlines: Vec<_> = attributed_datagrams
+    let mut target_deadlines: Vec<_> = prepared
+        .attributed_datagrams
         .iter()
-        .filter_map(|(_, satisfied, _)| satisfied.map(|target| target.deadline))
+        .filter_map(|attribution| attribution.satisfied.map(|target| target.deadline))
         .collect();
     target_deadlines.extend(absolute_handoff_deadline);
     let (sent_at, late_handoff) = loop {
@@ -14266,7 +18974,7 @@ async fn process_output_once_with_clock(
                 {
                     return Err(io::Error::from_raw_os_error(raw_os_error));
                 }
-                socket_handoff_policy.send(&endpoint.socket, &batch)
+                socket_handoff_policy.send(&endpoint.socket, &prepared.batch)
             },
             &mut *monotonic_clock,
         )? {
@@ -14282,58 +18990,15 @@ async fn process_output_once_with_clock(
             }
         }
     };
-    let wire_elapsed = defense_start.map(|started| sent_at.saturating_duration_since(started));
-    for observation in observations {
-        let terminal = terminal_observation_slot(observation.observation());
-        let terminal_us = match (terminal, wire_elapsed) {
-            (Some(_), Some(at)) => Some(duration_as_trace_micros(at)),
-            (Some(slot), None) => {
-                return Err(Error::SlotInvariant(format!(
-                    "slot {} reached a terminal adapter state before defense activation",
-                    slot.0
-                )));
-            }
-            (None, _) => None,
-        };
-        forward_qcsd_observation(controller, &observation, wire_elapsed);
-        record_qcsd_observation(
-            endpoint,
-            controller,
-            traces,
-            &observation,
-            terminal_us,
-            Some(sent_at),
-        )?;
-        if let (Some(slot), Some(at)) = (terminal, wire_elapsed) {
-            require_controller_terminal_resolution(controller, slot, at)?;
-        }
-    }
-    for (observed, satisfied, composition) in attributed_datagrams {
-        let qcsd = satisfied
-            .map_or_else(QcsdTraceColumns::default, |target| target.qcsd)
-            .with_built_composition(composition);
-        traces.packet(&PacketTraceRow {
-            now: sent_at,
-            endpoint: endpoint.id,
-            direction: "outgoing",
-            observed,
-            scheduled: satisfied
-                .map(|target| u16::try_from(target.observed_size).unwrap_or(u16::MAX)),
-            satisfaction: satisfied.map_or("unshaped", |target| target.status),
-            slot: satisfied.map(|target| target.slot),
-            qcsd,
-        })?;
-        if let Some((observation, at)) = datagram_observation(
-            endpoint.id,
-            Direction::Outgoing,
-            u16::try_from(observed).unwrap_or(u16::MAX),
-            wire_elapsed,
-        ) {
-            let record = observation_clock.record_at(observation, sent_at);
-            traces.observation(Some(endpoint.id), &record)?;
-            controller.observe(record.into_observation(), at);
-        }
-    }
+    finalize_prepared_output(
+        endpoint,
+        controller,
+        traces,
+        observation_clock,
+        &prepared,
+        defense_start,
+        sent_at,
+    )?;
     if let Some((deadline, boundary)) = late_handoff {
         // The UDP syscall already succeeded, so first preserve every packet,
         // schedule, event, and controller observation caused by the datagram.
@@ -14496,15 +19161,20 @@ fn cs_buflo_run_summary(
     })
 }
 
-fn write_run_json(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run-receipt renderer keeps each independently sourced evidence inventory explicit at the schema boundary"
+)]
+fn render_run_json(
     spec: &RunSpec,
     endpoints: &[Endpoint],
     responses: &[ResponseResult],
+    chaff_responses: &[ChaffResponseResult],
+    process_scheduler: &ProcessSchedulerEvidence,
+    evidence_render_errors: &[String],
     started_unix_ns: u128,
     completion: &RunCompletion<'_>,
-) -> Result<(), Error> {
-    let process_scheduler = process_scheduler_evidence()?;
-    let chaff_responses = collect_chaff_responses(endpoints)?;
+) -> Vec<u8> {
     let buflo_summary = buflo_run_summary(
         &spec.config.defense,
         completion.defense_diagnostics.as_ref(),
@@ -14531,6 +19201,25 @@ fn write_run_json(
             })
         })
         .collect();
+    let completion_status = if evidence_render_errors.is_empty() {
+        completion.status
+    } else {
+        "error"
+    };
+    let completion_error = if evidence_render_errors.is_empty() {
+        completion.error.map(str::to_string)
+    } else {
+        let render_error = evidence_render_errors.join(" | ");
+        Some(completion.error.map_or_else(
+            || render_error.clone(),
+            |primary| format!("{primary}; terminal evidence rendering failures: {render_error}"),
+        ))
+    };
+    let completion_error_class = if evidence_render_errors.is_empty() {
+        completion.error_class
+    } else {
+        Some("run-artifact-evidence-finalization-v1")
+    };
     let run = json!({
         "neqo_version": env!("CARGO_PKG_VERSION"),
         "neqo_base_commit": NEQO_BASE_COMMIT,
@@ -14555,18 +19244,51 @@ fn write_run_json(
         "process_scheduler": process_scheduler,
         "buflo_summary": buflo_summary,
         "cs_buflo_summary": cs_buflo_summary,
-        "completion_status": completion.status,
-        "error": completion.error,
-        "error_class": completion.error_class,
+        "completion_status": completion_status,
+        "error": completion_error,
+        "error_class": completion_error_class,
+        "terminal_evidence_render_errors": evidence_render_errors,
         "endpoints": endpoint_data,
         "responses": responses,
         "chaff_responses": chaff_responses,
     });
-    atomic_write(
-        &spec.output_dir.join("run.json"),
-        serde_json::to_string_pretty(&run)?.as_bytes(),
-    )?;
-    Ok(())
+    serde_json::to_vec_pretty(&run)
+        .expect("serializing a fully materialized serde_json::Value to Vec cannot fail")
+}
+
+#[cfg(test)]
+fn write_run_json(
+    spec: &RunSpec,
+    endpoints: &[Endpoint],
+    responses: &[ResponseResult],
+    started_unix_ns: u128,
+    completion: &RunCompletion<'_>,
+) -> Result<(), Error> {
+    let process_scheduler = process_scheduler_evidence()?;
+    let (chaff_responses, evidence_render_errors) = collect_chaff_responses_total(endpoints);
+    let bytes = render_run_json(
+        spec,
+        endpoints,
+        responses,
+        &chaff_responses,
+        &process_scheduler,
+        &evidence_render_errors,
+        started_unix_ns,
+        completion,
+    );
+    atomic_write(&spec.output_dir.join("run.json"), &bytes)
+}
+
+fn collect_chaff_responses_total(
+    endpoints: &[Endpoint],
+) -> (Vec<ChaffResponseResult>, Vec<String>) {
+    match collect_chaff_responses(endpoints) {
+        Ok(responses) => (responses, Vec::new()),
+        Err(error) => (
+            Vec::new(),
+            vec![format!("collect chaff responses failed: {error}")],
+        ),
+    }
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), Error> {
@@ -14580,6 +19302,16 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), Error> {
     file.write_all(contents)?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
+    #[cfg(unix)]
+    {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "atomic run artifact path had no parent directory",
+            )
+        })?;
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -14607,7 +19339,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
         fs,
-        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         num::NonZeroU64,
         path::{Path, PathBuf},
         sync::{
@@ -14649,18 +19381,19 @@ mod tests {
         CsExactIncomingRetry, CsExactIncomingRetryPhase, DefenseArg, Error, ExpectedChaffIdentity,
         OutputDriveCardinality, OutputWorkBoundary, PostOutputRollingBarrier, PrefixBurst,
         PrefixNumericProfile, PrefixPackSpec, PrefixStreamReceipt, PreparedExpectedResponse,
-        Preset, ProfileArg, QcsdRequestRole, QualificationAcknowledgement, QualifierStream,
-        RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS, RequestPolicyArg,
-        ResourceRunState, ResponseQualificationMode, ResponseQualificationRequest, RunCompletion,
-        RunSpec, RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket,
-        SocketHandoff, SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg,
-        StreamActivationStage, StreamRecord, StreamType, SustainedResponseQualificationRequest,
-        TerminalActionSemantics, TestOutputDrive, TrafficMorphingActivation, absolute_wakeup,
-        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
-        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
-        attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
-        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
-        buflo_exact_incoming_identities, buflo_exact_incoming_identity_is_pending,
+        PreparedOutputDrive, Preset, ProfileArg, QcsdRequestRole, QualificationAcknowledgement,
+        QualifierStream, RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS,
+        RequestPolicyArg, ResourceRunState, ResponseQualificationMode,
+        ResponseQualificationRequest, RunCompletion, RunSpec, RunnerWakeupMetrics,
+        RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff, SocketHandoffBoundary,
+        SocketHandoffPolicy, StaticModeArg, StreamActivationStage, StreamRecord, StreamType,
+        SustainedResponseQualificationRequest, TerminalActionSemantics, TestOutputDrive,
+        TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
+        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
+        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
+        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
+        bounded_qualification_wait, buflo_exact_incoming_identities,
+        buflo_exact_incoming_identity_is_pending,
         buflo_exact_release_failure_watchdog_cadence_validated,
         buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
         buflo_exact_release_wait_step, buflo_exact_release_zero_failure_watchdog_remainder_bound,
@@ -14678,14 +19411,15 @@ mod tests {
         endpoint_candidate_egress_backlog, endpoint_egress_backlog_pending, endpoint_send_terminal,
         ensure_defense_realizable, exact_incoming_retry_times,
         expected_application_response_length, expire_buflo_exact_incoming_credit,
-        finish_application_record, finish_chaff_record, finish_stream, forward_counter_delta,
-        forward_qcsd_observation, handle_all_qcsd_observations, handle_http_events,
-        has_in_flight_application_stream, is_candidate_defense, is_public_network_address,
-        late_socket_handoff_error, next_buflo_exact_release_guard, normalize_rolling_prearm_window,
-        now, pending_receive_identity_is_reconciled, prefix_numeric_profile_sha256,
-        prefix_receipts_pass, prefix_targetless_stream_bytes, preflight_receive_actions_with,
-        prepare_chaff_cancellation, projected_ael, projected_identity_chaff_headers,
-        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
+        finalize_prepared_output, finish_application_record, finish_chaff_record, finish_stream,
+        forward_counter_delta, forward_qcsd_observation, handle_all_qcsd_observations,
+        handle_http_events, has_in_flight_application_stream, is_candidate_defense,
+        is_public_network_address, late_socket_handoff_error, next_buflo_exact_release_guard,
+        normalize_rolling_prearm_window, now, pending_receive_identity_is_reconciled,
+        prefix_numeric_profile_sha256, prefix_receipts_pass, prefix_targetless_stream_bytes,
+        preflight_receive_actions_with, prepare_chaff_cancellation, prepare_output_once_with_clock,
+        projected_ael, projected_identity_chaff_headers, qcsd_connection_parameters,
+        qualification_content_encoding, ready_request_batch,
         reconcile_buflo_exact_incoming_output_error, record_adapter_action_error,
         record_buflo_authoritative_sample, record_receive_limit_error, record_terminal_action,
         refresh_buflo_exact_incoming_identities, register_action_batch, remaining_wakeup_delay,
@@ -15302,7 +20036,7 @@ mod tests {
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
-        reason = "the deterministic expiry oracle binds dependency closure, adapter tombstones, and absence of catch-up output"
+        reason = "the deterministic expiry oracle binds one exact pair, its adapter tombstone, and absence of catch-up output"
     )]
     async fn exact_handoff_large_oversleep_terminalizes_dependents_without_materializing_next_tick()
     {
@@ -15344,8 +20078,6 @@ mod tests {
         drop(endpoint.client.qcsd_timestamped_observations());
 
         let first = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("first incoming");
-        let dependent =
-            Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("dependent incoming");
         let next_tick = Packet::new(Duration::from_millis(20), Direction::Incoming, 100)
             .expect("next-tick incoming");
         let mut controller = QcsdController::with_defense(
@@ -15357,7 +20089,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([first, dependent, next_tick]),
+                events: VecDeque::from([outgoing_pair(first), first, next_tick]),
                 exact_incoming_window: true,
             }),
         )
@@ -15380,7 +20112,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let scheduled: Vec<_> = actions
             .iter()
             .filter_map(|action| match action {
@@ -15388,14 +20120,20 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(scheduled.len(), 2, "only the two t=0 credits are staged");
-        assert_eq!(
-            scheduled[0].1, scheduled[1].1,
-            "the later range depends on the first"
-        );
+        assert_eq!(scheduled.len(), 1, "only the paired t=0 credit is staged");
+        let incoming_slot = scheduled[0].0;
 
         let mut endpoints = vec![endpoint];
         endpoints[0].test_force_socket_handoff_success = true;
+        let defense_start = now();
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            defense_start,
+            defense_start + Duration::from_millis(20),
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -15408,24 +20146,10 @@ mod tests {
         )
         .expect("apply dependent receive credits");
 
-        let defense_start = now();
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: defense_start,
-            guard_at: defense_start,
-            active_wait_at: defense_start,
-            release: defense_start,
-            deadline: defense_start + Duration::from_millis(20),
-        };
         let mut captured =
             buflo_exact_incoming_identities(&guard, &endpoints, &controller, defense_start, None)
-                .expect("capture both dependent identities");
-        assert_eq!(captured.len(), 2);
+                .expect("capture the paired incoming identity");
+        assert_eq!(captured.len(), 1);
         let overslept_at = guard.deadline + Duration::from_millis(100);
         let error = expire_buflo_exact_incoming_credit(
             &guard,
@@ -15447,8 +20171,8 @@ mod tests {
                 .client
                 .qcsd_pending_receive_action_identities()
                 .len(),
-            2,
-            "accepted but unencoded ranges remain terminal transport tombstones"
+            1,
+            "the accepted but unencoded range remains a terminal transport tombstone"
         );
 
         drop(traces);
@@ -15470,7 +20194,7 @@ mod tests {
             .position(|column| *column == "miss_reason")
             .expect("miss-reason column");
         let observed: Vec<Vec<_>> = rows.map(|row| row.split(',').collect()).collect();
-        assert_eq!(observed.len(), 2, "the future tick is never materialized");
+        assert_eq!(observed.len(), 1, "the future tick is never materialized");
         assert!(observed.iter().all(|row| {
             row[direction] == "incoming"
                 && row[satisfaction] == "missed"
@@ -16565,6 +21289,32 @@ mod tests {
             super::scheduler_contract_matches(&unconstrained),
             "direct developer runs have no requested scheduler contract"
         );
+
+        let mut etf = unconstrained;
+        etf.contract = Some(super::QCSD_CLIENT_ETF_SCHEDULER_CONTRACT.into());
+        etf.contract_valid = true;
+        etf.policy = "SCHED_RR".into();
+        etf.effective_capabilities_hex = Some("0000000000001100".into());
+        let buflo = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: "buflo.json".into(),
+        });
+        assert!(super::process_scheduler_ready_for_network_execution(
+            &etf, &buflo
+        ));
+        assert!(!super::process_scheduler_ready_for_network_execution(
+            &etf,
+            &DefenseConfig::None
+        ));
+        etf.effective_capabilities_hex = Some("0000000000000000".into());
+        assert!(super::process_scheduler_ready_for_network_execution(
+            &etf,
+            &DefenseConfig::None
+        ));
+        etf.contract_valid = false;
+        assert!(!super::process_scheduler_ready_for_network_execution(
+            &etf,
+            &DefenseConfig::None
+        ));
     }
 
     #[test]
@@ -18957,6 +23707,95 @@ mod tests {
         endpoint.client.qcsd_enable_send_shaping(true);
         drop(endpoint.client.qcsd_timestamped_observations());
         stream
+    }
+
+    fn outgoing_pair(packet: Packet) -> Packet {
+        Packet::new(packet.timestamp(), Direction::Outgoing, 1_200)
+            .expect("synthetic paired outgoing packet")
+    }
+
+    /// Build a committed exact-release guard from the controller-issued
+    /// outgoing action immediately preceding `incoming_slot`.  The outgoing
+    /// action is resolved in controller state and removed from the adapter
+    /// batch, modelling the point immediately after its physical handoff and
+    /// before the paired receiver-credit turn.
+    fn synthetic_paired_buflo_guard(
+        controller: &mut QcsdController,
+        actions: &mut Vec<QcsdAction>,
+        endpoints: &[super::Endpoint],
+        incoming_slot: QcsdSlotId,
+        release: Instant,
+        deadline: Instant,
+    ) -> BufloExactReleaseGuard {
+        let (incoming_action_index, incoming_packet) = actions
+            .iter()
+            .enumerate()
+            .find_map(|(index, action)| match action {
+                QcsdAction::IncreaseReceiveLimit { packet, slot, .. } if *slot == incoming_slot => {
+                    Some((index, *packet))
+                }
+                _ => None,
+            })
+            .expect("controller-issued incoming action");
+        let (outgoing_action_index, outgoing_endpoint, outgoing_packet, outgoing_slot) = actions
+            .iter()
+            .enumerate()
+            .find_map(|(index, action)| match action {
+                QcsdAction::SendPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    ..
+                } if packet.direction() == Direction::Outgoing
+                    && packet.timestamp() == incoming_packet.timestamp()
+                    && slot.0.saturating_add(1) == incoming_slot.0 =>
+                {
+                    Some((index, *endpoint, *packet, *slot))
+                }
+                _ => None,
+            })
+            .expect("controller-issued outgoing action before incoming pair");
+        assert!(
+            outgoing_action_index < incoming_action_index,
+            "controller must issue the paired outgoing action before its incoming action"
+        );
+        assert_eq!(
+            incoming_slot.0,
+            outgoing_slot.0.saturating_add(1),
+            "synthetic exact pair must retain controller slot adjacency"
+        );
+        let removed = actions.remove(outgoing_action_index);
+        assert!(matches!(removed, QcsdAction::SendPacket { slot, .. } if slot == outgoing_slot));
+        controller.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint: outgoing_endpoint,
+                slot: outgoing_slot,
+                observed_size: outgoing_packet.length(),
+            },
+            outgoing_packet.timestamp(),
+        );
+        controller.drain_actions().for_each(drop);
+        assert_eq!(
+            controller.terminal_slot_resolution_at(outgoing_slot),
+            Some(outgoing_packet.timestamp()),
+            "synthetic outgoing handoff must be terminal in controller state"
+        );
+        let endpoint_index = endpoints
+            .iter()
+            .position(|endpoint| endpoint.id == outgoing_endpoint)
+            .expect("paired outgoing endpoint");
+        BufloExactReleaseGuard {
+            endpoint_index,
+            endpoint: outgoing_endpoint,
+            slot: outgoing_slot,
+            packet: outgoing_packet,
+            phase: BufloExactReleasePhase::Committed,
+            output_admission_at: release,
+            guard_at: release,
+            active_wait_at: release,
+            release,
+            deadline,
+        }
     }
 
     #[derive(Debug, Default)]
@@ -21462,12 +26301,12 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([incoming]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming]),
                 exact_incoming_window: false,
             }),
         )
         .expect("incoming controller");
-        for endpoint in [QcsdEndpointId(0), QcsdEndpointId(1)] {
+        for endpoint in [QcsdEndpointId(1), QcsdEndpointId(0)] {
             controller.observe(
                 QcsdObservation::EndpointReady {
                     endpoint,
@@ -21487,7 +26326,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let incoming_slot = actions
             .iter()
             .find_map(|action| match action {
@@ -21507,6 +26346,15 @@ mod tests {
         endpoints[0].test_force_socket_handoff_success = true;
         endpoints[1].test_observation_on_next_output =
             Some(observation_clock.record(QcsdObservation::EgressBacklog { pending: true }));
+        let release = now();
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            release,
+            release + Duration::from_millis(50),
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -21568,21 +26416,6 @@ mod tests {
             2
         );
 
-        let release = now();
-        let outgoing =
-            Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).expect("outgoing guard");
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 1,
-            endpoint: QcsdEndpointId(1),
-            slot: QcsdSlotId(999),
-            packet: outgoing,
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline: release + Duration::from_millis(50),
-        };
         let stale_guard = BufloExactReleaseGuard {
             packet: Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
                 .expect("later outgoing guard"),
@@ -21665,7 +26498,7 @@ mod tests {
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
-        reason = "the two-origin retry regression proves independent callback and slot ownership"
+        reason = "the two-origin retry regression proves independent callbacks for two physical owners of one logical pair"
     )]
     async fn exact_handoff_fans_out_distinct_owner_callbacks_without_cross_borrowing() {
         let output = trace_output_dir("multi-owner-post-handoff-credit");
@@ -21710,7 +26543,7 @@ mod tests {
                 .expect("create controlled request stream");
             endpoint
                 .client
-                .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(10_000))
+                .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(616))
                 .expect("register controlled response stream");
             endpoint
                 .client
@@ -21723,20 +26556,17 @@ mod tests {
             streams.push(stream);
         }
 
-        let first_incoming =
-            Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("first incoming");
-        let second_incoming =
-            Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("second incoming");
+        let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("incoming");
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
                 control_interval_us: 50_000,
                 initial_max_stream_data: 16,
-                max_stream_data_excess: 1_000,
+                max_stream_data_excess: 0,
                 ..QcsdConfig::default()
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([first_incoming, second_incoming]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming]),
                 exact_incoming_window: true,
             }),
         )
@@ -21759,13 +26589,23 @@ mod tests {
                     endpoint,
                     stream: QcsdStreamId(stream.as_u64()),
                     role: QcsdRequestRole::Application,
-                    expected_response_length: Some(10_000),
+                    expected_response_length: Some(616),
                 },
                 Duration::ZERO,
             );
         }
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
+        let incoming_slots: BTreeSet<_> = actions
+            .iter()
+            .filter_map(|action| action.receive_identity()?.slot())
+            .collect();
+        assert_eq!(
+            incoming_slots.len(),
+            1,
+            "both owners share one logical slot"
+        );
+        let incoming_slot = *incoming_slots.iter().next().expect("incoming slot");
         let owners: BTreeSet<_> = actions
             .iter()
             .filter_map(|action| match action {
@@ -21782,6 +26622,15 @@ mod tests {
         for endpoint in &mut endpoints {
             endpoint.test_force_socket_handoff_success = true;
         }
+        let release = now();
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            release,
+            release + Duration::from_millis(50),
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -21798,7 +26647,6 @@ mod tests {
             [0, 1]
         );
 
-        let release = now();
         let first_callback = release + Duration::from_millis(1);
         let second_callback = release + Duration::from_millis(2);
         endpoints[0]
@@ -21808,19 +26656,6 @@ mod tests {
             TestOutputDrive::CallbackAt(second_callback),
             TestOutputDrive::CallbackAt(second_callback),
         ]);
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline: release + Duration::from_millis(50),
-        };
         let mut runner_wakeup_metrics = RunnerWakeupMetrics::new();
         drive_buflo_unadvertised_scheduled_receive_credit(
             &guard,
@@ -21900,7 +26735,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([incoming]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming]),
                 exact_incoming_window: true,
             }),
         )
@@ -21928,7 +26763,7 @@ mod tests {
             );
         }
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let credits: Vec<_> = actions
             .iter()
             .filter_map(|action| match action {
@@ -21955,6 +26790,15 @@ mod tests {
         let mut endpoints = vec![first, second];
         endpoints[0].test_force_socket_handoff_success = true;
         endpoints[1].test_force_socket_handoff_success = true;
+        let release = now();
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            release,
+            release + Duration::from_millis(50),
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -21967,20 +26811,6 @@ mod tests {
         )
         .expect("apply split receive credit");
 
-        let release = now();
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline: release + Duration::from_millis(50),
-        };
         let mut captured =
             buflo_exact_incoming_identities(&guard, &endpoints, &controller, release, None)
                 .expect("capture both physical children");
@@ -22100,7 +26930,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([first, second]),
+                events: VecDeque::from([outgoing_pair(first), first, second]),
                 exact_incoming_window: true,
             }),
         )
@@ -22124,9 +26954,11 @@ mod tests {
         );
         controller.drain_actions().for_each(drop);
         controller.poll(Duration::ZERO);
-        let mut credits: Vec<_> = controller
-            .drain_actions()
+        let mut actions: Vec<_> = controller.drain_actions().collect();
+        let mut credits: Vec<_> = actions
+            .iter()
             .filter(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+            .cloned()
             .collect();
         assert_eq!(credits.len(), 2);
         let second_credit = credits.pop().expect("second logical credit");
@@ -22140,6 +26972,15 @@ mod tests {
         assert_ne!(first_slot, second_slot);
 
         let mut endpoints = vec![endpoint];
+        let release = now();
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            first_slot.expect("first incoming slot"),
+            release,
+            release + Duration::from_millis(50),
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -22151,20 +26992,6 @@ mod tests {
             vec![first_credit],
         )
         .expect("apply first logical slot only");
-        let release = now();
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline: release + Duration::from_millis(50),
-        };
         let mut captured =
             buflo_exact_incoming_identities(&guard, &endpoints, &controller, release, None)
                 .expect("capture first logical slot");
@@ -22218,8 +27045,8 @@ mod tests {
         let first_stream =
             open_controlled_runner_stream(&mut endpoint, &mut server, started, 4_433, 10_000);
         let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("incoming");
-        let future =
-            Packet::new(Duration::from_secs(1), Direction::Outgoing, 100).expect("future outgoing");
+        let future = Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
+            .expect("future outgoing");
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
                 control_interval_us: 20_000,
@@ -22229,7 +27056,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([incoming, future]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming, future]),
                 exact_incoming_window: true,
             }),
         )
@@ -22252,13 +27079,29 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let incoming_slot = actions
             .iter()
             .find_map(|action| action.receive_identity()?.slot())
             .expect("incoming slot");
+        let future_slot = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::PrearmPacket { packet, slot, .. } if *packet == future => Some(*slot),
+                _ => None,
+            })
+            .expect("future outgoing prearm");
         let mut endpoints = vec![endpoint];
         endpoints[0].test_force_socket_handoff_success = true;
+        let defense_start = now();
+        let first_guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            defense_start,
+            defense_start + Duration::from_millis(20),
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -22271,20 +27114,6 @@ mod tests {
         )
         .expect("apply first receive credit");
 
-        let defense_start = now();
-        let first_guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("first outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: defense_start,
-            guard_at: defense_start,
-            active_wait_at: defense_start,
-            release: defense_start,
-            deadline: defense_start + Duration::from_millis(20),
-        };
         let mut first_metrics = RunnerWakeupMetrics::new();
         drive_buflo_unadvertised_scheduled_receive_credit(
             &first_guard,
@@ -22309,10 +27138,9 @@ mod tests {
         let later_guard = BufloExactReleaseGuard {
             endpoint_index: 0,
             endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(1_000),
-            packet: Packet::new(later_tick, Direction::Outgoing, 1_200)
-                .expect("later outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
+            slot: future_slot,
+            packet: future,
+            phase: BufloExactReleasePhase::Prearmed,
             output_admission_at: later_release,
             guard_at: later_release,
             active_wait_at: later_release,
@@ -22380,7 +27208,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([incoming]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming]),
                 exact_incoming_window: true,
             }),
         )
@@ -22403,7 +27231,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let incoming_slot = actions
             .iter()
             .find_map(|action| {
@@ -22412,6 +27240,16 @@ mod tests {
             })
             .expect("incoming slot");
         let mut endpoints = vec![endpoint];
+        let release = now();
+        let deadline = release + Duration::from_millis(20);
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            release,
+            deadline,
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -22424,24 +27262,9 @@ mod tests {
         )
         .expect("apply receive credit");
 
-        let release = now();
-        let deadline = release + Duration::from_millis(20);
         endpoints[0]
             .test_output_drives
             .push_back(TestOutputDrive::ErrorAt(deadline));
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline,
-        };
         let mut metrics = RunnerWakeupMetrics::new();
         let error = drive_buflo_unadvertised_scheduled_receive_credit(
             &guard,
@@ -22514,7 +27337,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([incoming]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming]),
                 exact_incoming_window: true,
             }),
         )
@@ -22537,7 +27360,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let (incoming_slot, absolute_limit) = actions
             .iter()
             .find_map(|action| match action {
@@ -22550,6 +27373,20 @@ mod tests {
             })
             .expect("incoming credit");
         let mut endpoints = vec![endpoint];
+        let defense_start = now();
+        let release = defense_start + Duration::from_nanos(999);
+        let nominal_deadline = defense_start + Duration::from_millis(20);
+        let deadline = nominal_deadline
+            .checked_sub(Duration::from_nanos(999))
+            .expect("sub-microsecond adapter deadline");
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            release,
+            deadline,
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -22562,25 +27399,6 @@ mod tests {
         )
         .expect("apply receive credit");
 
-        let defense_start = now();
-        let release = defense_start + Duration::from_nanos(999);
-        let nominal_deadline = defense_start + Duration::from_millis(20);
-        let deadline = nominal_deadline
-            .checked_sub(Duration::from_nanos(999))
-            .expect("sub-microsecond adapter deadline");
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline,
-        };
         let mut captured =
             buflo_exact_incoming_identities(&guard, &endpoints, &controller, defense_start, None)
                 .expect("capture physical child");
@@ -22717,7 +27535,12 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([first, second]),
+                events: VecDeque::from([
+                    outgoing_pair(first),
+                    first,
+                    outgoing_pair(second),
+                    second,
+                ]),
                 exact_incoming_window: true,
             }),
         )
@@ -22740,7 +27563,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let mut credits: Vec<_> = actions
             .iter()
             .filter_map(|action| match action {
@@ -22758,6 +27581,24 @@ mod tests {
         let (_, late_slot) = credits[1];
 
         let mut endpoints = vec![endpoint];
+        let defense_start = now();
+        let deadline = defense_start + Duration::from_millis(20);
+        let _timely_guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            timely_slot,
+            defense_start,
+            deadline,
+        );
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            late_slot,
+            defense_start,
+            deadline,
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -22770,26 +27611,6 @@ mod tests {
         )
         .expect("apply same-owner credits");
 
-        let defense_start = now();
-        let deadline = defense_start + Duration::from_millis(20);
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: defense_start,
-            guard_at: defense_start,
-            active_wait_at: defense_start,
-            release: defense_start,
-            deadline,
-        };
-        let mut captured =
-            buflo_exact_incoming_identities(&guard, &endpoints, &controller, defense_start, None)
-                .expect("capture both same-owner identities");
-        assert_eq!(captured.len(), 2);
-
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint: QcsdEndpointId(0),
@@ -22801,6 +27622,11 @@ mod tests {
         );
         assert!(controller.incoming_slot_is_locally_realized(timely_slot));
         assert!(!controller.incoming_slot_is_locally_realized(late_slot));
+        let mut captured =
+            buflo_exact_incoming_identities(&guard, &endpoints, &controller, defense_start, None)
+                .expect("capture only the late guard's adjacent identity");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].slot, late_slot);
 
         let mut metrics = RunnerWakeupMetrics::new();
         let error = reconcile_buflo_exact_incoming_output_error(
@@ -22899,7 +27725,7 @@ mod tests {
             },
             None,
             Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([incoming]),
+                events: VecDeque::from([outgoing_pair(incoming), incoming]),
                 exact_incoming_window: true,
             }),
         )
@@ -22922,7 +27748,7 @@ mod tests {
             Duration::ZERO,
         );
         controller.poll(Duration::ZERO);
-        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut actions: Vec<_> = controller.drain_actions().collect();
         let incoming_slot = actions
             .iter()
             .find_map(|action| match action {
@@ -22933,6 +27759,19 @@ mod tests {
 
         let mut endpoints = vec![endpoint];
         endpoints[0].test_force_socket_handoff_success = true;
+        let release = now();
+        let defense_start = release
+            .checked_sub(Duration::from_nanos(999))
+            .expect("adapter release has a sub-microsecond nominal predecessor");
+        let deadline = defense_start + Duration::from_millis(20);
+        let guard = synthetic_paired_buflo_guard(
+            &mut controller,
+            &mut actions,
+            &endpoints,
+            incoming_slot,
+            release,
+            deadline,
+        );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
             &mut endpoints,
@@ -22949,24 +27788,6 @@ mod tests {
             [0]
         );
 
-        let release = now();
-        let defense_start = release
-            .checked_sub(Duration::from_nanos(999))
-            .expect("adapter release has a sub-microsecond nominal predecessor");
-        let deadline = defense_start + Duration::from_millis(20);
-        let guard = BufloExactReleaseGuard {
-            endpoint_index: 0,
-            endpoint: QcsdEndpointId(0),
-            slot: QcsdSlotId(999),
-            packet: Packet::new(Duration::ZERO, Direction::Outgoing, 1_200)
-                .expect("outgoing guard"),
-            phase: BufloExactReleasePhase::Committed,
-            output_admission_at: release,
-            guard_at: release,
-            active_wait_at: release,
-            release,
-            deadline,
-        };
         // The first two absolute callbacks are already due when returned.
         // The remainder alternate between the strict deadline and an instant
         // after it. The retry loop must neither spin forever nor adopt either
@@ -25497,6 +30318,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_exact_output_is_provisional_until_physical_finalisation() {
+        let output = trace_output_dir("prepared-exact-output-transaction");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let mut controller = rolling_abort_controller(packet);
+        let preview = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+            .expect("rolling preview");
+        let slot = match &preview {
+            QcsdAction::PrearmPacket { slot, .. } => *slot,
+            _ => unreachable!("selected rolling preview"),
+        };
+        let mut endpoints = vec![connected_runner_endpoint(
+            &output,
+            started,
+            &observation_clock,
+        )];
+        drop(endpoints[0].client.qcsd_timestamped_observations());
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            vec![preview],
+        )
+        .expect("apply rolling preview");
+
+        let release_at = started + packet.timestamp();
+        controller
+            .reconcile_due_rolling(packet.timestamp())
+            .expect("commit rolling target at its logical release");
+        controller.flush_defense_observations();
+        apply_queued_actions(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            release_at,
+            packet.timestamp(),
+        )
+        .expect("apply committed target");
+
+        let prepared = match prepare_output_once_with_clock(&mut endpoints[0], release_at)
+            .await
+            .expect("prepare one encrypted exact datagram")
+        {
+            PreparedOutputDrive::Datagram(prepared) => prepared,
+            PreparedOutputDrive::Callback(_) | PreparedOutputDrive::None => {
+                panic!("committed target must build one datagram")
+            }
+        };
+        assert_eq!(prepared.batch.num_datagrams(), 1);
+        assert!(
+            controller
+                .pending_slots()
+                .iter()
+                .any(|(pending, _)| *pending == slot),
+            "build alone must not claim controller success"
+        );
+        assert!(!traces.is_slot_terminal(slot));
+
+        let sent_at = release_at + Duration::from_micros(1);
+        finalize_prepared_output(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            &prepared,
+            Some(started),
+            sent_at,
+        )
+        .expect("physical finalisation applies the retained observations once");
+        assert!(controller.pending_slots().is_empty());
+        assert!(traces.is_slot_terminal(slot));
+
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 2);
+        assert!(packets.contains(",satisfied,"));
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
     async fn late_successful_target_handoff_records_all_trace_evidence_before_failing() {
         let output = trace_output_dir("late-successful-target-handoff");
         let started = test_fixture::now();
@@ -26348,7 +31259,7 @@ mod tests {
             .expect("record early aligned guard");
         assert!(early_metrics.buflo_exact_release_invariants_hold());
 
-        let mut inflated_active_duration = early_metrics;
+        let mut inflated_active_duration = early_metrics.clone();
         inflated_active_duration.buflo_exact_release_guard_wait_nanoseconds += 1;
         inflated_active_duration.buflo_exact_release_active_wait_nanoseconds += 1;
         assert!(
@@ -26356,7 +31267,7 @@ mod tests {
             "unretained successes cannot exceed their canonical window-plus-dispatch ceiling"
         );
 
-        let mut hidden_entry_without_duration_reduction = early_metrics;
+        let mut hidden_entry_without_duration_reduction = early_metrics.clone();
         hidden_entry_without_duration_reduction
             .buflo_exact_release_max_guard_entry_lateness_nanoseconds = 1;
         hidden_entry_without_duration_reduction
@@ -26366,7 +31277,7 @@ mod tests {
             "a hidden maximum entry lateness must reduce the unretained active-time capacity"
         );
 
-        let mut impossible_deadline_count = early_metrics;
+        let mut impossible_deadline_count = early_metrics.clone();
         impossible_deadline_count.buflo_exact_release_dispatch_at_or_after_deadline_guards = 1;
         assert!(
             !impossible_deadline_count.buflo_exact_release_invariants_hold(),
@@ -26374,7 +31285,7 @@ mod tests {
         );
 
         let active_maximum_ceiling = 5_000_000 + 7;
-        let mut impossible_spin_maximum = early_metrics;
+        let mut impossible_spin_maximum = early_metrics.clone();
         impossible_spin_maximum.buflo_exact_release_max_active_spin_gap_nanoseconds =
             active_maximum_ceiling + 1;
         if impossible_spin_maximum.buflo_exact_release_active_wait_poll_source
@@ -26388,14 +31299,14 @@ mod tests {
             "a per-guard spin maximum cannot exceed every reachable active duration"
         );
 
-        let mut impossible_sample_gap = early_metrics;
+        let mut impossible_sample_gap = early_metrics.clone();
         impossible_sample_gap.buflo_exact_release_max_authoritative_sample_gap_nanoseconds =
             active_maximum_ceiling + 1;
         assert!(
             !impossible_sample_gap.buflo_exact_release_invariants_hold(),
             "an authoritative sample gap cannot exceed every reachable active duration"
         );
-        let mut impossible_counter_lag = early_metrics;
+        let mut impossible_counter_lag = early_metrics.clone();
         impossible_counter_lag.buflo_exact_release_max_authoritative_counter_lag_nanoseconds =
             active_maximum_ceiling + 1;
         assert!(
@@ -26576,7 +31487,7 @@ mod tests {
             1
         );
         assert!(metrics.buflo_exact_release_invariants_hold());
-        let mut missing_success_predecessor = metrics;
+        let mut missing_success_predecessor = metrics.clone();
         missing_success_predecessor.buflo_exact_release_dispatch_ready_guards = 0;
         assert!(
             !missing_success_predecessor.buflo_exact_release_invariants_hold(),
@@ -26919,29 +31830,29 @@ mod tests {
         let valid = RunnerWakeupMetrics::new();
         assert!(valid.buflo_exact_release_invariants_hold());
 
-        let mut invalid_histogram = valid;
+        let mut invalid_histogram = valid.clone();
         invalid_histogram
             .buflo_exact_release_dispatch_lateness_histogram
             .counts[0] = 1;
         assert!(!invalid_histogram.buflo_exact_release_invariants_hold());
 
-        let mut invalid_counter_partition = valid;
+        let mut invalid_counter_partition = valid.clone();
         invalid_counter_partition.buflo_exact_release_active_wait_counter_guards = 1;
         assert!(!invalid_counter_partition.buflo_exact_release_invariants_hold());
 
-        let mut invalid_nonmonotonic = valid;
+        let mut invalid_nonmonotonic = valid.clone();
         invalid_nonmonotonic.buflo_exact_release_active_wait_counter_nonmonotonic_guards = 1;
         assert!(!invalid_nonmonotonic.buflo_exact_release_invariants_hold());
 
-        let mut invalid_worst_presence = valid;
+        let mut invalid_worst_presence = valid.clone();
         invalid_worst_presence.buflo_exact_release_guard_entries = 1;
         assert!(!invalid_worst_presence.buflo_exact_release_invariants_hold());
 
-        let mut invalid_passive_max = valid;
+        let mut invalid_passive_max = valid.clone();
         invalid_passive_max.buflo_exact_release_max_passive_sleep_overrun_nanoseconds = 1;
         assert!(!invalid_passive_max.buflo_exact_release_invariants_hold());
 
-        let mut invalid_spin_max = valid;
+        let mut invalid_spin_max = valid.clone();
         invalid_spin_max.buflo_exact_release_max_active_spin_gap_nanoseconds = 1;
         assert!(!invalid_spin_max.buflo_exact_release_invariants_hold());
 
@@ -27013,7 +31924,7 @@ mod tests {
             .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
             .expect("producer-shaped counter guard");
         assert!(counter_metrics.buflo_exact_release_invariants_hold());
-        let mut forged_singleton_chronology = counter_metrics;
+        let mut forged_singleton_chronology = counter_metrics.clone();
         let forged_worst = forged_singleton_chronology
             .buflo_exact_release_worst_guard
             .as_mut()
@@ -27031,17 +31942,17 @@ mod tests {
             1
         );
 
-        let mut missing_cadence_validation = counter_metrics;
+        let mut missing_cadence_validation = counter_metrics.clone();
         missing_cadence_validation
             .buflo_exact_release_active_wait_authoritative_watchdog_cadence_validated_guards = 0;
         assert!(!missing_cadence_validation.buflo_exact_release_invariants_hold());
 
-        let mut impossible_aggregate_remainder = counter_metrics;
+        let mut impossible_aggregate_remainder = counter_metrics.clone();
         impossible_aggregate_remainder.buflo_exact_release_active_wait_iterations +=
             super::BUFLO_EXACT_RELEASE_AUTHORITATIVE_WATCHDOG_INTERVAL;
         assert!(!impossible_aggregate_remainder.buflo_exact_release_invariants_hold());
 
-        let mut inflated_singleton_duration = counter_metrics;
+        let mut inflated_singleton_duration = counter_metrics.clone();
         inflated_singleton_duration.buflo_exact_release_guard_wait_nanoseconds += 1;
         inflated_singleton_duration.buflo_exact_release_active_wait_nanoseconds += 1;
         assert!(
@@ -27049,15 +31960,15 @@ mod tests {
             "one retained successful guard exactly binds aggregate active duration"
         );
 
-        let mut invalid_source_partition = counter_metrics;
+        let mut invalid_source_partition = counter_metrics.clone();
         invalid_source_partition.buflo_exact_release_active_wait_counter_unavailable_guards = 1;
         assert!(!invalid_source_partition.buflo_exact_release_invariants_hold());
 
-        let mut invalid_counter_gap = counter_metrics;
+        let mut invalid_counter_gap = counter_metrics.clone();
         invalid_counter_gap.buflo_exact_release_max_active_spin_gap_nanoseconds -= 1;
         assert!(!invalid_counter_gap.buflo_exact_release_invariants_hold());
 
-        let mut invalid_calibration_span = counter_metrics;
+        let mut invalid_calibration_span = counter_metrics.clone();
         invalid_calibration_span.buflo_exact_release_max_counter_calibration_span_nanoseconds =
             5_000_001;
         assert!(!invalid_calibration_span.buflo_exact_release_invariants_hold());
@@ -27247,7 +32158,7 @@ mod tests {
             .expect("producer-reachable watchdog then unavailable failure");
         assert!(singleton.buflo_exact_release_invariants_hold());
 
-        let mut forged_singleton_failure_chronology = singleton;
+        let mut forged_singleton_failure_chronology = singleton.clone();
         let forged_failure = forged_singleton_failure_chronology
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27260,14 +32171,14 @@ mod tests {
             "relative failure boundaries must match the scalar adapter geometry"
         );
 
-        let mut forged_singleton_iterations = singleton;
+        let mut forged_singleton_iterations = singleton.clone();
         forged_singleton_iterations.buflo_exact_release_active_wait_iterations = 132;
         assert!(
             !forged_singleton_iterations.buflo_exact_release_invariants_hold(),
             "one failure cannot hide relaxed reads outside its floor(R/64) cadence range"
         );
 
-        let mut forged_comparison_without_source = singleton;
+        let mut forged_comparison_without_source = singleton.clone();
         forged_comparison_without_source
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27320,7 +32231,7 @@ mod tests {
             .expect("sole terminal failure");
         assert!(pair.buflo_exact_release_invariants_hold());
 
-        let mut forged_dispatch_deadline_count = pair;
+        let mut forged_dispatch_deadline_count = pair.clone();
         let retained_dispatch_is_late = pair
             .buflo_exact_release_worst_guard
             .expect("sole-pair worst guard")
@@ -27332,7 +32243,7 @@ mod tests {
             "a sole successful predecessor exactly determines the paired late-dispatch count"
         );
 
-        let mut forged_failure_source = pair;
+        let mut forged_failure_source = pair.clone();
         forged_failure_source
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27343,7 +32254,7 @@ mod tests {
             "a retained typed counter failure must use the aggregate predictive source"
         );
 
-        let mut forged_worst_phase = pair;
+        let mut forged_worst_phase = pair.clone();
         forged_worst_phase
             .buflo_exact_release_worst_guard
             .as_mut()
@@ -27353,7 +32264,7 @@ mod tests {
             !forged_worst_phase.buflo_exact_release_invariants_hold(),
             "the retained worst-guard phase remains in the adapter phase domain"
         );
-        let mut forged_failure_phase = pair;
+        let mut forged_failure_phase = pair.clone();
         forged_failure_phase
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27364,7 +32275,7 @@ mod tests {
             "the retained failure phase remains in the adapter phase domain"
         );
 
-        let mut forged_failure_counter_tuple = pair;
+        let mut forged_failure_counter_tuple = pair.clone();
         let forged_tuple = forged_failure_counter_tuple
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27377,7 +32288,7 @@ mod tests {
             "a retained failure counter tuple is wholly present or wholly absent"
         );
 
-        let mut forged_failure_state = pair;
+        let mut forged_failure_state = pair.clone();
         forged_failure_state
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27395,7 +32306,7 @@ mod tests {
             "aggregate sums cannot mask an impossible retained-failure counter state"
         );
 
-        let mut forged_zero_progress_retry = pair;
+        let mut forged_zero_progress_retry = pair.clone();
         forged_zero_progress_retry
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27417,7 +32328,7 @@ mod tests {
             .buflo_exact_release_last_failure
             .expect("sole-pair failure")
             .active_wait_monotonic_nanoseconds;
-        let mut forged_failure_sample_gap = pair;
+        let mut forged_failure_sample_gap = pair.clone();
         forged_failure_sample_gap
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27427,7 +32338,7 @@ mod tests {
             !forged_failure_sample_gap.buflo_exact_release_invariants_hold(),
             "a retained failure sample gap cannot exceed that failure's active wait"
         );
-        let mut forged_failure_counter_lag = pair;
+        let mut forged_failure_counter_lag = pair.clone();
         forged_failure_counter_lag
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27442,7 +32353,7 @@ mod tests {
             .expect("sole-pair failure")
             .counter_nanoseconds
             .unwrap_or(0);
-        let mut forged_failure_counter_lead = pair;
+        let mut forged_failure_counter_lead = pair.clone();
         forged_failure_counter_lead
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27461,7 +32372,7 @@ mod tests {
             "a retained failure counter lead cannot exceed its counter-observed duration"
         );
 
-        let mut forged_worst_retry_partition = pair;
+        let mut forged_worst_retry_partition = pair.clone();
         let worst = forged_worst_retry_partition
             .buflo_exact_release_worst_guard
             .as_mut()
@@ -27557,7 +32468,7 @@ mod tests {
         )
         .expect("producer-shaped mixed receipt has a finite active-wait ceiling");
         assert!(mixed_active_wait_ceiling < u64::MAX);
-        let mut forged_mixed_active_wait = two_successes_then_failure;
+        let mut forged_mixed_active_wait = two_successes_then_failure.clone();
         forged_mixed_active_wait.buflo_exact_release_guard_wait_nanoseconds =
             mixed_active_wait_ceiling.saturating_add(1);
         forged_mixed_active_wait.buflo_exact_release_active_wait_nanoseconds =
@@ -27573,7 +32484,7 @@ mod tests {
             .max(retained_sample_gap)
             .max(retained_failure_sample_gap)
             .saturating_add(1);
-        let mut forged_mixed_sample_gap = two_successes_then_failure;
+        let mut forged_mixed_sample_gap = two_successes_then_failure.clone();
         forged_mixed_sample_gap.buflo_exact_release_max_authoritative_sample_gap_nanoseconds =
             impossible_sample_gap;
         assert!(
@@ -27588,7 +32499,7 @@ mod tests {
             .max(retained_counter_lag)
             .max(retained_failure_counter_lag)
             .saturating_add(1);
-        let mut forged_mixed_counter_lag = two_successes_then_failure;
+        let mut forged_mixed_counter_lag = two_successes_then_failure.clone();
         forged_mixed_counter_lag.buflo_exact_release_max_authoritative_counter_lag_nanoseconds =
             impossible_counter_lag;
         assert!(
@@ -27619,7 +32530,7 @@ mod tests {
             two_successes_then_late_failure.buflo_exact_release_invariants_hold(),
             "the retained typed failure itself authorises its later aggregate entry maximum"
         );
-        let mut forged_retained_failure_iterations = two_successes_then_failure;
+        let mut forged_retained_failure_iterations = two_successes_then_failure.clone();
         forged_retained_failure_iterations
             .buflo_exact_release_last_failure
             .as_mut()
@@ -27629,7 +32540,7 @@ mod tests {
             !forged_retained_failure_iterations.buflo_exact_release_invariants_hold(),
             "hidden successes cannot absorb a forged retained-failure iteration count"
         );
-        let mut forged_erased_remaining_success = two_successes_then_failure;
+        let mut forged_erased_remaining_success = two_successes_then_failure.clone();
         forged_erased_remaining_success.buflo_exact_release_active_wait_iterations =
             pair.buflo_exact_release_active_wait_iterations;
         assert!(
@@ -27711,52 +32622,52 @@ mod tests {
         let rejects = |candidate: RunnerWakeupMetrics| {
             assert!(!candidate.buflo_exact_release_invariants_hold());
         };
-        let mut forged_calibration_sum = pair;
+        let mut forged_calibration_sum = pair.clone();
         forged_calibration_sum.buflo_exact_release_active_wait_counter_calibrations += 1;
         rejects(forged_calibration_sum);
 
-        let mut forged_confirmation_retry_sum = pair;
+        let mut forged_confirmation_retry_sum = pair.clone();
         forged_confirmation_retry_sum.buflo_exact_release_active_wait_instant_confirmations += 1;
         forged_confirmation_retry_sum.buflo_exact_release_active_wait_early_confirmation_retries +=
             1;
         rejects(forged_confirmation_retry_sum);
 
-        let mut forged_watchdog_sum = pair;
+        let mut forged_watchdog_sum = pair.clone();
         forged_watchdog_sum.buflo_exact_release_active_wait_iterations += 64;
         forged_watchdog_sum.buflo_exact_release_active_wait_authoritative_watchdog_checks += 1;
         rejects(forged_watchdog_sum);
 
-        let mut forged_counter_sum = pair;
+        let mut forged_counter_sum = pair.clone();
         forged_counter_sum.buflo_exact_release_active_wait_counter_nanoseconds += 1;
         rejects(forged_counter_sum);
 
-        let mut forged_chronology_sum = pair;
+        let mut forged_chronology_sum = pair.clone();
         forged_chronology_sum.buflo_exact_release_guard_wait_nanoseconds += 1;
         forged_chronology_sum.buflo_exact_release_active_wait_nanoseconds += 1;
         rejects(forged_chronology_sum);
 
-        let mut forged_entry_max = pair;
+        let mut forged_entry_max = pair.clone();
         forged_entry_max.buflo_exact_release_max_guard_entry_lateness_nanoseconds += 1;
         forged_entry_max.buflo_exact_release_max_passive_wake_lateness_nanoseconds += 1;
         rejects(forged_entry_max);
 
-        let mut forged_span_max = pair;
+        let mut forged_span_max = pair.clone();
         forged_span_max.buflo_exact_release_max_counter_calibration_span_nanoseconds += 1;
         rejects(forged_span_max);
 
-        let mut forged_sample_max = pair;
+        let mut forged_sample_max = pair.clone();
         forged_sample_max.buflo_exact_release_max_authoritative_sample_gap_nanoseconds += 1;
         rejects(forged_sample_max);
 
-        let mut forged_lag_max = pair;
+        let mut forged_lag_max = pair.clone();
         forged_lag_max.buflo_exact_release_max_authoritative_counter_lag_nanoseconds += 1;
         rejects(forged_lag_max);
 
-        let mut forged_lead_max = pair;
+        let mut forged_lead_max = pair.clone();
         forged_lead_max.buflo_exact_release_max_counter_authoritative_lead_nanoseconds += 1;
         rejects(forged_lead_max);
 
-        let mut forged_aggregate_interruptions = pair;
+        let mut forged_aggregate_interruptions = pair.clone();
         let non_anchor_reads = forged_aggregate_interruptions
             .buflo_exact_release_active_wait_iterations
             .saturating_sub(forged_aggregate_interruptions.buflo_exact_release_guard_entries);
@@ -27764,7 +32675,7 @@ mod tests {
             non_anchor_reads + 1;
         rejects(forged_aggregate_interruptions);
 
-        let mut forged_failure_residual_interruptions = pair;
+        let mut forged_failure_residual_interruptions = pair.clone();
         forged_failure_residual_interruptions.buflo_exact_release_active_spin_interruptions = pair
             .buflo_exact_release_worst_guard
             .expect("sole-pair worst guard")
@@ -27772,7 +32683,7 @@ mod tests {
             + 66;
         rejects(forged_failure_residual_interruptions);
 
-        let mut forged_failure_residual_interruption_ns = pair;
+        let mut forged_failure_residual_interruption_ns = pair.clone();
         forged_failure_residual_interruption_ns
             .buflo_exact_release_active_spin_interruption_nanoseconds = pair
             .buflo_exact_release_worst_guard
@@ -29197,7 +34108,7 @@ mod tests {
     fn instant_fallback_remains_authoritative_and_declares_counter_unavailable() {
         let empty = RunnerWakeupMetrics::new();
         assert!(empty.buflo_exact_release_invariants_hold());
-        let mut forged_empty_duration = empty;
+        let mut forged_empty_duration = empty.clone();
         forged_empty_duration.buflo_exact_release_guard_wait_nanoseconds = 1;
         forged_empty_duration.buflo_exact_release_active_wait_nanoseconds = 1;
         assert!(
@@ -29257,7 +34168,7 @@ mod tests {
             .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
             .expect("active Instant-fallback wait records as schema-10 evidence");
         assert!(metrics.buflo_exact_release_invariants_hold());
-        let mut forged_source = metrics;
+        let mut forged_source = metrics.clone();
         forged_source.buflo_exact_release_active_wait_poll_source = "forged-source";
         forged_source
             .buflo_exact_release_worst_guard
@@ -29269,12 +34180,12 @@ mod tests {
             "aggregate and nested source labels remain restricted to the schema-10 domain"
         );
 
-        let mut two_fallback_guards = metrics;
+        let mut two_fallback_guards = metrics.clone();
         two_fallback_guards
             .record_buflo_exact_release_guard(&guard, Some(base), &evidence)
             .expect("second fallback guard records in the same histogram bucket");
         assert!(two_fallback_guards.buflo_exact_release_invariants_hold());
-        let mut forged_unretained_entry_max = two_fallback_guards;
+        let mut forged_unretained_entry_max = two_fallback_guards.clone();
         forged_unretained_entry_max.buflo_exact_release_max_guard_entry_lateness_nanoseconds =
             duration_as_u64_nanos(BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL) + 1;
         forged_unretained_entry_max.buflo_exact_release_max_passive_wake_lateness_nanoseconds =
@@ -29291,7 +34202,7 @@ mod tests {
             retained_active_wait
                 > two_fallback_guards.buflo_exact_release_max_active_spin_gap_nanoseconds
         );
-        let mut forged_saturated_fallback = two_fallback_guards;
+        let mut forged_saturated_fallback = two_fallback_guards.clone();
         forged_saturated_fallback.buflo_exact_release_active_wait_iterations = u64::MAX;
         forged_saturated_fallback.buflo_exact_release_active_wait_nanoseconds =
             retained_active_wait - 1;
@@ -29301,7 +34212,7 @@ mod tests {
             !forged_saturated_fallback.buflo_exact_release_invariants_hold(),
             "saturated aggregate allocation cannot hide a duration below the retained guard"
         );
-        let mut forged_fallback_maximum = two_fallback_guards;
+        let mut forged_fallback_maximum = two_fallback_guards.clone();
         forged_fallback_maximum.buflo_exact_release_max_active_spin_gap_nanoseconds = 1_000_001;
         assert!(
             !forged_fallback_maximum.buflo_exact_release_invariants_hold(),
@@ -29403,7 +34314,7 @@ mod tests {
                 metrics.buflo_exact_release_max_active_wait_counter_gap_nanoseconds,
                 1_000
             );
-            let mut forged_nullable_counter_tuple = metrics;
+            let mut forged_nullable_counter_tuple = metrics.clone();
             let forged_worst = forged_nullable_counter_tuple
                 .buflo_exact_release_worst_guard
                 .as_mut()
@@ -29804,5 +34715,1493 @@ mod tests {
             prefix_targetless_stream_bytes(&[transmission(Some(QcsdSlotId(99)))], &slots),
             5
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_kernel_raw_item(finalization_state: &str) -> super::BufloKernelRawItem {
+        super::BufloKernelRawItem {
+            item_id: 0,
+            job_id: 0,
+            order_index: 0,
+            event_id: 0,
+            role: "exact-outgoing",
+            endpoint_index: 0,
+            endpoint: QcsdEndpointId(0),
+            send_path: "etf",
+            datagram_sha256: "00".repeat(32),
+            source_address: "127.0.0.1:4433".parse().expect("source address"),
+            destination_address: "127.0.0.1:4434".parse().expect("destination address"),
+            udp_payload_bytes: 1_200,
+            target_tai_ns: 100,
+            scm_txtime_tai_ns: Some(104),
+            enqueue_monotonic_ns: Some(90),
+            enqueue_tai_lower_ns: Some(90),
+            enqueue_tai_upper_ns: Some(91),
+            socket_timestamp_id: Some(0),
+            tx_sched_realtime_ns: Some(100),
+            tx_software_realtime_ns: Some(101),
+            provisional_tx_software_tai_lower_ns: Some(100),
+            provisional_tx_software_tai_upper_ns: Some(101),
+            send_attempt: None,
+            txtime_error: None,
+            terminal_error: None,
+            terminal_error_detail: None,
+            finalization_state: finalization_state.into(),
+            terminal_outcome: "transmitted".into(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_kernel_raw_job(
+        items: Vec<super::BufloKernelRawItem>,
+    ) -> super::BufloKernelRawJob {
+        super::BufloKernelRawJob {
+            job_id: 0,
+            tick: 0,
+            release_monotonic_ns: 100,
+            release_tai_ns: 100,
+            deadline_monotonic_ns: 200,
+            deadline_tai_ns: 200,
+            items,
+            credit_identities: Vec::new(),
+            prepared_output_failure: None,
+            helper_job_close: None,
+            helper_job_abort: None,
+            terminal_error: None,
+            terminal_outcome: "failed".into(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_item_finalization_is_identity_bound_and_one_shot() {
+        let mut job = synthetic_buflo_kernel_raw_job(vec![synthetic_buflo_kernel_raw_item(
+            "physical-transmit-proven",
+        )]);
+        super::mark_buflo_kernel_item_controller_and_trace_finalized(&mut job, 0)
+            .expect("physical item finalizes once");
+        assert_eq!(
+            job.items[0].finalization_state,
+            "controller-and-trace-finalized"
+        );
+        assert!(
+            super::mark_buflo_kernel_item_controller_and_trace_finalized(&mut job, 0).is_err(),
+            "a finalized physical identity cannot be applied twice"
+        );
+        assert!(
+            super::mark_buflo_kernel_item_controller_and_trace_finalized(&mut job, 1).is_err(),
+            "an unknown physical identity cannot be finalized"
+        );
+
+        let mut failed = synthetic_buflo_kernel_raw_job(vec![synthetic_buflo_kernel_raw_item(
+            "physical-transmit-proven",
+        )]);
+        failed.items[0].terminal_error = Some("trace write failed".into());
+        assert!(
+            super::mark_buflo_kernel_item_controller_and_trace_finalized(&mut failed, 0).is_err()
+        );
+        assert_eq!(
+            failed.items[0].finalization_state,
+            "physical-transmit-proven"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_job_close_readiness_rejects_partial_state() {
+        let empty = synthetic_buflo_kernel_raw_job(Vec::new());
+        assert!(!super::buflo_kernel_job_ready_to_close(&empty, 1));
+
+        let mut job = synthetic_buflo_kernel_raw_job(vec![synthetic_buflo_kernel_raw_item(
+            "physical-transmit-proven",
+        )]);
+        assert!(!super::buflo_kernel_job_ready_to_close(&job, 1));
+        super::mark_buflo_kernel_item_controller_and_trace_finalized(&mut job, 0)
+            .expect("finalize main");
+        assert!(super::buflo_kernel_job_ready_to_close(&job, 1));
+
+        job.credit_identities
+            .push(super::BufloKernelCreditIdentityReceipt {
+                schema_version: 1,
+                slot: 1,
+                endpoint_index: 0,
+                endpoint: 0,
+                stream_id: 0,
+                absolute_limit: 1_200,
+                identity_kind: "scheduled",
+                identity_detail: 0,
+                resolution: "pending".into(),
+                carrier_item_id: None,
+            });
+        assert!(!super::buflo_kernel_job_ready_to_close(&job, 1));
+        job.credit_identities[0].resolution = "coalesced-in-main-finalized".into();
+        assert!(super::buflo_kernel_job_ready_to_close(&job, 1));
+
+        job.prepared_output_failure = Some(super::BufloKernelPreparedOutputFailureReceipt {
+            schema_version: 1,
+            job_id: 0,
+            endpoint_index: 0,
+            endpoint: 0,
+            failure: super::PreparedOutputFailureReceipt {
+                schema_version: 1,
+                stage: "packet-build-cardinality",
+                transport_output_mutated: true,
+                observations_drained: true,
+                batch_source_address: None,
+                batch_destination_address: None,
+                batch_datagram_count: 1,
+                batch_datagram_lengths: vec![1_200],
+                batch_sha256: None,
+                batch_hash_error: Some("synthetic".into()),
+                observation_count: 1,
+                built_composition_count: 0,
+                satisfied_datagram_count: 1,
+                attributed_datagram_count: 0,
+                error: "synthetic failure".into(),
+            },
+        });
+        assert!(!super::buflo_kernel_job_ready_to_close(&job, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_credit_identity(
+        endpoint_index: usize,
+        endpoint: u64,
+        resolution: &str,
+        carrier_item_id: Option<u64>,
+    ) -> super::BufloKernelCreditIdentityReceipt {
+        super::BufloKernelCreditIdentityReceipt {
+            schema_version: 1,
+            slot: 1,
+            endpoint_index,
+            endpoint,
+            stream_id: u64::try_from(endpoint_index).expect("small endpoint"),
+            absolute_limit: 1_200,
+            identity_kind: "scheduled",
+            identity_detail: 0,
+            resolution: resolution.into(),
+            carrier_item_id,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_complete_credit_job() -> super::BufloKernelRawJob {
+        let mut main = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        main.endpoint_index = 0;
+        main.endpoint = QcsdEndpointId(0);
+        let mut credit = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        credit.item_id = 1;
+        credit.order_index = 1;
+        credit.event_id = 1;
+        credit.role = "incoming-credit";
+        credit.endpoint_index = 1;
+        credit.endpoint = QcsdEndpointId(1);
+        credit.send_path = "ordered-after-exact";
+        credit.scm_txtime_tai_ns = None;
+        let mut job = synthetic_buflo_kernel_raw_job(vec![main, credit]);
+        job.credit_identities.push(synthetic_buflo_credit_identity(
+            1,
+            1,
+            "post-main-carrier-finalized",
+            Some(1),
+        ));
+        job
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_job_close_readiness_rejects_identity_and_prior_terminal_mutations() {
+        let valid = synthetic_buflo_complete_credit_job();
+        assert!(super::buflo_kernel_job_ready_to_close(&valid, 2));
+
+        let mut cases = Vec::new();
+        let mut missing_carrier = valid.clone();
+        missing_carrier.credit_identities[0].carrier_item_id = None;
+        cases.push(missing_carrier);
+        let mut wrong_carrier = valid.clone();
+        wrong_carrier.credit_identities[0].carrier_item_id = Some(99);
+        cases.push(wrong_carrier);
+        let mut coalesced_foreign = valid.clone();
+        coalesced_foreign.credit_identities[0].resolution = "coalesced-in-main-finalized".into();
+        coalesced_foreign.credit_identities[0].carrier_item_id = None;
+        cases.push(coalesced_foreign);
+        let mut foreign_slot = valid.clone();
+        foreign_slot.credit_identities[0].slot = 3;
+        cases.push(foreign_slot);
+        let mut endpoint_mismatch = valid.clone();
+        endpoint_mismatch.credit_identities[0].endpoint = 0;
+        cases.push(endpoint_mismatch);
+        let mut wrong_schema = valid.clone();
+        wrong_schema.credit_identities[0].schema_version = 2;
+        cases.push(wrong_schema);
+        let mut unknown_kind = valid.clone();
+        unknown_kind.credit_identities[0].identity_kind = "unknown";
+        cases.push(unknown_kind);
+        let mut scheduled_detail = valid.clone();
+        scheduled_detail.credit_identities[0].identity_detail = 1;
+        cases.push(scheduled_detail);
+        let mut empty_parser_lease = valid.clone();
+        empty_parser_lease.credit_identities[0].identity_kind = "parser-lease";
+        empty_parser_lease.credit_identities[0].identity_detail = 0;
+        cases.push(empty_parser_lease);
+        let mut duplicate_identity = valid.clone();
+        duplicate_identity
+            .credit_identities
+            .push(duplicate_identity.credit_identities[0].clone());
+        cases.push(duplicate_identity);
+        let mut duplicate_owner = valid.clone();
+        let mut second_credit = duplicate_owner.items[1].clone();
+        second_credit.item_id = 2;
+        second_credit.order_index = 2;
+        duplicate_owner.items.push(second_credit);
+        cases.push(duplicate_owner);
+        let mut terminal_error = valid.clone();
+        terminal_error.terminal_error = Some("prior failure".into());
+        cases.push(terminal_error);
+        let mut prior_close = valid.clone();
+        prior_close.helper_job_close = Some(super::timed_egress::HelperJobCloseReceipt {
+            schema_version: 1,
+            job_id: 0,
+            unused_post_main_datagrams: 0,
+            complete: true,
+        });
+        cases.push(prior_close);
+        let mut prior_abort = valid.clone();
+        prior_abort.helper_job_abort = Some(super::timed_egress::HelperJobAbortReceipt {
+            schema_version: 1,
+            job_id: 0,
+            reason: "synthetic".into(),
+            unused_post_main_datagrams: 0,
+            complete: true,
+            aborted: true,
+            global_poisoned: false,
+            failed_commands: 0,
+        });
+        cases.push(prior_abort);
+
+        for (index, case) in cases.iter().enumerate() {
+            assert!(
+                !super::buflo_kernel_job_ready_to_close(case, 2),
+                "malformed close-readiness case {index} was accepted"
+            );
+        }
+
+        let mut parser_lease = valid;
+        parser_lease.credit_identities[0].identity_kind = "parser-lease";
+        parser_lease.credit_identities[0].identity_detail = 1;
+        assert!(super::buflo_kernel_job_ready_to_close(&parser_lease, 2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the mutation test exhaustively covers every close, abort, and consumed-capacity receipt field"
+    )]
+    fn buflo_kernel_close_and_abort_receipts_are_mutation_checked() {
+        type AbortReceiptMutation = Box<dyn Fn(&mut super::timed_egress::HelperJobAbortReceipt)>;
+
+        let close = super::timed_egress::HelperJobCloseReceipt {
+            schema_version: 1,
+            job_id: 7,
+            unused_post_main_datagrams: 2,
+            complete: true,
+        };
+        assert!(super::buflo_kernel_close_receipt_valid(&close, 7, 2));
+        let mut malformed_closes = Vec::new();
+        let mut value = close.clone();
+        value.schema_version = 2;
+        malformed_closes.push(value);
+        let mut value = close.clone();
+        value.job_id = 8;
+        malformed_closes.push(value);
+        let mut value = close.clone();
+        value.unused_post_main_datagrams = 1;
+        malformed_closes.push(value);
+        let mut value = close;
+        value.complete = false;
+        malformed_closes.push(value);
+        for malformed in malformed_closes {
+            assert!(!super::buflo_kernel_close_receipt_valid(&malformed, 7, 2));
+        }
+
+        let reason = "synthetic terminal controller failure";
+        let abort = super::timed_egress::HelperJobAbortReceipt {
+            schema_version: 1,
+            job_id: 7,
+            reason: reason.into(),
+            unused_post_main_datagrams: 2,
+            complete: false,
+            aborted: true,
+            global_poisoned: true,
+            failed_commands: 0,
+        };
+        assert!(super::buflo_kernel_abort_receipt_valid(
+            &abort, 7, reason, 2, 0
+        ));
+        let mutations: Vec<AbortReceiptMutation> = vec![
+            Box::new(|value| value.schema_version = 2),
+            Box::new(|value| value.job_id = 8),
+            Box::new(|value| value.reason.clear()),
+            Box::new(|value| value.reason = "different".into()),
+            Box::new(|value| value.unused_post_main_datagrams = 1),
+            Box::new(|value| value.complete = true),
+            Box::new(|value| value.aborted = false),
+            Box::new(|value| value.global_poisoned = false),
+            Box::new(|value| value.failed_commands = 1),
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut malformed = abort.clone();
+            mutate(&mut malformed);
+            assert!(
+                !super::buflo_kernel_abort_receipt_valid(&malformed, 7, reason, 2, 0),
+                "malformed abort receipt case {index} was accepted"
+            );
+        }
+        assert!(!super::buflo_kernel_abort_receipt_valid(
+            &abort, 7, " ", 2, 0
+        ));
+
+        let poisoned_abort = super::timed_egress::HelperJobAbortReceipt {
+            failed_commands: 1,
+            ..abort
+        };
+        assert!(super::buflo_kernel_abort_receipt_valid(
+            &poisoned_abort,
+            7,
+            reason,
+            2,
+            1,
+        ));
+        assert!(!super::buflo_kernel_abort_receipt_valid(
+            &poisoned_abort,
+            7,
+            reason,
+            2,
+            0,
+        ));
+        assert!(!super::buflo_kernel_abort_receipt_valid(
+            &poisoned_abort,
+            7,
+            reason,
+            2,
+            2,
+        ));
+
+        let mut outgoing = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        outgoing.role = "exact-outgoing";
+        let mut finalized = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        finalized.role = "incoming-credit";
+        let mut physical = synthetic_buflo_kernel_raw_item("physical-transmit-proven");
+        physical.role = "incoming-credit";
+        let mut helper_failure = synthetic_buflo_kernel_raw_item("helper-terminal-failure");
+        helper_failure.role = "incoming-credit";
+        assert_eq!(
+            super::buflo_kernel_consumed_post_main_datagram_count(&[
+                outgoing,
+                finalized,
+                physical,
+                helper_failure,
+            ]),
+            2,
+            "only helper-success incoming datagrams consume post-main capacity"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the mutation test keeps every independent item, job, and aggregate predicate case visible"
+    )]
+    fn buflo_kernel_finish_predicates_reject_every_independent_mutation() {
+        type ItemValidationMutation = Box<dyn Fn(&mut super::BufloKernelItemValidation)>;
+
+        let raw = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        let validation = super::BufloKernelItemValidation {
+            enqueue_interval_complete: true,
+            enqueue_clock_consistent: true,
+            timestamp_evidence_complete: true,
+            tx_order_valid: true,
+            physical_window_valid: true,
+            provisional_interval_valid: true,
+            endpoint_tuple_valid: true,
+            item_sequence_valid: true,
+            job_identity_and_timing_valid: true,
+            controller_and_trace_finalized: true,
+            structural_and_order_valid: true,
+        };
+        assert!(super::buflo_kernel_item_validation_complete(
+            &raw,
+            &validation
+        ));
+        let item_mutations: Vec<ItemValidationMutation> = vec![
+            Box::new(|value| value.enqueue_interval_complete = false),
+            Box::new(|value| value.enqueue_clock_consistent = false),
+            Box::new(|value| value.timestamp_evidence_complete = false),
+            Box::new(|value| value.tx_order_valid = false),
+            Box::new(|value| value.physical_window_valid = false),
+            Box::new(|value| value.provisional_interval_valid = false),
+            Box::new(|value| value.endpoint_tuple_valid = false),
+            Box::new(|value| value.item_sequence_valid = false),
+            Box::new(|value| value.job_identity_and_timing_valid = false),
+            Box::new(|value| value.controller_and_trace_finalized = false),
+            Box::new(|value| value.structural_and_order_valid = false),
+        ];
+        for (index, mutate) in item_mutations.into_iter().enumerate() {
+            let mut malformed = validation.clone();
+            mutate(&mut malformed);
+            assert!(
+                !super::buflo_kernel_item_validation_complete(&raw, &malformed),
+                "malformed final item predicate case {index} was accepted"
+            );
+        }
+        let raw_item_mutations: [fn(&mut super::BufloKernelRawItem); 3] = [
+            |value: &mut super::BufloKernelRawItem| value.terminal_outcome = "failed".into(),
+            |value: &mut super::BufloKernelRawItem| value.terminal_error = Some("failure".into()),
+            |value: &mut super::BufloKernelRawItem| {
+                value.txtime_error = Some(super::timed_egress::TxtimeDropDiagnostic {
+                    family: super::timed_egress::SocketFamily::Ipv4,
+                    errno: u32::try_from(libc::ECANCELED).expect("positive errno"),
+                    kind: super::timed_egress::TxtimeDropKind::Missed,
+                    requested_txtime_tai_ns: 104,
+                });
+            },
+        ];
+        for (index, mutate) in raw_item_mutations.into_iter().enumerate() {
+            let mut malformed = raw.clone();
+            mutate(&mut malformed);
+            assert!(
+                !super::buflo_kernel_item_validation_complete(&malformed, &validation),
+                "malformed raw item terminal case {index} was accepted"
+            );
+        }
+
+        let close = super::timed_egress::HelperJobCloseReceipt {
+            schema_version: 1,
+            job_id: 0,
+            unused_post_main_datagrams: 1,
+            complete: true,
+        };
+        let job_complete = |terminal: &str,
+                            terminal_error: bool,
+                            item_count: usize,
+                            items_transmitted: bool,
+                            credit_complete: bool,
+                            close: Option<&super::timed_egress::HelperJobCloseReceipt>,
+                            prepared_failure: bool,
+                            abort: bool| {
+            super::buflo_kernel_job_validation_complete(
+                terminal,
+                terminal_error,
+                item_count,
+                items_transmitted,
+                credit_complete,
+                close,
+                0,
+                1,
+                prepared_failure,
+                abort,
+            )
+        };
+        assert!(job_complete(
+            "complete",
+            false,
+            1,
+            true,
+            true,
+            Some(&close),
+            false,
+            false,
+        ));
+        assert!(!job_complete(
+            "failed",
+            false,
+            1,
+            true,
+            true,
+            Some(&close),
+            false,
+            false
+        ));
+        assert!(!job_complete(
+            "complete",
+            true,
+            1,
+            true,
+            true,
+            Some(&close),
+            false,
+            false
+        ));
+        assert!(!job_complete(
+            "complete",
+            false,
+            0,
+            true,
+            true,
+            Some(&close),
+            false,
+            false
+        ));
+        assert!(!job_complete(
+            "complete",
+            false,
+            1,
+            false,
+            true,
+            Some(&close),
+            false,
+            false
+        ));
+        assert!(!job_complete(
+            "complete",
+            false,
+            1,
+            true,
+            false,
+            Some(&close),
+            false,
+            false
+        ));
+        assert!(!job_complete(
+            "complete", false, 1, true, true, None, false, false
+        ));
+        assert!(!job_complete(
+            "complete",
+            false,
+            1,
+            true,
+            true,
+            Some(&close),
+            true,
+            false
+        ));
+        assert!(!job_complete(
+            "complete",
+            false,
+            1,
+            true,
+            true,
+            Some(&close),
+            false,
+            true
+        ));
+
+        let aggregate_complete =
+            |failed_items, jobs, every_job, helper, mapping, primary, cleanup, terminal| {
+                super::buflo_kernel_aggregate_validation_complete(
+                    failed_items,
+                    jobs,
+                    every_job,
+                    helper,
+                    mapping,
+                    primary,
+                    cleanup,
+                    terminal,
+                )
+            };
+        assert!(aggregate_complete(0, 1, true, true, true, false, 0, 0));
+        assert!(!aggregate_complete(1, 1, true, true, true, false, 0, 0));
+        assert!(!aggregate_complete(0, 0, true, true, true, false, 0, 0));
+        assert!(!aggregate_complete(0, 1, false, true, true, false, 0, 0));
+        assert!(!aggregate_complete(0, 1, true, false, true, false, 0, 0));
+        assert!(!aggregate_complete(0, 1, true, true, false, false, 0, 0));
+        assert!(!aggregate_complete(0, 1, true, true, true, true, 0, 0));
+        assert!(!aggregate_complete(0, 1, true, true, true, false, 1, 0));
+        assert!(!aggregate_complete(0, 1, true, true, true, false, 0, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_conservative_interval_boundaries_are_half_open() {
+        assert!(super::buflo_kernel_interval_within_half_open_window(
+            100, 199, 100, 200
+        ));
+        assert!(!super::buflo_kernel_interval_within_half_open_window(
+            99, 100, 100, 200
+        ));
+        assert!(!super::buflo_kernel_interval_within_half_open_window(
+            100, 200, 100, 200
+        ));
+        assert!(!super::buflo_kernel_interval_within_half_open_window(
+            101, 100, 100, 200
+        ));
+
+        assert!(super::buflo_kernel_final_envelope_contains_provisional(
+            110, 120, 100, 130
+        ));
+        assert!(!super::buflo_kernel_final_envelope_contains_provisional(
+            110, 120, 111, 130
+        ));
+        assert!(!super::buflo_kernel_final_envelope_contains_provisional(
+            110, 120, 100, 119
+        ));
+
+        assert!(super::buflo_kernel_credit_intervals_are_causally_ordered(
+            120, 120, 121, 120, 200
+        ));
+        assert!(!super::buflo_kernel_credit_intervals_are_causally_ordered(
+            120, 119, 121, 120, 200
+        ));
+        assert!(!super::buflo_kernel_credit_intervals_are_causally_ordered(
+            120, 120, 200, 120, 200
+        ));
+        assert!(!super::buflo_kernel_credit_intervals_are_causally_ordered(
+            120, 120, 121, 119, 200
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_cleanup_mutation_preserves_raw_receipt_and_fails_it() {
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.buflo_kernel_tx = Some(json!({
+            "terminal_outcome": "complete",
+            "cleanup_errors": [],
+            "aggregate": {"terminal_outcome": "complete"},
+            "jobs": [{"job_id": 0}],
+        }));
+        metrics
+            .append_buflo_kernel_cleanup_errors(&["trace flush failed".into()])
+            .expect("append cleanup failure");
+        let receipt = metrics
+            .buflo_kernel_tx
+            .expect("raw receipt remains attached");
+        assert_eq!(receipt["terminal_outcome"], "failed");
+        assert_eq!(receipt["aggregate"]["terminal_outcome"], "failed");
+        assert_eq!(receipt["cleanup_errors"][0], "trace flush failed");
+        assert_eq!(receipt["jobs"][0]["job_id"], 0);
+    }
+
+    #[test]
+    fn primary_terminal_write_failure_retries_exact_staged_bytes() {
+        let output = Path::new("/synthetic-output");
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": 11,
+            "completion_status": "error",
+            "runner_wakeup_metrics": {
+                "buflo_kernel_tx": {"terminal_outcome": "failed"}
+            }
+        }))
+        .expect("serialize terminal fixture");
+        let mut attempts = Vec::new();
+        let mut staged = None;
+        let mut writer = |_: &Path, candidate: &[u8]| {
+            attempts.push(candidate.to_vec());
+            if attempts.len() == 1 {
+                Err(Error::Argument("synthetic primary write failure".into()))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(
+            super::stage_and_persist_terminal_with(&mut staged, output, bytes.clone(), &mut writer)
+                .is_err()
+        );
+        assert!(
+            super::retry_staged_terminal_with(&mut staged, output, &mut writer)
+                .expect("outer exact retry")
+        );
+        assert_eq!(attempts, vec![bytes.clone(), bytes.clone()]);
+        assert_eq!(staged.expect("staged receipt").bytes, bytes);
+    }
+
+    #[test]
+    fn failed_success_receipt_is_replaced_before_exact_error_retry() {
+        let output = Path::new("/synthetic-output");
+        let complete = serde_json::to_vec(&json!({
+            "schema_version": 11,
+            "completion_status": "complete",
+            "runner_wakeup_metrics": {
+                "buflo_kernel_tx": {"terminal_outcome": "complete"}
+            }
+        }))
+        .expect("serialize complete fixture");
+        let failed = serde_json::to_vec(&json!({
+            "schema_version": 11,
+            "completion_status": "error",
+            "runner_wakeup_metrics": {
+                "buflo_kernel_tx": {
+                    "terminal_outcome": "failed",
+                    "cleanup_errors": ["terminal persistence failed"],
+                    "aggregate": {"terminal_outcome": "failed"}
+                }
+            }
+        }))
+        .expect("serialize failed fixture");
+        let mut attempts = Vec::new();
+        let mut staged = None;
+        let mut writer = |_: &Path, candidate: &[u8]| {
+            attempts.push(candidate.to_vec());
+            if attempts.len() < 3 {
+                Err(Error::Argument("synthetic write failure".into()))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(
+            super::stage_and_persist_terminal_with(
+                &mut staged,
+                output,
+                complete.clone(),
+                &mut writer
+            )
+            .is_err()
+        );
+        assert!(
+            super::stage_and_persist_terminal_with(
+                &mut staged,
+                output,
+                failed.clone(),
+                &mut writer
+            )
+            .is_err()
+        );
+        assert!(
+            super::retry_staged_terminal_with(&mut staged, output, &mut writer)
+                .expect("outer exact retry")
+        );
+        assert_eq!(attempts, vec![complete, failed.clone(), failed.clone()]);
+        let artifact = staged.expect("latest staged receipt");
+        assert!(artifact.persisted);
+        assert_eq!(artifact.bytes, failed);
+    }
+
+    #[test]
+    fn terminal_persistence_failure_preserves_both_primary_and_write_causes() {
+        let primary = Error::DefenseExecution("synthetic defence failure".into());
+        let persistence = Error::Io(std::io::Error::other("synthetic fsync failure"));
+        let combined = super::terminal_artifact_persistence_error(Some(&primary), &persistence);
+        assert_eq!(run_error_class(&combined), "run-artifact-persistence-v1");
+        let message = combined.to_string();
+        assert!(message.contains("synthetic defence failure"));
+        assert!(message.contains("synthetic fsync failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_success_tail_write_failure_renders_the_persistence_error_class() {
+        let original = Error::Io(std::io::Error::other("synthetic terminal rename failure"));
+        let persistence_error = super::terminal_artifact_persistence_error(None, &original);
+        let message = persistence_error.to_string();
+        let spec = RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: Vec::new(),
+            },
+            workload_hash: "00".repeat(32),
+            application_workload_source: None,
+            config: QcsdConfig::default(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 0,
+            output_dir: PathBuf::from("/synthetic-output"),
+            max_response_bytes: 1_024,
+            timeout_seconds: 30,
+        };
+        let (runtime, _, _) = synthetic_buflo_helper_contracts();
+        let bytes = super::render_run_json(
+            &spec,
+            &[],
+            &[],
+            &[],
+            &runtime.scheduler_initial,
+            &[],
+            1,
+            &RunCompletion {
+                ended_unix_ns: Some(2),
+                status: "error",
+                error: Some(&message),
+                error_class: Some(run_error_class(&persistence_error)),
+                defense_start_monotonic_ns: Some(3),
+                application_completion_monotonic_ns: Some(4),
+                defense_diagnostics: None,
+                runner_wakeup_metrics: Some(RunnerWakeupMetrics::new()),
+            },
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse replacement error receipt");
+        assert_eq!(receipt["completion_status"], "error");
+        assert_eq!(receipt["error_class"], "run-artifact-persistence-v1");
+        assert!(
+            receipt["error"]
+                .as_str()
+                .is_some_and(|value| value.contains("synthetic terminal rename failure"))
+        );
+    }
+
+    #[test]
+    fn atomic_run_artifact_write_replaces_bytes_without_a_residual_temp_file() {
+        let output = std::env::temp_dir().join(format!(
+            "qcsd-atomic-run-json-{}-{}",
+            std::process::id(),
+            super::unix_nanos()
+        ));
+        fs::create_dir_all(&output).expect("create atomic-write test directory");
+        let path = output.join("run.json");
+        super::atomic_write(&path, b"first").expect("first durable write");
+        super::atomic_write(&path, b"second").expect("replacement durable write");
+        assert_eq!(fs::read(&path).expect("read durable artifact"), b"second");
+        assert!(!output.join("run.json.tmp").exists());
+        fs::remove_dir_all(output).expect("remove atomic-write test directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_clock_phase(
+        offset_ns: u64,
+        elapsed_ns: u64,
+    ) -> super::BufloKernelClockPhase {
+        let sample = |clock_ns| super::BufloKernelClockSample {
+            schema_version: 1,
+            tai_before_ns: clock_ns + offset_ns,
+            clock_ns,
+            tai_after_ns: clock_ns + offset_ns + 10,
+            bracket_width_ns: 10,
+        };
+        super::BufloKernelClockPhase {
+            monotonic: sample(1_000 + elapsed_ns),
+            realtime: sample(2_000 + elapsed_ns),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_instant_alignment() -> super::BufloKernelInstantAlignmentReceipt {
+        super::BufloKernelInstantAlignmentReceipt {
+            schema_version: 1,
+            monotonic_clock_ns: 1_000,
+            instant_bracket_width_ns: 10,
+            selected_upper_offset_ns: 10,
+            semantics: super::BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the clock mapping mutation test retains raw phase, alignment, chronology, and drift cases together"
+    )]
+    fn buflo_kernel_clock_mapping_failures_retain_raw_phase_evidence_and_reason() {
+        let start = synthetic_buflo_clock_phase(10_000, 0);
+        let alignment = synthetic_buflo_instant_alignment();
+        let end_failure = "BuFLO final clock sample failed: synthetic";
+        let missing = super::build_buflo_kernel_clock_mapping(
+            &start,
+            None,
+            Some(&alignment),
+            Some(end_failure),
+        )
+        .expect_err("missing end phase must reject mapping");
+        assert_eq!(missing, end_failure);
+        assert_eq!(start, synthetic_buflo_clock_phase(10_000, 0));
+
+        let end = synthetic_buflo_clock_phase(310_001, 10_000);
+        let drift =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect_err("excessive drift must reject mapping");
+        assert_eq!(
+            drift,
+            "BuFLO kernel clock offset drift 300001 ns exceeded 250000 ns"
+        );
+        assert_eq!(start.monotonic.tai_before_ns, 11_000);
+        assert_eq!(end.monotonic.tai_before_ns, 321_001);
+
+        let valid_end = synthetic_buflo_clock_phase(10_000, 10_000);
+        let mutations: [fn(&mut super::BufloKernelClockSample); 4] = [
+            |sample| sample.schema_version = 2,
+            |sample| sample.tai_after_ns = sample.tai_before_ns.saturating_sub(1),
+            |sample| sample.bracket_width_ns += 1,
+            |sample| {
+                sample.tai_after_ns = sample.tai_before_ns + 250_001;
+                sample.bracket_width_ns = 250_001;
+            },
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut malformed_start = start.clone();
+            mutate(&mut malformed_start.monotonic);
+            assert_eq!(
+                super::build_buflo_kernel_clock_mapping(
+                    &malformed_start,
+                    Some(&valid_end),
+                    Some(&alignment),
+                    None,
+                )
+                .expect_err("malformed start clock sample"),
+                "BuFLO kernel start clock phase retained an invalid raw sample",
+                "start mutation {index}"
+            );
+
+            let mut malformed_end = valid_end.clone();
+            mutate(&mut malformed_end.realtime);
+            assert_eq!(
+                super::build_buflo_kernel_clock_mapping(
+                    &start,
+                    Some(&malformed_end),
+                    Some(&alignment),
+                    None,
+                )
+                .expect_err("malformed end clock sample"),
+                "BuFLO kernel end clock phase retained an invalid raw sample",
+                "end mutation {index}"
+            );
+        }
+
+        let alignment_mutations: [fn(&mut super::BufloKernelInstantAlignmentReceipt); 4] = [
+            |receipt| receipt.schema_version = 2,
+            |receipt| receipt.instant_bracket_width_ns = 250_001,
+            |receipt| receipt.selected_upper_offset_ns = 9,
+            |receipt| receipt.semantics = "wrong-semantics",
+        ];
+        for (index, mutate) in alignment_mutations.into_iter().enumerate() {
+            let mut malformed = alignment;
+            mutate(&mut malformed);
+            assert_eq!(
+                super::build_buflo_kernel_clock_mapping(
+                    &start,
+                    Some(&valid_end),
+                    Some(&malformed),
+                    None,
+                )
+                .expect_err("malformed Instant alignment"),
+                "BuFLO kernel Instant alignment receipt was invalid",
+                "alignment mutation {index}"
+            );
+        }
+
+        for (index, malformed) in [
+            {
+                let mut value = valid_end.clone();
+                value.monotonic.clock_ns = start.monotonic.clock_ns.saturating_sub(1);
+                value
+            },
+            {
+                let mut value = valid_end.clone();
+                value.realtime.clock_ns = start.realtime.clock_ns.saturating_sub(1);
+                value
+            },
+            {
+                let mut value = valid_end.clone();
+                value.monotonic.tai_before_ns = start.realtime.tai_after_ns.saturating_sub(1);
+                value.monotonic.tai_after_ns = value.monotonic.tai_before_ns + 10;
+                value
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                super::build_buflo_kernel_clock_mapping(
+                    &start,
+                    Some(&malformed),
+                    Some(&alignment),
+                    None,
+                )
+                .expect_err("misordered clock phases"),
+                "BuFLO kernel clock phases and Instant anchor were not temporally ordered",
+                "chronology mutation {index}"
+            );
+        }
+        for monotonic_clock_ns in [
+            start.monotonic.clock_ns.saturating_sub(1),
+            valid_end.monotonic.clock_ns.saturating_add(1),
+        ] {
+            let malformed = super::BufloKernelInstantAlignmentReceipt {
+                monotonic_clock_ns,
+                ..alignment
+            };
+            assert_eq!(
+                super::build_buflo_kernel_clock_mapping(
+                    &start,
+                    Some(&valid_end),
+                    Some(&malformed),
+                    None,
+                )
+                .expect_err("Instant anchor outside clock phases"),
+                "BuFLO kernel clock phases and Instant anchor were not temporally ordered"
+            );
+        }
+
+        let wide_alignment = super::BufloKernelInstantAlignmentReceipt {
+            instant_bracket_width_ns: 250_000,
+            selected_upper_offset_ns: 250_000,
+            ..alignment
+        };
+        let mapping = super::build_buflo_kernel_clock_mapping(
+            &start,
+            Some(&valid_end),
+            Some(&wide_alignment),
+            None,
+        )
+        .expect("maximum inclusive Instant bracket");
+        assert_eq!(mapping.max_observed_bracket_width_ns, 250_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_clock_mapping_includes_intermediate_item_envelopes() {
+        let start = synthetic_buflo_clock_phase(10_000, 0);
+        let end = synthetic_buflo_clock_phase(10_020, 10_000);
+        let alignment = synthetic_buflo_instant_alignment();
+        let mut mapping =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect("endpoint clock phases");
+        let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        item.tx_software_realtime_ns = Some(1_000_000);
+        item.provisional_tx_software_tai_lower_ns = Some(1_009_900);
+        item.provisional_tx_software_tai_upper_ns = Some(1_010_200);
+        item.enqueue_monotonic_ns = Some(500_000);
+        item.enqueue_tai_lower_ns = Some(509_950);
+        item.enqueue_tai_upper_ns = Some(510_150);
+        let job = synthetic_buflo_kernel_raw_job(vec![item]);
+        super::widen_buflo_kernel_clock_mapping_with_items(&mut mapping, &[job])
+            .expect("intermediate evidence widens the conservative envelope");
+        assert_eq!(mapping.effective_realtime_offset_lower_ns, 9_900);
+        assert_eq!(mapping.effective_realtime_offset_upper_ns, 10_200);
+        assert_eq!(mapping.effective_monotonic_offset_lower_ns, 9_950);
+        assert_eq!(mapping.effective_monotonic_offset_upper_ns, 10_150);
+        assert_eq!(mapping.per_item_realtime_evidence_count, 1);
+        assert_eq!(mapping.per_item_monotonic_evidence_count, 1);
+        assert!(super::buflo_kernel_final_envelope_contains_provisional(
+            1_009_900,
+            1_010_200,
+            super::translate_clock_interval(
+                1_000_000,
+                super::clock_mapping_offset_bounds(&mapping, true)
+            )
+            .expect("translate final envelope")
+            .0,
+            super::translate_clock_interval(
+                1_000_000,
+                super::clock_mapping_offset_bounds(&mapping, true)
+            )
+            .expect("translate final envelope")
+            .1,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_enqueue_brackets_enforce_the_inclusive_250us_limit() {
+        let start = synthetic_buflo_clock_phase(10_000, 0);
+        let end = synthetic_buflo_clock_phase(10_000, 10_000);
+        let alignment = synthetic_buflo_instant_alignment();
+        let base_mapping =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect("endpoint clock phases");
+        let job_with_width = |width: u64| {
+            let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+            item.tx_software_realtime_ns = None;
+            item.provisional_tx_software_tai_lower_ns = None;
+            item.provisional_tx_software_tai_upper_ns = None;
+            item.enqueue_monotonic_ns = Some(500_000);
+            let half = width / 2;
+            item.enqueue_tai_lower_ns = Some(510_000 - half);
+            item.enqueue_tai_upper_ns = Some(510_000 + width - half);
+            synthetic_buflo_kernel_raw_job(vec![item])
+        };
+
+        let mut inclusive = base_mapping.clone();
+        super::widen_buflo_kernel_clock_mapping_with_items(
+            &mut inclusive,
+            &[job_with_width(250_000)],
+        )
+        .expect("the exact 250 us bound is admissible");
+        assert_eq!(inclusive.max_observed_bracket_width_ns, 250_000);
+
+        let mut excessive = base_mapping;
+        let error = super::widen_buflo_kernel_clock_mapping_with_items(
+            &mut excessive,
+            &[job_with_width(250_001)],
+        )
+        .expect_err("a bracket over 250 us must fail closed");
+        assert_eq!(
+            error,
+            "BuFLO kernel clock bracket 250001 ns exceeded 250000 ns"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_credit_composition_is_control_only_and_exactly_accounted() {
+        type CompositionMutation = Box<dyn Fn(&mut QcsdSlotComposition)>;
+
+        let valid = QcsdSlotComposition {
+            desired_udp_bytes: 100,
+            observed_udp_bytes: 100,
+            application_stream_bytes: 0,
+            retransmission_stream_bytes: 0,
+            chaff_stream_bytes: 0,
+            defense_control_bytes: 8,
+            quic_padding_bytes: 70,
+            other_quic_bytes: 22,
+            lateness_us: 0,
+        };
+        assert!(super::buflo_kernel_credit_composition_valid(&valid, 100));
+        let mutations: Vec<CompositionMutation> = vec![
+            Box::new(|value| value.desired_udp_bytes = 99),
+            Box::new(|value| value.observed_udp_bytes = 99),
+            Box::new(|value| value.application_stream_bytes = 1),
+            Box::new(|value| value.retransmission_stream_bytes = 1),
+            Box::new(|value| value.chaff_stream_bytes = 1),
+            Box::new(|value| value.defense_control_bytes = 0),
+            Box::new(|value| value.other_quic_bytes = 21),
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut malformed = valid;
+            mutate(&mut malformed);
+            assert!(
+                !super::buflo_kernel_credit_composition_valid(&malformed, 100),
+                "malformed credit composition case {index} was accepted"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the synthetic helper fixture constructs one internally consistent runtime, qdisc, lifecycle, and socket contract"
+    )]
+    fn synthetic_buflo_helper_contracts() -> (
+        super::BufloKernelRuntimeContract,
+        super::BufloKernelQdiscContract,
+        Vec<(SocketAddr, SocketAddr)>,
+    ) {
+        let source: SocketAddr = "127.0.0.1:4433".parse().expect("source");
+        let destination: SocketAddr = "127.0.0.1:4434".parse().expect("destination");
+        let privilege = super::timed_egress::PrivilegeDropReceipt {
+            schema_version: 1,
+            uid: [1_000; 4],
+            gid: [1_000; 4],
+            supplementary_groups: Vec::new(),
+            cap_inheritable: "0000000000000000".into(),
+            cap_permitted: "0000000000000000".into(),
+            cap_effective: "0000000000000000".into(),
+            cap_bounding: "0000000000000000".into(),
+            cap_ambient: "0000000000000000".into(),
+            no_new_privileges: true,
+        };
+        let lifecycle = super::timed_egress::HelperLifecycleReceipt {
+            schema_version: 1,
+            globally_poisoned: false,
+            poison_reason: None,
+            completed_main_jobs: 1,
+            completed_immediate_datagrams: 1,
+            aborted_jobs: 0,
+            failed_commands: 0,
+            causal_main_proven: false,
+            active_job_id: None,
+            last_main_job_id: Some(0),
+            remaining_post_main_datagrams: 0,
+        };
+        let socket_state = super::timed_egress::HelperSocketShutdownReceipt {
+            schema_version: 1,
+            socket_count: 1,
+            active_job_id: None,
+            pending_socket_count: 0,
+            stale_error_queue_socket_count: 0,
+            nonzero_priority_socket_count: 0,
+            inspection_errors: Vec::new(),
+            clean: true,
+        };
+        let priority_method = super::timed_egress::TimedPriorityMethod::SerializedSocketSoPriority;
+        let setup = super::timed_egress::TimedEgressSetupReceipt {
+            schema_version: 1,
+            family: super::timed_egress::SocketFamily::Ipv4,
+            local_address: source,
+            duplicated_fd_cloexec: true,
+            nonblocking: true,
+            socket_type: libc::SOCK_DGRAM,
+            txtime_clock_id: libc::CLOCK_TAI,
+            txtime_flags: libc::SOF_TXTIME_REPORT_ERRORS,
+            timestamping_report_flags: (libc::SOF_TIMESTAMPING_SOFTWARE
+                | libc::SOF_TIMESTAMPING_OPT_ID
+                | libc::SOF_TIMESTAMPING_OPT_TSONLY)
+                .cast_signed(),
+            timed_priority: 6,
+            priority_before_probe: 0,
+            priority_after_probe: 0,
+            corresponding_error_queue_enabled: true,
+            etf_deadline_mode: false,
+            etf_skip_socket_check: false,
+            priority_method,
+            scm_priority_supported: false,
+            scm_priority_probe_family: super::timed_egress::SocketFamily::Ipv4,
+            scm_priority_probe_errno: Some(libc::EINVAL),
+            exclusive_socket_sender_required: true,
+            per_datagram_timestamp_requests: true,
+        };
+        let scheduler = super::ProcessSchedulerEvidence {
+            schema_version: 1,
+            source: "linux-sched-and-procfs-v1",
+            policy: "SCHED_RR".into(),
+            priority: 1,
+            affinity_cpus: vec![10],
+            rlimit_rtprio: super::RealtimePriorityLimit { soft: 1, hard: 1 },
+            no_new_privileges: Some(true),
+            effective_capabilities_hex: Some("0000000000001100".into()),
+            cgroup_effective_cpuset: Some("10-11".into()),
+            affinity_scope: "qcsd_container_affinity_partition_not_physical_cpu_isolation",
+            contract: Some(super::QCSD_CLIENT_ETF_SCHEDULER_CONTRACT.into()),
+            contract_valid: true,
+        };
+        let runtime = super::BufloKernelRuntimeContract {
+            schema_version: 1,
+            scheduler_contract: super::QCSD_CLIENT_ETF_SCHEDULER_CONTRACT,
+            scheduler_initial: scheduler,
+            socket_setup: vec![setup],
+            privilege_drop: privilege.clone(),
+            helper_thread: super::timed_egress::HelperThreadReceipt {
+                schema_version: 1,
+                contract_name: super::QCSD_CLIENT_ETF_SCHEDULER_CONTRACT.into(),
+                target_cpu: 11,
+                observed_affinity: vec![11],
+                scheduler_policy: libc::SCHED_RR,
+                scheduler_policy_name: "SCHED_RR".into(),
+                scheduler_priority: 1,
+                thread_id: 42,
+                privilege,
+                endpoint_socket_count: 1,
+                credit_owner_capacity: 1,
+                max_datagrams_per_owner: 1,
+                max_post_main_datagrams: 1,
+            },
+            helper_lifecycle: Some(lifecycle.clone()),
+            helper_shutdown: Some(super::timed_egress::HelperShutdownReceipt {
+                schema_version: 1,
+                shutdown_command_sent: true,
+                shutdown_received: true,
+                worker_joined: true,
+                shutdown_complete: true,
+                clean_socket_state: true,
+                global_poisoned: false,
+                failed_commands: Some(0),
+                remaining_post_main_datagrams: Some(0),
+                socket_state: Some(socket_state),
+                lifecycle: Some(lifecycle),
+                errors: Vec::new(),
+            }),
+            socket_count: 1,
+            single_threaded_sender_control_flow_enforced: true,
+            prebuild_selection_cutoff_lead_ns: 5_000_000,
+            prebuild_selection_semantics: "application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; client_only_adaptation; paper_equivalent=false",
+            post_main_inventory_semantics: "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram",
+            max_post_main_datagrams: 1,
+        };
+        let qdisc = super::BufloKernelQdiscContract {
+            schema_version: 1,
+            interface: "eth0".into(),
+            root_kind: "prio",
+            root_handle: "1:",
+            bands: 2,
+            priomap: [1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            timed_kind: "etf",
+            timed_parent: "1:1",
+            timed_handle: "20:",
+            ordinary_kind: "pfifo",
+            ordinary_parent: "1:2",
+            ordinary_handle: "10:",
+            clock_id: "CLOCK_TAI",
+            delta_ns: 4_000_000,
+            deadline_mode: false,
+            offload: false,
+            skip_socket_check: false,
+            timed_socket_priority: 6,
+            ordinary_socket_priority: 0,
+            priority_method,
+            scm_priority_supported: false,
+            single_threaded_sender_control_flow_enforced: true,
+            so_priority_before: 0,
+            so_priority_during: 6,
+            so_priority_after: 0,
+            so_priority_reset_valid: true,
+            so_txtime_enabled: true,
+            tx_sched_timestamping_enabled: true,
+            tx_software_timestamping_enabled: true,
+            tx_timestamp_opt_id_enabled: true,
+            txtime_errors_enabled: true,
+        };
+        (runtime, qdisc, vec![(source, destination)])
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_helper_completion_gate_rejects_each_contract_family() {
+        type Mutation = Box<
+            dyn Fn(&mut super::BufloKernelRuntimeContract, &mut super::BufloKernelQdiscContract),
+        >;
+
+        let (valid_runtime, valid_qdisc, endpoints) = synthetic_buflo_helper_contracts();
+        assert!(super::buflo_kernel_helper_evidence_complete(
+            &valid_runtime,
+            &valid_qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+        ));
+        let mutations: Vec<Mutation> = vec![
+            Box::new(|runtime, _| runtime.scheduler_initial.contract = None),
+            Box::new(|runtime, _| runtime.scheduler_initial.contract_valid = false),
+            Box::new(|runtime, _| runtime.socket_setup.clear()),
+            Box::new(|runtime, _| runtime.socket_setup[0].txtime_flags = 0),
+            Box::new(|runtime, _| runtime.socket_setup[0].local_address.set_port(9)),
+            Box::new(|runtime, _| {
+                runtime.scheduler_initial.effective_capabilities_hex =
+                    Some("0000000000000000".into());
+            }),
+            Box::new(|runtime, _| runtime.privilege_drop.cap_effective = "1".into()),
+            Box::new(|runtime, _| runtime.helper_thread.target_cpu = 10),
+            Box::new(|runtime, _| {
+                runtime
+                    .helper_lifecycle
+                    .as_mut()
+                    .expect("lifecycle")
+                    .failed_commands = 1;
+            }),
+            Box::new(|runtime, _| {
+                runtime
+                    .helper_shutdown
+                    .as_mut()
+                    .expect("shutdown")
+                    .clean_socket_state = false;
+            }),
+            Box::new(|runtime, _| {
+                runtime
+                    .helper_shutdown
+                    .as_mut()
+                    .expect("shutdown")
+                    .socket_state
+                    .as_mut()
+                    .expect("socket state")
+                    .clean = false;
+            }),
+            Box::new(|_, qdisc| qdisc.interface.clear()),
+            Box::new(|_, qdisc| qdisc.interface = " eth0".into()),
+            Box::new(|_, qdisc| qdisc.so_txtime_enabled = false),
+            Box::new(|_, qdisc| qdisc.so_priority_reset_valid = false),
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut runtime = valid_runtime.clone();
+            let mut qdisc = valid_qdisc.clone();
+            mutate(&mut runtime, &mut qdisc);
+            assert!(
+                !super::buflo_kernel_helper_evidence_complete(
+                    &runtime,
+                    &qdisc,
+                    &endpoints,
+                    1,
+                    Some(0),
+                    1,
+                ),
+                "malformed helper contract case {index} was accepted"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_receipt_attachment_promotes_schema_before_legacy_conflict_failure() {
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics.buflo_exact_release_guard_entries = 1;
+        let raw = json!({
+            "schema_version": 1,
+            "terminal_outcome": "complete",
+            "aggregate": {"terminal_outcome": "complete"},
+            "cleanup_errors": []
+        });
+        assert!(metrics.attach_buflo_kernel_tx_value(raw).is_err());
+        assert_eq!(metrics.schema_version, 11);
+        assert!(metrics.semantics.contains("buflo_kernel_tx_raw_semantics="));
+        let retained = metrics
+            .buflo_kernel_tx
+            .expect("raw receipt remains attached");
+        assert_eq!(retained["terminal_outcome"], "failed");
+        assert_eq!(retained["aggregate"]["terminal_outcome"], "failed");
+        assert_eq!(
+            retained["cleanup_errors"][0],
+            "BuFLO kernel timing cannot coexist with legacy exact-release metrics"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_render_error_is_embedded_without_erasing_schema_eleven_kernel_evidence() {
+        let mut metrics = RunnerWakeupMetrics::new();
+        let raw = json!({
+            "schema_version": 1,
+            "terminal_outcome": "failed",
+            "aggregate": {"terminal_outcome": "failed"},
+            "cleanup_errors": ["synthetic render failure"]
+        });
+        metrics
+            .attach_buflo_kernel_tx_value(raw.clone())
+            .expect("attach synthetic kernel evidence");
+        let spec = RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: Vec::new(),
+            },
+            workload_hash: "00".repeat(32),
+            application_workload_source: None,
+            config: QcsdConfig::default(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 0,
+            output_dir: PathBuf::from("/synthetic-output"),
+            max_response_bytes: 1_024,
+            timeout_seconds: 30,
+        };
+        let scheduler = super::ProcessSchedulerEvidence {
+            schema_version: 1,
+            source: "linux-sched-and-procfs-v1",
+            policy: "SCHED_RR".into(),
+            priority: 1,
+            affinity_cpus: vec![10],
+            rlimit_rtprio: super::RealtimePriorityLimit { soft: 1, hard: 1 },
+            no_new_privileges: Some(true),
+            effective_capabilities_hex: Some("0000000000000000".into()),
+            cgroup_effective_cpuset: Some("10-11".into()),
+            affinity_scope: "qcsd_container_affinity_partition_not_physical_cpu_isolation",
+            contract: Some(super::QCSD_CLIENT_ETF_SCHEDULER_CONTRACT.into()),
+            contract_valid: true,
+        };
+        let render_errors = vec!["collect chaff responses failed: synthetic".into()];
+        let bytes = super::render_run_json(
+            &spec,
+            &[],
+            &[],
+            &[],
+            &scheduler,
+            &render_errors,
+            1,
+            &RunCompletion {
+                ended_unix_ns: Some(2),
+                status: "complete",
+                error: None,
+                error_class: None,
+                defense_start_monotonic_ns: Some(3),
+                application_completion_monotonic_ns: Some(4),
+                defense_diagnostics: None,
+                runner_wakeup_metrics: Some(metrics),
+            },
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse total terminal rendering");
+        assert_eq!(receipt["completion_status"], "error");
+        assert_eq!(
+            receipt["error_class"],
+            "run-artifact-evidence-finalization-v1"
+        );
+        assert_eq!(
+            receipt["terminal_evidence_render_errors"][0],
+            render_errors[0]
+        );
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 11);
+        assert_eq!(receipt["runner_wakeup_metrics"]["buflo_kernel_tx"], raw);
     }
 }

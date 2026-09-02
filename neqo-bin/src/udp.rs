@@ -6,6 +6,8 @@
 
 #![expect(clippy::missing_errors_doc, reason = "Passing up tokio errors.")]
 
+#[cfg(all(feature = "qcsd", target_os = "linux"))]
+use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(feature = "qcsd")]
 use std::time::Instant;
 use std::{io, net::SocketAddr};
@@ -23,6 +25,13 @@ use neqo_udp::{DatagramIter, RecvBuf};
 pub struct Socket {
     state: quinn_udp::UdpSocketState,
     inner: tokio::net::UdpSocket,
+}
+
+#[cfg(all(feature = "qcsd", target_os = "linux"))]
+impl AsFd for Socket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
 }
 
 impl Socket {
