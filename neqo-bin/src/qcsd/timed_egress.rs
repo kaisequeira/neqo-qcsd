@@ -3832,6 +3832,24 @@ mod tests {
          NoNewPrivs:\t1\n"
     }
 
+    fn configure_timed_socket_or_explain_missing_net_admin(
+        socket: &UdpSocket,
+    ) -> Option<PreparedTimedEgressSocket> {
+        match PreparedTimedEgressSocket::configure(socket, EtfContract::STRICT) {
+            Ok(prepared) => Some(prepared),
+            Err(TimedEgressError::Io("setsockopt(SO_TXTIME)", source))
+                if source.raw_os_error() == Some(libc::EPERM) =>
+            {
+                eprintln!(
+                    "skipping CAP_NET_ADMIN-dependent SO_TXTIME assertions: \
+                     setsockopt(SO_TXTIME) returned EPERM"
+                );
+                None
+            }
+            Err(error) => panic!("timed socket setup failed unexpectedly: {error}"),
+        }
+    }
+
     fn pending_socket() -> ActiveTimedEgressSocket {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
         socket.set_nonblocking(true).expect("nonblocking");
@@ -4141,8 +4159,9 @@ mod tests {
     fn setup_reads_back_minimum_global_options_and_selects_one_priority_method() {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
         socket.set_nonblocking(true).expect("nonblocking");
-        let prepared =
-            PreparedTimedEgressSocket::configure(&socket, EtfContract::STRICT).expect("setup");
+        let Some(prepared) = configure_timed_socket_or_explain_missing_net_admin(&socket) else {
+            return;
+        };
         let receipt = prepared.receipt();
         let mut untouched = [0_u8; 1];
         assert!(matches!(
@@ -4181,8 +4200,9 @@ mod tests {
         sender.set_nonblocking(true).expect("nonblocking");
         let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("receiver");
         receiver.set_nonblocking(true).expect("nonblocking");
-        let prepared =
-            PreparedTimedEgressSocket::configure(&sender, EtfContract::STRICT).expect("setup");
+        let Some(prepared) = configure_timed_socket_or_explain_missing_net_admin(&sender) else {
+            return;
+        };
         sender
             .send_to(&[0x42], receiver.local_addr().expect("receiver address"))
             .expect("ordinary send");

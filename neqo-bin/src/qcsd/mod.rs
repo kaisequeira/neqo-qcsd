@@ -8046,6 +8046,11 @@ struct Endpoint {
     test_output_observations: Vec<TimestampedQcsdObservation>,
     #[cfg(test)]
     test_output_drives: VecDeque<TestOutputDrive>,
+    /// Logical completion instant supplied by a test output drive. This lets
+    /// deadline reconciliation be exercised without relying on scheduler
+    /// latency or sleeping until a real wall-clock boundary.
+    #[cfg(test)]
+    test_output_completion_at: Option<Instant>,
     #[cfg(test)]
     test_force_socket_handoff_success: bool,
     /// Inject one strict-path OS error without depending on host buffer state.
@@ -11978,6 +11983,8 @@ fn create_endpoints(
                 test_output_observations: Vec::new(),
                 #[cfg(test)]
                 test_output_drives: VecDeque::new(),
+                #[cfg(test)]
+                test_output_completion_at: None,
                 #[cfg(test)]
                 test_force_socket_handoff_success: false,
                 #[cfg(test)]
@@ -16373,6 +16380,11 @@ async fn drive_buflo_unadvertised_scheduled_receive_credit(
             )
             .await;
             let drive_completed_at = now();
+            #[cfg(test)]
+            let drive_completed_at = endpoints[endpoint_index]
+                .test_output_completion_at
+                .take()
+                .unwrap_or(drive_completed_at);
             let callback = match drive_result {
                 Ok(callback) => callback,
                 Err(source) => {
@@ -18671,12 +18683,9 @@ fn due_rolling_output_target<'a>(
     clippy::too_many_lines,
     reason = "one output microstep keeps packet-build, slot-resolution, and trace evidence atomic"
 )]
-#[cfg_attr(
-    not(test),
-    expect(
-        clippy::unused_async,
-        reason = "test fault injection waits at an exact boundary while production preparation remains one shared async seam"
-    )
+#[expect(
+    clippy::unused_async,
+    reason = "logical test completion and production preparation retain one shared async seam"
 )]
 async fn prepare_output_once_with_evidence(
     endpoint: &mut Endpoint,
@@ -18706,7 +18715,7 @@ async fn prepare_output_once_with_evidence(
                 return Ok(PreparedOutputDrive::Callback(wakeup));
             }
             TestOutputDrive::ErrorAt(at) => {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                endpoint.test_output_completion_at = Some(at);
                 return Err(PreparedOutputFailure::new(
                     "test-output",
                     Error::SlotInvariant(
@@ -19326,11 +19335,41 @@ fn elapsed_ns(start: Instant, instant: Instant) -> u64 {
     u64::try_from(instant.duration_since(start).as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_MONOTONIC_NOW_OVERRIDE: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct TestMonotonicNowOverride {
+    previous: Option<Instant>,
+}
+
+#[cfg(test)]
+impl TestMonotonicNowOverride {
+    fn fixed(at: Instant) -> Self {
+        let previous = TEST_MONOTONIC_NOW_OVERRIDE.with(|clock| clock.replace(Some(at)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestMonotonicNowOverride {
+    fn drop(&mut self) {
+        TEST_MONOTONIC_NOW_OVERRIDE.with(|clock| clock.set(self.previous));
+    }
+}
+
 fn now() -> Instant {
     #![expect(
         clippy::disallowed_methods,
         reason = "research traces require monotonic wall time"
     )]
+    #[cfg(test)]
+    if let Some(at) = TEST_MONOTONIC_NOW_OVERRIDE.with(std::cell::Cell::get) {
+        return at;
+    }
     Instant::now()
 }
 
@@ -19387,8 +19426,8 @@ mod tests {
         ResponseQualificationRequest, RunCompletion, RunSpec, RunnerWakeupMetrics,
         RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff, SocketHandoffBoundary,
         SocketHandoffPolicy, StaticModeArg, StreamActivationStage, StreamRecord, StreamType,
-        SustainedResponseQualificationRequest, TerminalActionSemantics, TestOutputDrive,
-        TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
+        SustainedResponseQualificationRequest, TerminalActionSemantics, TestMonotonicNowOverride,
+        TestOutputDrive, TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
         activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
         apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
         await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
@@ -19433,8 +19472,8 @@ mod tests {
         validate_chaff_manifest_defense, validate_prefix_capacity_plan, validate_prefix_pack_spec,
         validate_qualified_chaff_binding, validate_terminal_chaff_receive_identities,
         validate_walkie_talkie_chaff_precondition, wait_for_activity_until,
-        wait_for_buflo_exact_release, wait_for_buflo_exact_release_with_clocks,
-        walkie_talkie_qualification_binding_matches, write_run_json,
+        wait_for_buflo_exact_release_with_clocks, walkie_talkie_qualification_binding_matches,
+        write_run_json,
     };
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     use super::{ProductionBufloExactReleasePollClock, validate_counter_frequency_hz};
@@ -25759,7 +25798,7 @@ mod tests {
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[expect(
         clippy::too_many_lines,
         reason = "the connected two-origin oracle spans paired controller ordering, two socket handoffs, deferred reduction, and trace evidence"
@@ -25950,9 +25989,9 @@ mod tests {
         );
         assert_eq!(guard.active_wait_at, guard.guard_at);
 
-        tokio::time::sleep_until(tokio::time::Instant::from_std(guard.guard_at)).await;
-        let exact_release_evidence = wait_for_buflo_exact_release(&guard)
-            .expect("production exact-release wait remains inside the adapter window");
+        let _logical_now = TestMonotonicNowOverride::fixed(guard.release);
+        let exact_release_evidence =
+            production_shaped_dispatch_ready_evidence(guard.guard_at, guard.release);
         let dispatch_at = exact_release_evidence
             .dispatch_at
             .expect("dispatch-ready exact-release evidence");
@@ -27240,7 +27279,12 @@ mod tests {
             })
             .expect("incoming slot");
         let mut endpoints = vec![endpoint];
-        let release = now();
+        // Keep the physical guard comfortably in the future so machine load
+        // cannot expire it during fixture setup. `ErrorAt` injects the exact
+        // logical completion instant without sleeping, retaining a 20 ms
+        // controller-time window while making this boundary oracle
+        // deterministic.
+        let release = now() + Duration::from_secs(60);
         let deadline = release + Duration::from_millis(20);
         let guard = synthetic_paired_buflo_guard(
             &mut controller,
