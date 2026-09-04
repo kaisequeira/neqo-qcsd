@@ -1742,6 +1742,26 @@ struct BufloKernelTxRuntime {
 }
 
 #[cfg(target_os = "linux")]
+fn buflo_kernel_activation_start(
+    defense_start: Option<Instant>,
+    epoch_start: Option<Instant>,
+) -> Result<Option<Instant>, Error> {
+    match (defense_start, epoch_start) {
+        (None, None) => Ok(None),
+        (Some(started), Some(epoch)) if started == epoch => Ok(Some(started)),
+        (None, Some(_)) => Err(Error::SlotInvariant(
+            "BuFLO kernel epoch was armed without a defense start".into(),
+        )),
+        (Some(_), None) => Err(Error::SlotInvariant(
+            "BuFLO defense start existed before kernel epoch arm".into(),
+        )),
+        (Some(_), Some(_)) => Err(Error::SlotInvariant(
+            "BuFLO defense start differed from the kernel epoch".into(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn mark_buflo_kernel_item_controller_and_trace_finalized(
     job: &mut BufloKernelRawJob,
     item_id: u64,
@@ -2831,6 +2851,10 @@ impl BufloKernelTxRuntime {
             tick_zero_staged: false,
         });
         Ok(start)
+    }
+
+    fn activation_start(&self, defense_start: Option<Instant>) -> Result<Option<Instant>, Error> {
+        buflo_kernel_activation_start(defense_start, self.epoch.map(|epoch| epoch.start))
     }
 
     fn epoch(&self) -> Result<BufloKernelEpoch, Error> {
@@ -5251,14 +5275,7 @@ impl RunnerWakeupMetrics {
         self.semantics = format!(
             "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema10_layout_is_retained_for_non_kernel_metrics; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
         );
-        if self.buflo_exact_release_guard_entries != 0
-            || self.buflo_exact_release_dispatch_ready_guards != 0
-            || self.buflo_exact_release_failed_guards != 0
-            || self.buflo_exact_release_guard_wait_nanoseconds != 0
-            || self.buflo_exact_release_active_wait_nanoseconds != 0
-            || self.buflo_exact_incoming_retry_drives != 0
-            || self.buflo_exact_incoming_retry_resolutions != 0
-        {
+        if !self.legacy_buflo_metrics_neutral() {
             let detail =
                 "BuFLO kernel timing cannot coexist with legacy exact-release metrics".to_string();
             self.append_buflo_kernel_cleanup_errors(std::slice::from_ref(&detail))
@@ -5269,7 +5286,22 @@ impl RunnerWakeupMetrics {
                 })?;
             return Err(Error::SlotInvariant(detail));
         }
+        // Schema 11 retains the schema-10 fields for compatibility, but the
+        // kernel path never observes the superseded user-space polling
+        // source. Publish its neutral value only after proving that no legacy
+        // exact-release metric was recorded.
+        self.buflo_exact_release_active_wait_poll_source = BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE;
+        self.buflo_exact_release_active_wait_counter_frequency_hz = None;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn legacy_buflo_metrics_neutral(&self) -> bool {
+        self.buflo_exact_release_guard_entries == 0
+            && self.buflo_exact_release_invariants_hold()
+            && self.buflo_exact_incoming_retry_drives == 0
+            && self.buflo_exact_incoming_retry_resolutions == 0
+            && self.buflo_exact_incoming_retry_max_wake_lateness_nanoseconds == 0
     }
 
     #[cfg(target_os = "linux")]
@@ -10962,6 +10994,7 @@ async fn execute_run_inner(
             ($runner:lifetime) => {
                 #[cfg(target_os = "linux")]
                 if let Some(runtime) = buflo_kernel_tx.as_mut()
+                    && let Some(started) = runtime.activation_start(defense_start)?
                     && dispatch_due_buflo_kernel_release(
                         &spec.config.defense,
                         &mut endpoints,
@@ -10969,7 +11002,7 @@ async fn execute_run_inner(
                         spec.chaff_manifest.as_ref(),
                         &mut traces,
                         &observation_clock,
-                        defense_start,
+                        started,
                         runtime,
                     )
                     .await?
@@ -11436,6 +11469,7 @@ async fn execute_run_inner(
             }
             #[cfg(target_os = "linux")]
             if let Some(runtime) = buflo_kernel_tx.as_ref()
+                && runtime.activation_start(defense_start)?.is_some()
                 && !runtime.tick_zero_staged()?
             {
                 let stage_at = runtime.tick_zero_stage_at()?;
@@ -17340,7 +17374,7 @@ async fn dispatch_due_buflo_kernel_release(
     chaff_manifest: Option<&RuntimeChaffManifest>,
     traces: &mut TraceFiles,
     observation_clock: &QcsdObservationClock,
-    defense_start: Option<Instant>,
+    started: Instant,
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<bool, Error> {
     if !matches!(defense, DefenseConfig::Buflo(_)) {
@@ -17348,9 +17382,6 @@ async fn dispatch_due_buflo_kernel_release(
             "BuFLO kernel runtime was active for a non-BuFLO defense".into(),
         ));
     }
-    let started = defense_start.ok_or_else(|| {
-        Error::SlotInvariant("BuFLO kernel runtime was active before defense arm".into())
-    })?;
     if !runtime.tick_zero_staged()? {
         let stage_at = runtime.tick_zero_stage_at()?;
         if now() < stage_at {
@@ -35905,6 +35936,39 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_activation_reconciles_prearm_and_epoch() {
+        let started = now();
+        let different_start = started + Duration::from_nanos(1);
+
+        assert_eq!(
+            super::buflo_kernel_activation_start(None, None)
+                .expect("an initialised but unarmed runtime is the handshake phase"),
+            None
+        );
+        assert_eq!(
+            super::buflo_kernel_activation_start(Some(started), Some(started))
+                .expect("an armed runtime has the same defense start"),
+            Some(started)
+        );
+        assert!(matches!(
+            super::buflo_kernel_activation_start(None, Some(started)),
+            Err(Error::SlotInvariant(message))
+                if message == "BuFLO kernel epoch was armed without a defense start"
+        ));
+        assert!(matches!(
+            super::buflo_kernel_activation_start(Some(started), None),
+            Err(Error::SlotInvariant(message))
+                if message == "BuFLO defense start existed before kernel epoch arm"
+        ));
+        assert!(matches!(
+            super::buflo_kernel_activation_start(Some(started), Some(different_start)),
+            Err(Error::SlotInvariant(message))
+                if message == "BuFLO defense start differed from the kernel epoch"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     #[expect(
         clippy::too_many_lines,
         reason = "the synthetic helper fixture constructs one internally consistent runtime, qdisc, lifecycle, and socket contract"
@@ -36173,8 +36237,45 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn kernel_receipt_attachment_rejects_omitted_legacy_metric_families() {
+        let mutations: [fn(&mut RunnerWakeupMetrics); 4] = [
+            |metrics| metrics.buflo_exact_release_active_wait_iterations = 1,
+            |metrics| {
+                metrics.buflo_exact_release_invalid_counter_frequency_guards = 1;
+            },
+            |metrics| {
+                metrics
+                    .buflo_exact_release_dispatch_lateness_histogram
+                    .counts[0] = 1;
+            },
+            |metrics| {
+                metrics.buflo_exact_incoming_retry_max_wake_lateness_nanoseconds = 1;
+            },
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut metrics = RunnerWakeupMetrics::new();
+            mutate(&mut metrics);
+            let raw = json!({
+                "schema_version": 1,
+                "terminal_outcome": "complete",
+                "aggregate": {"terminal_outcome": "complete"},
+                "cleanup_errors": []
+            });
+            assert!(
+                metrics.attach_buflo_kernel_tx_value(raw).is_err(),
+                "legacy metric family mutation {index} was accepted"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn terminal_render_error_is_embedded_without_erasing_schema_eleven_kernel_evidence() {
         let mut metrics = RunnerWakeupMetrics::new();
+        // Exercise schema-11 normalisation even on hosts whose production
+        // schema-10 default already uses the neutral fallback source.
+        metrics.buflo_exact_release_active_wait_poll_source =
+            BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
         let raw = json!({
             "schema_version": 1,
             "terminal_outcome": "failed",
@@ -36184,6 +36285,14 @@ mod tests {
         metrics
             .attach_buflo_kernel_tx_value(raw.clone())
             .expect("attach synthetic kernel evidence");
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_poll_source,
+            BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE
+        );
+        assert_eq!(
+            metrics.buflo_exact_release_active_wait_counter_frequency_hz,
+            None
+        );
         let spec = RunSpec {
             method: "GET",
             workload: ResourceManifest {
