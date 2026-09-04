@@ -27133,6 +27133,7 @@ mod tests {
         let mut endpoints = vec![endpoint];
         endpoints[0].test_force_socket_handoff_success = true;
         let defense_start = now();
+        let _logical_now = TestMonotonicNowOverride::fixed(defense_start);
         let first_guard = synthetic_paired_buflo_guard(
             &mut controller,
             &mut actions,
