@@ -117,7 +117,15 @@ pub enum SocketFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimedPriorityMethod {
+    /// `SCM_PRIORITY` selects the ETF band without changing socket-global
+    /// state. Both IPv4 `IP_TOS` and IPv6 `IPV6_TCLASS` remain per-message.
     PerDatagramScmPriority,
+    /// `SO_PRIORITY` selects the ETF band inside the helper's exclusive send
+    /// transaction. On IPv4 only, that transaction also applies `IP_TOS` at
+    /// socket scope *before* `SO_PRIORITY`: Linux derives `skb->priority` from
+    /// a per-message `IP_TOS`, which would otherwise override priority six and
+    /// route the timed datagram to the ordinary band. IPv6 retains its
+    /// per-message `IPV6_TCLASS` behaviour.
     SerializedSocketSoPriority,
 }
 
@@ -882,6 +890,7 @@ impl ActiveTimedEgressSocket {
                 self.fd.as_raw_fd(),
                 &message,
                 self.contract.timed_priority,
+                serialized_ipv4_socket_tos(batch, self.setup_receipt.priority_method),
                 txtime_tai_ns,
                 latest_enqueue_tai_ns,
             ),
@@ -1087,7 +1096,7 @@ impl ActiveTimedEgressSocket {
 
         let mut control = ControlBuffer::<SEND_CONTROL_WORDS>::new();
         control.push(libc::SOL_SOCKET, libc::SO_TIMESTAMPING, REQUEST_FLAGS)?;
-        append_ip_control_messages(&mut control, batch)?;
+        append_ip_control_messages(&mut control, batch, true)?;
         let mut destination = SocketAddress::new(batch.destination());
         let mut iov = libc::iovec {
             iov_base: batch.data().as_ptr().cast_mut().cast(),
@@ -2901,23 +2910,49 @@ fn build_timed_send_control(
 ) -> Result<ControlBuffer<SEND_CONTROL_WORDS>, TimedEgressError> {
     let mut control = ControlBuffer::<SEND_CONTROL_WORDS>::new();
     control.push(libc::SOL_SOCKET, libc::SCM_TXTIME, txtime_tai_ns)?;
+    control.push(libc::SOL_SOCKET, libc::SO_TIMESTAMPING, REQUEST_FLAGS)?;
+    // Linux IPv4's per-message IP_TOS path derives skb->priority from TOS and
+    // therefore defeats the serialized SO_PRIORITY fallback. In that one
+    // case, sendmsg_with_serialized_priority applies TOS at socket scope before
+    // arming priority. Native SCM_PRIORITY and all IPv6 behaviour stay intact.
+    append_ip_control_messages(
+        &mut control,
+        batch,
+        serialized_ipv4_socket_tos(batch, priority_method).is_none(),
+    )?;
     if matches!(priority_method, TimedPriorityMethod::PerDatagramScmPriority) {
-        // Exactly one per-datagram priority cmsg is part of the native path.
+        // Keep the one native priority cmsg after every protocol-level traffic
+        // class message. Kernels that implement SCM_PRIORITY store both it and
+        // IPv4 IP_TOS-derived priority in the same per-send cookie, so the last
+        // value must be the explicit ETF selector.
         control.push(libc::SOL_SOCKET, SCM_PRIORITY, timed_priority)?;
     }
-    control.push(libc::SOL_SOCKET, libc::SO_TIMESTAMPING, REQUEST_FLAGS)?;
-    append_ip_control_messages(&mut control, batch)?;
     Ok(control)
+}
+
+fn serialized_ipv4_socket_tos(
+    batch: &datagram::Batch,
+    priority_method: TimedPriorityMethod,
+) -> Option<libc::c_int> {
+    (matches!(
+        priority_method,
+        TimedPriorityMethod::SerializedSocketSoPriority
+    ) && batch.source().is_ipv4()
+        && batch.destination().is_ipv4())
+    .then(|| libc::c_int::from(u8::from(batch.tos())))
 }
 
 fn append_ip_control_messages<const WORDS: usize>(
     control: &mut ControlBuffer<WORDS>,
     batch: &datagram::Batch,
+    include_ipv4_tos: bool,
 ) -> Result<(), TimedEgressError> {
     let tos = libc::c_int::from(u8::from(batch.tos()));
     match (batch.source().ip(), batch.destination().ip()) {
         (IpAddr::V4(source), IpAddr::V4(_)) => {
-            control.push(libc::SOL_IP, libc::IP_TOS, tos)?;
+            if include_ipv4_tos {
+                control.push(libc::SOL_IP, libc::IP_TOS, tos)?;
+            }
             if !source.is_unspecified() {
                 control.push(
                     libc::SOL_IP,
@@ -3140,6 +3175,129 @@ impl Drop for SocketPriorityRestoreGuard {
     }
 }
 
+/// Restores the socket-global state used by the serialized priority fallback.
+///
+/// IPv4 `IP_TOS` must be restored first because Linux updates `sk_priority`
+/// while applying that option. Restoring `SO_PRIORITY` last re-establishes the
+/// ordinary-send invariant even when the saved TOS maps to another priority.
+struct SerializedSocketStateRestoreGuard {
+    fd: RawFd,
+    restore_ipv4_tos: Option<libc::c_int>,
+    restore_priority: libc::c_int,
+    armed: bool,
+}
+
+impl SerializedSocketStateRestoreGuard {
+    const fn new(
+        fd: RawFd,
+        restore_ipv4_tos: Option<libc::c_int>,
+        restore_priority: libc::c_int,
+    ) -> Self {
+        Self {
+            fd,
+            restore_ipv4_tos,
+            restore_priority,
+            armed: true,
+        }
+    }
+
+    fn restore_verified(mut self) -> Result<(), TimedEgressError> {
+        // Compute every set/readback result before combining them. A failed
+        // IP_TOS restoration must never prevent the final SO_PRIORITY reset.
+        let tos_result = self.restore_ipv4_tos.map_or(Ok(()), |expected| {
+            let set_result = setsockopt(
+                self.fd,
+                libc::SOL_IP,
+                libc::IP_TOS,
+                &expected,
+                "setsockopt(IP_TOS after serialized send)",
+            );
+            let observed_result = getsockopt::<libc::c_int>(
+                self.fd,
+                libc::SOL_IP,
+                libc::IP_TOS,
+                "getsockopt(IP_TOS after serialized send)",
+            );
+            set_result?;
+            let observed = observed_result?;
+            if observed != expected {
+                return Err(TimedEgressError::CapabilityMismatch(format!(
+                    "IP_TOS restoration read {observed:#04x}, expected {expected:#04x}"
+                )));
+            }
+            Ok(())
+        });
+        let priority_set_result = setsockopt(
+            self.fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &self.restore_priority,
+            "setsockopt(SO_PRIORITY after serialized send)",
+        );
+        let priority_observed_result = getsockopt::<libc::c_int>(
+            self.fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            "getsockopt(SO_PRIORITY after serialized send)",
+        );
+        let priority_result = (|| {
+            priority_set_result?;
+            let observed = priority_observed_result?;
+            if observed != self.restore_priority {
+                return Err(TimedEgressError::CapabilityMismatch(format!(
+                    "SO_PRIORITY restoration read {observed}, expected {}",
+                    self.restore_priority
+                )));
+            }
+            Ok(())
+        })();
+        let result = match (tos_result, priority_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(tos_error), Err(priority_error)) => {
+                Err(TimedEgressError::CapabilityMismatch(format!(
+                    "serialized socket restoration failed for both IP_TOS ({tos_error}) and \
+                     SO_PRIORITY ({priority_error})"
+                )))
+            }
+        };
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for SerializedSocketStateRestoreGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let length = libc::socklen_t::try_from(size_of::<libc::c_int>())
+            .expect("integer socket-option size fits socklen_t");
+        unsafe {
+            // SAFETY: this is a last-resort unwind/error-path reset on the
+            // live descriptor. The checked path above supplies evidence.
+            if let Some(tos) = self.restore_ipv4_tos {
+                libc::setsockopt(
+                    self.fd,
+                    libc::SOL_IP,
+                    libc::IP_TOS,
+                    ptr::from_ref(&tos).cast(),
+                    length,
+                );
+            }
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                ptr::from_ref(&self.restore_priority).cast(),
+                length,
+            );
+        }
+    }
+}
+
 fn probe_socket_so_priority(
     fd: RawFd,
     priority: libc::c_int,
@@ -3193,29 +3351,60 @@ fn sendmsg_with_serialized_priority(
     fd: RawFd,
     message: &libc::msghdr,
     priority: libc::c_int,
+    ipv4_tos: Option<libc::c_int>,
     txtime_tai_ns: u64,
     latest_enqueue_tai_ns: u64,
 ) -> Result<RawSendAttempt, TimedEgressError> {
-    let before: libc::c_int = getsockopt(
+    let priority_before: libc::c_int = getsockopt(
         fd,
         libc::SOL_SOCKET,
         libc::SO_PRIORITY,
         "getsockopt(SO_PRIORITY before serialized send)",
     )?;
-    if before != 0 {
+    if priority_before != 0 {
         return Err(TimedEgressError::CapabilityMismatch(format!(
-            "serialized send began with SO_PRIORITY={before}, expected 0"
+            "serialized send began with SO_PRIORITY={priority_before}, expected 0"
         )));
     }
-    setsockopt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_PRIORITY,
-        &priority,
-        "setsockopt(SO_PRIORITY=6 serialized send)",
-    )?;
-    let restore = SocketPriorityRestoreGuard::new(fd, 0);
+    let ipv4_tos_before = ipv4_tos
+        .map(|_| {
+            getsockopt::<libc::c_int>(
+                fd,
+                libc::SOL_IP,
+                libc::IP_TOS,
+                "getsockopt(IP_TOS before serialized send)",
+            )
+        })
+        .transpose()?;
+    let restore = SerializedSocketStateRestoreGuard::new(fd, ipv4_tos_before, priority_before);
     let operation_result = (|| {
+        if let Some(tos) = ipv4_tos {
+            // Linux's IPv4 IP_TOS socket option also derives sk_priority from
+            // the TOS value. It must therefore precede SO_PRIORITY=6.
+            setsockopt(
+                fd,
+                libc::SOL_IP,
+                libc::IP_TOS,
+                &tos,
+                "setsockopt(IP_TOS serialized send)",
+            )?;
+        }
+        setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &priority,
+            "setsockopt(SO_PRIORITY serialized send)",
+        )?;
+        if let Some(expected) = ipv4_tos {
+            let observed: libc::c_int =
+                getsockopt(fd, libc::SOL_IP, libc::IP_TOS, "getsockopt(IP_TOS armed)")?;
+            if observed != expected {
+                return Err(TimedEgressError::CapabilityMismatch(format!(
+                    "serialized send armed IP_TOS={observed:#04x}, expected {expected:#04x}"
+                )));
+            }
+        }
         let armed: libc::c_int = getsockopt(
             fd,
             libc::SOL_SOCKET,
@@ -3227,8 +3416,8 @@ fn sendmsg_with_serialized_priority(
                 "serialized send armed SO_PRIORITY={armed}, expected {priority}"
             )));
         }
-        // The serialized fallback must arm/read priority first; this TAI read
-        // is therefore its final userspace operation before sendmsg.
+        // The serialized fallback must apply TOS, then arm/read priority. This
+        // TAI read is therefore its final userspace operation before sendmsg.
         let enqueue_before_tai_ns = clock_tai_ns()?;
         validate_enqueue_deadline(txtime_tai_ns, latest_enqueue_tai_ns, enqueue_before_tai_ns)?;
         let sent = unsafe {
@@ -3243,7 +3432,7 @@ fn sendmsg_with_serialized_priority(
             || monotonic_result.err(),
             |source| {
                 Some(TimedEgressError::Io(
-                    "sendmsg(SCM_TXTIME, serialized SO_PRIORITY)",
+                    "sendmsg(SCM_TXTIME, serialized socket state)",
                     source,
                 ))
             },
@@ -3256,14 +3445,11 @@ fn sendmsg_with_serialized_priority(
             post_send_error,
         })
     })();
-    let restore_result = restore.restore_verified(
-        "setsockopt(SO_PRIORITY=0 after serialized send)",
-        "getsockopt(SO_PRIORITY=0 after serialized send)",
-    );
+    let restore_result = restore.restore_verified();
     match operation_result {
         Err(error) => {
             // No sendmsg was reached. Restoration still dominates because
-            // leaked socket priority would corrupt future ordinary sends.
+            // leaked TOS or priority would corrupt future ordinary sends.
             restore_result?;
             Err(error)
         }
@@ -3912,18 +4098,46 @@ mod tests {
         decode_error_queue_message(&message)
     }
 
-    fn count_control_messages<const WORDS: usize>(
+    fn control_message_layout<const WORDS: usize>(
         control: &mut ControlBuffer<WORDS>,
-        level: libc::c_int,
-        kind: libc::c_int,
-    ) -> usize {
+    ) -> Vec<(libc::c_int, libc::c_int)> {
         let mut message: libc::msghdr = unsafe {
             // SAFETY: all-zero is a valid initial msghdr state.
             mem::zeroed()
         };
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = control.len();
-        let mut count = 0;
+        let mut layout = Vec::new();
+        let mut current = unsafe {
+            // SAFETY: message points at the live test control buffer.
+            libc::CMSG_FIRSTHDR(&raw const message)
+        };
+        while !current.is_null() {
+            let header = unsafe {
+                // SAFETY: current is returned by the CMSG traversal API.
+                &*current
+            };
+            layout.push((header.cmsg_level, header.cmsg_type));
+            current = unsafe {
+                // SAFETY: current and message refer to the same live buffer.
+                libc::CMSG_NXTHDR(&raw const message, current)
+            };
+        }
+        layout
+    }
+
+    fn control_message_values<T: Copy, const WORDS: usize>(
+        control: &mut ControlBuffer<WORDS>,
+        level: libc::c_int,
+        kind: libc::c_int,
+    ) -> Vec<T> {
+        let mut message: libc::msghdr = unsafe {
+            // SAFETY: all-zero is a valid initial msghdr state.
+            mem::zeroed()
+        };
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        let mut values = Vec::new();
         let mut current = unsafe {
             // SAFETY: message points at the live test control buffer.
             libc::CMSG_FIRSTHDR(&raw const message)
@@ -3934,14 +4148,122 @@ mod tests {
                 &*current
             };
             if header.cmsg_level == level && header.cmsg_type == kind {
-                count += 1;
+                let header_len = unsafe {
+                    // SAFETY: a zero-byte cmsg length is representable.
+                    libc::CMSG_LEN(0)
+                } as usize;
+                let data_len = header
+                    .cmsg_len
+                    .checked_sub(header_len)
+                    .expect("cmsg length");
+                assert_eq!(
+                    data_len,
+                    size_of::<T>(),
+                    "unexpected cmsg data size for level={level} type={kind}"
+                );
+                values.push(read_cmsg::<T>(current, data_len).expect("cmsg value"));
             }
             current = unsafe {
                 // SAFETY: current and message refer to the same live buffer.
                 libc::CMSG_NXTHDR(&raw const message, current)
             };
         }
-        count
+        values
+    }
+
+    fn set_ipv4_socket_state(fd: RawFd, tos: libc::c_int, priority: libc::c_int) {
+        // IP_TOS rewrites sk_priority on Linux, so tests establish the same
+        // ordering required by the production transaction.
+        setsockopt(
+            fd,
+            libc::SOL_IP,
+            libc::IP_TOS,
+            &tos,
+            "test setsockopt(IP_TOS)",
+        )
+        .expect("set test TOS");
+        setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &priority,
+            "test setsockopt(SO_PRIORITY)",
+        )
+        .expect("set test priority");
+    }
+
+    fn ipv4_socket_state(fd: RawFd) -> (libc::c_int, libc::c_int) {
+        (
+            getsockopt(fd, libc::SOL_IP, libc::IP_TOS, "test getsockopt(IP_TOS)")
+                .expect("test TOS"),
+            getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                "test getsockopt(SO_PRIORITY)",
+            )
+            .expect("test priority"),
+        )
+    }
+
+    fn receive_ipv4_tos(socket: &UdpSocket) -> (u8, u8) {
+        let mut payload = 0_u8;
+        let mut iov = libc::iovec {
+            iov_base: ptr::from_mut(&mut payload).cast(),
+            iov_len: 1,
+        };
+        let mut control = [0_usize; 8];
+        let mut message: libc::msghdr = unsafe {
+            // SAFETY: all-zero is a valid initial msghdr state.
+            mem::zeroed()
+        };
+        message.msg_iov = ptr::from_mut(&mut iov);
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = size_of_val(&control);
+        let received = unsafe {
+            // SAFETY: message points at live payload, iovec, and control data.
+            libc::recvmsg(socket.as_raw_fd(), ptr::from_mut(&mut message), 0)
+        };
+        assert_eq!(
+            received,
+            1,
+            "recvmsg failed: {}",
+            io::Error::last_os_error()
+        );
+
+        let mut observed_tos = None;
+        let mut current = unsafe {
+            // SAFETY: successful recvmsg initialized the live control buffer.
+            libc::CMSG_FIRSTHDR(&raw const message)
+        };
+        while !current.is_null() {
+            let header = unsafe {
+                // SAFETY: current is returned by the CMSG traversal API.
+                &*current
+            };
+            if header.cmsg_level == libc::SOL_IP && header.cmsg_type == libc::IP_TOS {
+                let header_len = unsafe {
+                    // SAFETY: a zero-byte cmsg length is representable.
+                    libc::CMSG_LEN(0)
+                } as usize;
+                let data_len = header
+                    .cmsg_len
+                    .checked_sub(header_len)
+                    .expect("cmsg length");
+                assert!(data_len >= size_of::<u8>());
+                assert!(observed_tos.is_none(), "duplicate received IP_TOS cmsg");
+                observed_tos = Some(unsafe {
+                    // SAFETY: data_len proves at least one initialized byte.
+                    ptr::read_unaligned(libc::CMSG_DATA(current).cast::<u8>())
+                });
+            }
+            current = unsafe {
+                // SAFETY: current and message refer to the same live buffer.
+                libc::CMSG_NXTHDR(&raw const message, current)
+            };
+        }
+        (payload, observed_tos.expect("received IP_TOS cmsg"))
     }
 
     #[test]
@@ -4008,9 +4330,11 @@ mod tests {
     }
 
     #[test]
-    fn expired_main_cutoff_refuses_sendmsg_and_restores_default_priority() {
+    fn expired_main_cutoff_refuses_sendmsg_and_restores_ipv4_socket_state() {
         let mut socket = pending_socket();
         socket.pending = None;
+        let original_tos = 0x28;
+        set_ipv4_socket_state(socket.fd.as_raw_fd(), original_tos, 0);
         let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("receiver");
         receiver
             .set_nonblocking(true)
@@ -4018,7 +4342,7 @@ mod tests {
         let batch = datagram::Batch::new(
             socket.local_address,
             receiver.local_addr().expect("receiver address"),
-            Tos::default(),
+            Tos::from(Ecn::Ect0),
             NonZeroUsize::new(1).expect("nonzero"),
             vec![0x51],
         );
@@ -4037,16 +4361,7 @@ mod tests {
             receiver.recv(&mut payload),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock
         ));
-        assert_eq!(
-            getsockopt::<libc::c_int>(
-                socket.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PRIORITY,
-                "test priority after main cutoff"
-            )
-            .expect("priority"),
-            0
-        );
+        assert_eq!(ipv4_socket_state(socket.fd.as_raw_fd()), (original_tos, 0));
         assert!(socket.pending.is_none());
         assert!(matches!(
             socket.ensure_usable(),
@@ -4265,49 +4580,223 @@ mod tests {
     }
 
     #[test]
-    fn native_timed_control_contains_exactly_one_priority_message() {
-        let source = SocketAddr::from((Ipv6Addr::LOCALHOST, 12_000));
-        let destination = SocketAddr::from((Ipv6Addr::LOCALHOST, 12_001));
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one test binds the complete native/fallback IPv4 and preserved IPv6 cmsg contract"
+    )]
+    fn timed_control_binds_cmsg_order_values_and_ipv4_fallback() {
+        let source_ip = Ipv4Addr::new(127, 0, 0, 2);
+        let source = SocketAddr::from((source_ip, 12_000));
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 12_001));
         let batch = datagram::Batch::new(
             source,
             destination,
-            Tos::default(),
+            Tos::from(Ecn::Ect0),
             NonZeroUsize::new(4).expect("nonzero"),
             vec![1; 4],
         );
-        let mut native =
-            build_timed_send_control(&batch, 123, TimedPriorityMethod::PerDatagramScmPriority, 6)
-                .expect("native control");
+        let txtime = 0x1122_3344_5566_7788;
+        let mut native = build_timed_send_control(
+            &batch,
+            txtime,
+            TimedPriorityMethod::PerDatagramScmPriority,
+            6,
+        )
+        .expect("native control");
         assert_eq!(
-            count_control_messages(&mut native, libc::SOL_SOCKET, SCM_PRIORITY),
-            1
+            control_message_layout(&mut native),
+            vec![
+                (libc::SOL_SOCKET, libc::SCM_TXTIME),
+                (libc::SOL_SOCKET, libc::SO_TIMESTAMPING),
+                (libc::SOL_IP, libc::IP_TOS),
+                (libc::SOL_IP, libc::IP_PKTINFO),
+                (libc::SOL_SOCKET, SCM_PRIORITY),
+            ],
+            "SCM_PRIORITY must be last so IP_TOS cannot override it"
         );
         assert_eq!(
-            count_control_messages(&mut native, libc::SOL_SOCKET, libc::SCM_TXTIME),
-            1
+            control_message_values::<u64, SEND_CONTROL_WORDS>(
+                &mut native,
+                libc::SOL_SOCKET,
+                libc::SCM_TXTIME,
+            ),
+            vec![txtime]
         );
         assert_eq!(
-            count_control_messages(&mut native, libc::SOL_SOCKET, libc::SO_TIMESTAMPING),
-            1
+            control_message_values::<libc::c_int, SEND_CONTROL_WORDS>(
+                &mut native,
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPING,
+            ),
+            vec![REQUEST_FLAGS]
         );
+        assert_eq!(
+            control_message_values::<libc::c_int, SEND_CONTROL_WORDS>(
+                &mut native,
+                libc::SOL_IP,
+                libc::IP_TOS,
+            ),
+            vec![libc::c_int::from(u8::from(Ecn::Ect0))]
+        );
+        assert_eq!(
+            control_message_values::<libc::c_int, SEND_CONTROL_WORDS>(
+                &mut native,
+                libc::SOL_SOCKET,
+                SCM_PRIORITY,
+            ),
+            vec![6]
+        );
+        let native_pktinfo = control_message_values::<libc::in_pktinfo, SEND_CONTROL_WORDS>(
+            &mut native,
+            libc::SOL_IP,
+            libc::IP_PKTINFO,
+        );
+        assert_eq!(native_pktinfo.len(), 1);
+        assert_eq!(native_pktinfo[0].ipi_ifindex, 0);
+        assert_eq!(
+            native_pktinfo[0].ipi_spec_dst.s_addr,
+            u32::from(source_ip).to_be()
+        );
+        assert_eq!(native_pktinfo[0].ipi_addr.s_addr, 0);
 
         let mut fallback = build_timed_send_control(
             &batch,
-            123,
+            txtime,
             TimedPriorityMethod::SerializedSocketSoPriority,
             6,
         )
         .expect("fallback control");
         assert_eq!(
-            count_control_messages(&mut fallback, libc::SOL_SOCKET, SCM_PRIORITY),
-            0
+            control_message_layout(&mut fallback),
+            vec![
+                (libc::SOL_SOCKET, libc::SCM_TXTIME),
+                (libc::SOL_SOCKET, libc::SO_TIMESTAMPING),
+                (libc::SOL_IP, libc::IP_PKTINFO),
+            ],
+            "IPv4 fallback must omit both SCM_PRIORITY and per-message IP_TOS"
+        );
+        assert_eq!(
+            serialized_ipv4_socket_tos(&batch, TimedPriorityMethod::SerializedSocketSoPriority),
+            Some(libc::c_int::from(u8::from(Ecn::Ect0)))
+        );
+
+        let source_v6 = Ipv6Addr::LOCALHOST;
+        let batch_v6 = datagram::Batch::new(
+            SocketAddr::from((source_v6, 12_000)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 12_001)),
+            Tos::from(Ecn::Ect0),
+            NonZeroUsize::new(4).expect("nonzero"),
+            vec![2; 4],
+        );
+        let mut fallback_v6 = build_timed_send_control(
+            &batch_v6,
+            txtime,
+            TimedPriorityMethod::SerializedSocketSoPriority,
+            6,
+        )
+        .expect("IPv6 fallback control");
+        assert_eq!(
+            control_message_layout(&mut fallback_v6),
+            vec![
+                (libc::SOL_SOCKET, libc::SCM_TXTIME),
+                (libc::SOL_SOCKET, libc::SO_TIMESTAMPING),
+                (libc::SOL_IPV6, libc::IPV6_TCLASS),
+                (libc::SOL_IPV6, libc::IPV6_PKTINFO),
+            ],
+            "IPv6 fallback keeps the existing per-message traffic class"
+        );
+        assert_eq!(
+            control_message_values::<libc::c_int, SEND_CONTROL_WORDS>(
+                &mut fallback_v6,
+                libc::SOL_IPV6,
+                libc::IPV6_TCLASS,
+            ),
+            vec![libc::c_int::from(u8::from(Ecn::Ect0))]
+        );
+        let fallback_v6_pktinfo = control_message_values::<libc::in6_pktinfo, SEND_CONTROL_WORDS>(
+            &mut fallback_v6,
+            libc::SOL_IPV6,
+            libc::IPV6_PKTINFO,
+        );
+        assert_eq!(fallback_v6_pktinfo.len(), 1);
+        assert_eq!(fallback_v6_pktinfo[0].ipi6_addr.s6_addr, source_v6.octets());
+        assert_eq!(fallback_v6_pktinfo[0].ipi6_ifindex, 0);
+        assert_eq!(
+            serialized_ipv4_socket_tos(&batch_v6, TimedPriorityMethod::SerializedSocketSoPriority,),
+            None
         );
     }
 
     #[test]
-    fn serialized_priority_restores_zero_when_send_fails() {
+    fn serialized_ipv4_tos_reaches_wire_and_shared_socket_state_is_restored() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("receiver");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("receiver timeout");
+        let enabled: libc::c_int = 1;
+        setsockopt(
+            receiver.as_raw_fd(),
+            libc::SOL_IP,
+            libc::IP_RECVTOS,
+            &enabled,
+            "test setsockopt(IP_RECVTOS)",
+        )
+        .expect("enable IP_RECVTOS");
+
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("sender");
+        sender
+            .connect(receiver.local_addr().expect("receiver address"))
+            .expect("connect sender");
+        sender.set_nonblocking(true).expect("nonblocking");
+        let original_tos = 0x28;
+        let transmitted_tos = libc::c_int::from(u8::from(Ecn::Ect0));
+        set_ipv4_socket_state(sender.as_raw_fd(), original_tos, 0);
+        let duplicate = duplicate_cloexec(sender.as_fd()).expect("duplicate sender");
+
+        let mut byte = 0x5a_u8;
+        let mut iov = libc::iovec {
+            iov_base: ptr::from_mut(&mut byte).cast(),
+            iov_len: 1,
+        };
+        let mut message: libc::msghdr = unsafe {
+            // SAFETY: all-zero is a valid initial msghdr state.
+            mem::zeroed()
+        };
+        message.msg_iov = ptr::from_mut(&mut iov);
+        message.msg_iovlen = 1;
+        let now = clock_tai_ns().expect("TAI");
+        let attempt = sendmsg_with_serialized_priority(
+            duplicate.as_raw_fd(),
+            &message,
+            6,
+            Some(transmitted_tos),
+            now + 2_000_000_000,
+            now + 1_000_000_000,
+        )
+        .expect("serialized send");
+        assert_eq!(attempt.sendmsg_result, 1);
+        assert!(attempt.post_send_error.is_none());
+        assert_eq!(
+            receive_ipv4_tos(&receiver),
+            (
+                0x5a,
+                u8::try_from(transmitted_tos).expect("transmitted TOS fits u8"),
+            )
+        );
+        assert_eq!(
+            ipv4_socket_state(sender.as_raw_fd()),
+            (original_tos, 0),
+            "restoration through the duplicate must be visible on the original descriptor"
+        );
+    }
+
+    #[test]
+    fn serialized_ipv4_socket_state_is_restored_when_send_fails() {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
         socket.set_nonblocking(true).expect("nonblocking");
+        let original_tos = 0x28;
+        let transmitted_tos = libc::c_int::from(u8::from(Ecn::Ect0));
+        set_ipv4_socket_state(socket.as_raw_fd(), original_tos, 0);
         let mut byte = 1_u8;
         let mut iov = libc::iovec {
             iov_base: ptr::from_mut(&mut byte).cast(),
@@ -4324,6 +4813,7 @@ mod tests {
             socket.as_raw_fd(),
             &message,
             6,
+            Some(transmitted_tos),
             now + 2_000_000_000,
             now + 1_000_000_000,
         )
@@ -4332,16 +4822,7 @@ mod tests {
             attempt.post_send_error,
             Some(TimedEgressError::Io(_, _))
         ));
-        assert_eq!(
-            getsockopt::<libc::c_int>(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PRIORITY,
-                "test readback"
-            )
-            .expect("priority"),
-            0
-        );
+        assert_eq!(ipv4_socket_state(socket.as_raw_fd()), (original_tos, 0));
     }
 
     #[test]
