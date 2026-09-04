@@ -1331,9 +1331,17 @@ const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v2; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; tx_sched_and_tx_software_are_linux_error_queue_timestamps; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 2;
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 2;
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 2;
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v2; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; tx_sched_and_tx_software_are_linux_error_queue_timestamps; enqueue_monotonic_corroboration=item_local_post_tx_phase; global_monotonic_drift_is_diagnostic=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS: &str = "start_and_end_clock_phases_plus_every_explicit_per_item_post_tx_clock_phase; every_clock_phase_subsample_and_instant_alignment_bracket_is_at_most_250us; effective_monotonic_offset_is_a_nonfatal_diagnostic_union_and_max_observed_offset_drift_is_the_exact_maximum_start_relative_midpoint_drift_across_both_clocks_and_all_retained_phases; each_enqueue_MONOTONIC_timestamp_is_translated_only_with_its_item_local_post_TX_monotonic_phase_and_must_overlap_its_direct_enqueue_TAI_bracket; realtime_offset_is_the_nonempty_running_intersection_used_online_and_recomputed_exactly_at_finalization; final_realtime_interval_must_be_contained_by_every_provisional_interval; direct_enqueue_TAI_before_release_and_causal_order_predicates_remain_hard_gates; incoming_TX_lower_must_not_precede_its_enqueue_TAI_lower";
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1473,6 +1481,7 @@ struct BufloKernelRawItem {
     socket_timestamp_id: Option<u32>,
     tx_sched_realtime_ns: Option<u64>,
     tx_software_realtime_ns: Option<u64>,
+    post_tx_clock_phase: Option<BufloKernelClockPhase>,
     provisional_tx_software_tai_lower_ns: Option<u64>,
     provisional_tx_software_tai_upper_ns: Option<u64>,
     send_attempt: Option<timed_egress::SendAttemptReceipt>,
@@ -1639,6 +1648,7 @@ struct BufloKernelItemReceipt {
     tx_sched_tai_lower_ns: Option<u64>,
     tx_sched_tai_upper_ns: Option<u64>,
     tx_software_realtime_ns: Option<u64>,
+    post_tx_clock_phase: Option<BufloKernelClockPhase>,
     provisional_tx_software_tai_lower_ns: Option<u64>,
     provisional_tx_software_tai_upper_ns: Option<u64>,
     tx_software_tai_ns: Option<u64>,
@@ -1736,6 +1746,7 @@ struct BufloKernelTxRuntime {
     qdisc_contract: BufloKernelQdiscContract,
     endpoint_tuples: Vec<(SocketAddr, SocketAddr)>,
     clock_start: BufloKernelClockPhase,
+    realtime_offset_intersection: Option<(i128, i128)>,
     epoch: Option<BufloKernelEpoch>,
     jobs: Vec<BufloKernelRawJob>,
     next_item_id: u64,
@@ -2215,10 +2226,27 @@ fn sample_buflo_kernel_clock(
 
 #[cfg(target_os = "linux")]
 fn sample_buflo_kernel_clock_phase() -> Result<BufloKernelClockPhase, Error> {
-    Ok(BufloKernelClockPhase {
-        monotonic: sample_buflo_kernel_clock(timed_egress::clock_monotonic_ns)?,
-        realtime: sample_buflo_kernel_clock(timed_egress::clock_realtime_ns)?,
-    })
+    assemble_buflo_kernel_clock_phase(
+        sample_buflo_kernel_clock(timed_egress::clock_monotonic_ns)?,
+        sample_buflo_kernel_clock(timed_egress::clock_realtime_ns)?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn assemble_buflo_kernel_clock_phase(
+    monotonic: BufloKernelClockSample,
+    realtime: BufloKernelClockSample,
+) -> Result<BufloKernelClockPhase, Error> {
+    let phase = BufloKernelClockPhase {
+        monotonic,
+        realtime,
+    };
+    if !buflo_kernel_clock_phase_valid(&phase) {
+        return Err(Error::DefenseExecution(
+            "BuFLO kernel clock phase cross-subsample TAI chronology was invalid".into(),
+        ));
+    }
+    Ok(phase)
 }
 
 #[cfg(target_os = "linux")]
@@ -2303,11 +2331,75 @@ fn buflo_kernel_clock_chronology_valid(
     end: &BufloKernelClockPhase,
     alignment: &BufloKernelInstantAlignmentReceipt,
 ) -> bool {
-    start.realtime.tai_after_ns <= end.monotonic.tai_before_ns
-        && start.monotonic.clock_ns <= end.monotonic.clock_ns
-        && start.realtime.clock_ns <= end.realtime.clock_ns
+    buflo_kernel_clock_phases_ordered(start, end)
         && (start.monotonic.clock_ns..=end.monotonic.clock_ns)
             .contains(&alignment.monotonic_clock_ns)
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_clock_phases_ordered(
+    earlier: &BufloKernelClockPhase,
+    later: &BufloKernelClockPhase,
+) -> bool {
+    earlier.realtime.tai_after_ns <= later.monotonic.tai_before_ns
+        && earlier.monotonic.clock_ns <= later.monotonic.clock_ns
+        && earlier.realtime.clock_ns <= later.realtime.clock_ns
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_post_tx_clock_phase_follows_evidence(
+    phase: &BufloKernelClockPhase,
+    enqueue_monotonic_ns: u64,
+    enqueue_tai_upper_ns: u64,
+    tx_software_realtime_ns: u64,
+) -> bool {
+    buflo_kernel_clock_phase_valid(phase)
+        && enqueue_monotonic_ns <= phase.monotonic.clock_ns
+        && enqueue_tai_upper_ns <= phase.monotonic.tai_before_ns
+        && tx_software_realtime_ns <= phase.realtime.clock_ns
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_item_local_enqueue_clock_consistent(
+    phase: &BufloKernelClockPhase,
+    enqueue_monotonic_ns: u64,
+    enqueue_tai_lower_ns: u64,
+    enqueue_tai_upper_ns: u64,
+) -> bool {
+    if !buflo_kernel_clock_phase_valid(phase)
+        || enqueue_monotonic_ns > phase.monotonic.clock_ns
+        || enqueue_tai_lower_ns > enqueue_tai_upper_ns
+        || enqueue_tai_upper_ns > phase.monotonic.tai_before_ns
+    {
+        return false;
+    }
+    translate_clock_interval(enqueue_monotonic_ns, clock_offset_bounds(&phase.monotonic)).is_ok_and(
+        |(mapped_lower, mapped_upper)| {
+            mapped_lower <= enqueue_tai_upper_ns && enqueue_tai_lower_ns <= mapped_upper
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+const fn intersect_clock_offset_bounds(
+    current: (i128, i128),
+    sample: (i128, i128),
+) -> Option<(i128, i128)> {
+    let lower = if current.0 > sample.0 {
+        current.0
+    } else {
+        sample.0
+    };
+    let upper = if current.1 < sample.1 {
+        current.1
+    } else {
+        sample.1
+    };
+    if lower <= upper {
+        Some((lower, upper))
+    } else {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2367,19 +2459,18 @@ fn build_buflo_kernel_clock_mapping(
     .max()
     .unwrap_or(0);
     let max_observed_offset_drift_ns =
-        clock_offset_midpoint_drift(&start.monotonic, &end.monotonic)
-            .max(clock_offset_midpoint_drift(&start.realtime, &end.realtime));
-    if max_observed_offset_drift_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
-        return Err(format!(
-            "BuFLO kernel clock offset drift {max_observed_offset_drift_ns} ns exceeded 250000 ns"
-        ));
-    }
+        clock_offset_midpoint_drift(&start.monotonic, &end.monotonic)?
+            .max(clock_offset_midpoint_drift(&start.realtime, &end.realtime)?);
     let start_monotonic = clock_offset_bounds(&start.monotonic);
     let end_monotonic = clock_offset_bounds(&end.monotonic);
     let start_realtime = clock_offset_bounds(&start.realtime);
     let end_realtime = clock_offset_bounds(&end.realtime);
+    let realtime_intersection = intersect_clock_offset_bounds(start_realtime, end_realtime)
+        .ok_or_else(|| {
+            "BuFLO kernel start/end realtime offset intersection was empty".to_string()
+        })?;
     Ok(BufloKernelClockMapping {
-        schema_version: 1,
+        schema_version: BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION,
         tai_clock_id: "CLOCK_TAI",
         monotonic_clock_id: "CLOCK_MONOTONIC",
         realtime_clock_id: "CLOCK_REALTIME",
@@ -2390,87 +2481,92 @@ fn build_buflo_kernel_clock_mapping(
         max_observed_offset_drift_ns,
         effective_monotonic_offset_lower_ns: start_monotonic.0.min(end_monotonic.0),
         effective_monotonic_offset_upper_ns: start_monotonic.1.max(end_monotonic.1),
-        effective_realtime_offset_lower_ns: start_realtime.0.min(end_realtime.0),
-        effective_realtime_offset_upper_ns: start_realtime.1.max(end_realtime.1),
+        effective_realtime_offset_lower_ns: realtime_intersection.0,
+        effective_realtime_offset_upper_ns: realtime_intersection.1,
         per_item_monotonic_evidence_count: 0,
         per_item_realtime_evidence_count: 0,
-        effective_envelope_semantics: "start_and_end_clock_phases_plus_every_retained_per_item_post_tx_realtime_bracket_and_enqueue_monotonic_direct_tai_bracket; final_interval_is_conservative_union; widened_interval_must_still_fit_half_open_realization_window",
+        effective_envelope_semantics: BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS,
     })
 }
 
 #[cfg(target_os = "linux")]
-const fn offset_interval_midpoint(bounds: (i128, i128)) -> i128 {
-    bounds.0 + (bounds.1 - bounds.0) / 2
-}
-
-#[cfg(target_os = "linux")]
-fn offset_midpoint_drift(reference: i128, bounds: (i128, i128)) -> u64 {
-    u64::try_from((reference - offset_interval_midpoint(bounds)).unsigned_abs()).unwrap_or(u64::MAX)
-}
-
-#[cfg(target_os = "linux")]
-fn widen_buflo_kernel_clock_mapping_with_items(
+fn refine_buflo_kernel_clock_mapping_with_items(
     mapping: &mut BufloKernelClockMapping,
     jobs: &[BufloKernelRawJob],
 ) -> Result<(), String> {
-    let realtime_reference = offset_interval_midpoint(clock_offset_bounds(&mapping.start.realtime));
-    let monotonic_reference =
-        offset_interval_midpoint(clock_offset_bounds(&mapping.start.monotonic));
+    let mut previous_phase = mapping.start.clone();
     for item in jobs.iter().flat_map(|job| &job.items) {
-        if let Some((raw, (lower, upper))) = item.tx_software_realtime_ns.zip(
-            item.provisional_tx_software_tai_lower_ns
-                .zip(item.provisional_tx_software_tai_upper_ns),
-        ) {
-            let bounds = (
-                i128::from(lower) - i128::from(raw),
-                i128::from(upper) - i128::from(raw),
-            );
-            if bounds.0 > bounds.1 {
-                return Err(format!(
-                    "BuFLO kernel item {} retained a reversed realtime offset interval",
-                    item.item_id
-                ));
-            }
-            mapping.effective_realtime_offset_lower_ns =
-                mapping.effective_realtime_offset_lower_ns.min(bounds.0);
-            mapping.effective_realtime_offset_upper_ns =
-                mapping.effective_realtime_offset_upper_ns.max(bounds.1);
-            mapping.per_item_realtime_evidence_count =
-                mapping.per_item_realtime_evidence_count.saturating_add(1);
-            mapping.max_observed_bracket_width_ns = mapping
-                .max_observed_bracket_width_ns
-                .max(u64::try_from(bounds.1 - bounds.0).unwrap_or(u64::MAX));
-            mapping.max_observed_offset_drift_ns = mapping
-                .max_observed_offset_drift_ns
-                .max(offset_midpoint_drift(realtime_reference, bounds));
+        let Some(phase) = item.post_tx_clock_phase.as_ref() else {
+            continue;
+        };
+        if !buflo_kernel_clock_phase_valid(phase) {
+            return Err(format!(
+                "BuFLO kernel item {} retained an invalid post-TX clock phase",
+                item.item_id
+            ));
         }
-        if let Some((raw, (lower, upper))) = item
-            .enqueue_monotonic_ns
-            .zip(item.enqueue_tai_lower_ns.zip(item.enqueue_tai_upper_ns))
+        if !buflo_kernel_clock_phases_ordered(&previous_phase, phase)
+            || !buflo_kernel_clock_phases_ordered(phase, &mapping.end)
         {
-            let bounds = (
-                i128::from(lower) - i128::from(raw),
-                i128::from(upper) - i128::from(raw),
-            );
-            if bounds.0 > bounds.1 {
-                return Err(format!(
-                    "BuFLO kernel item {} retained a reversed monotonic offset interval",
-                    item.item_id
-                ));
-            }
-            mapping.effective_monotonic_offset_lower_ns =
-                mapping.effective_monotonic_offset_lower_ns.min(bounds.0);
-            mapping.effective_monotonic_offset_upper_ns =
-                mapping.effective_monotonic_offset_upper_ns.max(bounds.1);
-            mapping.per_item_monotonic_evidence_count =
-                mapping.per_item_monotonic_evidence_count.saturating_add(1);
-            mapping.max_observed_bracket_width_ns = mapping
-                .max_observed_bracket_width_ns
-                .max(u64::try_from(bounds.1 - bounds.0).unwrap_or(u64::MAX));
-            mapping.max_observed_offset_drift_ns = mapping
-                .max_observed_offset_drift_ns
-                .max(offset_midpoint_drift(monotonic_reference, bounds));
+            return Err(format!(
+                "BuFLO kernel item {} retained an out-of-order post-TX clock phase",
+                item.item_id
+            ));
         }
+        if item
+            .tx_software_realtime_ns
+            .is_some_and(|raw| raw > phase.realtime.clock_ns)
+            || item
+                .enqueue_monotonic_ns
+                .is_some_and(|raw| raw > phase.monotonic.clock_ns)
+            || item
+                .enqueue_tai_upper_ns
+                .is_some_and(|raw| raw > phase.monotonic.tai_before_ns)
+        {
+            return Err(format!(
+                "BuFLO kernel item {} clock phase preceded its retained transmission evidence",
+                item.item_id
+            ));
+        }
+        let monotonic_bounds = clock_offset_bounds(&phase.monotonic);
+        let realtime_bounds = clock_offset_bounds(&phase.realtime);
+        let monotonic_drift =
+            clock_offset_midpoint_drift(&mapping.start.monotonic, &phase.monotonic)?;
+        let realtime_drift = clock_offset_midpoint_drift(&mapping.start.realtime, &phase.realtime)?;
+        let current_realtime = (
+            mapping.effective_realtime_offset_lower_ns,
+            mapping.effective_realtime_offset_upper_ns,
+        );
+        let realtime_intersection =
+            intersect_clock_offset_bounds(current_realtime, realtime_bounds).ok_or_else(|| {
+                format!(
+                    "BuFLO kernel realtime offset intersection became empty at item {}",
+                    item.item_id
+                )
+            })?;
+        mapping.effective_monotonic_offset_lower_ns = mapping
+            .effective_monotonic_offset_lower_ns
+            .min(monotonic_bounds.0);
+        mapping.effective_monotonic_offset_upper_ns = mapping
+            .effective_monotonic_offset_upper_ns
+            .max(monotonic_bounds.1);
+        mapping.effective_realtime_offset_lower_ns = realtime_intersection.0;
+        mapping.effective_realtime_offset_upper_ns = realtime_intersection.1;
+        mapping.per_item_monotonic_evidence_count =
+            mapping.per_item_monotonic_evidence_count.saturating_add(1);
+        mapping.per_item_realtime_evidence_count =
+            mapping.per_item_realtime_evidence_count.saturating_add(1);
+        mapping.max_observed_bracket_width_ns = mapping.max_observed_bracket_width_ns.max(
+            phase
+                .monotonic
+                .bracket_width_ns
+                .max(phase.realtime.bracket_width_ns),
+        );
+        mapping.max_observed_offset_drift_ns = mapping
+            .max_observed_offset_drift_ns
+            .max(monotonic_drift)
+            .max(realtime_drift);
+        previous_phase = phase.clone();
     }
     if mapping.max_observed_bracket_width_ns
         > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
@@ -2478,14 +2574,6 @@ fn widen_buflo_kernel_clock_mapping_with_items(
         return Err(format!(
             "BuFLO kernel clock bracket {} ns exceeded 250000 ns",
             mapping.max_observed_bracket_width_ns
-        ));
-    }
-    if mapping.max_observed_offset_drift_ns
-        > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
-    {
-        return Err(format!(
-            "BuFLO kernel clock offset drift {} ns exceeded 250000 ns",
-            mapping.max_observed_offset_drift_ns
         ));
     }
     Ok(())
@@ -2524,7 +2612,7 @@ const fn buflo_kernel_interval_within_half_open_window(
 }
 
 #[cfg(target_os = "linux")]
-const fn buflo_kernel_final_envelope_contains_provisional(
+const fn buflo_kernel_provisional_envelope_contains_final(
     provisional_lower: u64,
     provisional_upper: u64,
     final_lower: u64,
@@ -2532,8 +2620,8 @@ const fn buflo_kernel_final_envelope_contains_provisional(
 ) -> bool {
     provisional_lower <= provisional_upper
         && final_lower <= final_upper
-        && final_lower <= provisional_lower
-        && final_upper >= provisional_upper
+        && provisional_lower <= final_lower
+        && provisional_upper >= final_upper
 }
 
 #[cfg(target_os = "linux")]
@@ -2548,18 +2636,21 @@ const fn buflo_kernel_credit_intervals_are_causally_ordered(
         && enqueue_lower >= prior_tx_upper
         && enqueue_upper < deadline
         && tx_lower >= prior_tx_upper
+        && tx_lower >= enqueue_lower
 }
 
 #[cfg(target_os = "linux")]
 fn clock_offset_midpoint_drift(
     start: &BufloKernelClockSample,
     end: &BufloKernelClockSample,
-) -> u64 {
+) -> Result<u64, String> {
     let start_twice = i128::from(start.tai_before_ns) + i128::from(start.tai_after_ns)
         - 2 * i128::from(start.clock_ns);
     let end_twice =
         i128::from(end.tai_before_ns) + i128::from(end.tai_after_ns) - 2 * i128::from(end.clock_ns);
-    u64::try_from((start_twice - end_twice).unsigned_abs().div_ceil(2)).unwrap_or(u64::MAX)
+    u64::try_from((start_twice - end_twice).unsigned_abs().div_ceil(2)).map_err(|_| {
+        "BuFLO kernel clock offset midpoint drift exceeded the u64 receipt range".to_string()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2803,6 +2894,7 @@ impl BufloKernelTxRuntime {
                 .map(|endpoint| (endpoint.local_addr, endpoint.remote_addr))
                 .collect(),
             clock_start,
+            realtime_offset_intersection: None,
             epoch: None,
             jobs: Vec::new(),
             next_item_id: 0,
@@ -2816,6 +2908,7 @@ impl BufloKernelTxRuntime {
             ));
         }
         self.clock_start = sample_buflo_kernel_clock_phase()?;
+        self.realtime_offset_intersection = Some(clock_offset_bounds(&self.clock_start.realtime));
         let offset = clock_offset_bounds(&self.clock_start.monotonic);
         let offset_midpoint = offset.0 + (offset.1 - offset.0) / 2;
         let base_tai_ns = self.clock_start.monotonic.tai_after_ns;
@@ -3201,6 +3294,69 @@ impl BufloKernelTxRuntime {
             .ok_or_else(|| Error::SlotInvariant(format!("missing BuFLO kernel job {job_id}")))
     }
 
+    fn refine_realtime_offset_intersection(
+        &mut self,
+        phase: &BufloKernelClockPhase,
+    ) -> Result<(i128, i128), Error> {
+        if !buflo_kernel_clock_phase_valid(phase) {
+            return Err(Error::DefenseExecution(
+                "BuFLO post-TX clock phase was invalid".into(),
+            ));
+        }
+        let previous_phase = self
+            .jobs
+            .iter()
+            .rev()
+            .flat_map(|job| job.items.iter().rev())
+            .find_map(|item| item.post_tx_clock_phase.as_ref())
+            .unwrap_or(&self.clock_start);
+        if !buflo_kernel_clock_phases_ordered(previous_phase, phase) {
+            return Err(Error::DefenseExecution(
+                "BuFLO post-TX clock phase was not chronologically ordered".into(),
+            ));
+        }
+        let current = self.realtime_offset_intersection.ok_or_else(|| {
+            Error::SlotInvariant("BuFLO realtime offset intersection was not armed".into())
+        })?;
+        let refined = intersect_clock_offset_bounds(current, clock_offset_bounds(&phase.realtime))
+            .ok_or_else(|| {
+                Error::DefenseExecution(
+                    "BuFLO kernel realtime offset intersection became empty".into(),
+                )
+            })?;
+        let width = u64::try_from(refined.1 - refined.0).unwrap_or(u64::MAX);
+        if width > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel realtime offset intersection width {width} ns exceeded 250000 ns"
+            )));
+        }
+        self.realtime_offset_intersection = Some(refined);
+        Ok(refined)
+    }
+
+    fn refine_realtime_then_corroborate_enqueue(
+        &mut self,
+        phase: &BufloKernelClockPhase,
+        enqueue_monotonic_ns: u64,
+        enqueue_tai_lower_ns: u64,
+        enqueue_tai_upper_ns: u64,
+        local_failure: &str,
+    ) -> Result<(i128, i128), Error> {
+        // A phase that follows retained transmission evidence remains part of
+        // the clock record even if its local MONOTONIC translation then fails.
+        // Refine first so final recomputation consumes exactly the same phase.
+        let realtime_bounds = self.refine_realtime_offset_intersection(phase)?;
+        if !buflo_kernel_item_local_enqueue_clock_consistent(
+            phase,
+            enqueue_monotonic_ns,
+            enqueue_tai_lower_ns,
+            enqueue_tai_upper_ns,
+        ) {
+            return Err(Error::DefenseExecution(local_failure.into()));
+        }
+        Ok(realtime_bounds)
+    }
+
     fn physical_instant_from_monotonic(&self, monotonic_ns: u64) -> Result<Instant, Error> {
         let epoch = self.epoch()?;
         if monotonic_ns >= epoch.instant_anchor.monotonic_ns {
@@ -3227,10 +3383,11 @@ impl BufloKernelTxRuntime {
         job_id: u64,
         tx_realtime_ns: u64,
         phase: &BufloKernelClockPhase,
+        realtime_offset_intersection: (i128, i128),
     ) -> Result<(u64, u64, Instant), Error> {
         let job = self.current_job(job_id)?;
         let (lower, upper) =
-            translate_clock_interval(tx_realtime_ns, clock_offset_bounds(&phase.realtime))?;
+            translate_clock_interval(tx_realtime_ns, realtime_offset_intersection)?;
         if !buflo_kernel_interval_within_half_open_window(
             lower,
             upper,
@@ -3347,6 +3504,7 @@ impl BufloKernelTxRuntime {
                 socket_timestamp_id: failure.socket_timestamp_id,
                 tx_sched_realtime_ns: failure.tx_sched_realtime_ns,
                 tx_software_realtime_ns: failure.tx_software_realtime_ns,
+                post_tx_clock_phase: None,
                 provisional_tx_software_tai_lower_ns: None,
                 provisional_tx_software_tai_upper_ns: None,
                 send_attempt: failure.send_attempt,
@@ -3456,6 +3614,7 @@ impl BufloKernelTxRuntime {
                         socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
                         tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
                         tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
+                        post_tx_clock_phase: None,
                         provisional_tx_software_tai_lower_ns: None,
                         provisional_tx_software_tai_upper_ns: None,
                         send_attempt: None,
@@ -3469,8 +3628,35 @@ impl BufloKernelTxRuntime {
                 return Err(error);
             }
         };
-        let window =
-            self.check_physical_window(job_id, result.outcome.tx_software_realtime_ns, &phase);
+        let phase_follows_evidence = buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            result.enqueue.enqueue_monotonic_ns,
+            result.enqueue.enqueue_after_tai_ns,
+            result.outcome.tx_software_realtime_ns,
+        );
+        let window = if phase_follows_evidence {
+            self.refine_realtime_then_corroborate_enqueue(
+                &phase,
+                result.enqueue.enqueue_monotonic_ns,
+                result.enqueue.enqueue_before_tai_ns,
+                result.enqueue.enqueue_after_tai_ns,
+                &format!(
+                    "BuFLO kernel job {job_id} item-local MONOTONIC phase did not corroborate exact enqueue TAI evidence"
+                ),
+            )
+                .and_then(|realtime_bounds| {
+                    self.check_physical_window(
+                        job_id,
+                        result.outcome.tx_software_realtime_ns,
+                        &phase,
+                        realtime_bounds,
+                    )
+                })
+        } else {
+            Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} post-TX clock phase did not follow exact transmission evidence"
+            )))
+        };
         let enqueued_before_release = result.enqueue.enqueue_before_tai_ns
             <= result.enqueue.enqueue_after_tai_ns
             && result.enqueue.enqueue_after_tai_ns < target_tai_ns;
@@ -3504,6 +3690,7 @@ impl BufloKernelTxRuntime {
                 socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
                 tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
                 tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
+                post_tx_clock_phase: Some(phase),
                 provisional_tx_software_tai_lower_ns: window.as_ref().ok().map(|value| value.0),
                 provisional_tx_software_tai_upper_ns: window.as_ref().ok().map(|value| value.1),
                 send_attempt: None,
@@ -3626,6 +3813,7 @@ impl BufloKernelTxRuntime {
                         socket_timestamp_id: Some(result.kernel_timestamp_id),
                         tx_sched_realtime_ns: Some(result.tx_sched_realtime_ns),
                         tx_software_realtime_ns: Some(result.tx_software_realtime_ns),
+                        post_tx_clock_phase: None,
                         provisional_tx_software_tai_lower_ns: None,
                         provisional_tx_software_tai_upper_ns: None,
                         send_attempt: None,
@@ -3639,7 +3827,35 @@ impl BufloKernelTxRuntime {
                 return Err(error);
             }
         };
-        let window = self.check_physical_window(job_id, result.tx_software_realtime_ns, &phase);
+        let phase_follows_evidence = buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            result.enqueue_monotonic_ns,
+            result.enqueue_after_tai_ns,
+            result.tx_software_realtime_ns,
+        );
+        let window = if phase_follows_evidence {
+            self.refine_realtime_then_corroborate_enqueue(
+                &phase,
+                result.enqueue_monotonic_ns,
+                result.enqueue_before_tai_ns,
+                result.enqueue_after_tai_ns,
+                &format!(
+                    "BuFLO kernel job {job_id} item-local MONOTONIC phase did not corroborate incoming-credit enqueue TAI evidence"
+                ),
+            )
+                .and_then(|realtime_bounds| {
+                    self.check_physical_window(
+                        job_id,
+                        result.tx_software_realtime_ns,
+                        &phase,
+                        realtime_bounds,
+                    )
+                })
+        } else {
+            Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} post-TX clock phase did not follow incoming-credit transmission evidence"
+            )))
+        };
         let causally_ordered = window.as_ref().is_ok_and(|(lower, _, _)| {
             buflo_kernel_credit_intervals_are_causally_ordered(
                 prior_tx_upper_tai_ns,
@@ -3679,6 +3895,7 @@ impl BufloKernelTxRuntime {
                 socket_timestamp_id: Some(result.kernel_timestamp_id),
                 tx_sched_realtime_ns: Some(result.tx_sched_realtime_ns),
                 tx_software_realtime_ns: Some(result.tx_software_realtime_ns),
+                post_tx_clock_phase: Some(phase),
                 provisional_tx_software_tai_lower_ns: window.as_ref().ok().map(|value| value.0),
                 provisional_tx_software_tai_upper_ns: window.as_ref().ok().map(|value| value.1),
                 send_attempt: None,
@@ -3873,9 +4090,23 @@ impl BufloKernelTxRuntime {
             clock_end_error.as_deref(),
         );
         if let Ok(mapping) = &mut mapping_result
-            && let Err(error) = widen_buflo_kernel_clock_mapping_with_items(mapping, &self.jobs)
+            && let Err(error) = refine_buflo_kernel_clock_mapping_with_items(mapping, &self.jobs)
         {
             mapping_result = Err(error);
+        }
+        if let Ok(mapping) = &mapping_result {
+            let final_realtime_bounds = clock_mapping_offset_bounds(mapping, true);
+            let online_with_end = self
+                .realtime_offset_intersection
+                .zip(clock_end.as_ref())
+                .and_then(|(online, end)| {
+                    intersect_clock_offset_bounds(online, clock_offset_bounds(&end.realtime))
+                });
+            if online_with_end != Some(final_realtime_bounds) {
+                mapping_result = Err(
+                    "BuFLO final realtime offset intersection differed from online evidence".into(),
+                );
+            }
         }
         let (mapping, clock_mapping_error) = match mapping_result {
             Ok(mapping) => (Some(mapping), None),
@@ -3889,9 +4120,6 @@ impl BufloKernelTxRuntime {
         let realtime_bounds = mapping
             .as_ref()
             .map(|mapping| clock_mapping_offset_bounds(mapping, true));
-        let monotonic_bounds = mapping
-            .as_ref()
-            .map(|mapping| clock_mapping_offset_bounds(mapping, false));
         let mut jobs = Vec::with_capacity(self.jobs.len());
         let endpoint_tuples = self.endpoint_tuples;
         let mut expected_item_id = 0_u64;
@@ -3937,24 +4165,39 @@ impl BufloKernelTxRuntime {
                 };
                 let tx_sched = translate(raw.tx_sched_realtime_ns);
                 let tx_software = translate(raw.tx_software_realtime_ns);
-                let enqueue_from_monotonic = raw.enqueue_monotonic_ns.and_then(|raw_ns| {
-                    let bounds = monotonic_bounds?;
-                    translate_clock_interval(raw_ns, bounds).ok()
-                });
                 let enqueue_interval_complete = raw
                     .enqueue_tai_lower_ns
                     .zip(raw.enqueue_tai_upper_ns)
                     .is_some_and(|(lower, upper)| lower <= upper);
-                let enqueue_clock_consistent = enqueue_from_monotonic
-                    .zip(raw.enqueue_tai_lower_ns.zip(raw.enqueue_tai_upper_ns))
-                    .is_some_and(
-                        |((mapped_lower, mapped_upper), (direct_lower, direct_upper))| {
-                            mapped_lower <= direct_upper && direct_lower <= mapped_upper
-                        },
-                    );
+                let enqueue_clock_consistent = raw
+                    .post_tx_clock_phase
+                    .as_ref()
+                    .zip(raw.enqueue_monotonic_ns)
+                    .zip(raw.enqueue_tai_lower_ns)
+                    .zip(raw.enqueue_tai_upper_ns)
+                    .is_some_and(|(((phase, monotonic), lower), upper)| {
+                        buflo_kernel_item_local_enqueue_clock_consistent(
+                            phase, monotonic, lower, upper,
+                        )
+                    });
+                let post_tx_clock_phase_complete =
+                    raw.post_tx_clock_phase.as_ref().is_some_and(|phase| {
+                        raw.enqueue_monotonic_ns
+                            .zip(raw.enqueue_tai_upper_ns)
+                            .zip(raw.tx_software_realtime_ns)
+                            .is_some_and(|((enqueue_monotonic, enqueue_tai_upper), tx_software)| {
+                                buflo_kernel_post_tx_clock_phase_follows_evidence(
+                                    phase,
+                                    enqueue_monotonic,
+                                    enqueue_tai_upper,
+                                    tx_software,
+                                )
+                            })
+                    });
                 let timestamp_evidence_complete = raw.socket_timestamp_id.is_some()
                     && tx_sched.is_some()
-                    && tx_software.is_some();
+                    && tx_software.is_some()
+                    && post_tx_clock_phase_complete;
                 let tx_order_valid = raw
                     .tx_sched_realtime_ns
                     .zip(raw.tx_software_realtime_ns)
@@ -3972,7 +4215,7 @@ impl BufloKernelTxRuntime {
                     .zip(raw.provisional_tx_software_tai_upper_ns)
                     .zip(tx_software)
                     .is_some_and(|((provisional_lower, provisional_upper), final_interval)| {
-                        buflo_kernel_final_envelope_contains_provisional(
+                        buflo_kernel_provisional_envelope_contains_final(
                             provisional_lower,
                             provisional_upper,
                             final_interval.0,
@@ -4076,7 +4319,7 @@ impl BufloKernelTxRuntime {
                     .then(|| tx_software.map(|(_, upper)| upper))
                     .flatten();
                 items.push(BufloKernelItemReceipt {
-                    schema_version: 1,
+                    schema_version: BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION,
                     item_id: raw.item_id,
                     job_id: raw.job_id,
                     order_index: raw.order_index,
@@ -4104,6 +4347,7 @@ impl BufloKernelTxRuntime {
                     tx_sched_tai_lower_ns: tx_sched.map(|value| value.0),
                     tx_sched_tai_upper_ns: tx_sched.map(|value| value.1),
                     tx_software_realtime_ns: raw.tx_software_realtime_ns,
+                    post_tx_clock_phase: raw.post_tx_clock_phase,
                     provisional_tx_software_tai_lower_ns: raw.provisional_tx_software_tai_lower_ns,
                     provisional_tx_software_tai_upper_ns: raw.provisional_tx_software_tai_upper_ns,
                     tx_software_tai_ns: tx_software
@@ -4296,7 +4540,7 @@ impl BufloKernelTxRuntime {
         };
         let terminal_outcome = aggregate.terminal_outcome.to_string();
         BufloKernelTxReceipt {
-            schema_version: 1,
+            schema_version: BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION,
             semantics: BUFLO_KERNEL_TX_SEMANTICS,
             terminal_outcome,
             primary_error,
@@ -34816,6 +35060,7 @@ mod tests {
             socket_timestamp_id: Some(0),
             tx_sched_realtime_ns: Some(100),
             tx_software_realtime_ns: Some(101),
+            post_tx_clock_phase: Some(synthetic_buflo_clock_phase(10_000, 0)),
             provisional_tx_software_tai_lower_ns: Some(100),
             provisional_tx_software_tai_upper_ns: Some(101),
             send_attempt: None,
@@ -35404,14 +35649,14 @@ mod tests {
             101, 100, 100, 200
         ));
 
-        assert!(super::buflo_kernel_final_envelope_contains_provisional(
-            110, 120, 100, 130
+        assert!(super::buflo_kernel_provisional_envelope_contains_final(
+            100, 130, 110, 120
         ));
-        assert!(!super::buflo_kernel_final_envelope_contains_provisional(
-            110, 120, 111, 130
+        assert!(!super::buflo_kernel_provisional_envelope_contains_final(
+            111, 130, 110, 120
         ));
-        assert!(!super::buflo_kernel_final_envelope_contains_provisional(
-            110, 120, 100, 119
+        assert!(!super::buflo_kernel_provisional_envelope_contains_final(
+            100, 119, 110, 120
         ));
 
         assert!(super::buflo_kernel_credit_intervals_are_causally_ordered(
@@ -35425,6 +35670,9 @@ mod tests {
         ));
         assert!(!super::buflo_kernel_credit_intervals_are_causally_ordered(
             120, 120, 121, 119, 200
+        ));
+        assert!(!super::buflo_kernel_credit_intervals_are_causally_ordered(
+            100, 150, 160, 149, 200
         ));
     }
 
@@ -35644,6 +35892,47 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn synthetic_buflo_clock_phase_with_offsets(
+        monotonic_offset_ns: u64,
+        realtime_offset_ns: u64,
+        elapsed_ns: u64,
+        monotonic_width_ns: u64,
+        realtime_width_ns: u64,
+    ) -> super::BufloKernelClockPhase {
+        let monotonic_tai_before_ns = 1_000_000 + elapsed_ns;
+        let realtime_tai_before_ns = monotonic_tai_before_ns + monotonic_width_ns + 10;
+        super::BufloKernelClockPhase {
+            monotonic: super::BufloKernelClockSample {
+                schema_version: 1,
+                tai_before_ns: monotonic_tai_before_ns,
+                clock_ns: monotonic_tai_before_ns - monotonic_offset_ns,
+                tai_after_ns: monotonic_tai_before_ns + monotonic_width_ns,
+                bracket_width_ns: monotonic_width_ns,
+            },
+            realtime: super::BufloKernelClockSample {
+                schema_version: 1,
+                tai_before_ns: realtime_tai_before_ns,
+                clock_ns: realtime_tai_before_ns - realtime_offset_ns,
+                tai_after_ns: realtime_tai_before_ns + realtime_width_ns,
+                bracket_width_ns: realtime_width_ns,
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_buflo_instant_alignment_for(
+        phase: &super::BufloKernelClockPhase,
+    ) -> super::BufloKernelInstantAlignmentReceipt {
+        super::BufloKernelInstantAlignmentReceipt {
+            schema_version: 1,
+            monotonic_clock_ns: phase.monotonic.clock_ns,
+            instant_bracket_width_ns: 10,
+            selected_upper_offset_ns: 10,
+            semantics: super::BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn synthetic_buflo_instant_alignment() -> super::BufloKernelInstantAlignmentReceipt {
         super::BufloKernelInstantAlignmentReceipt {
             schema_version: 1,
@@ -35656,11 +35945,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn buflo_kernel_clock_phase_assembly_rejects_cross_sample_tai_discontinuity() {
+        let valid = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10);
+        assert_eq!(
+            super::assemble_buflo_kernel_clock_phase(
+                valid.monotonic.clone(),
+                valid.realtime.clone(),
+            )
+            .expect("ordered clock subsamples"),
+            valid
+        );
+
+        let mut realtime = valid.realtime;
+        realtime.tai_before_ns = valid.monotonic.tai_after_ns - 1;
+        realtime.tai_after_ns = realtime.tai_before_ns + realtime.bracket_width_ns;
+        assert!(super::buflo_kernel_clock_sample_valid(&realtime));
+        assert!(matches!(
+            super::assemble_buflo_kernel_clock_phase(valid.monotonic, realtime),
+            Err(Error::DefenseExecution(message))
+                if message
+                    == "BuFLO kernel clock phase cross-subsample TAI chronology was invalid"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "the clock mapping mutation test retains raw phase, alignment, chronology, and drift cases together"
     )]
-    fn buflo_kernel_clock_mapping_failures_retain_raw_phase_evidence_and_reason() {
+    fn buflo_kernel_clock_mapping_retains_failures_and_nonfatal_monotonic_drift() {
         let start = synthetic_buflo_clock_phase(10_000, 0);
         let alignment = synthetic_buflo_instant_alignment();
         let end_failure = "BuFLO final clock sample failed: synthetic";
@@ -35674,16 +35988,14 @@ mod tests {
         assert_eq!(missing, end_failure);
         assert_eq!(start, synthetic_buflo_clock_phase(10_000, 0));
 
-        let end = synthetic_buflo_clock_phase(310_001, 10_000);
+        let mut end = synthetic_buflo_clock_phase(10_000, 1_000_000);
+        end.monotonic.clock_ns -= 300_001;
         let drift =
             super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
-                .expect_err("excessive drift must reject mapping");
-        assert_eq!(
-            drift,
-            "BuFLO kernel clock offset drift 300001 ns exceeded 250000 ns"
-        );
+                .expect("global monotonic correction is retained as a diagnostic");
+        assert_eq!(drift.max_observed_offset_drift_ns, 300_001);
         assert_eq!(start.monotonic.tai_before_ns, 11_000);
-        assert_eq!(end.monotonic.tai_before_ns, 321_001);
+        assert_eq!(end.monotonic.tai_before_ns, 1_011_000);
 
         let valid_end = synthetic_buflo_clock_phase(10_000, 10_000);
         let mutations: [fn(&mut super::BufloKernelClockSample); 4] = [
@@ -35817,85 +36129,424 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_clock_mapping_includes_intermediate_item_envelopes() {
-        let start = synthetic_buflo_clock_phase(10_000, 0);
-        let end = synthetic_buflo_clock_phase(10_020, 10_000);
-        let alignment = synthetic_buflo_instant_alignment();
+    fn buflo_kernel_clock_mapping_recomputes_the_exact_refined_intersection() {
+        let start = synthetic_buflo_clock_phase_with_offsets(10_000, 10_000, 0, 10, 10);
+        let item_phase = synthetic_buflo_clock_phase_with_offsets(9_900, 10_004, 5_000, 8, 8);
+        let end = synthetic_buflo_clock_phase_with_offsets(10_020, 10_006, 10_000, 2, 2);
+        let alignment = synthetic_buflo_instant_alignment_for(&start);
         let mut mapping =
             super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
-                .expect("endpoint clock phases");
+                .expect("endpoint clock phases intersect");
         let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
-        item.tx_software_realtime_ns = Some(1_000_000);
-        item.provisional_tx_software_tai_lower_ns = Some(1_009_900);
-        item.provisional_tx_software_tai_upper_ns = Some(1_010_200);
-        item.enqueue_monotonic_ns = Some(500_000);
-        item.enqueue_tai_lower_ns = Some(509_950);
-        item.enqueue_tai_upper_ns = Some(510_150);
-        let job = synthetic_buflo_kernel_raw_job(vec![item]);
-        super::widen_buflo_kernel_clock_mapping_with_items(&mut mapping, &[job])
-            .expect("intermediate evidence widens the conservative envelope");
-        assert_eq!(mapping.effective_realtime_offset_lower_ns, 9_900);
-        assert_eq!(mapping.effective_realtime_offset_upper_ns, 10_200);
-        assert_eq!(mapping.effective_monotonic_offset_lower_ns, 9_950);
-        assert_eq!(mapping.effective_monotonic_offset_upper_ns, 10_150);
-        assert_eq!(mapping.per_item_realtime_evidence_count, 1);
-        assert_eq!(mapping.per_item_monotonic_evidence_count, 1);
-        assert!(super::buflo_kernel_final_envelope_contains_provisional(
-            1_009_900,
-            1_010_200,
-            super::translate_clock_interval(
-                1_000_000,
-                super::clock_mapping_offset_bounds(&mapping, true)
-            )
-            .expect("translate final envelope")
-            .0,
-            super::translate_clock_interval(
-                1_000_000,
-                super::clock_mapping_offset_bounds(&mapping, true)
-            )
-            .expect("translate final envelope")
-            .1,
+        let tx_realtime_ns = item_phase.realtime.clock_ns - 100;
+        item.tx_software_realtime_ns = Some(tx_realtime_ns);
+        item.enqueue_monotonic_ns = Some(item_phase.monotonic.clock_ns - 100);
+        item.enqueue_tai_lower_ns = Some(item_phase.monotonic.tai_before_ns - 101);
+        item.enqueue_tai_upper_ns = Some(item_phase.monotonic.tai_before_ns - 100);
+        item.post_tx_clock_phase = Some(item_phase.clone());
+        item.provisional_tx_software_tai_lower_ns = Some(tx_realtime_ns + 10_004);
+        item.provisional_tx_software_tai_upper_ns = Some(tx_realtime_ns + 10_010);
+        let mut missing_phase = synthetic_buflo_kernel_raw_item("physical-transmit-proven");
+        missing_phase.item_id = 1;
+        missing_phase.order_index = 1;
+        missing_phase.post_tx_clock_phase = None;
+        let retained_phase_count = [&item, &missing_phase]
+            .into_iter()
+            .filter(|item| item.post_tx_clock_phase.is_some())
+            .count();
+        let job = synthetic_buflo_kernel_raw_job(vec![item, missing_phase]);
+
+        super::refine_buflo_kernel_clock_mapping_with_items(&mut mapping, &[job])
+            .expect("intermediate evidence refines the realtime intersection");
+
+        let online_after_item = super::intersect_clock_offset_bounds(
+            super::clock_offset_bounds(&start.realtime),
+            super::clock_offset_bounds(&item_phase.realtime),
+        )
+        .expect("online item intersection");
+        let exact_online_with_end = super::intersect_clock_offset_bounds(
+            online_after_item,
+            super::clock_offset_bounds(&end.realtime),
+        )
+        .expect("online end intersection");
+        assert_eq!(mapping.schema_version, 2);
+        assert_eq!(
+            mapping.effective_envelope_semantics,
+            super::BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS
+        );
+        assert_eq!(
+            super::clock_mapping_offset_bounds(&mapping, true),
+            exact_online_with_end
+        );
+        assert_eq!(exact_online_with_end, (10_006, 10_008));
+        assert_eq!(
+            super::clock_mapping_offset_bounds(&mapping, false),
+            (9_900, 10_022)
+        );
+        assert_eq!(
+            mapping.per_item_realtime_evidence_count,
+            retained_phase_count
+        );
+        assert_eq!(
+            mapping.per_item_monotonic_evidence_count,
+            retained_phase_count
+        );
+        let final_interval = super::translate_clock_interval(
+            tx_realtime_ns,
+            super::clock_mapping_offset_bounds(&mapping, true),
+        )
+        .expect("translate final envelope");
+        assert!(super::buflo_kernel_provisional_envelope_contains_final(
+            tx_realtime_ns + 10_004,
+            tx_realtime_ns + 10_010,
+            final_interval.0,
+            final_interval.1,
+        ));
+        assert!(!super::buflo_kernel_provisional_envelope_contains_final(
+            final_interval.0,
+            final_interval.1,
+            tx_realtime_ns + 10_004,
+            tx_realtime_ns + 10_010,
         ));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_enqueue_brackets_enforce_the_inclusive_250us_limit() {
-        let start = synthetic_buflo_clock_phase(10_000, 0);
-        let end = synthetic_buflo_clock_phase(10_000, 10_000);
-        let alignment = synthetic_buflo_instant_alignment();
+    fn buflo_kernel_realtime_intersection_is_closed_and_fails_when_empty() {
+        assert_eq!(
+            super::intersect_clock_offset_bounds((10, 20), (15, 25)),
+            Some((15, 20))
+        );
+        assert_eq!(
+            super::intersect_clock_offset_bounds((10, 20), (20, 30)),
+            Some((20, 20))
+        );
+        assert_eq!(
+            super::intersect_clock_offset_bounds((10, 19), (20, 30)),
+            None
+        );
+
+        let start = synthetic_buflo_clock_phase_with_offsets(10_000, 10_000, 0, 10, 10);
+        let end = synthetic_buflo_clock_phase_with_offsets(10_000, 10_011, 10_000, 10, 10);
+        let error = super::build_buflo_kernel_clock_mapping(
+            &start,
+            Some(&end),
+            Some(&synthetic_buflo_instant_alignment_for(&start)),
+            None,
+        )
+        .expect_err("disjoint start/end realtime evidence must fail closed");
+        assert_eq!(
+            error,
+            "BuFLO kernel start/end realtime offset intersection was empty"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_post_tx_phase_is_local_ordered_evidence() {
+        let phase = synthetic_buflo_clock_phase_with_offsets(10_000, 10_000, 0, 10, 10);
+        assert!(super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            phase.monotonic.clock_ns,
+            phase.monotonic.tai_before_ns,
+            phase.realtime.clock_ns,
+        ));
+        assert!(!super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            phase.monotonic.clock_ns + 1,
+            phase.monotonic.tai_before_ns,
+            phase.realtime.clock_ns,
+        ));
+        assert!(!super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            phase.monotonic.clock_ns,
+            phase.monotonic.tai_before_ns + 1,
+            phase.realtime.clock_ns,
+        ));
+        assert!(!super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            phase.monotonic.clock_ns,
+            phase.monotonic.tai_before_ns,
+            phase.realtime.clock_ns + 1,
+        ));
+        let mut malformed = phase;
+        malformed.realtime.schema_version = 2;
+        assert!(!super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &malformed,
+            malformed.monotonic.clock_ns,
+            malformed.monotonic.tai_before_ns,
+            malformed.realtime.clock_ns,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_item_local_monotonic_corroboration_is_exact() {
+        let phase = synthetic_buflo_clock_phase_with_offsets(3_300_000, 10_000, 30_000_000, 10, 10);
+        let enqueue_monotonic_ns = phase.monotonic.clock_ns - 1_000;
+        let mapped_lower = phase.monotonic.tai_before_ns - 1_000;
+        let mapped_upper = phase.monotonic.tai_before_ns - 990;
+        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            phase.monotonic.tai_before_ns - 995,
+            phase.monotonic.tai_before_ns - 985,
+        ));
+        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            mapped_upper,
+            mapped_upper,
+        ));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            mapped_lower - 2,
+            mapped_lower - 1,
+        ));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            mapped_upper + 1,
+            mapped_upper + 2,
+        ));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            mapped_upper,
+            mapped_lower,
+        ));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            phase.monotonic.clock_ns + 1,
+            phase.monotonic.tai_before_ns,
+            phase.monotonic.tai_before_ns,
+        ));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            phase.monotonic.tai_before_ns,
+            phase.monotonic.tai_before_ns + 1,
+        ));
+
+        let underflow_phase = super::BufloKernelClockPhase {
+            monotonic: super::BufloKernelClockSample {
+                schema_version: 1,
+                tai_before_ns: 100,
+                clock_ns: 1_000,
+                tai_after_ns: 110,
+                bracket_width_ns: 10,
+            },
+            realtime: super::BufloKernelClockSample {
+                schema_version: 1,
+                tai_before_ns: 120,
+                clock_ns: 2_000,
+                tai_after_ns: 130,
+                bracket_width_ns: 10,
+            },
+        };
+        assert!(super::buflo_kernel_clock_phase_valid(&underflow_phase));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &underflow_phase,
+            0,
+            0,
+            1,
+        ));
+        assert!(super::translate_clock_interval(0, (-1, -1)).is_err());
+        assert!(super::translate_clock_interval(u64::MAX, (1, 1)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_clock_drift_diagnostic_rejects_unrepresentable_values() {
+        let high_tai = super::BufloKernelClockSample {
+            schema_version: 1,
+            tai_before_ns: u64::MAX - 10,
+            clock_ns: 0,
+            tai_after_ns: u64::MAX,
+            bracket_width_ns: 10,
+        };
+        let high_clock = super::BufloKernelClockSample {
+            schema_version: 1,
+            tai_before_ns: 0,
+            clock_ns: u64::MAX,
+            tai_after_ns: 10,
+            bracket_width_ns: 10,
+        };
+        assert!(super::buflo_kernel_clock_sample_valid(&high_tai));
+        assert!(super::buflo_kernel_clock_sample_valid(&high_clock));
+        assert_eq!(
+            super::clock_offset_midpoint_drift(&high_tai, &high_clock),
+            Err("BuFLO kernel clock offset midpoint drift exceeded the u64 receipt range".into())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_mapping_accepts_multi_millisecond_wsl_monotonic_steps() {
+        let start = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 100, 100);
+        let first =
+            synthetic_buflo_clock_phase_with_offsets(3_300_000, 10_000, 30_000_000, 100, 100);
+        let second =
+            synthetic_buflo_clock_phase_with_offsets(6_900_000, 10_000, 60_000_000, 100, 100);
+        let end =
+            synthetic_buflo_clock_phase_with_offsets(8_300_000, 10_000, 100_000_000, 100, 100);
+        let alignment = synthetic_buflo_instant_alignment_for(&start);
+        let mut mapping =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect("WSL-style monotonic correction remains diagnostic");
+        assert_eq!(mapping.max_observed_offset_drift_ns, 8_000_000);
+
+        let item_for_phase = |item_id: u64, phase: &super::BufloKernelClockPhase| {
+            let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+            item.item_id = item_id;
+            item.order_index = item_id;
+            item.enqueue_monotonic_ns = Some(phase.monotonic.clock_ns - 1_000);
+            item.enqueue_tai_lower_ns = Some(phase.monotonic.tai_before_ns - 995);
+            item.enqueue_tai_upper_ns = Some(phase.monotonic.tai_before_ns - 985);
+            item.tx_software_realtime_ns = Some(phase.realtime.clock_ns - 100);
+            item.post_tx_clock_phase = Some(phase.clone());
+            item
+        };
+        let first_item = item_for_phase(0, &first);
+        let second_item = item_for_phase(1, &second);
+        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &first,
+            first_item.enqueue_monotonic_ns.expect("enqueue monotonic"),
+            first_item.enqueue_tai_lower_ns.expect("enqueue TAI lower"),
+            first_item.enqueue_tai_upper_ns.expect("enqueue TAI upper"),
+        ));
+        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &second,
+            second_item.enqueue_monotonic_ns.expect("enqueue monotonic"),
+            second_item.enqueue_tai_lower_ns.expect("enqueue TAI lower"),
+            second_item.enqueue_tai_upper_ns.expect("enqueue TAI upper"),
+        ));
+        let job = synthetic_buflo_kernel_raw_job(vec![first_item.clone(), second_item.clone()]);
+        super::refine_buflo_kernel_clock_mapping_with_items(&mut mapping, &[job])
+            .expect("piecewise local monotonic evidence permits WSL correction");
+        assert_eq!(mapping.max_observed_offset_drift_ns, 8_000_000);
+        assert_eq!(
+            super::clock_mapping_offset_bounds(&mapping, true),
+            (10_000, 10_100)
+        );
+
+        let mut misordered =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect("endpoint mapping");
+        let error = super::refine_buflo_kernel_clock_mapping_with_items(
+            &mut misordered,
+            &[synthetic_buflo_kernel_raw_job(vec![
+                second_item,
+                first_item,
+            ])],
+        )
+        .expect_err("phase chronology remains a hard gate");
+        assert_eq!(
+            error,
+            "BuFLO kernel item 0 retained an out-of-order post-TX clock phase"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_per_item_phases_enforce_the_inclusive_250us_limit() {
+        let start = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10);
+        let end = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 1_100_000, 10, 10);
+        let alignment = synthetic_buflo_instant_alignment_for(&start);
         let base_mapping =
             super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
                 .expect("endpoint clock phases");
         let job_with_width = |width: u64| {
             let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
-            item.tx_software_realtime_ns = None;
-            item.provisional_tx_software_tai_lower_ns = None;
-            item.provisional_tx_software_tai_upper_ns = None;
-            item.enqueue_monotonic_ns = Some(500_000);
-            let half = width / 2;
-            item.enqueue_tai_lower_ns = Some(510_000 - half);
-            item.enqueue_tai_upper_ns = Some(510_000 + width - half);
+            let phase = synthetic_buflo_clock_phase_with_offsets(50_000, 0, 500_000, width, width);
+            item.enqueue_monotonic_ns = Some(phase.monotonic.clock_ns - 100);
+            item.enqueue_tai_upper_ns = Some(phase.monotonic.tai_before_ns - 100);
+            item.tx_software_realtime_ns = Some(phase.realtime.clock_ns - 100);
+            item.post_tx_clock_phase = Some(phase);
             synthetic_buflo_kernel_raw_job(vec![item])
         };
 
         let mut inclusive = base_mapping.clone();
-        super::widen_buflo_kernel_clock_mapping_with_items(
+        super::refine_buflo_kernel_clock_mapping_with_items(
             &mut inclusive,
             &[job_with_width(250_000)],
         )
-        .expect("the exact 250 us bound is admissible");
+        .expect("the exact 250 us phase bracket is admissible");
         assert_eq!(inclusive.max_observed_bracket_width_ns, 250_000);
+        assert_eq!(inclusive.max_observed_offset_drift_ns, 125_005);
 
         let mut excessive = base_mapping;
-        let error = super::widen_buflo_kernel_clock_mapping_with_items(
+        let error = super::refine_buflo_kernel_clock_mapping_with_items(
             &mut excessive,
             &[job_with_width(250_001)],
         )
-        .expect_err("a bracket over 250 us must fail closed");
+        .expect_err("a phase bracket over 250 us must fail closed");
         assert_eq!(
             error,
-            "BuFLO kernel clock bracket 250001 ns exceeded 250000 ns"
+            "BuFLO kernel item 0 retained an invalid post-TX clock phase"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_per_item_monotonic_drift_is_exact_but_nonfatal() {
+        let start = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10);
+        let end = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 1_100_000, 10, 10);
+        let alignment = synthetic_buflo_instant_alignment_for(&start);
+        let base_mapping =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect("stable endpoint clock phases");
+        let job_with_monotonic_offset = |offset: u64| {
+            let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+            let phase = synthetic_buflo_clock_phase_with_offsets(offset, 10_000, 500_000, 10, 10);
+            item.enqueue_monotonic_ns = Some(phase.monotonic.clock_ns - 100);
+            item.enqueue_tai_upper_ns = Some(phase.monotonic.tai_before_ns - 100);
+            item.tx_software_realtime_ns = Some(phase.realtime.clock_ns - 100);
+            item.post_tx_clock_phase = Some(phase);
+            synthetic_buflo_kernel_raw_job(vec![item])
+        };
+
+        let mut inclusive = base_mapping.clone();
+        super::refine_buflo_kernel_clock_mapping_with_items(
+            &mut inclusive,
+            &[job_with_monotonic_offset(50_000)],
+        )
+        .expect("250 us monotonic offset drift remains diagnostic");
+        assert_eq!(inclusive.max_observed_offset_drift_ns, 250_000);
+
+        let mut excessive = base_mapping;
+        super::refine_buflo_kernel_clock_mapping_with_items(
+            &mut excessive,
+            &[job_with_monotonic_offset(49_999)],
+        )
+        .expect("start-relative monotonic correction is diagnostic, not fatal");
+        assert_eq!(excessive.max_observed_offset_drift_ns, 250_001);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_per_item_realtime_intersection_fails_when_empty() {
+        let start = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10);
+        let end = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 1_100_000, 10, 10);
+        let alignment = synthetic_buflo_instant_alignment_for(&start);
+        let mut mapping =
+            super::build_buflo_kernel_clock_mapping(&start, Some(&end), Some(&alignment), None)
+                .expect("stable endpoint clock phases");
+        let mut item = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        let phase = synthetic_buflo_clock_phase_with_offsets(300_000, 10_011, 500_000, 10, 10);
+        item.enqueue_monotonic_ns = Some(phase.monotonic.clock_ns - 100);
+        item.enqueue_tai_upper_ns = Some(phase.monotonic.tai_before_ns - 100);
+        item.tx_software_realtime_ns = Some(phase.realtime.clock_ns - 100);
+        item.post_tx_clock_phase = Some(phase);
+        let error = super::refine_buflo_kernel_clock_mapping_with_items(
+            &mut mapping,
+            &[synthetic_buflo_kernel_raw_job(vec![item])],
+        )
+        .expect_err("disjoint per-item realtime evidence must fail closed");
+        assert_eq!(
+            error,
+            "BuFLO kernel realtime offset intersection became empty at item 0"
         );
     }
 
@@ -36133,6 +36784,174 @@ mod tests {
             txtime_errors_enabled: true,
         };
         (runtime, qdisc, vec![(source, destination)])
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_nested_schema_two_serializes_before_arm_and_on_item_failure() {
+        let runtime_with_jobs = |jobs: Vec<super::BufloKernelRawJob>| {
+            let next_item_id = u64::try_from(jobs.iter().map(|job| job.items.len()).sum::<usize>())
+                .expect("small synthetic inventory");
+            let (runtime_contract, qdisc_contract, endpoint_tuples) =
+                synthetic_buflo_helper_contracts();
+            super::BufloKernelTxRuntime {
+                helper: None,
+                runtime_contract,
+                qdisc_contract,
+                endpoint_tuples,
+                clock_start: super::sample_buflo_kernel_clock_phase()
+                    .expect("sample synthetic runtime start clocks"),
+                realtime_offset_intersection: None,
+                epoch: None,
+                jobs,
+                next_item_id,
+            }
+        };
+
+        let failed_before_arm =
+            runtime_with_jobs(Vec::new()).finish(Some("synthetic pre-arm failure".into()));
+        let failed_before_arm_json =
+            serde_json::to_value(&failed_before_arm).expect("serialize pre-arm receipt");
+        assert_eq!(
+            failed_before_arm_json["schema_version"],
+            super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            failed_before_arm_json["semantics"],
+            super::BUFLO_KERNEL_TX_SEMANTICS
+        );
+        assert!(failed_before_arm_json["clock_mapping"].is_null());
+        assert_eq!(
+            failed_before_arm_json["jobs"].as_array().map(Vec::len),
+            Some(0)
+        );
+
+        let with_phase = synthetic_buflo_kernel_raw_item("physical-transmit-proven");
+        let mut without_phase = synthetic_buflo_kernel_raw_item("physical-transmit-proven");
+        without_phase.item_id = 1;
+        without_phase.order_index = 1;
+        without_phase.post_tx_clock_phase = None;
+        let failed_items = runtime_with_jobs(vec![synthetic_buflo_kernel_raw_job(vec![
+            with_phase,
+            without_phase,
+        ])])
+        .finish(Some("synthetic item failure".into()));
+        let failed_items_json =
+            serde_json::to_value(&failed_items).expect("serialize failed item receipt");
+        let items = failed_items_json["jobs"][0]["items"]
+            .as_array()
+            .expect("serialized items");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            item["schema_version"] == super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION
+        }));
+        assert!(items[0]["post_tx_clock_phase"].is_object());
+        assert!(items[1]["post_tx_clock_phase"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_online_realtime_intersection_updates_and_fails_closed() {
+        let runtime = |clock_start: super::BufloKernelClockPhase, realtime_offset_intersection| {
+            let (runtime_contract, qdisc_contract, endpoint_tuples) =
+                synthetic_buflo_helper_contracts();
+            super::BufloKernelTxRuntime {
+                helper: None,
+                runtime_contract,
+                qdisc_contract,
+                endpoint_tuples,
+                clock_start,
+                realtime_offset_intersection,
+                epoch: None,
+                jobs: Vec::new(),
+                next_item_id: 0,
+            }
+        };
+        let start = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10);
+        let first = synthetic_buflo_clock_phase_with_offsets(300_000, 10_004, 500_000, 8, 8);
+        let second = synthetic_buflo_clock_phase_with_offsets(300_000, 10_006, 600_000, 2, 2);
+        let start_bounds = super::clock_offset_bounds(&start.realtime);
+        let mut online = runtime(start.clone(), Some(start_bounds));
+        assert_eq!(
+            online
+                .refine_realtime_offset_intersection(&first)
+                .expect("first online refinement"),
+            (10_004, 10_010)
+        );
+        let mut first_item = synthetic_buflo_kernel_raw_item("physical-transmit-proven");
+        first_item.post_tx_clock_phase = Some(first.clone());
+        online
+            .jobs
+            .push(synthetic_buflo_kernel_raw_job(vec![first_item]));
+        assert_eq!(
+            online
+                .refine_realtime_offset_intersection(&second)
+                .expect("second online refinement"),
+            (10_006, 10_008)
+        );
+        assert_eq!(online.realtime_offset_intersection, Some((10_006, 10_008)));
+
+        let mut unarmed = runtime(start.clone(), None);
+        assert!(matches!(
+            unarmed.refine_realtime_offset_intersection(&first),
+            Err(Error::SlotInvariant(message))
+                if message == "BuFLO realtime offset intersection was not armed"
+        ));
+
+        let disjoint = synthetic_buflo_clock_phase_with_offsets(300_000, 10_011, 500_000, 10, 10);
+        let mut empty = runtime(start.clone(), Some(start_bounds));
+        assert!(matches!(
+            empty.refine_realtime_offset_intersection(&disjoint),
+            Err(Error::DefenseExecution(message))
+                if message == "BuFLO kernel realtime offset intersection became empty"
+        ));
+        assert_eq!(empty.realtime_offset_intersection, Some(start_bounds));
+
+        let excessive_drift =
+            synthetic_buflo_clock_phase_with_offsets(49_999, 10_000, 500_000, 10, 10);
+        let mut unstable = runtime(start.clone(), Some(start_bounds));
+        assert_eq!(
+            unstable
+                .refine_realtime_offset_intersection(&excessive_drift)
+                .expect("monotonic drift does not weaken the realtime intersection"),
+            start_bounds
+        );
+        assert_eq!(unstable.realtime_offset_intersection, Some(start_bounds));
+
+        let narrowing = synthetic_buflo_clock_phase_with_offsets(300_000, 10_004, 500_000, 2, 2);
+        let enqueue_monotonic_ns = narrowing.monotonic.clock_ns - 100;
+        let enqueue_tai_lower_ns = narrowing.monotonic.tai_before_ns - 200;
+        let enqueue_tai_upper_ns = narrowing.monotonic.tai_before_ns - 190;
+        let tx_software_realtime_ns = narrowing.realtime.clock_ns - 100;
+        assert!(super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &narrowing,
+            enqueue_monotonic_ns,
+            enqueue_tai_upper_ns,
+            tx_software_realtime_ns,
+        ));
+        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+            &narrowing,
+            enqueue_monotonic_ns,
+            enqueue_tai_lower_ns,
+            enqueue_tai_upper_ns,
+        ));
+        let mut local_mismatch = runtime(start, Some(start_bounds));
+        assert!(matches!(
+            local_mismatch.refine_realtime_then_corroborate_enqueue(
+                &narrowing,
+                enqueue_monotonic_ns,
+                enqueue_tai_lower_ns,
+                enqueue_tai_upper_ns,
+                "synthetic local enqueue mismatch",
+            ),
+            Err(Error::DefenseExecution(message))
+                if message == "synthetic local enqueue mismatch"
+        ));
+        assert_eq!(
+            local_mismatch.realtime_offset_intersection,
+            Some((10_004, 10_006)),
+            "retained narrowing phase must refine online evidence before local failure"
+        );
     }
 
     #[cfg(target_os = "linux")]
