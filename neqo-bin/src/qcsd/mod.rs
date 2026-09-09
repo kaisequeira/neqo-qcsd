@@ -28108,10 +28108,12 @@ mod tests {
             [0]
         );
 
-        // The first two absolute callbacks are already due when returned.
-        // The remainder alternate between the strict deadline and an instant
-        // after it. The retry loop must neither spin forever nor adopt either
-        // callback as permission to drive at or beyond the half-open boundary.
+        // If the helper enters the retry loop before the strict deadline, the
+        // first two absolute callbacks are already due when returned. The
+        // remainder alternate between the deadline and an instant after it.
+        // The real deadline may instead win before the first drive. In either
+        // case, the retry loop must neither spin forever nor adopt a callback
+        // as permission to drive at or beyond the half-open boundary.
         endpoints[0].test_output_drives.extend([
             TestOutputDrive::CallbackAt(release),
             TestOutputDrive::CallbackAt(release),
@@ -28148,7 +28150,7 @@ mod tests {
             0
         );
         let retry_drives = runner_wakeup_metrics.buflo_exact_incoming_retry_drives;
-        assert!((1..=6).contains(&retry_drives));
+        assert!(retry_drives <= 6);
         assert!(runner_wakeup_metrics.wait_returns <= retry_drives);
         assert!(retry_drives <= runner_wakeup_metrics.wait_returns.saturating_add(1));
         assert_eq!(
