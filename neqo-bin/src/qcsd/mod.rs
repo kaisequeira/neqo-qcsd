@@ -36789,7 +36789,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn synthetic_buflo_kernel_runtime(
         clock_start: super::BufloKernelClockPhase,
-        realtime_offset_intersection: Option<(i128, i128)>,
+        realtime_offset_intersection: Option<&(i128, i128)>,
         jobs: Vec<super::BufloKernelRawJob>,
     ) -> super::BufloKernelTxRuntime {
         let next_item_id = u64::try_from(jobs.iter().map(|job| job.items.len()).sum::<usize>())
@@ -36802,7 +36802,7 @@ mod tests {
             qdisc_contract,
             endpoint_tuples,
             clock_start,
-            realtime_offset_intersection,
+            realtime_offset_intersection: realtime_offset_intersection.copied(),
             epoch: None,
             jobs,
             next_item_id,
@@ -36871,7 +36871,7 @@ mod tests {
         let first = synthetic_buflo_clock_phase_with_offsets(300_000, 10_004, 500_000, 8, 8);
         let second = synthetic_buflo_clock_phase_with_offsets(300_000, 10_006, 600_000, 2, 2);
         let start_bounds = super::clock_offset_bounds(&start.realtime);
-        let mut online = runtime(start.clone(), Some(start_bounds));
+        let mut online = runtime(start.clone(), Some(&start_bounds));
         assert_eq!(
             online
                 .refine_realtime_offset_intersection(&first)
@@ -36899,7 +36899,7 @@ mod tests {
         ));
 
         let disjoint = synthetic_buflo_clock_phase_with_offsets(300_000, 10_011, 500_000, 10, 10);
-        let mut empty = runtime(start.clone(), Some(start_bounds));
+        let mut empty = runtime(start.clone(), Some(&start_bounds));
         assert!(matches!(
             empty.refine_realtime_offset_intersection(&disjoint),
             Err(Error::DefenseExecution(message))
@@ -36909,7 +36909,7 @@ mod tests {
 
         let excessive_drift =
             synthetic_buflo_clock_phase_with_offsets(49_999, 10_000, 500_000, 10, 10);
-        let mut unstable = runtime(start.clone(), Some(start_bounds));
+        let mut unstable = runtime(start.clone(), Some(&start_bounds));
         assert_eq!(
             unstable
                 .refine_realtime_offset_intersection(&excessive_drift)
@@ -36935,7 +36935,7 @@ mod tests {
             enqueue_tai_lower_ns,
             enqueue_tai_upper_ns,
         ));
-        let mut offset_step = runtime(start.clone(), Some(start_bounds));
+        let mut offset_step = runtime(start.clone(), Some(&start_bounds));
         assert_eq!(
             offset_step
                 .refine_realtime_then_validate_enqueue_order(
@@ -36949,7 +36949,7 @@ mod tests {
             (10_004, 10_006)
         );
 
-        let mut local_mismatch = runtime(start, Some(start_bounds));
+        let mut local_mismatch = runtime(start, Some(&start_bounds));
         assert!(matches!(
             local_mismatch.refine_realtime_then_validate_enqueue_order(
                 &narrowing,
