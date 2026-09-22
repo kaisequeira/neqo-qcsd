@@ -658,6 +658,13 @@ pub fn drop_process_privileges_permanently(
     Ok(receipt)
 }
 
+/// Successful timed-send enqueue evidence.
+///
+/// The helper samples these fields in strict operation order:
+/// `enqueue_before_tai_ns`, `sendmsg`, `enqueue_monotonic_ns`, then
+/// `enqueue_after_tai_ns`.  The two TAI values are therefore direct,
+/// send-sequence-local bounds; translating the MONOTONIC sample with a later
+/// clock phase is not required for their validity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TimedEnqueueReceipt {
     pub schema_version: u32,
@@ -701,6 +708,8 @@ pub struct ImmediateTxOutcome {
     pub tx_software_realtime_ns: u64,
 }
 
+/// Successful immediate-send enqueue evidence with the same clock-sampling
+/// order as [`TimedEnqueueReceipt`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ImmediateEnqueueReceipt {
     pub schema_version: u32,

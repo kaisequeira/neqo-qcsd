@@ -1331,17 +1331,17 @@ const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 2;
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 3;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 2;
+const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 3;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 2;
+const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 3;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v2; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; tx_sched_and_tx_software_are_linux_error_queue_timestamps; enqueue_monotonic_corroboration=item_local_post_tx_phase; global_monotonic_drift_is_diagnostic=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v3; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; tx_sched_and_tx_software_are_linux_error_queue_timestamps; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS: &str = "start_and_end_clock_phases_plus_every_explicit_per_item_post_tx_clock_phase; every_clock_phase_subsample_and_instant_alignment_bracket_is_at_most_250us; effective_monotonic_offset_is_a_nonfatal_diagnostic_union_and_max_observed_offset_drift_is_the_exact_maximum_start_relative_midpoint_drift_across_both_clocks_and_all_retained_phases; each_enqueue_MONOTONIC_timestamp_is_translated_only_with_its_item_local_post_TX_monotonic_phase_and_must_overlap_its_direct_enqueue_TAI_bracket; realtime_offset_is_the_nonempty_running_intersection_used_online_and_recomputed_exactly_at_finalization; final_realtime_interval_must_be_contained_by_every_provisional_interval; direct_enqueue_TAI_before_release_and_causal_order_predicates_remain_hard_gates; incoming_TX_lower_must_not_precede_its_enqueue_TAI_lower";
+const BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS: &str = "start_and_end_clock_phases_plus_every_explicit_per_item_post_tx_clock_phase; every_clock_phase_subsample_and_instant_alignment_bracket_is_at_most_250us; effective_monotonic_offset_is_a_nonfatal_diagnostic_union_and_max_observed_offset_drift_is_the_exact_maximum_start_relative_midpoint_drift_across_both_clocks_and_all_retained_phases; each_enqueue_TAI_interval_is_direct_send_sequence_evidence_and_must_be_ordered; each_enqueue_MONOTONIC_and_TAI_upper_must_precede_its_post_TX_phase_in_their_respective_clock_frames; enqueue_to_post_TX_MONOTONIC_offset_overlap_is_diagnostic_not_a_hard_gate; realtime_offset_is_the_nonempty_running_intersection_used_online_and_recomputed_exactly_at_finalization; final_realtime_interval_must_be_contained_by_every_provisional_interval; direct_enqueue_TAI_before_release_and_causal_order_predicates_remain_hard_gates; incoming_TX_lower_must_not_precede_its_enqueue_TAI_lower";
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2360,24 +2360,16 @@ fn buflo_kernel_post_tx_clock_phase_follows_evidence(
 }
 
 #[cfg(target_os = "linux")]
-fn buflo_kernel_item_local_enqueue_clock_consistent(
+fn buflo_kernel_enqueue_clock_order_consistent(
     phase: &BufloKernelClockPhase,
     enqueue_monotonic_ns: u64,
     enqueue_tai_lower_ns: u64,
     enqueue_tai_upper_ns: u64,
 ) -> bool {
-    if !buflo_kernel_clock_phase_valid(phase)
-        || enqueue_monotonic_ns > phase.monotonic.clock_ns
-        || enqueue_tai_lower_ns > enqueue_tai_upper_ns
-        || enqueue_tai_upper_ns > phase.monotonic.tai_before_ns
-    {
-        return false;
-    }
-    translate_clock_interval(enqueue_monotonic_ns, clock_offset_bounds(&phase.monotonic)).is_ok_and(
-        |(mapped_lower, mapped_upper)| {
-            mapped_lower <= enqueue_tai_upper_ns && enqueue_tai_lower_ns <= mapped_upper
-        },
-    )
+    buflo_kernel_clock_phase_valid(phase)
+        && enqueue_monotonic_ns <= phase.monotonic.clock_ns
+        && enqueue_tai_lower_ns <= enqueue_tai_upper_ns
+        && enqueue_tai_upper_ns <= phase.monotonic.tai_before_ns
 }
 
 #[cfg(target_os = "linux")]
@@ -3334,7 +3326,7 @@ impl BufloKernelTxRuntime {
         Ok(refined)
     }
 
-    fn refine_realtime_then_corroborate_enqueue(
+    fn refine_realtime_then_validate_enqueue_order(
         &mut self,
         phase: &BufloKernelClockPhase,
         enqueue_monotonic_ns: u64,
@@ -3343,10 +3335,10 @@ impl BufloKernelTxRuntime {
         local_failure: &str,
     ) -> Result<(i128, i128), Error> {
         // A phase that follows retained transmission evidence remains part of
-        // the clock record even if its local MONOTONIC translation then fails.
+        // the clock record even if its enqueue-order validation then fails.
         // Refine first so final recomputation consumes exactly the same phase.
         let realtime_bounds = self.refine_realtime_offset_intersection(phase)?;
-        if !buflo_kernel_item_local_enqueue_clock_consistent(
+        if !buflo_kernel_enqueue_clock_order_consistent(
             phase,
             enqueue_monotonic_ns,
             enqueue_tai_lower_ns,
@@ -3635,23 +3627,23 @@ impl BufloKernelTxRuntime {
             result.outcome.tx_software_realtime_ns,
         );
         let window = if phase_follows_evidence {
-            self.refine_realtime_then_corroborate_enqueue(
+            self.refine_realtime_then_validate_enqueue_order(
                 &phase,
                 result.enqueue.enqueue_monotonic_ns,
                 result.enqueue.enqueue_before_tai_ns,
                 result.enqueue.enqueue_after_tai_ns,
                 &format!(
-                    "BuFLO kernel job {job_id} item-local MONOTONIC phase did not corroborate exact enqueue TAI evidence"
+                    "BuFLO kernel job {job_id} enqueue and post-TX clock evidence was not ordered"
                 ),
             )
-                .and_then(|realtime_bounds| {
-                    self.check_physical_window(
-                        job_id,
-                        result.outcome.tx_software_realtime_ns,
-                        &phase,
-                        realtime_bounds,
-                    )
-                })
+            .and_then(|realtime_bounds| {
+                self.check_physical_window(
+                    job_id,
+                    result.outcome.tx_software_realtime_ns,
+                    &phase,
+                    realtime_bounds,
+                )
+            })
         } else {
             Err(Error::DefenseExecution(format!(
                 "BuFLO kernel job {job_id} post-TX clock phase did not follow exact transmission evidence"
@@ -3834,13 +3826,13 @@ impl BufloKernelTxRuntime {
             result.tx_software_realtime_ns,
         );
         let window = if phase_follows_evidence {
-            self.refine_realtime_then_corroborate_enqueue(
+            self.refine_realtime_then_validate_enqueue_order(
                 &phase,
                 result.enqueue_monotonic_ns,
                 result.enqueue_before_tai_ns,
                 result.enqueue_after_tai_ns,
                 &format!(
-                    "BuFLO kernel job {job_id} item-local MONOTONIC phase did not corroborate incoming-credit enqueue TAI evidence"
+                    "BuFLO kernel job {job_id} incoming-credit enqueue and post-TX clock evidence was not ordered"
                 ),
             )
                 .and_then(|realtime_bounds| {
@@ -4176,9 +4168,7 @@ impl BufloKernelTxRuntime {
                     .zip(raw.enqueue_tai_lower_ns)
                     .zip(raw.enqueue_tai_upper_ns)
                     .is_some_and(|(((phase, monotonic), lower), upper)| {
-                        buflo_kernel_item_local_enqueue_clock_consistent(
-                            phase, monotonic, lower, upper,
-                        )
+                        buflo_kernel_enqueue_clock_order_consistent(phase, monotonic, lower, upper)
                     });
                 let post_tx_clock_phase_complete =
                     raw.post_tx_clock_phase.as_ref().is_some_and(|phase| {
@@ -5515,9 +5505,9 @@ impl RunnerWakeupMetrics {
         // legacy-metric exclusion. A validation failure must not erase the
         // helper/clock/packet evidence that explains the failed attempt.
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = 11;
+        self.schema_version = 12;
         self.semantics = format!(
-            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema10_layout_is_retained_for_non_kernel_metrics; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
+            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema12_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
         );
         if !self.legacy_buflo_metrics_neutral() {
             let detail =
@@ -5530,7 +5520,7 @@ impl RunnerWakeupMetrics {
                 })?;
             return Err(Error::SlotInvariant(detail));
         }
-        // Schema 11 retains the schema-10 fields for compatibility, but the
+        // Schema 12 retains the schema-10 fields for compatibility, but the
         // kernel path never observes the superseded user-space polling
         // source. Publish its neutral value only after proving that no legacy
         // exact-release metric was recorded.
@@ -36171,7 +36161,7 @@ mod tests {
             super::clock_offset_bounds(&end.realtime),
         )
         .expect("online end intersection");
-        assert_eq!(mapping.schema_version, 2);
+        assert_eq!(mapping.schema_version, 3);
         assert_eq!(
             mapping.effective_envelope_semantics,
             super::BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS
@@ -36283,77 +36273,85 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_item_local_monotonic_corroboration_is_exact() {
-        let phase = synthetic_buflo_clock_phase_with_offsets(3_300_000, 10_000, 30_000_000, 10, 10);
-        let enqueue_monotonic_ns = phase.monotonic.clock_ns - 1_000;
-        let mapped_lower = phase.monotonic.tai_before_ns - 1_000;
-        let mapped_upper = phase.monotonic.tai_before_ns - 990;
-        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            enqueue_monotonic_ns,
-            phase.monotonic.tai_before_ns - 995,
-            phase.monotonic.tai_before_ns - 985,
-        ));
-        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            enqueue_monotonic_ns,
-            mapped_upper,
-            mapped_upper,
-        ));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            enqueue_monotonic_ns,
-            mapped_lower - 2,
-            mapped_lower - 1,
-        ));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            enqueue_monotonic_ns,
-            mapped_upper + 1,
-            mapped_upper + 2,
-        ));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            enqueue_monotonic_ns,
-            mapped_upper,
-            mapped_lower,
-        ));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            phase.monotonic.clock_ns + 1,
-            phase.monotonic.tai_before_ns,
-            phase.monotonic.tai_before_ns,
-        ));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &phase,
-            enqueue_monotonic_ns,
-            phase.monotonic.tai_before_ns,
-            phase.monotonic.tai_before_ns + 1,
-        ));
-
-        let underflow_phase = super::BufloKernelClockPhase {
+    fn buflo_kernel_enqueue_clock_order_accepts_v105_offset_step() {
+        // Exact retained evidence from v105 timing-stress item 497. The
+        // enqueue-local TAI interval and the later post-TX MONOTONIC offset do
+        // not overlap because WSL corrected the TAI-to-MONOTONIC offset during
+        // the intervening 4.55 ms. Their same-clock chronology is nevertheless
+        // complete, and the independent realtime physical window was valid.
+        let phase = super::BufloKernelClockPhase {
             monotonic: super::BufloKernelClockSample {
                 schema_version: 1,
-                tai_before_ns: 100,
-                clock_ns: 1_000,
-                tai_after_ns: 110,
-                bracket_width_ns: 10,
+                tai_before_ns: 1_790_050_934_370_605_317,
+                clock_ns: 43_495_169_464_471,
+                tai_after_ns: 1_790_050_934_370_611_017,
+                bracket_width_ns: 5_700,
             },
             realtime: super::BufloKernelClockSample {
                 schema_version: 1,
-                tai_before_ns: 120,
-                clock_ns: 2_000,
-                tai_after_ns: 130,
-                bracket_width_ns: 10,
+                tai_before_ns: 1_790_050_934_370_612_917,
+                clock_ns: 1_790_050_897_370_614_817,
+                tai_after_ns: 1_790_050_934_370_616_318,
+                bracket_width_ns: 3_401,
             },
         };
-        assert!(super::buflo_kernel_clock_phase_valid(&underflow_phase));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
-            &underflow_phase,
-            0,
-            0,
-            1,
+        let enqueue_monotonic_ns = 43_495_164_909_827;
+        let enqueue_tai_lower_ns = 1_790_050_934_365_488_067;
+        let enqueue_tai_upper_ns = 1_790_050_934_365_504_769;
+        assert!(super::buflo_kernel_enqueue_clock_order_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            enqueue_tai_lower_ns,
+            enqueue_tai_upper_ns,
         ));
+
+        let post_offset = super::clock_offset_bounds(&phase.monotonic);
+        let (mapped_lower, mapped_upper) =
+            super::translate_clock_interval(enqueue_monotonic_ns, post_offset)
+                .expect("representable post-TX diagnostic translation");
+        assert!(mapped_lower > enqueue_tai_upper_ns);
+        assert!(mapped_upper > mapped_lower);
+        assert_eq!(mapped_lower - enqueue_tai_upper_ns, 545_904);
+
+        let release_tai_ns = 1_790_050_934_370_359_358;
+        let deadline_tai_ns = release_tai_ns + 5_000_000;
+        let tx_software_tai_lower_ns = 1_790_050_934_370_441_304;
+        let tx_software_tai_upper_ns = 1_790_050_934_370_442_204;
+        assert!(enqueue_tai_upper_ns < release_tai_ns);
+        assert!(super::buflo_kernel_interval_within_half_open_window(
+            tx_software_tai_lower_ns,
+            tx_software_tai_upper_ns,
+            release_tai_ns,
+            deadline_tai_ns,
+        ));
+
+        assert!(!super::buflo_kernel_enqueue_clock_order_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            enqueue_tai_upper_ns,
+            enqueue_tai_lower_ns,
+        ));
+        assert!(!super::buflo_kernel_enqueue_clock_order_consistent(
+            &phase,
+            phase.monotonic.clock_ns + 1,
+            enqueue_tai_lower_ns,
+            enqueue_tai_upper_ns,
+        ));
+        assert!(!super::buflo_kernel_enqueue_clock_order_consistent(
+            &phase,
+            enqueue_monotonic_ns,
+            enqueue_tai_lower_ns,
+            phase.monotonic.tai_before_ns + 1,
+        ));
+        let mut malformed = phase;
+        malformed.monotonic.schema_version = 2;
+        assert!(!super::buflo_kernel_enqueue_clock_order_consistent(
+            &malformed,
+            enqueue_monotonic_ns,
+            enqueue_tai_lower_ns,
+            enqueue_tai_upper_ns,
+        ));
+
         assert!(super::translate_clock_interval(0, (-1, -1)).is_err());
         assert!(super::translate_clock_interval(u64::MAX, (1, 1)).is_err());
     }
@@ -36412,13 +36410,13 @@ mod tests {
         };
         let first_item = item_for_phase(0, &first);
         let second_item = item_for_phase(1, &second);
-        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
+        assert!(super::buflo_kernel_enqueue_clock_order_consistent(
             &first,
             first_item.enqueue_monotonic_ns.expect("enqueue monotonic"),
             first_item.enqueue_tai_lower_ns.expect("enqueue TAI lower"),
             first_item.enqueue_tai_upper_ns.expect("enqueue TAI upper"),
         ));
-        assert!(super::buflo_kernel_item_local_enqueue_clock_consistent(
+        assert!(super::buflo_kernel_enqueue_clock_order_consistent(
             &second,
             second_item.enqueue_monotonic_ns.expect("enqueue monotonic"),
             second_item.enqueue_tai_lower_ns.expect("enqueue TAI lower"),
@@ -36931,19 +36929,33 @@ mod tests {
             enqueue_tai_upper_ns,
             tx_software_realtime_ns,
         ));
-        assert!(!super::buflo_kernel_item_local_enqueue_clock_consistent(
+        assert!(super::buflo_kernel_enqueue_clock_order_consistent(
             &narrowing,
             enqueue_monotonic_ns,
             enqueue_tai_lower_ns,
             enqueue_tai_upper_ns,
         ));
+        let mut offset_step = runtime(start.clone(), Some(start_bounds));
+        assert_eq!(
+            offset_step
+                .refine_realtime_then_validate_enqueue_order(
+                    &narrowing,
+                    enqueue_monotonic_ns,
+                    enqueue_tai_lower_ns,
+                    enqueue_tai_upper_ns,
+                    "synthetic local enqueue mismatch",
+                )
+                .expect("an ordered enqueue survives diagnostic offset movement"),
+            (10_004, 10_006)
+        );
+
         let mut local_mismatch = runtime(start, Some(start_bounds));
         assert!(matches!(
-            local_mismatch.refine_realtime_then_corroborate_enqueue(
+            local_mismatch.refine_realtime_then_validate_enqueue_order(
                 &narrowing,
                 enqueue_monotonic_ns,
                 enqueue_tai_lower_ns,
-                enqueue_tai_upper_ns,
+                narrowing.monotonic.tai_before_ns + 1,
                 "synthetic local enqueue mismatch",
             ),
             Err(Error::DefenseExecution(message))
@@ -37043,7 +37055,7 @@ mod tests {
             "cleanup_errors": []
         });
         assert!(metrics.attach_buflo_kernel_tx_value(raw).is_err());
-        assert_eq!(metrics.schema_version, 11);
+        assert_eq!(metrics.schema_version, 12);
         assert!(metrics.semantics.contains("buflo_kernel_tx_raw_semantics="));
         let retained = metrics
             .buflo_kernel_tx
@@ -37091,9 +37103,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn terminal_render_error_is_embedded_without_erasing_schema_eleven_kernel_evidence() {
+    fn terminal_render_error_is_embedded_without_erasing_schema_twelve_kernel_evidence() {
         let mut metrics = RunnerWakeupMetrics::new();
-        // Exercise schema-11 normalisation even on hosts whose production
+        // Exercise schema-12 normalisation even on hosts whose production
         // schema-10 default already uses the neutral fallback source.
         metrics.buflo_exact_release_active_wait_poll_source =
             BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
@@ -37176,7 +37188,7 @@ mod tests {
             receipt["terminal_evidence_render_errors"][0],
             render_errors[0]
         );
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 11);
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 12);
         assert_eq!(receipt["runner_wakeup_metrics"]["buflo_kernel_tx"], raw);
     }
 }
