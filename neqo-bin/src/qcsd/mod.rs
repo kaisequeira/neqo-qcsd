@@ -1331,13 +1331,13 @@ const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 7;
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 8;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v7; schema7_retains_schema6_layout=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms; protected_selection_wait_applies_to_tick_zero_and_rolling_slots=true; protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; selection_window_is_half_open_release_minus_5ms_through_release=true; late_or_failed_selection_remains_fatal=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v8; schema8_retains_schema7_layout=true;main_coalesced_credit_without_residual_reconciled_at_proven_physical_time_before_current_tai_expiry=true;any_residual_pending_credit_defers_initial_global_reduction_until_first_residual_owner_turn=true;completed_credit_inventory_precedes_current_tai_expiry=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms; protected_selection_wait_applies_to_tick_zero_and_rolling_slots=true; protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; selection_window_is_half_open_release_minus_5ms_through_release=true; late_or_failed_selection_remains_fatal=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS: &str = "CLOCK_TAI_protected_wait_enters_during_release_minus_10ms_to_release_minus_5ms; application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; late_wait_entry_and_release_expiry_fail_closed; client_only_adaptation; paper_equivalent=false";
 #[cfg(target_os = "linux")]
@@ -3787,6 +3787,19 @@ fn buflo_kernel_incoming_retry_step(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn buflo_kernel_incoming_retry_after_inventory(
+    inventory_complete: bool,
+    current_tai_ns: impl FnOnce() -> Result<u64, Error>,
+    release_tai_ns: u64,
+    deadline_tai_ns: u64,
+) -> Result<Option<BufloKernelIncomingRetryStep>, Error> {
+    if inventory_complete {
+        return Ok(None);
+    }
+    buflo_kernel_incoming_retry_step(current_tai_ns()?, release_tai_ns, deadline_tai_ns).map(Some)
+}
+
 const fn buflo_kernel_provisional_envelope_contains_final(
     provisional_lower: u64,
     provisional_upper: u64,
@@ -6098,10 +6111,10 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
 const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 10;
 const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=5000; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guard_coincides_with_output_admission=false; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_exact_release_schema10_passive_wait_unreachable=true; buflo_exact_release_guard_wait_equals_active_wait=true; buflo_exact_release_max_passive_wake_lateness_equals_max_guard_entry_lateness=true; buflo_exact_release_aggregate_entry_lateness_reachable=max_retained_failure_entry_or_5000000_plus_max_dispatch_lateness; buflo_exact_release_aggregate_active_wait_reachable=retained_success_plus_retained_failure_plus_bounded_unretained_successes_with_hidden_entry_max_subtraction_saturating; buflo_exact_release_active_derived_maxima_reachable=retained_per_metric_or_unretained_success_5000000_plus_dispatch; buflo_exact_release_deadline_count_reachable=outside_zero_or_max_dispatch_lateness_at_least_4999000; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_one_actual_adapter_window_before_release=true; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_wait_iterations=counter_read_attempts_including_ordered_and_unavailable_or_fallback_authoritative_polls; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard_entry; buflo_exact_release_dispatch_lateness_histogram_counts_one_dispatch_ready_guard; buflo_exact_release_guard_entries=dispatch_ready_guards+failed_guards; buflo_exact_release_failed_guards=sum_typed_failure_guards; buflo_exact_release_failed_guards_max=1; buflo_exact_release_last_failure_present_iff_failed_guards=1; buflo_exact_release_failure_dispatch_at_is_null=true; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=actual_adapter_window_ns; buflo_exact_release_configured_output_admission_lead_us=10000; buflo_exact_release_configured_guard_and_active_wait_lead_us=5000; buflo_exact_release_active_wait_poll=linux_aarch64_cntvct_el0_predictive_authoritative_watchdog_else_instant_authoritative_fallback; buflo_exact_release_counter_target_rounding=ceil; buflo_exact_release_counter_calibration=counter_instant_counter; buflo_exact_release_counter_is_predictive_with_periodic_authoritative_watchdog=true; buflo_exact_release_authoritative_watchdog_interval_successful_relaxed_reads=64; buflo_exact_release_authoritative_watchdog_dispatch_preserves_strict_half_open_transport_check=true; buflo_exact_release_authoritative_watchdog_cadence_validated_guards=count_dispatch_ready_production_guards_passing_exact_per_guard_cadence; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_reads=active_wait_iterations-2*counter_calibrations; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_bound=counter_calibrations=guards+early_confirmation_retries_and_64*checks<=remainder<64*(checks+guards)_and_remainder>=early_confirmation_retries; buflo_exact_release_zero_failure_empty_partition=zero_iterations_calibrations_checks_retries_dispatches; buflo_exact_release_remaining_success_guard_projection=subtract_worst_and_exact_retained_failure_then_same_remainder_bounds; buflo_exact_release_zero_failure_watchdog_dispatch_residue=dispatches<=checks_and_remainder-64*checks<=63*(guards-dispatches); buflo_exact_release_max_authoritative_sample_gap=consecutive_calibration_watchdog_or_final_authoritative_samples; buflo_exact_release_authoritative_counter_lag=max_authoritative_elapsed_minus_counter_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_authoritative_lead=max_counter_elapsed_minus_authoritative_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_frequency_hz_range_inclusive=1000000..4294967295; buflo_exact_release_counter_target_error=defensive_unreachable_for_valid_live_guard_and_frequency; buflo_exact_release_first_calibration_target_error=exactly_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_zero_calibration_counter_unavailable=one_or_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_counter_unavailable=scripted_trait_failure_not_architectural_trap_receipt; buflo_exact_release_production_counter_access=target_gated_live_smoke_test; buflo_exact_release_counter_frequency_change=hard_failure_before_transport_dispatch_and_before_success_metrics_mutation; buflo_exact_release_cross_guard_frequency_precedence=typed_wait_failure_preserved_dispatch_ready_retyped; buflo_exact_release_dispatch_confirmation=authoritative_instant; buflo_exact_release_transport_and_socket_clock=authoritative_instant; buflo_exact_release_counter_regression=hard_failure; buflo_exact_release_guard_metrics_recorded_before_result_propagation=true; buflo_exact_release_transport_dispatch_result_precedes_guard_metrics=true; buflo_exact_release_failure_authoritative_watchdog_cadence=successful_relaxed_reads_R_checks_floor_R_div_64; buflo_exact_release_failure_terminal_counter_reads=target_or_frequency_change_0_unavailable_or_nonmonotonic_1_or_2_C_eq_confirmations_plus_1_requires_1; buflo_exact_release_failure_retry_requires_successful_relaxed_read=true; buflo_exact_release_early_confirmation_retry_requires_positive_counter_nanoseconds=true; buflo_exact_release_failure_counter_comparison_absence=zero_watchdog_and_zero_confirmation_implies_zero_lag_and_lead; buflo_exact_release_sole_success_failure_projection=exact_saturating_sums_chronology_and_maxima; buflo_exact_release_retained_failure_exact_fields=iterations_active_duration_interruptions_interruption_nanoseconds_and_max_gap; buflo_exact_release_nullable_chronology_duration=adapter_window_exists_in_4999000_or_5000000_nanoseconds; buflo_exact_release_structural_count_partitions=checked_u64_exact_no_saturation; buflo_exact_release_histogram_integrity=max_bucket_and_coupled_G_plus_A_minus_H_times_50001; buflo_exact_release_remaining_histograms=subtract_exact_worst_and_failure; buflo_exact_release_remaining_success_duration=dispatch_bucket_floor_with_4999000ns_window; buflo_exact_incoming_retry_zero_drives_implies_zero_max_lateness=true; buflo_exact_release_predictive_interruptions=count_le_iterations_minus_anchor_and_nonmonotonic_or_calibrated_unavailable_failed_read_and_nanoseconds_le_counter";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 16;
+const BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 17;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS: &str =
-    "runner_schema16_retains_schema15_and_schema10_layout_for_non_kernel_metrics=true";
+    "runner_schema17_retains_schema16_schema15_and_schema10_layout_for_non_kernel_metrics=true";
 
 const BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE: &str =
     "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
@@ -6915,7 +6928,7 @@ impl RunnerWakeupMetrics {
                 })?;
             return Err(Error::SlotInvariant(detail));
         }
-        // Schema 16 retains the schema-15 and schema-10 fields for
+        // Schema 17 retains the schema-16, schema-15, and schema-10 fields for
         // compatibility. The kernel path never observes the superseded polling
         // source. Publish its neutral value only after proving that no legacy
         // exact-release metric was recorded.
@@ -18048,6 +18061,16 @@ fn buflo_exact_incoming_inventory_is_complete(
     Ok(complete)
 }
 
+#[cfg(target_os = "linux")]
+fn buflo_kernel_residual_incoming_credit_pending(
+    endpoints: &[Endpoint],
+    captured: &[BufloExactIncomingIdentity],
+) -> bool {
+    captured
+        .iter()
+        .any(|candidate| buflo_exact_incoming_identity_is_pending(endpoints, candidate))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "expiry must reconcile the exact slot, transport, controller, trace, and clock ownership boundary"
@@ -18779,7 +18802,17 @@ async fn drive_buflo_kernel_incoming_credit(
         }
         runtime.resolve_credit_identity(job_id, candidate, "coalesced-in-main-finalized", None)?;
     }
-    if captured.is_empty() {
+    // A same-endpoint exact main can carry every retained receive-credit
+    // identity itself.  In that case there is no residual owner turn to
+    // protect from the global reduction barrier, so reconcile the already
+    // physical main before consulting the current wall clock.  Confirmation
+    // and trace finalisation may resume after the strict window even though
+    // the packet was physically transmitted inside it.  Residual identities
+    // keep the historical outgoing-before-incoming ordering and defer the
+    // barrier until their one-shot owner turn has physically completed.
+    let residual_credit_pending =
+        buflo_kernel_residual_incoming_credit_pending(endpoints, &captured);
+    if !residual_credit_pending {
         reduce_buflo_kernel_exact_pair_output(
             guard,
             endpoints,
@@ -18791,7 +18824,7 @@ async fn drive_buflo_kernel_incoming_credit(
             &mut captured,
         )?;
         runtime.retain_credit_identities(job_id, &captured)?;
-        if captured.is_empty() {
+        if buflo_exact_incoming_inventory_is_complete(controller, &captured)? {
             runtime.complete_job(job_id)?;
             return Ok(());
         }
@@ -18803,12 +18836,30 @@ async fn drive_buflo_kernel_incoming_credit(
     let mut sent_owners = BTreeSet::new();
     let mut retained_callback = None;
     loop {
-        let current_tai_ns = runtime.current_tai_ns("incoming-credit phase sample")?;
-        let next_wake_tai_ns = match buflo_kernel_incoming_retry_step(
-            current_tai_ns,
+        refresh_buflo_kernel_exact_incoming_identities(
+            guard,
+            endpoints,
+            controller,
+            defense_start,
+            &mut captured,
+        )?;
+        runtime.retain_credit_identities(job_id, &captured)?;
+        // Completion is authoritative at the retained physical handoff time.
+        // Only genuinely unresolved work is compared with the current TAI
+        // sample; a later userspace scheduling delay cannot relabel an
+        // already-realised incoming opportunity as missed.
+        let inventory_complete = buflo_exact_incoming_inventory_is_complete(controller, &captured)?;
+        let retry = buflo_kernel_incoming_retry_after_inventory(
+            inventory_complete,
+            || runtime.current_tai_ns("incoming-credit phase sample"),
             release_tai_ns,
             deadline_tai_ns,
-        )? {
+        )?;
+        let Some(retry) = retry else {
+            runtime.complete_job(job_id)?;
+            return Ok(());
+        };
+        let next_wake_tai_ns = match retry {
             BufloKernelIncomingRetryStep::Open { next_wake_tai_ns } => next_wake_tai_ns,
             BufloKernelIncomingRetryStep::Pending => {
                 return Err(Error::DefenseExecution(format!(
@@ -18821,18 +18872,6 @@ async fn drive_buflo_kernel_incoming_credit(
                 )));
             }
         };
-        refresh_buflo_kernel_exact_incoming_identities(
-            guard,
-            endpoints,
-            controller,
-            defense_start,
-            &mut captured,
-        )?;
-        runtime.retain_credit_identities(job_id, &captured)?;
-        if buflo_exact_incoming_inventory_is_complete(controller, &captured)? {
-            runtime.complete_job(job_id)?;
-            return Ok(());
-        }
         let owners: BTreeSet<_> = captured
             .iter()
             .filter(|candidate| buflo_exact_incoming_identity_is_pending(endpoints, candidate))
@@ -28110,6 +28149,22 @@ mod tests {
         assert!(endpoints[0].prearmed_outgoing.is_empty());
         assert_eq!(endpoints[0].scheduled_outgoing.len(), 1);
         let outgoing_slot = endpoints[0].scheduled_outgoing[0].slot;
+        #[cfg(target_os = "linux")]
+        let kernel_guard = {
+            let scheduled = endpoints[0].scheduled_outgoing[0];
+            BufloExactReleaseGuard {
+                endpoint_index: 0,
+                endpoint: endpoints[0].id,
+                slot: scheduled.slot,
+                packet: scheduled.packet,
+                phase: BufloExactReleasePhase::Committed,
+                output_admission_at: dispatch_at,
+                guard_at: release_at,
+                active_wait_at: release_at,
+                release: adapter_release,
+                deadline: scheduled.deadline,
+            }
+        };
         assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 1);
         let pending_receive = endpoints[0].client.qcsd_pending_receive_action_identities();
         assert_eq!(pending_receive.len(), 1);
@@ -28134,6 +28189,22 @@ mod tests {
                 .contains(&(incoming_slot, incoming))
         );
         assert_eq!(controller.pending_slots().len(), 2);
+        #[cfg(target_os = "linux")]
+        let retained_kernel_credit = [super::BufloExactIncomingIdentity {
+            endpoint_index: 0,
+            endpoint: endpoints[0].id,
+            slot: incoming_slot,
+            packet: incoming,
+            identity: pending_receive[0],
+        }];
+        #[cfg(target_os = "linux")]
+        assert!(
+            super::buflo_kernel_residual_incoming_credit_pending(
+                &endpoints,
+                &retained_kernel_credit,
+            ),
+            "the retained identity is residual before the exact main is built"
+        );
 
         let just_before_adapter = adapter_release
             .checked_sub(Duration::from_nanos(1))
@@ -28186,7 +28257,91 @@ mod tests {
             buflo_unadvertised_scheduled_receive_credit_endpoints(&endpoints).is_empty(),
             "same-endpoint credit composed into the exact cell is never selected for a duplicate follow-up drive"
         );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !super::buflo_kernel_residual_incoming_credit_pending(
+                &endpoints,
+                &retained_kernel_credit,
+            ),
+            "the exact main clears the retained same-endpoint identity before reduction"
+        );
         assert_eq!(controller.pending_slots(), [(incoming_slot, incoming)]);
+
+        #[cfg(target_os = "linux")]
+        {
+            // Reproduce v115's decisive ordering seam: the exact main has
+            // physically carried the retained same-endpoint credit, while
+            // the controller still awaits reduction.  Physical chronology,
+            // rather than a later userspace resumption time, records its local
+            // realization exactly once. Peer consumption remains the separate
+            // terminal boundary for an incoming slot.
+            let physical_offset = Duration::from_micros(124);
+            let physical_elapsed = outgoing.timestamp() + physical_offset;
+            let mut raw_main = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+            raw_main.event_id = kernel_guard.slot.0;
+            raw_main.endpoint_index = kernel_guard.endpoint_index;
+            raw_main.endpoint = kernel_guard.endpoint;
+            let mut raw_job = synthetic_buflo_kernel_raw_job(vec![raw_main]);
+            raw_job.tick = kernel_guard.slot.0 / 2;
+            raw_job.release_tai_ns = 20_000_000;
+            raw_job.deadline_tai_ns = 25_000_000;
+            assert!(
+                super::timed_egress::clock_tai_ns().expect("sample deliberately late current TAI")
+                    >= raw_job.deadline_tai_ns,
+                "the direct regression must resume after the synthetic strict deadline"
+            );
+            let mut runtime = synthetic_buflo_kernel_runtime(
+                super::sample_buflo_kernel_clock_phase()
+                    .expect("sample synthetic runtime start clocks"),
+                None,
+                vec![raw_job],
+            );
+            let error = super::drive_buflo_kernel_incoming_credit(
+                0,
+                &kernel_guard,
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                &observation_clock,
+                started,
+                super::BufloKernelPhysicalTxTime {
+                    observed_at: adapter_release + physical_offset,
+                    defense_elapsed: physical_elapsed,
+                },
+                retained_kernel_credit.to_vec(),
+                &mut runtime,
+            )
+            .await
+            .expect_err("the synthetic runtime deliberately has no live helper to close");
+            assert!(
+                matches!(
+                    &error,
+                    Error::SlotInvariant(message)
+                        if message == "BuFLO helper was already shut down"
+                ),
+                "the completed physical inventory must reach helper close before consulting the late expiry clock: {error}"
+            );
+            assert_eq!(runtime.jobs[0].credit_identities.len(), 1);
+            assert_eq!(
+                runtime.jobs[0].credit_identities[0].resolution,
+                "coalesced-in-main-finalized"
+            );
+            assert_eq!(runtime.jobs[0].credit_identities[0].carrier_item_id, None);
+            assert_eq!(controller.pending_slots(), [(incoming_slot, incoming)]);
+            assert!(controller.incoming_slot_is_locally_realized(incoming_slot));
+            assert_eq!(
+                controller.terminal_slot_resolution_at(incoming_slot),
+                None,
+                "local advertisement is not falsely promoted to peer consumption"
+            );
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_advertised_bytes,
+                1_200
+            );
+        }
 
         drop(traces);
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule trace");
@@ -28200,7 +28355,7 @@ mod tests {
         assert_eq!(
             schedule_rows.len(),
             1,
-            "one terminal row for the exact cell"
+            "only the terminal outgoing cell is recorded before peer credit consumption"
         );
         let schedule_fields: Vec<_> = schedule_rows[0].split(',').collect();
         assert_eq!(
@@ -28398,6 +28553,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the cross-endpoint oracle keeps selection and direct strict-expiry preservation in one fixture"
+    )]
     async fn kernel_selection_stages_cross_endpoint_pair_on_one_transport_floor() {
         let output = trace_output_dir("kernel-selection-cross-endpoint-pair");
         let mut fixture = cross_endpoint_exact_pair_fixture(&output);
@@ -28458,6 +28617,66 @@ mod tests {
         assert_eq!(kernel_identities[0].endpoint, QcsdEndpointId(0));
         assert_eq!(kernel_identities[0].slot, fixture.incoming_slot);
         assert_eq!(guard.endpoint, QcsdEndpointId(1));
+        assert!(
+            super::buflo_kernel_residual_incoming_credit_pending(
+                &fixture.endpoints,
+                &kernel_identities,
+            ),
+            "cross-endpoint credit must defer the global reducer until its owner turn"
+        );
+        let mut raw_main = synthetic_buflo_kernel_raw_item("controller-and-trace-finalized");
+        raw_main.event_id = guard.slot.0;
+        raw_main.endpoint_index = guard.endpoint_index;
+        raw_main.endpoint = guard.endpoint;
+        let mut raw_job = synthetic_buflo_kernel_raw_job(vec![raw_main]);
+        raw_job.tick = guard.slot.0 / 2;
+        raw_job.release_tai_ns = 20_000_000;
+        raw_job.deadline_tai_ns = 25_000_000;
+        let mut runtime = synthetic_buflo_kernel_runtime(
+            super::sample_buflo_kernel_clock_phase()
+                .expect("sample synthetic runtime start clocks"),
+            None,
+            vec![raw_job],
+        );
+        _ = runtime
+            .arm()
+            .expect("arm the synthetic epoch before testing unresolved expiry");
+        let error = super::drive_buflo_kernel_incoming_credit(
+            0,
+            &guard,
+            &mut fixture.endpoints,
+            &mut fixture.controller,
+            None,
+            &mut fixture.traces,
+            &fixture.observation_clock,
+            fixture.defense_start,
+            super::BufloKernelPhysicalTxTime {
+                observed_at: fixture.release + Duration::from_micros(124),
+                defense_elapsed: fixture.tick + Duration::from_micros(124),
+            },
+            kernel_identities.clone(),
+            &mut runtime,
+        );
+        let error = error
+            .await
+            .expect_err("unresolved cross-endpoint credit must retain strict expiry");
+        assert!(
+            matches!(
+                &error,
+                Error::DefenseExecution(message)
+                    if message.contains("incoming credit exhausted its strict TAI window")
+            ),
+            "unresolved cross-endpoint credit must expire rather than reconcile through the main: {error}"
+        );
+        assert_eq!(runtime.jobs[0].credit_identities.len(), 1);
+        assert_eq!(runtime.jobs[0].credit_identities[0].resolution, "pending");
+        assert!(
+            super::buflo_kernel_residual_incoming_credit_pending(
+                &fixture.endpoints,
+                &kernel_identities,
+            ),
+            "expiry classification must not consume or mutate residual credit"
+        );
 
         drop(fixture);
         fs::remove_dir_all(output).expect("remove trace test directory");
@@ -39366,6 +39585,38 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn buflo_kernel_completed_incoming_inventory_precedes_current_tai_expiry() {
+        let release = 20_000_000_u64;
+        let deadline = release + 5_000_000;
+        let mut sampled = false;
+        let complete = super::buflo_kernel_incoming_retry_after_inventory(
+            true,
+            || {
+                sampled = true;
+                Ok(deadline)
+            },
+            release,
+            deadline,
+        )
+        .expect("completed inventory is terminal without a decision-clock sample");
+        assert_eq!(complete, None);
+        assert!(!sampled, "completed physical work must not sample expiry");
+
+        let unresolved = super::buflo_kernel_incoming_retry_after_inventory(
+            false,
+            || Ok(deadline),
+            release,
+            deadline,
+        )
+        .expect("unresolved inventory retains the half-open deadline");
+        assert_eq!(
+            unresolved,
+            Some(super::BufloKernelIncomingRetryStep::Expired)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn buflo_kernel_pre_epoch_elapsed_and_transport_floor_are_bounded() {
         let start_tai_ns = 30_000_000_u64;
         assert_eq!(
@@ -40282,8 +40533,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_seven_binds_diagnostic_expiry_and_strict_physical_gate() {
-        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 7);
+    fn buflo_kernel_schema_eight_binds_credit_reconciliation_and_strict_physical_gate() {
+        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 8);
         assert_eq!(super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION, 5);
         assert_eq!(super::BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION, 5);
 
@@ -40296,10 +40547,10 @@ mod tests {
         assert!(duration_as_u64_nanos(super::BUFLO_KERNEL_TX_REPORT_ALLOWANCE) > delta_ns);
         assert!(
             super::BUFLO_KERNEL_TX_SEMANTICS
-                .starts_with("client_only_buflo_kernel_timed_egress_v7;")
+                .starts_with("client_only_buflo_kernel_timed_egress_v8;")
         );
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
-            "schema7_retains_schema6_layout=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true;"
+            "schema8_retains_schema7_layout=true;main_coalesced_credit_without_residual_reconciled_at_proven_physical_time_before_current_tai_expiry=true;any_residual_pending_credit_defers_initial_global_reduction_until_first_residual_owner_turn=true;completed_credit_inventory_precedes_current_tai_expiry=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true;"
         ));
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
             "protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms;"
@@ -40397,7 +40648,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_seven_serializes_before_arm_and_on_item_failure() {
+    fn buflo_kernel_schema_eight_serializes_before_arm_and_on_item_failure() {
         let runtime_with_jobs = |jobs| {
             synthetic_buflo_kernel_runtime(
                 super::sample_buflo_kernel_clock_phase()
@@ -40707,9 +40958,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn terminal_render_error_is_embedded_without_erasing_schema_sixteen_kernel_evidence() {
+    fn terminal_render_error_is_embedded_without_erasing_schema_seventeen_kernel_evidence() {
+        assert_eq!(super::BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 17);
         let mut metrics = RunnerWakeupMetrics::new();
-        // Exercise schema-16 normalisation even on hosts whose production
+        // Exercise schema-17 normalisation even on hosts whose production
         // schema-10 default already uses the neutral fallback source.
         metrics.buflo_exact_release_active_wait_poll_source =
             BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
