@@ -25068,6 +25068,227 @@ mod tests {
         (endpoints, server, controller, incoming_slot, traces)
     }
 
+    struct CrossEndpointExactPairFixture {
+        observation_clock: QcsdObservationClock,
+        credit_server: neqo_http3::Http3Server,
+        outgoing_server: neqo_http3::Http3Server,
+        endpoints: Vec<super::Endpoint>,
+        controller: QcsdController,
+        traces: TraceFiles,
+        defense_start: Instant,
+        tick: Duration,
+        next: Packet,
+        incoming_slot: QcsdSlotId,
+        release: Instant,
+        tick_actions: Vec<QcsdAction>,
+    }
+
+    impl CrossEndpointExactPairFixture {
+        fn apply_tick_actions_at(&mut self, action_at: Instant) {
+            apply_action_batch(
+                &mut self.endpoints,
+                &mut self.controller,
+                None,
+                &mut self.traces,
+                action_at,
+                self.tick,
+                std::mem::take(&mut self.tick_actions),
+            )
+            .expect("apply outgoing-first paired tick");
+        }
+
+        fn committed_guard(&self) -> BufloExactReleaseGuard {
+            let scheduled = self.endpoints[1]
+                .scheduled_outgoing
+                .front()
+                .copied()
+                .expect("committed outgoing owner");
+            buflo_exact_release_guard_from_candidates(
+                true,
+                [BufloExactReleaseCandidate {
+                    endpoint_index: 1,
+                    endpoint: QcsdEndpointId(1),
+                    slot: scheduled.slot,
+                    packet: scheduled.packet,
+                    phase: BufloExactReleasePhase::Committed,
+                    release: scheduled.not_before,
+                    deadline: scheduled.deadline,
+                }],
+                BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+            )
+            .expect("valid committed exact-release candidate")
+            .expect("committed outgoing owner has a release guard")
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the shared connected fixture preserves one visible setup sequence for both kernel selection and legacy dispatch tests"
+    )]
+    fn cross_endpoint_exact_pair_fixture(output: &Path) -> CrossEndpointExactPairFixture {
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut credit_endpoint, mut credit_server) = connected_runner_endpoint_with_server(
+            output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        let (mut outgoing_endpoint, outgoing_server) = connected_runner_endpoint_with_server(
+            output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(1),
+            4_434,
+            5_000,
+        );
+        drop(outgoing_endpoint.client.qcsd_timestamped_observations());
+        let stream = open_controlled_runner_stream(
+            &mut credit_endpoint,
+            &mut credit_server,
+            started,
+            4_433,
+            10_000,
+        );
+        assert!(!credit_endpoint.client.qcsd_has_pending_stream_send());
+
+        let tick = Duration::from_millis(20);
+        let outgoing = Packet::new(tick, Direction::Outgoing, 1_200).expect("outgoing");
+        let incoming = Packet::new(tick, Direction::Incoming, 1_200).expect("incoming");
+        let next = Packet::new(tick * 2, Direction::Outgoing, 1_200).expect("next outgoing");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([outgoing, incoming, next]),
+                exact_incoming_window: true,
+            }),
+        )
+        .expect("paired rolling controller");
+        // Independent direction cursors start from the first eligible origin.
+        // Endpoint 1 is ready first for outgoing selection, while only the
+        // endpoint-0 application stream is eligible for incoming credit.
+        for endpoint in [QcsdEndpointId(1), QcsdEndpointId(0)] {
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: format!("https://127.0.0.1:{}", 4_433_u64 + endpoint.0),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let setup_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(setup_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket {
+                endpoint: QcsdEndpointId(1),
+                packet,
+                ..
+            } if *packet == outgoing
+        )));
+
+        // The test fixture handshakes at `test_fixture::now()`, one second
+        // ahead of physical monotonic time for NSS anti-replay tests.  Use the
+        // same instant for the defense epoch so the nondecreasing transport
+        // floor does not manufacture one second of controller lateness.
+        let defense_start = started;
+        let mut endpoints = vec![credit_endpoint, outgoing_endpoint];
+        endpoints[0].test_force_socket_handoff_success = true;
+        endpoints[1].test_force_socket_handoff_success = true;
+        let mut traces = TraceFiles::new(output, defense_start).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            defense_start,
+            Duration::ZERO,
+            setup_actions,
+        )
+        .expect("apply paired setup and outgoing prearm");
+        assert_eq!(endpoints[1].prearmed_outgoing.len(), 1);
+        let release = endpoints[1].prearmed_outgoing[0].not_before;
+
+        controller
+            .reconcile_due_rolling(tick)
+            .expect("commit paired tick");
+        let tick_actions: Vec<_> = controller.drain_actions().collect();
+        let outgoing_action_index = tick_actions
+            .iter()
+            .position(|action| {
+                matches!(
+                    action,
+                    QcsdAction::CommitPrearmedPacket {
+                        endpoint: QcsdEndpointId(1),
+                        packet,
+                        ..
+                    } if *packet == outgoing
+                )
+            })
+            .expect("outgoing commit");
+        let incoming_action_index = tick_actions
+            .iter()
+            .position(|action| {
+                matches!(
+                    action,
+                    QcsdAction::IncreaseReceiveLimit {
+                        endpoint: QcsdEndpointId(0),
+                        packet,
+                        ..
+                    } if *packet == incoming
+                )
+            })
+            .expect("cross-endpoint incoming opportunity");
+        assert!(
+            outgoing_action_index < incoming_action_index,
+            "controller action order remains outgoing before incoming"
+        );
+        assert!(tick_actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::PrearmPacket { packet, .. } if *packet == next
+        )));
+        let incoming_slot = tick_actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .expect("incoming slot");
+
+        CrossEndpointExactPairFixture {
+            observation_clock,
+            credit_server,
+            outgoing_server,
+            endpoints,
+            controller,
+            traces,
+            defense_start,
+            tick,
+            next,
+            incoming_slot,
+            release,
+            tick_actions,
+        }
+    }
+
     fn open_controlled_runner_stream(
         endpoint: &mut super::Endpoint,
         server: &mut neqo_http3::Http3Server,
@@ -25136,6 +25357,7 @@ mod tests {
             .client
             .stream_close_send(stream, transport_at)
             .expect("close clock-seam request send side");
+        drop(endpoint.client.qcsd_timestamped_observations());
     }
 
     fn outgoing_pair(packet: Packet) -> Packet {
@@ -27230,237 +27452,86 @@ mod tests {
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the connected two-origin oracle spans paired controller ordering, two socket handoffs, deferred reduction, and trace evidence"
-    )]
-    async fn exact_release_dispatch_orders_cross_endpoint_pair_inside_one_window() {
-        let output = trace_output_dir("exact-release-cross-endpoint-pair");
-        let started = test_fixture::now();
-        let observation_clock = QcsdObservationClock::new(started);
-        let (mut credit_endpoint, mut credit_server) = connected_runner_endpoint_with_server(
-            &output,
-            started,
-            &observation_clock,
-            QcsdEndpointId(0),
-            4_433,
-            5_000,
-        );
-        let (outgoing_endpoint, outgoing_server) = connected_runner_endpoint_with_server(
-            &output,
-            started,
-            &observation_clock,
-            QcsdEndpointId(1),
-            4_434,
-            5_000,
-        );
-        credit_endpoint.client.qcsd_enable_send_shaping(false);
-        let stream = open_controlled_runner_stream(
-            &mut credit_endpoint,
-            &mut credit_server,
-            started,
-            4_433,
-            10_000,
-        );
-        assert!(!credit_endpoint.client.qcsd_has_pending_stream_send());
-        credit_endpoint.client.qcsd_enable_send_shaping(true);
-        drop(credit_endpoint.client.qcsd_timestamped_observations());
-
-        let tick = Duration::from_millis(20);
-        let outgoing = Packet::new(tick, Direction::Outgoing, 1_200).expect("outgoing");
-        let incoming = Packet::new(tick, Direction::Incoming, 1_200).expect("incoming");
-        let next = Packet::new(tick * 2, Direction::Outgoing, 1_200).expect("next outgoing");
-        let mut controller = QcsdController::with_defense(
-            QcsdConfig {
-                control_interval_us: 5_000,
-                initial_max_stream_data: 16,
-                max_stream_data_excess: 1_000,
-                ..QcsdConfig::default()
-            },
-            None,
-            Box::new(RollingOutgoingSequence {
-                events: VecDeque::from([outgoing, incoming, next]),
-                exact_incoming_window: true,
-            }),
-        )
-        .expect("paired rolling controller");
-        // Independent direction cursors start from the first eligible origin.
-        // Endpoint 1 is ready first for outgoing selection, while only the
-        // endpoint-0 application stream is eligible for incoming credit.
-        for endpoint in [QcsdEndpointId(1), QcsdEndpointId(0)] {
-            controller.observe(
-                QcsdObservation::EndpointReady {
-                    endpoint,
-                    origin: format!("https://127.0.0.1:{}", 4_433_u64 + endpoint.0),
-                    max_udp_payload_size: 1_200,
-                },
-                Duration::ZERO,
-            );
-        }
-        controller.observe(
-            QcsdObservation::StreamOpened {
-                endpoint: QcsdEndpointId(0),
-                stream: QcsdStreamId(stream.as_u64()),
-                role: QcsdRequestRole::Application,
-                expected_response_length: Some(10_000),
-            },
-            Duration::ZERO,
-        );
-        controller.poll(Duration::ZERO);
-        let setup_actions: Vec<_> = controller.drain_actions().collect();
-        assert!(setup_actions.iter().any(|action| matches!(
-            action,
-            QcsdAction::PrearmPacket {
-                endpoint: QcsdEndpointId(1),
-                packet,
-                ..
-            } if *packet == outgoing
-        )));
-
-        let defense_start = now();
-        let mut endpoints = vec![credit_endpoint, outgoing_endpoint];
-        endpoints[0].test_force_socket_handoff_success = true;
-        endpoints[1].test_force_socket_handoff_success = true;
-        let mut traces = TraceFiles::new(&output, defense_start).expect("trace files");
-        apply_action_batch(
-            &mut endpoints,
-            &mut controller,
-            None,
-            &mut traces,
-            defense_start,
-            Duration::ZERO,
-            setup_actions,
-        )
-        .expect("apply paired setup and outgoing prearm");
-        assert_eq!(endpoints[1].prearmed_outgoing.len(), 1);
-        let release = endpoints[1].prearmed_outgoing[0].not_before;
-
-        controller
-            .reconcile_due_rolling(tick)
-            .expect("commit paired tick");
-        let tick_actions: Vec<_> = controller.drain_actions().collect();
-        let outgoing_action_index = tick_actions
-            .iter()
-            .position(|action| {
-                matches!(
-                    action,
-                    QcsdAction::CommitPrearmedPacket {
-                        endpoint: QcsdEndpointId(1),
-                        packet,
-                        ..
-                    } if *packet == outgoing
-                )
-            })
-            .expect("outgoing commit");
-        let incoming_action_index = tick_actions
-            .iter()
-            .position(|action| {
-                matches!(
-                    action,
-                    QcsdAction::IncreaseReceiveLimit {
-                        endpoint: QcsdEndpointId(0),
-                        packet,
-                        ..
-                    } if *packet == incoming
-                )
-            })
-            .expect("cross-endpoint incoming opportunity");
-        assert!(
-            outgoing_action_index < incoming_action_index,
-            "controller action order remains outgoing before incoming"
-        );
-        assert!(tick_actions.iter().any(|action| matches!(
-            action,
-            QcsdAction::PrearmPacket { packet, .. } if *packet == next
-        )));
-        let incoming_slot = tick_actions
-            .iter()
-            .find_map(|action| match action {
-                QcsdAction::IncreaseReceiveLimit { slot, .. } => Some(*slot),
-                _ => None,
-            })
-            .expect("incoming slot");
-        let selection_at = release
+    async fn kernel_selection_stages_cross_endpoint_pair_on_one_transport_floor() {
+        let output = trace_output_dir("kernel-selection-cross-endpoint-pair");
+        let mut fixture = cross_endpoint_exact_pair_fixture(&output);
+        let selection_at = fixture
+            .release
             .checked_sub(Duration::from_millis(5))
             .expect("release has one selection cutoff");
-        super::advance_endpoint_transport_floors(&mut endpoints, release);
-        apply_action_batch(
-            &mut endpoints,
-            &mut controller,
-            None,
-            &mut traces,
-            selection_at,
-            tick,
-            tick_actions,
-        )
-        .expect("apply outgoing-first paired tick");
-        let scheduled = endpoints[1]
-            .scheduled_outgoing
-            .front()
-            .copied()
-            .expect("committed outgoing owner");
-        let guard = buflo_exact_release_guard_from_candidates(
-            true,
-            [BufloExactReleaseCandidate {
-                endpoint_index: 1,
-                endpoint: QcsdEndpointId(1),
-                slot: scheduled.slot,
-                packet: scheduled.packet,
-                phase: BufloExactReleasePhase::Committed,
-                release: scheduled.not_before,
-                deadline: scheduled.deadline,
-            }],
-            BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
-        )
-        .expect("valid committed exact-release candidate")
-        .expect("committed outgoing owner has a release guard");
-        assert_eq!(guard.release, release);
-        assert_eq!(guard.deadline, release + Duration::from_millis(5));
-        assert_eq!(
-            guard.guard_at,
-            release
-                .checked_sub(Duration::from_millis(5))
-                .expect("release has one adapter-window predecessor")
+        super::advance_endpoint_transport_floors(&mut fixture.endpoints, fixture.release);
+        assert!(
+            fixture
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.transport_instant_floor == fixture.release),
+            "kernel selection projects every endpoint onto the same transport floor"
         );
+        fixture.apply_tick_actions_at(selection_at);
+        let guard = fixture.committed_guard();
+        assert_eq!(guard.release, fixture.release);
+        assert_eq!(guard.deadline, fixture.release + Duration::from_millis(5));
+        assert_eq!(guard.guard_at, selection_at);
         assert_eq!(guard.active_wait_at, guard.guard_at);
-        let next_prearm = endpoints
+        let next_prearm = fixture
+            .endpoints
             .iter()
             .flat_map(|endpoint| endpoint.prearmed_outgoing.iter())
-            .find(|prearm| prearm.packet == next)
+            .find(|prearm| prearm.packet == fixture.next)
             .expect("cross-endpoint next tick remains prearmed");
         assert_eq!(
             next_prearm.not_before,
-            release + tick,
+            fixture.release + fixture.tick,
             "all action owners share the current exact release as their Neqo base",
         );
 
-        let drifted_epoch = release
-            .checked_sub(tick + Duration::from_nanos(5_800_072))
+        let drifted_epoch = fixture
+            .release
+            .checked_sub(fixture.tick + Duration::from_nanos(5_800_072))
             .expect("synthetic epoch precedes the tick");
         assert!(matches!(
             buflo_exact_incoming_identities(
                 &guard,
-                &endpoints,
-                &controller,
+                &fixture.endpoints,
+                &fixture.controller,
                 drifted_epoch,
                 None,
             ),
             Err(Error::SlotInvariant(message))
                 if message.contains("adapter release skew")
         ));
-        assert_eq!(
-            super::buflo_kernel_exact_incoming_identities(
-                &guard,
-                &endpoints,
-                &controller,
-                drifted_epoch,
-                None,
-            )
-            .expect("kernel identity validation is independent of stale epoch Instant")
-            .len(),
-            1,
-        );
+        let kernel_identities = super::buflo_kernel_exact_incoming_identities(
+            &guard,
+            &fixture.endpoints,
+            &fixture.controller,
+            drifted_epoch,
+            None,
+        )
+        .expect("kernel identity validation is independent of stale epoch Instant");
+        assert_eq!(kernel_identities.len(), 1);
+        assert_eq!(kernel_identities[0].endpoint, QcsdEndpointId(0));
+        assert_eq!(kernel_identities[0].slot, fixture.incoming_slot);
+        assert_eq!(guard.endpoint, QcsdEndpointId(1));
+
+        drop(fixture);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the legacy connected oracle verifies dispatch, metrics, controller state, and both packet trace rows"
+    )]
+    async fn exact_release_dispatch_orders_cross_endpoint_pair_inside_one_window() {
+        let output = trace_output_dir("exact-release-cross-endpoint-pair");
+        let mut fixture = cross_endpoint_exact_pair_fixture(&output);
+        let release = fixture.release;
+        fixture.apply_tick_actions_at(release);
+        let guard = fixture.committed_guard();
+        assert_eq!(guard.release, release);
+        assert_eq!(guard.deadline, release + Duration::from_millis(5));
 
         let _logical_now = TestMonotonicNowOverride::fixed(guard.release);
         let exact_release_evidence =
@@ -27472,19 +27543,25 @@ mod tests {
         let mut metrics = RunnerWakeupMetrics::new();
         let dispatch_result = dispatch_buflo_exact_release(
             &guard,
-            &mut endpoints,
-            &mut controller,
+            &mut fixture.endpoints,
+            &mut fixture.controller,
             None,
-            &mut traces,
-            &observation_clock,
-            Some(defense_start),
+            &mut fixture.traces,
+            &fixture.observation_clock,
+            Some(fixture.defense_start),
             &mut metrics,
         )
         .await;
+        dispatch_result
+            .as_ref()
+            .expect("outgoing owner then incoming owner fit the same exact window");
         metrics
-            .record_buflo_exact_release_guard(&guard, Some(defense_start), &exact_release_evidence)
+            .record_buflo_exact_release_guard(
+                &guard,
+                Some(fixture.defense_start),
+                &exact_release_evidence,
+            )
             .expect("record production exact-release wait after transport dispatch");
-        dispatch_result.expect("outgoing owner then incoming owner fit the same exact window");
         assert_eq!(metrics.buflo_exact_release_guard_entries, 1);
         assert_eq!(metrics.buflo_exact_release_dispatch_ready_guards, 1);
         assert_eq!(metrics.buflo_exact_release_failed_guards, 0);
@@ -27492,12 +27569,17 @@ mod tests {
         assert_eq!(metrics.buflo_exact_incoming_retry_resolutions, 1);
         assert_eq!(metrics.wait_returns, 0);
         assert_eq!(metrics.timer_wakeups, 0);
-        assert!(controller.incoming_slot_is_locally_realized(incoming_slot));
-        assert!(!controller.has_due_rolling_reconciliation());
-        assert!(controller.drain_actions().next().is_none());
-        assert!(endpoints[1].scheduled_outgoing.is_empty());
+        assert!(
+            fixture
+                .controller
+                .incoming_slot_is_locally_realized(fixture.incoming_slot)
+        );
+        assert!(!fixture.controller.has_due_rolling_reconciliation());
+        assert!(fixture.controller.drain_actions().next().is_none());
+        assert!(fixture.endpoints[1].scheduled_outgoing.is_empty());
         assert_eq!(
-            endpoints
+            fixture
+                .endpoints
                 .iter()
                 .map(|endpoint| endpoint.prearmed_outgoing.len())
                 .sum::<usize>(),
@@ -27506,14 +27588,14 @@ mod tests {
         );
 
         terminalize_pending_slots(
-            &mut controller,
-            &mut traces,
+            &mut fixture.controller,
+            &mut fixture.traces,
             now(),
-            now().saturating_duration_since(defense_start),
+            now().saturating_duration_since(fixture.defense_start),
             MissedSlotReason::RunAborted,
         )
         .expect("terminalize unconsumed incoming credit");
-        drop(traces);
+        drop(fixture.traces);
         let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
         let mut packet_lines = packets.lines();
         let header: Vec<_> = packet_lines
@@ -27533,9 +27615,13 @@ mod tests {
         assert_eq!(rows[0][column("scheduled_target")], "1200");
         assert_eq!(rows[1][column("connection")], "0");
         assert_eq!(rows[1][column("satisfaction")], "unshaped");
-        let release_us = duration_as_trace_micros(release.saturating_duration_since(defense_start));
-        let deadline_us =
-            duration_as_trace_micros(guard.deadline.saturating_duration_since(defense_start));
+        let release_us =
+            duration_as_trace_micros(release.saturating_duration_since(fixture.defense_start));
+        let deadline_us = duration_as_trace_micros(
+            guard
+                .deadline
+                .saturating_duration_since(fixture.defense_start),
+        );
         for row in &rows {
             let sent_us = row[column("monotonic_us")]
                 .parse::<u64>()
@@ -27543,9 +27629,9 @@ mod tests {
             assert!(sent_us >= release_us && sent_us < deadline_us);
         }
 
-        drop(endpoints);
-        drop(credit_server);
-        drop(outgoing_server);
+        drop(fixture.endpoints);
+        drop(fixture.credit_server);
+        drop(fixture.outgoing_server);
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
