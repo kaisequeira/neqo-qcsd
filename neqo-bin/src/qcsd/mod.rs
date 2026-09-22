@@ -1828,6 +1828,51 @@ impl RunnerDefenseClock {
         }
     }
 
+    fn sample_boundary(
+        self,
+        defense_start: Instant,
+        observed_at: Instant,
+        boundary_elapsed: Duration,
+    ) -> Result<(Duration, bool), Error> {
+        match self {
+            Self::Monotonic => {
+                let boundary_at = defense_start.checked_add(boundary_elapsed).ok_or_else(|| {
+                    Error::DefenseExecution("defense semantic boundary overflow".into())
+                })?;
+                Ok((
+                    observed_at.saturating_duration_since(defense_start),
+                    observed_at >= boundary_at,
+                ))
+            }
+            #[cfg(target_os = "linux")]
+            Self::KernelTai {
+                start,
+                start_tai_ns,
+            } => {
+                if start != defense_start {
+                    return Err(Error::SlotInvariant(
+                        "BuFLO runner defense clock differed from the kernel epoch".into(),
+                    ));
+                }
+                let boundary_nanoseconds =
+                    u64::try_from(boundary_elapsed.as_nanos()).map_err(|_| {
+                        Error::DefenseExecution("BuFLO semantic boundary overflow".into())
+                    })?;
+                let boundary_tai_ns =
+                    start_tai_ns
+                        .checked_add(boundary_nanoseconds)
+                        .ok_or_else(|| {
+                            Error::DefenseExecution("BuFLO semantic boundary overflow".into())
+                        })?;
+                let current_tai_ns = buflo_decision_tai_ns("runner boundary sample")?;
+                Ok((
+                    buflo_kernel_defense_elapsed_at_tai(current_tai_ns, start_tai_ns),
+                    current_tai_ns >= boundary_tai_ns,
+                ))
+            }
+        }
+    }
+
     fn project_elapsed_hint(
         self,
         defense_start: Instant,
@@ -2790,10 +2835,6 @@ const fn buflo_kernel_tai_window_state(
 #[cfg(target_os = "linux")]
 const fn buflo_kernel_tai_boundary_reached(current_tai_ns: u64, boundary_tai_ns: u64) -> bool {
     current_tai_ns >= boundary_tai_ns
-}
-
-fn semantic_handoff_interrupt_crossed(wire_elapsed: Duration, interrupt_elapsed: Duration) -> bool {
-    wire_elapsed >= interrupt_elapsed
 }
 
 fn hard_unshaped_handoff_interrupt(
@@ -20235,13 +20276,12 @@ async fn process_output_once_with_clock(
         .filter_map(|attribution| attribution.satisfied.map(|target| target.deadline))
         .collect();
     target_deadlines.extend(absolute_handoff_deadline);
-    let (sent_at, late_handoff, semantic_wire_elapsed) = loop {
+    let (sent_at, late_handoff, semantic_wire_elapsed, semantic_interrupt_crossed) = loop {
         if let (Some(started), Some(interrupt_elapsed)) =
             (defense_start, semantic_handoff_interrupt)
-            && semantic_handoff_interrupt_crossed(
-                defense_clock.sample(started, monotonic_clock())?,
-                interrupt_elapsed,
-            )
+            && defense_clock
+                .sample_boundary(started, monotonic_clock(), interrupt_elapsed)?
+                .1
         {
             return Err(Error::DefenseExecution(
                 "BuFLO ordinary socket handoff reached its CLOCK_TAI semantic interrupt before send"
@@ -20275,22 +20315,42 @@ async fn process_output_once_with_clock(
             &mut *monotonic_clock,
         )? {
             SocketHandoff::Sent(sent_at) => {
-                let elapsed = match defense_start {
-                    Some(started) => Some(defense_clock.sample(started, sent_at)?),
-                    None => None,
+                let (elapsed, crossed) = match defense_start {
+                    Some(started) => match semantic_handoff_interrupt {
+                        Some(interrupt_elapsed) => {
+                            let (elapsed, crossed) = defense_clock.sample_boundary(
+                                started,
+                                sent_at,
+                                interrupt_elapsed,
+                            )?;
+                            (Some(elapsed), crossed)
+                        }
+                        None => (Some(defense_clock.sample(started, sent_at)?), false),
+                    },
+                    None => (None, false),
                 };
-                break (sent_at, None, elapsed);
+                break (sent_at, None, elapsed, crossed);
             }
             SocketHandoff::SentLate {
                 sent_at,
                 deadline,
                 boundary,
             } => {
-                let elapsed = match defense_start {
-                    Some(started) => Some(defense_clock.sample(started, sent_at)?),
-                    None => None,
+                let (elapsed, crossed) = match defense_start {
+                    Some(started) => match semantic_handoff_interrupt {
+                        Some(interrupt_elapsed) => {
+                            let (elapsed, crossed) = defense_clock.sample_boundary(
+                                started,
+                                sent_at,
+                                interrupt_elapsed,
+                            )?;
+                            (Some(elapsed), crossed)
+                        }
+                        None => (Some(defense_clock.sample(started, sent_at)?), false),
+                    },
+                    None => (None, false),
                 };
-                break (sent_at, Some((deadline, boundary)), elapsed);
+                break (sent_at, Some((deadline, boundary)), elapsed, crossed);
             }
             SocketHandoff::RetryUnshaped => {
                 if let (Some(started), Some(interrupt_elapsed)) =
@@ -20324,10 +20384,7 @@ async fn process_output_once_with_clock(
         semantic_wire_elapsed,
         sent_at,
     )?;
-    if let (Some(wire_elapsed), Some(interrupt_elapsed)) =
-        (semantic_wire_elapsed, semantic_handoff_interrupt)
-        && semantic_handoff_interrupt_crossed(wire_elapsed, interrupt_elapsed)
-    {
+    if semantic_interrupt_crossed {
         return Err(Error::DefenseExecution(
             "BuFLO ordinary socket handoff crossed its CLOCK_TAI semantic interrupt".into(),
         ));
@@ -31937,6 +31994,118 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
+    async fn kernel_tai_output_path_allows_tick_zero_before_future_epoch() {
+        let output = trace_output_dir("kernel-tai-output-pre-epoch");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        endpoint.test_force_socket_handoff_success = true;
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let start_tai_ns = 75_000_000_000_u64;
+        let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns - 1);
+        let mut monotonic_clock = || started;
+        assert_eq!(
+            super::process_output_once_with_clock(
+                &mut endpoint,
+                &mut controller,
+                &mut traces,
+                &observation_clock,
+                started,
+                Some(started),
+                Some(started),
+                None,
+                RunnerDefenseClock::KernelTai {
+                    start: started,
+                    start_tai_ns,
+                },
+                Some(Duration::ZERO),
+                &mut monotonic_clock,
+            )
+            .await
+            .expect("pre-epoch tick zero remains in the future"),
+            super::OutputDrive::Datagram,
+        );
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 2, "one pre-epoch datagram");
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn kernel_tai_output_path_records_send_before_post_handoff_boundary_failure() {
+        let output = trace_output_dir("kernel-tai-output-post-handoff-boundary");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        endpoint.test_force_socket_handoff_success = true;
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let start_tai_ns = 77_000_000_000_u64;
+        let interrupt = Duration::from_millis(5);
+        let boundary_tai_ns = start_tai_ns + 5_000_000;
+        let _tai =
+            super::TestBufloDecisionTaiOverride::sequence([boundary_tai_ns - 1, boundary_tai_ns]);
+        let mut monotonic_clock = || started;
+        let error = super::process_output_once_with_clock(
+            &mut endpoint,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            started,
+            Some(started),
+            Some(started),
+            None,
+            RunnerDefenseClock::KernelTai {
+                start: started,
+                start_tai_ns,
+            },
+            Some(interrupt),
+            &mut monotonic_clock,
+        )
+        .await
+        .expect_err("a handoff crossing the semantic boundary is a fidelity failure");
+        assert!(matches!(
+            error,
+            Error::DefenseExecution(message)
+                if message.contains("crossed its CLOCK_TAI semantic interrupt")
+                    && !message.contains("before send")
+        ));
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(
+            packets.lines().count(),
+            2,
+            "the successful datagram is retained before the fidelity error",
+        );
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
     async fn kernel_tai_output_path_rejects_exact_semantic_interrupt_before_send() {
         let output = trace_output_dir("kernel-tai-output-deadline");
         let started = test_fixture::now();
@@ -38426,22 +38595,50 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn buflo_kernel_handoff_uses_immediate_elapsed_and_retry_reprojects() {
-        let interrupt = Duration::from_millis(5);
-        let immediate_handoff = interrupt
-            .checked_sub(Duration::from_nanos(1))
-            .expect("interrupt has a predecessor");
-        let later_finalization = interrupt + Duration::from_millis(8);
-        assert!(!super::semantic_handoff_interrupt_crossed(
-            immediate_handoff,
-            interrupt,
-        ));
-        assert!(super::semantic_handoff_interrupt_crossed(
-            later_finalization,
-            interrupt,
-        ));
-
         let target_tai_ns = 500_000_000_u64;
         let first_physical = now();
+        let defense_clock = RunnerDefenseClock::KernelTai {
+            start: first_physical,
+            start_tai_ns: target_tai_ns,
+        };
+        {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(target_tai_ns.saturating_sub(1));
+            assert_eq!(
+                defense_clock
+                    .sample_boundary(first_physical, first_physical, Duration::ZERO)
+                    .expect("pre-epoch boundary sample"),
+                (Duration::ZERO, false),
+                "saturated elapsed zero does not mean that tick zero was reached",
+            );
+        }
+        {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(target_tai_ns);
+            assert_eq!(
+                defense_clock
+                    .sample_boundary(first_physical, first_physical, Duration::ZERO)
+                    .expect("at-epoch boundary sample"),
+                (Duration::ZERO, true),
+                "the half-open tick-zero boundary closes at the exact epoch",
+            );
+        }
+        {
+            let boundary = Duration::from_millis(5);
+            let boundary_nanoseconds =
+                u64::try_from(boundary.as_nanos()).expect("test boundary fits in u64");
+            let boundary_predecessor = boundary
+                .checked_sub(Duration::from_nanos(1))
+                .expect("test boundary has a predecessor");
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(
+                target_tai_ns + boundary_nanoseconds - 1,
+            );
+            assert_eq!(
+                defense_clock
+                    .sample_boundary(first_physical, first_physical, boundary)
+                    .expect("pre-boundary sample"),
+                (boundary_predecessor, false),
+                "a nonzero boundary remains open until its exact TAI instant",
+            );
+        }
         let stale_hint = super::buflo_kernel_project_tai_hint(
             first_physical,
             target_tai_ns - 2_000_000,
@@ -38460,6 +38657,48 @@ mod tests {
         assert!(
             fresh_hint > stale_hint,
             "WouldBlock retry uses a new mapping"
+        );
+    }
+
+    #[test]
+    fn monotonic_semantic_boundaries_distinguish_pre_epoch_and_exact_instants() {
+        let start = now();
+        let pre_epoch = start
+            .checked_sub(Duration::from_nanos(1))
+            .expect("test instant has a predecessor");
+        assert_eq!(
+            RunnerDefenseClock::Monotonic
+                .sample_boundary(start, pre_epoch, Duration::ZERO)
+                .expect("pre-epoch monotonic sample"),
+            (Duration::ZERO, false),
+        );
+        assert_eq!(
+            RunnerDefenseClock::Monotonic
+                .sample_boundary(start, start, Duration::ZERO)
+                .expect("exact monotonic epoch sample"),
+            (Duration::ZERO, true),
+        );
+        let boundary = Duration::from_millis(5);
+        let boundary_predecessor = boundary
+            .checked_sub(Duration::from_nanos(1))
+            .expect("test boundary has a predecessor");
+        let boundary_at = start
+            .checked_add(boundary)
+            .expect("test boundary does not overflow");
+        let pre_boundary = boundary_at
+            .checked_sub(Duration::from_nanos(1))
+            .expect("test boundary instant has a predecessor");
+        assert_eq!(
+            RunnerDefenseClock::Monotonic
+                .sample_boundary(start, pre_boundary, boundary)
+                .expect("pre-boundary monotonic sample"),
+            (boundary_predecessor, false),
+        );
+        assert_eq!(
+            RunnerDefenseClock::Monotonic
+                .sample_boundary(start, boundary_at, boundary)
+                .expect("exact monotonic boundary sample"),
+            (boundary, true),
         );
     }
 
