@@ -1325,19 +1325,19 @@ const BUFLO_KERNEL_TX_ARM_LEAD: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_SELECTION_CUTOFF: Duration = Duration::from_millis(5);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_ETF_DELTA: Duration = Duration::from_millis(4);
+const BUFLO_KERNEL_TX_ETF_DELTA: Duration = Duration::from_micros(4_500);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 3;
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 4;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 3;
+const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 4;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 3;
+const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 4;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v3; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; tx_sched_and_tx_software_are_linux_error_queue_timestamps; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v4; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
 #[cfg(target_os = "linux")]
@@ -5505,9 +5505,9 @@ impl RunnerWakeupMetrics {
         // legacy-metric exclusion. A validation failure must not erase the
         // helper/clock/packet evidence that explains the failed attempt.
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = 12;
+        self.schema_version = 13;
         self.semantics = format!(
-            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema12_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
+            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema13_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
         );
         if !self.legacy_buflo_metrics_neutral() {
             let detail =
@@ -5520,7 +5520,7 @@ impl RunnerWakeupMetrics {
                 })?;
             return Err(Error::SlotInvariant(detail));
         }
-        // Schema 12 retains the schema-10 fields for compatibility, but the
+        // Schema 13 retains the schema-10 fields for compatibility, but the
         // kernel path never observes the superseded user-space polling
         // source. Publish its neutral value only after proving that no legacy
         // exact-release metric was recorded.
@@ -36161,7 +36161,7 @@ mod tests {
             super::clock_offset_bounds(&end.realtime),
         )
         .expect("online end intersection");
-        assert_eq!(mapping.schema_version, 3);
+        assert_eq!(mapping.schema_version, 4);
         assert_eq!(
             mapping.effective_envelope_semantics,
             super::BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS
@@ -36764,7 +36764,7 @@ mod tests {
             ordinary_parent: "1:2",
             ordinary_handle: "10:",
             clock_id: "CLOCK_TAI",
-            delta_ns: 4_000_000,
+            delta_ns: 4_500_000,
             deadline_mode: false,
             offload: false,
             skip_socket_check: false,
@@ -36784,6 +36784,34 @@ mod tests {
             txtime_errors_enabled: true,
         };
         (runtime, qdisc, vec![(source, destination)])
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_schema_four_binds_etf_expiry_horizon() {
+        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 4);
+        assert_eq!(super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION, 4);
+        assert_eq!(super::BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION, 4);
+
+        let delta_ns = duration_as_u64_nanos(super::BUFLO_KERNEL_TX_ETF_DELTA);
+        assert_eq!(delta_ns, 4_500_000);
+        for adapter_window_ns in [4_999_000_u64, 5_000_000] {
+            assert!(delta_ns < adapter_window_ns);
+            assert!(adapter_window_ns - delta_ns >= 499_000);
+        }
+        assert!(
+            super::BUFLO_KERNEL_TX_SEMANTICS
+                .starts_with("client_only_buflo_kernel_timed_egress_v4;")
+        );
+        assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
+            "selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true;"
+        ));
+        assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
+            "tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true;"
+        ));
+
+        let (_, qdisc, _) = synthetic_buflo_helper_contracts();
+        assert_eq!(qdisc.delta_ns, delta_ns);
     }
 
     #[cfg(target_os = "linux")]
@@ -36811,7 +36839,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_nested_schema_two_serializes_before_arm_and_on_item_failure() {
+    fn buflo_kernel_schema_four_serializes_before_arm_and_on_item_failure() {
         let runtime_with_jobs = |jobs| {
             synthetic_buflo_kernel_runtime(
                 super::sample_buflo_kernel_clock_phase()
@@ -37055,8 +37083,16 @@ mod tests {
             "cleanup_errors": []
         });
         assert!(metrics.attach_buflo_kernel_tx_value(raw).is_err());
-        assert_eq!(metrics.schema_version, 12);
-        assert!(metrics.semantics.contains("buflo_kernel_tx_raw_semantics="));
+        assert_eq!(metrics.schema_version, 13);
+        assert!(
+            metrics
+                .semantics
+                .contains("runner_schema13_retains_schema10_layout_for_non_kernel_metrics=true")
+        );
+        assert!(metrics.semantics.contains(&format!(
+            "buflo_kernel_tx_raw_semantics={}",
+            super::BUFLO_KERNEL_TX_SEMANTICS
+        )));
         let retained = metrics
             .buflo_kernel_tx
             .expect("raw receipt remains attached");
@@ -37103,9 +37139,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn terminal_render_error_is_embedded_without_erasing_schema_twelve_kernel_evidence() {
+    fn terminal_render_error_is_embedded_without_erasing_schema_thirteen_kernel_evidence() {
         let mut metrics = RunnerWakeupMetrics::new();
-        // Exercise schema-12 normalisation even on hosts whose production
+        // Exercise schema-13 normalisation even on hosts whose production
         // schema-10 default already uses the neutral fallback source.
         metrics.buflo_exact_release_active_wait_poll_source =
             BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
@@ -37188,7 +37224,7 @@ mod tests {
             receipt["terminal_evidence_render_errors"][0],
             render_errors[0]
         );
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 12);
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 13);
         assert_eq!(receipt["runner_wakeup_metrics"]["buflo_kernel_tx"], raw);
     }
 }

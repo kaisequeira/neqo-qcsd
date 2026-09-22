@@ -3724,28 +3724,12 @@ fn decode_error_queue_message(message: &libc::msghdr) -> Result<KernelTxEvent, T
         });
     }
     if error.ee_origin == SO_EE_ORIGIN_TXTIME {
-        if timestamp.is_some() {
-            return Err(TimedEgressError::MalformedAncillary(
-                "TXTIME drop unexpectedly carried timestamp data".into(),
-            ));
-        }
-        let kind = match error.ee_code {
-            SO_EE_CODE_TXTIME_INVALID_PARAM => TxtimeDropKind::InvalidParameter,
-            SO_EE_CODE_TXTIME_MISSED => TxtimeDropKind::Missed,
-            other => {
-                return Err(TimedEgressError::MalformedAncillary(format!(
-                    "unknown TXTIME ee_code={other}"
-                )));
-            }
-        };
-        return Ok(KernelTxEvent::TxtimeDrop(TxtimeDropDiagnostic {
-            family,
-            errno: error.ee_errno,
-            kind,
-            // Linux encodes the low word in ee_info and high word in ee_data.
-            // No SO_TIMESTAMPING OPT_ID is available for this origin.
-            requested_txtime_tai_ns: (u64::from(error.ee_data) << 32) | u64::from(error.ee_info),
-        }));
+        let timestamp = timestamp.ok_or_else(|| {
+            TimedEgressError::MalformedAncillary(
+                "TXTIME drop lacked required SCM_TIMESTAMPING".into(),
+            )
+        })?;
+        return decode_txtime_drop(family, error, &timestamp).map(KernelTxEvent::TxtimeDrop);
     }
     if timestamp.is_some() {
         return Err(TimedEgressError::MalformedAncillary(format!(
@@ -3762,6 +3746,64 @@ fn decode_error_queue_message(message: &libc::msghdr) -> Result<KernelTxEvent, T
         info: error.ee_info,
         data: error.ee_data,
     }))
+}
+
+fn decode_txtime_drop(
+    family: SocketFamily,
+    error: libc::sock_extended_err,
+    timestamp: &ScmTimestamping,
+) -> Result<TxtimeDropDiagnostic, TimedEgressError> {
+    let (kind, expected_errno) = match error.ee_code {
+        SO_EE_CODE_TXTIME_INVALID_PARAM => (TxtimeDropKind::InvalidParameter, libc::EINVAL),
+        SO_EE_CODE_TXTIME_MISSED => (TxtimeDropKind::Missed, libc::ECANCELED),
+        other => {
+            return Err(TimedEgressError::MalformedAncillary(format!(
+                "unknown TXTIME ee_code={other}"
+            )));
+        }
+    };
+    if error.ee_errno != expected_errno.cast_unsigned() {
+        return Err(TimedEgressError::MalformedAncillary(format!(
+            "TXTIME code {} carried errno {}, expected {expected_errno}",
+            error.ee_code, error.ee_errno
+        )));
+    }
+    if error.ee_type != 0 || error.ee_pad != 0 {
+        return Err(TimedEgressError::MalformedAncillary(format!(
+            "TXTIME drop carried nonzero type={} or pad={}",
+            error.ee_type, error.ee_pad
+        )));
+    }
+
+    // ETF clones a dropped skb without clearing its requested CLOCK_TAI
+    // skb->tstamp.  Because this socket enables SOF_TIMESTAMPING_SOFTWARE,
+    // generic error-queue handling emits that requested txtime in
+    // SCM_TIMESTAMPING ts[0].  It is correlation evidence for the drop and
+    // must never be interpreted as TX_SOFTWARE or successful transmission.
+    let requested_txtime_tai_ns = (u64::from(error.ee_data) << 32) | u64::from(error.ee_info);
+    let timestamp_txtime_tai_ns = timespec_ns(timestamp.ts[0])?;
+    if timestamp_txtime_tai_ns != requested_txtime_tai_ns {
+        return Err(TimedEgressError::MalformedAncillary(format!(
+            "TXTIME drop timestamp {timestamp_txtime_tai_ns} did not match requested txtime {requested_txtime_tai_ns}"
+        )));
+    }
+    if timestamp.ts[1].tv_sec != 0
+        || timestamp.ts[1].tv_nsec != 0
+        || timestamp.ts[2].tv_sec != 0
+        || timestamp.ts[2].tv_nsec != 0
+    {
+        return Err(TimedEgressError::MalformedAncillary(
+            "TXTIME drop carried unexpected non-software timestamp slots".into(),
+        ));
+    }
+    Ok(TxtimeDropDiagnostic {
+        family,
+        errno: error.ee_errno,
+        kind,
+        // Linux encodes the low word in ee_info and high word in ee_data.
+        // No SO_TIMESTAMPING OPT_ID is available for this origin.
+        requested_txtime_tai_ns,
+    })
 }
 
 fn read_cmsg<T: Copy>(cmsg: *const libc::cmsghdr, data_len: usize) -> Result<T, TimedEgressError> {
@@ -4105,6 +4147,75 @@ mod tests {
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = control.len();
         decode_error_queue_message(&message)
+    }
+
+    fn txtime_timestamp(requested_txtime_tai_ns: u64) -> ScmTimestamping {
+        ScmTimestamping {
+            ts: [
+                libc::timespec {
+                    tv_sec: libc::time_t::try_from(requested_txtime_tai_ns / 1_000_000_000)
+                        .expect("seconds fit time_t"),
+                    tv_nsec: libc::c_long::try_from(requested_txtime_tai_ns % 1_000_000_000)
+                        .expect("nanoseconds fit c_long"),
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            ],
+        }
+    }
+
+    fn txtime_error(
+        requested_txtime_tai_ns: u64,
+        code: u8,
+        errno: libc::c_int,
+    ) -> libc::sock_extended_err {
+        libc::sock_extended_err {
+            ee_errno: u32::try_from(errno).expect("positive errno"),
+            ee_origin: SO_EE_ORIGIN_TXTIME,
+            ee_type: 0,
+            ee_code: code,
+            ee_pad: 0,
+            ee_info: u32::try_from(requested_txtime_tai_ns & u64::from(u32::MAX))
+                .expect("low word"),
+            ee_data: u32::try_from(requested_txtime_tai_ns >> 32).expect("high word"),
+        }
+    }
+
+    fn txtime_control(
+        level: libc::c_int,
+        error: libc::sock_extended_err,
+        timestamp: Option<&ScmTimestamping>,
+        timestamp_first: bool,
+    ) -> ControlBuffer<32> {
+        let mut control = ControlBuffer::<32>::new();
+        if timestamp_first && let Some(timestamp) = timestamp {
+            control
+                .push(libc::SOL_SOCKET, libc::SCM_TIMESTAMPING, *timestamp)
+                .expect("timestamp");
+        }
+        control
+            .push(
+                level,
+                if level == libc::SOL_IP {
+                    libc::IP_RECVERR
+                } else {
+                    libc::IPV6_RECVERR
+                },
+                error,
+            )
+            .expect("extended error");
+        if !timestamp_first && let Some(timestamp) = timestamp {
+            control
+                .push(libc::SOL_SOCKET, libc::SCM_TIMESTAMPING, *timestamp)
+                .expect("timestamp");
+        }
+        control
     }
 
     fn control_message_layout<const WORDS: usize>(
@@ -4958,39 +5069,31 @@ mod tests {
 
     #[test]
     fn decodes_txtime_missed_and_invalid_parameter_drops() {
-        for (level, code, kind) in [
+        for (level, requested_txtime_tai_ns, code, errno, kind, timestamp_first) in [
             (
                 libc::SOL_IP,
+                1_790_061_466_219_487_402,
                 SO_EE_CODE_TXTIME_MISSED,
+                libc::ECANCELED,
                 TxtimeDropKind::Missed,
+                true,
             ),
             (
                 libc::SOL_IPV6,
+                1_234_567_890_123_456_789,
                 SO_EE_CODE_TXTIME_INVALID_PARAM,
+                libc::EINVAL,
                 TxtimeDropKind::InvalidParameter,
+                false,
             ),
         ] {
-            let error = libc::sock_extended_err {
-                ee_errno: libc::ECANCELED as u32,
-                ee_origin: SO_EE_ORIGIN_TXTIME,
-                ee_type: 0,
-                ee_code: code,
-                ee_pad: 0,
-                ee_info: 0x1234_5678,
-                ee_data: 0x90ab_cdef,
-            };
-            let mut control = ControlBuffer::<32>::new();
-            control
-                .push(
-                    level,
-                    if level == libc::SOL_IP {
-                        libc::IP_RECVERR
-                    } else {
-                        libc::IPV6_RECVERR
-                    },
-                    error,
-                )
-                .expect("extended error");
+            let error = txtime_error(requested_txtime_tai_ns, code, errno);
+            let mut control = txtime_control(
+                level,
+                error,
+                Some(&txtime_timestamp(requested_txtime_tai_ns)),
+                timestamp_first,
+            );
             assert_eq!(
                 decode_control(&mut control).expect("decode"),
                 KernelTxEvent::TxtimeDrop(TxtimeDropDiagnostic {
@@ -4999,12 +5102,240 @@ mod tests {
                     } else {
                         SocketFamily::Ipv6
                     },
-                    errno: libc::ECANCELED as u32,
+                    errno: u32::try_from(errno).expect("positive errno"),
                     kind,
-                    requested_txtime_tai_ns: 0x90ab_cdef_1234_5678,
+                    requested_txtime_tai_ns,
                 })
             );
         }
+    }
+
+    #[test]
+    fn decodes_v108_txtime_words_without_round_trip_encoding() {
+        let requested_txtime_tai_ns = 1_790_061_466_219_487_402_u64;
+        let error = libc::sock_extended_err {
+            ee_errno: libc::ECANCELED as u32,
+            ee_origin: SO_EE_ORIGIN_TXTIME,
+            ee_type: 0,
+            ee_code: SO_EE_CODE_TXTIME_MISSED,
+            ee_pad: 0,
+            // Exact words preserved from the v108 failure receipt.  Keep
+            // these literal so an encode/decode word-order swap cannot make
+            // the regression vector pass by construction.
+            ee_info: 0x5c20_a0aa,
+            ee_data: 0x18d7_936b,
+        };
+        let mut control = txtime_control(
+            libc::SOL_IP,
+            error,
+            Some(&txtime_timestamp(requested_txtime_tai_ns)),
+            false,
+        );
+        assert_eq!(
+            decode_control(&mut control).expect("decode exact v108 vector"),
+            KernelTxEvent::TxtimeDrop(TxtimeDropDiagnostic {
+                family: SocketFamily::Ipv4,
+                errno: libc::ECANCELED as u32,
+                kind: TxtimeDropKind::Missed,
+                requested_txtime_tai_ns,
+            })
+        );
+    }
+
+    #[test]
+    fn txtime_drop_timestamp_is_context_not_transmit_evidence() {
+        let requested_txtime_tai_ns = 12_000_000_034_u64;
+        let error = txtime_error(
+            requested_txtime_tai_ns,
+            SO_EE_CODE_TXTIME_MISSED,
+            libc::ECANCELED,
+        );
+        for (timestamping, expected_detail) in [
+            (
+                ScmTimestamping {
+                    ts: [
+                        libc::timespec {
+                            tv_sec: 12,
+                            tv_nsec: 35,
+                        },
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        },
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        },
+                    ],
+                },
+                "did not match requested txtime",
+            ),
+            (
+                ScmTimestamping {
+                    ts: [
+                        libc::timespec {
+                            tv_sec: 12,
+                            tv_nsec: 34,
+                        },
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 1,
+                        },
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        },
+                    ],
+                },
+                "unexpected non-software timestamp slots",
+            ),
+            (
+                ScmTimestamping {
+                    ts: [
+                        libc::timespec {
+                            tv_sec: 12,
+                            tv_nsec: 34,
+                        },
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        },
+                        libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 1,
+                        },
+                    ],
+                },
+                "unexpected non-software timestamp slots",
+            ),
+        ] {
+            let mut control = txtime_control(libc::SOL_IP, error, Some(&timestamping), true);
+            assert!(matches!(
+                decode_control(&mut control),
+                Err(TimedEgressError::MalformedAncillary(detail))
+                    if detail.contains(expected_detail)
+            ));
+        }
+    }
+
+    #[test]
+    fn txtime_drop_rejects_missing_or_inconsistent_kernel_context() {
+        let requested_txtime_tai_ns = 12_000_000_034_u64;
+        let valid_timestamp = txtime_timestamp(requested_txtime_tai_ns);
+        let valid_error = txtime_error(
+            requested_txtime_tai_ns,
+            SO_EE_CODE_TXTIME_MISSED,
+            libc::ECANCELED,
+        );
+
+        let mut missing = txtime_control(libc::SOL_IP, valid_error, None, false);
+        assert!(matches!(
+            decode_control(&mut missing),
+            Err(TimedEgressError::MalformedAncillary(detail))
+                if detail.contains("lacked required SCM_TIMESTAMPING")
+        ));
+
+        let mut wrong_errno = valid_error;
+        wrong_errno.ee_errno = libc::EINVAL as u32;
+        let mut wrong_errno =
+            txtime_control(libc::SOL_IP, wrong_errno, Some(&valid_timestamp), false);
+        assert!(matches!(
+            decode_control(&mut wrong_errno),
+            Err(TimedEgressError::MalformedAncillary(detail))
+                if detail.contains("expected")
+        ));
+
+        let mut nonzero_type = valid_error;
+        nonzero_type.ee_type = 1;
+        let mut nonzero_pad = valid_error;
+        nonzero_pad.ee_pad = 1;
+        for malformed in [nonzero_type, nonzero_pad] {
+            let mut control = txtime_control(libc::SOL_IP, malformed, Some(&valid_timestamp), true);
+            assert!(matches!(
+                decode_control(&mut control),
+                Err(TimedEgressError::MalformedAncillary(detail))
+                    if detail.contains("nonzero type")
+            ));
+        }
+
+        let mut unknown_code = valid_error;
+        unknown_code.ee_code = u8::MAX;
+        let mut unknown_code =
+            txtime_control(libc::SOL_IP, unknown_code, Some(&valid_timestamp), true);
+        assert!(matches!(
+            decode_control(&mut unknown_code),
+            Err(TimedEgressError::MalformedAncillary(detail))
+                if detail.contains("unknown TXTIME ee_code")
+        ));
+    }
+
+    #[test]
+    fn decoded_txtime_drop_is_terminal_and_never_becomes_tx_software() {
+        let requested_txtime_tai_ns = 123_u64;
+        let error = txtime_error(
+            requested_txtime_tai_ns,
+            SO_EE_CODE_TXTIME_MISSED,
+            libc::ECANCELED,
+        );
+        let mut control = txtime_control(
+            libc::SOL_IP,
+            error,
+            Some(&txtime_timestamp(requested_txtime_tai_ns)),
+            true,
+        );
+        let event = decode_control(&mut control).expect("typed TXTIME drop");
+        let expected = TxtimeDropDiagnostic {
+            family: SocketFamily::Ipv4,
+            errno: libc::ECANCELED as u32,
+            kind: TxtimeDropKind::Missed,
+            requested_txtime_tai_ns,
+        };
+        assert_eq!(event, KernelTxEvent::TxtimeDrop(expected.clone()));
+
+        let mut socket = pending_socket();
+        assert!(
+            socket
+                .observe_event(timestamp_event(TimestampKind::Scheduled, 7, 1_000))
+                .expect("scheduled")
+                .is_none()
+        );
+        let failure = socket
+            .observe_event(event)
+            .expect_err("drop must be terminal");
+        assert!(matches!(&failure, TimedEgressError::TxtimeDrop(value) if *value == expected));
+        assert_eq!(failure.terminal_error_code(), "txtime_missed");
+        let pending = socket
+            .pending
+            .expect("failed pending receipt remains available");
+        assert_eq!(pending.tx_sched_realtime_ns, Some(1_000));
+        assert_eq!(pending.tx_software_realtime_ns, None);
+        assert!(matches!(
+            socket.ensure_usable(),
+            Err(TimedEgressError::Poisoned(_))
+        ));
+
+        let mismatched_txtime_tai_ns = requested_txtime_tai_ns + 1;
+        let mismatch_error = txtime_error(
+            mismatched_txtime_tai_ns,
+            SO_EE_CODE_TXTIME_MISSED,
+            libc::ECANCELED,
+        );
+        let mut mismatch_control = txtime_control(
+            libc::SOL_IP,
+            mismatch_error,
+            Some(&txtime_timestamp(mismatched_txtime_tai_ns)),
+            false,
+        );
+        let mismatch_event = decode_control(&mut mismatch_control).expect("typed mismatch drop");
+        let mut mismatch_socket = pending_socket();
+        assert!(matches!(
+            mismatch_socket.observe_event(mismatch_event),
+            Err(TimedEgressError::TxtimeDropMismatch {
+                expected: 123,
+                observed: 124,
+                ..
+            })
+        ));
     }
 
     #[test]
