@@ -1331,17 +1331,17 @@ const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 4;
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 4;
+const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 4;
+const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v4; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v5; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS: &str = "start_and_end_clock_phases_plus_every_explicit_per_item_post_tx_clock_phase; every_clock_phase_subsample_and_instant_alignment_bracket_is_at_most_250us; effective_monotonic_offset_is_a_nonfatal_diagnostic_union_and_max_observed_offset_drift_is_the_exact_maximum_start_relative_midpoint_drift_across_both_clocks_and_all_retained_phases; each_enqueue_TAI_interval_is_direct_send_sequence_evidence_and_must_be_ordered; each_enqueue_MONOTONIC_and_TAI_upper_must_precede_its_post_TX_phase_in_their_respective_clock_frames; enqueue_to_post_TX_MONOTONIC_offset_overlap_is_diagnostic_not_a_hard_gate; realtime_offset_is_the_nonempty_running_intersection_used_online_and_recomputed_exactly_at_finalization; final_realtime_interval_must_be_contained_by_every_provisional_interval; direct_enqueue_TAI_before_release_and_causal_order_predicates_remain_hard_gates; incoming_TX_lower_must_not_precede_its_enqueue_TAI_lower";
+const BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS: &str = "start_and_end_clock_phases_plus_every_explicit_per_item_post_tx_clock_phase; every_clock_phase_subsample_and_instant_alignment_bracket_is_at_most_250us; effective_monotonic_offset_is_a_nonfatal_diagnostic_union_and_max_observed_offset_drift_is_the_exact_maximum_start_relative_midpoint_drift_across_both_clocks_and_all_retained_phases; each_enqueue_TAI_interval_is_direct_send_sequence_evidence_and_must_be_ordered; each_enqueue_MONOTONIC_and_TAI_upper_must_precede_its_post_TX_phase_in_their_respective_clock_frames; enqueue_to_post_TX_MONOTONIC_offset_overlap_is_diagnostic_not_a_hard_gate; realtime_offset_is_the_nonempty_running_intersection_used_online_and_recomputed_exactly_at_finalization; final_realtime_interval_must_be_contained_by_every_provisional_interval; direct_enqueue_TAI_before_release_and_causal_order_predicates_remain_hard_gates; incoming_TX_lower_must_not_precede_its_enqueue_TAI_lower; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI";
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1737,6 +1737,175 @@ struct BufloKernelEpoch {
     instant_anchor: BufloKernelInstantAnchor,
     tick_zero_application_ready: bool,
     tick_zero_staged: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufloKernelPhysicalTxTime {
+    /// Best available physical timestamp in the process monotonic frame.  It
+    /// remains useful for packet/observation chronology, but is never used to
+    /// advance the defense state machine because WSL can step this mapping.
+    observed_at: Instant,
+    /// Conservative semantic time: the upper edge of the proven physical TX
+    /// interval relative to the immutable TAI defense epoch.
+    defense_elapsed: Duration,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufloKernelTaiWindowState {
+    Pending,
+    Open,
+    Expired,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufloKernelIncomingRetryStep {
+    Pending,
+    Open { next_wake_tai_ns: u64 },
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerDefenseClock {
+    Monotonic,
+    #[cfg(target_os = "linux")]
+    KernelTai {
+        start: Instant,
+        start_tai_ns: u64,
+    },
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_decision_tai_ns(context: &str) -> Result<u64, Error> {
+    #[cfg(test)]
+    if let Some(value) = TEST_BUFLO_DECISION_TAI_NS_OVERRIDE.with(|clock| {
+        let mut clock = clock.borrow_mut();
+        let samples = clock.as_mut()?;
+        let value = *samples.front()?;
+        if samples.len() > 1 {
+            _ = samples.pop_front();
+        }
+        Some(value)
+    }) {
+        return Ok(value);
+    }
+    timed_egress::clock_tai_ns().map_err(|error| buflo_kernel_timed_error(context, error))
+}
+
+impl RunnerDefenseClock {
+    const fn uses_kernel_tai(self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self, Self::KernelTai { .. })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    fn sample(self, defense_start: Instant, observed_at: Instant) -> Result<Duration, Error> {
+        match self {
+            Self::Monotonic => Ok(observed_at.saturating_duration_since(defense_start)),
+            #[cfg(target_os = "linux")]
+            Self::KernelTai {
+                start,
+                start_tai_ns,
+            } => {
+                if start != defense_start {
+                    return Err(Error::SlotInvariant(
+                        "BuFLO runner defense clock differed from the kernel epoch".into(),
+                    ));
+                }
+                let current_tai_ns = buflo_decision_tai_ns("runner clock sample")?;
+                Ok(buflo_kernel_defense_elapsed_at_tai(
+                    current_tai_ns,
+                    start_tai_ns,
+                ))
+            }
+        }
+    }
+
+    fn project_elapsed_hint(
+        self,
+        defense_start: Instant,
+        target_elapsed: Duration,
+        observed_at: Instant,
+    ) -> Result<Instant, Error> {
+        match self {
+            Self::Monotonic => defense_start.checked_add(target_elapsed).ok_or_else(|| {
+                Error::DefenseExecution("defense wake-hint deadline overflow".into())
+            }),
+            #[cfg(target_os = "linux")]
+            Self::KernelTai {
+                start,
+                start_tai_ns,
+            } => {
+                if start != defense_start {
+                    return Err(Error::SlotInvariant(
+                        "BuFLO runner defense clock differed from the kernel epoch".into(),
+                    ));
+                }
+                let current_tai_ns = buflo_decision_tai_ns("runner wake-hint sample")?;
+                let target_tai_ns = start_tai_ns
+                    .checked_add(duration_as_u64_nanos(target_elapsed))
+                    .ok_or_else(|| {
+                        Error::DefenseExecution("BuFLO semantic wake-hint overflow".into())
+                    })?;
+                buflo_kernel_project_tai_hint(observed_at, current_tai_ns, target_tai_ns)
+            }
+        }
+    }
+
+    fn project_buflo_ordinary_guard_hints(
+        self,
+        defense_start: Instant,
+        guard: &BufloExactReleaseGuard,
+        observed_at: Instant,
+    ) -> Result<BufloOrdinaryOutputGuard, Error> {
+        let Self::KernelTai {
+            start,
+            start_tai_ns,
+        } = self
+        else {
+            return Ok(BufloOrdinaryOutputGuard::from(*guard));
+        };
+        if start != defense_start {
+            return Err(Error::SlotInvariant(
+                "BuFLO runner defense clock differed from the kernel epoch".into(),
+            ));
+        }
+        let current_tai_ns = buflo_decision_tai_ns("guard projection sample")?;
+        project_buflo_ordinary_guard_hints_from_sample(
+            start_tai_ns,
+            guard.packet.timestamp(),
+            current_tai_ns,
+            observed_at,
+        )
+    }
+
+    fn closed_output_wakeup(
+        self,
+        boundary: &OutputWorkBoundary,
+        current: Instant,
+    ) -> Result<Option<Instant>, Error> {
+        #[cfg(target_os = "linux")]
+        if let Self::KernelTai { .. } = self {
+            let admission_tai_ns = boundary.kernel_admission_tai_ns.ok_or_else(|| {
+                Error::SlotInvariant(
+                    "BuFLO kernel ordinary-work boundary lacked its TAI admission authority".into(),
+                )
+            })?;
+            let current_tai_ns = buflo_decision_tai_ns("ordinary-work admission TAI sample")?;
+            return Ok(
+                buflo_kernel_tai_boundary_reached(current_tai_ns, admission_tai_ns)
+                    .then_some(boundary.resume_at),
+            );
+        }
+        Ok(boundary.closed_wakeup(current))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2604,6 +2773,149 @@ const fn buflo_kernel_interval_within_half_open_window(
 }
 
 #[cfg(target_os = "linux")]
+const fn buflo_kernel_tai_window_state(
+    current_tai_ns: u64,
+    not_before_tai_ns: u64,
+    deadline_tai_ns: u64,
+) -> BufloKernelTaiWindowState {
+    if current_tai_ns < not_before_tai_ns {
+        BufloKernelTaiWindowState::Pending
+    } else if current_tai_ns < deadline_tai_ns {
+        BufloKernelTaiWindowState::Open
+    } else {
+        BufloKernelTaiWindowState::Expired
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_tai_boundary_reached(current_tai_ns: u64, boundary_tai_ns: u64) -> bool {
+    current_tai_ns >= boundary_tai_ns
+}
+
+fn semantic_handoff_interrupt_crossed(wire_elapsed: Duration, interrupt_elapsed: Duration) -> bool {
+    wire_elapsed >= interrupt_elapsed
+}
+
+fn hard_unshaped_handoff_interrupt(
+    kernel_tai_authoritative: bool,
+    physical_hint: Option<Instant>,
+) -> Option<Instant> {
+    (!kernel_tai_authoritative)
+        .then_some(physical_hint)
+        .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_defense_elapsed_from_tai_upper(
+    tx_tai_upper_ns: u64,
+    defense_start_tai_ns: u64,
+) -> Result<Duration, Error> {
+    tx_tai_upper_ns
+        .checked_sub(defense_start_tai_ns)
+        .map(Duration::from_nanos)
+        .ok_or_else(|| {
+            Error::DefenseExecution(
+                "BuFLO physical TX upper bound preceded the TAI defense epoch".into(),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_defense_elapsed_at_tai(
+    current_tai_ns: u64,
+    defense_start_tai_ns: u64,
+) -> Duration {
+    Duration::from_nanos(current_tai_ns.saturating_sub(defense_start_tai_ns))
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_project_tai_hint(
+    observed_at: Instant,
+    current_tai_ns: u64,
+    target_tai_ns: u64,
+) -> Result<Instant, Error> {
+    observed_at
+        .checked_add(Duration::from_nanos(
+            target_tai_ns.saturating_sub(current_tai_ns),
+        ))
+        .ok_or_else(|| Error::DefenseExecution("BuFLO projected TAI hint overflow".into()))
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_terminal_elapsed_or_fallback(
+    snapshot: Option<Result<Duration, Error>>,
+    defense_start: Option<Instant>,
+    ended_at: Instant,
+    cleanup_errors: &mut Vec<String>,
+) -> Duration {
+    match snapshot {
+        Some(Ok(elapsed)) => elapsed,
+        Some(Err(clock_error)) => {
+            cleanup_errors.push(format!(
+                "snapshot BuFLO terminal CLOCK_TAI elapsed failed: {clock_error}"
+            ));
+            defense_start.map_or(Duration::ZERO, |started| {
+                ended_at.saturating_duration_since(started)
+            })
+        }
+        None => defense_start.map_or(Duration::ZERO, |started| {
+            ended_at.saturating_duration_since(started)
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn exact_incoming_retry_tai_times(target_tai_ns: u64, deadline_tai_ns: u64) -> Option<[u64; 3]> {
+    let window = deadline_tai_ns.checked_sub(target_tai_ns)?;
+    let quarter = window / 4;
+    if quarter == 0 {
+        return None;
+    }
+    let quarter_at = target_tai_ns.checked_add(quarter)?;
+    let half_at = quarter_at.checked_add(quarter)?;
+    let three_quarter_at = half_at.checked_add(quarter)?;
+    (target_tai_ns < quarter_at && three_quarter_at < deadline_tai_ns).then_some([
+        quarter_at,
+        half_at,
+        three_quarter_at,
+    ])
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_incoming_retry_step(
+    current_tai_ns: u64,
+    release_tai_ns: u64,
+    deadline_tai_ns: u64,
+) -> Result<BufloKernelIncomingRetryStep, Error> {
+    match buflo_kernel_tai_window_state(current_tai_ns, release_tai_ns, deadline_tai_ns) {
+        BufloKernelTaiWindowState::Pending => Ok(BufloKernelIncomingRetryStep::Pending),
+        BufloKernelTaiWindowState::Expired => Ok(BufloKernelIncomingRetryStep::Expired),
+        BufloKernelTaiWindowState::Open => {
+            let phases = exact_incoming_retry_tai_times(release_tai_ns, deadline_tai_ns)
+                .ok_or_else(|| {
+                    Error::SlotInvariant(
+                        "BuFLO kernel incoming-credit window lacked strict retry phases".into(),
+                    )
+                })?;
+            Ok(BufloKernelIncomingRetryStep::Open {
+                next_wake_tai_ns: phases
+                    .into_iter()
+                    .find(|phase| *phase > current_tai_ns)
+                    .unwrap_or(deadline_tai_ns),
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_pending_selection_is_clock_regression(
+    tick_zero_staged: bool,
+    packet_timestamp: Duration,
+) -> bool {
+    tick_zero_staged && packet_timestamp.is_zero()
+}
+
+#[cfg(target_os = "linux")]
 const fn buflo_kernel_provisional_envelope_contains_final(
     provisional_lower: u64,
     provisional_upper: u64,
@@ -2948,12 +3260,117 @@ impl BufloKernelTxRuntime {
         })
     }
 
-    fn tick_zero_stage_at(&self) -> Result<Instant, Error> {
+    fn current_tai_ns(&self, context: &str) -> Result<u64, Error> {
+        _ = self.epoch()?;
+        buflo_decision_tai_ns(context)
+    }
+
+    fn defense_elapsed_at_tai(&self, current_tai_ns: u64) -> Result<Duration, Error> {
         let epoch = self.epoch()?;
-        epoch
-            .start
-            .checked_sub(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
-            .ok_or_else(|| Error::DefenseExecution("BuFLO tick-zero cutoff underflow".into()))
+        Ok(buflo_kernel_defense_elapsed_at_tai(
+            current_tai_ns,
+            epoch.start_tai_ns,
+        ))
+    }
+
+    fn defense_elapsed_now(&self) -> Result<Duration, Error> {
+        self.defense_elapsed_at_tai(self.current_tai_ns("defense elapsed sample")?)
+    }
+
+    fn runner_defense_clock(&self) -> Result<RunnerDefenseClock, Error> {
+        let epoch = self.epoch()?;
+        Ok(RunnerDefenseClock::KernelTai {
+            start: epoch.start,
+            start_tai_ns: epoch.start_tai_ns,
+        })
+    }
+
+    fn tai_wake_hint(&self, target_tai_ns: u64) -> Result<Instant, Error> {
+        // The monotonic value is deliberately only a Tokio wake hint.  Every
+        // caller re-samples CLOCK_TAI before making a phase/deadline decision.
+        let hint_base = now();
+        let current_tai_ns = self.current_tai_ns("wake-hint TAI sample")?;
+        buflo_kernel_project_tai_hint(hint_base, current_tai_ns, target_tai_ns)
+    }
+
+    fn guard_tai_times(&self, guard: &BufloExactReleaseGuard) -> Result<(u64, u64, u64), Error> {
+        let epoch = self.epoch()?;
+        let release_tai_ns = epoch
+            .start_tai_ns
+            .checked_add(duration_as_u64_nanos(guard.packet.timestamp()))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI release overflow".into()))?;
+        let selection_tai_ns = release_tai_ns
+            .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI selection underflow".into()))?;
+        let deadline_tai_ns = release_tai_ns
+            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI deadline overflow".into()))?;
+        Ok((selection_tai_ns, release_tai_ns, deadline_tai_ns))
+    }
+
+    fn selection_state(
+        &self,
+        guard: &BufloExactReleaseGuard,
+    ) -> Result<BufloKernelTaiWindowState, Error> {
+        let (selection_tai_ns, release_tai_ns, _) = self.guard_tai_times(guard)?;
+        Ok(buflo_kernel_tai_window_state(
+            self.current_tai_ns("selection TAI sample")?,
+            selection_tai_ns,
+            release_tai_ns,
+        ))
+    }
+
+    fn tick_zero_selection_state(&self) -> Result<BufloKernelTaiWindowState, Error> {
+        let epoch = self.epoch()?;
+        let selection_tai_ns = epoch
+            .start_tai_ns
+            .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+            .ok_or_else(|| {
+                Error::DefenseExecution("BuFLO tick-zero TAI cutoff underflow".into())
+            })?;
+        Ok(buflo_kernel_tai_window_state(
+            self.current_tai_ns("tick-zero selection TAI sample")?,
+            selection_tai_ns,
+            epoch.start_tai_ns,
+        ))
+    }
+
+    fn selection_wake_hint(&self, guard: &BufloExactReleaseGuard) -> Result<Instant, Error> {
+        let (selection_tai_ns, _, _) = self.guard_tai_times(guard)?;
+        self.tai_wake_hint(selection_tai_ns)
+    }
+
+    fn output_admission_wake_hint(&self, guard: &BufloExactReleaseGuard) -> Result<Instant, Error> {
+        self.tai_wake_hint(self.output_admission_tai_ns(guard)?)
+    }
+
+    fn output_admission_tai_ns(&self, guard: &BufloExactReleaseGuard) -> Result<u64, Error> {
+        let (_, release_tai_ns, _) = self.guard_tai_times(guard)?;
+        release_tai_ns
+            .checked_sub(duration_as_u64_nanos(
+                BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2),
+            ))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO TAI admission underflow".into()))
+    }
+
+    fn tick_zero_selection_wake_hint(&self) -> Result<Instant, Error> {
+        let selection_tai_ns = self
+            .epoch()?
+            .start_tai_ns
+            .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+            .ok_or_else(|| {
+                Error::DefenseExecution("BuFLO tick-zero TAI cutoff underflow".into())
+            })?;
+        self.tai_wake_hint(selection_tai_ns)
+    }
+
+    fn elapsed_wake_hint(&self, elapsed: Duration) -> Result<Instant, Error> {
+        let target_tai_ns = self
+            .epoch()?
+            .start_tai_ns
+            .checked_add(duration_as_u64_nanos(elapsed))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO elapsed TAI wake overflow".into()))?;
+        self.tai_wake_hint(target_tai_ns)
     }
 
     fn tick_zero_staged(&self) -> Result<bool, Error> {
@@ -3376,7 +3793,7 @@ impl BufloKernelTxRuntime {
         tx_realtime_ns: u64,
         phase: &BufloKernelClockPhase,
         realtime_offset_intersection: (i128, i128),
-    ) -> Result<(u64, u64, Instant), Error> {
+    ) -> Result<(u64, u64, BufloKernelPhysicalTxTime), Error> {
         let job = self.current_job(job_id)?;
         let (lower, upper) =
             translate_clock_interval(tx_realtime_ns, realtime_offset_intersection)?;
@@ -3397,12 +3814,21 @@ impl BufloKernelTxRuntime {
             .map_err(|_| {
                 Error::DefenseExecution("BuFLO physical monotonic translation overflowed".into())
             })?;
-        // Finalise at the latest clock-consistent physical instant. This can
-        // never stamp controller evidence earlier than the proven TX boundary.
+        // Retain the best physical Instant for trace chronology, but advance
+        // the controller exclusively with the conservative TAI upper edge.
+        // A contemporaneous MONOTONIC mapping can step by milliseconds under
+        // WSL and therefore must not manufacture a late defense outcome.
+        let epoch = self.epoch()?;
         Ok((
             lower,
             upper,
-            self.physical_instant_from_monotonic(monotonic_upper_ns)?,
+            BufloKernelPhysicalTxTime {
+                observed_at: self.physical_instant_from_monotonic(monotonic_upper_ns)?,
+                defense_elapsed: buflo_kernel_defense_elapsed_from_tai_upper(
+                    upper,
+                    epoch.start_tai_ns,
+                )?,
+            },
         ))
     }
 
@@ -3525,7 +3951,7 @@ impl BufloKernelTxRuntime {
         endpoint: QcsdEndpointId,
         event_id: u64,
         batch: datagram::Batch,
-    ) -> Result<(Instant, u64), Error> {
+    ) -> Result<(BufloKernelPhysicalTxTime, u64), Error> {
         let job = self.current_job(job_id)?;
         if !job.items.is_empty() || event_id != job.tick.saturating_mul(2) {
             return Err(Error::SlotInvariant(format!(
@@ -3704,7 +4130,7 @@ impl BufloKernelTxRuntime {
                 "BuFLO kernel job {job_id} exact datagram was not fully enqueued before release"
             )));
         }
-        window.map(|(_, _, instant)| (instant, item_id))
+        window.map(|(_, _, physical_time)| (physical_time, item_id))
     }
 
     #[expect(
@@ -3719,7 +4145,7 @@ impl BufloKernelTxRuntime {
         event_id: u64,
         batch: datagram::Batch,
         timeout: Duration,
-    ) -> Result<(Instant, u64), Error> {
+    ) -> Result<(BufloKernelPhysicalTxTime, u64), Error> {
         let job = self.current_job(job_id)?;
         if job.items.is_empty() || event_id != job.tick.saturating_mul(2).saturating_add(1) {
             return Err(Error::SlotInvariant(format!(
@@ -3902,7 +4328,7 @@ impl BufloKernelTxRuntime {
                 "BuFLO kernel job {job_id} incoming-credit intervals did not prove strict ordering and deadline admission"
             )));
         }
-        window.map(|(_, _, instant)| (instant, item_id))
+        window.map(|(_, _, physical_time)| (physical_time, item_id))
     }
 
     fn complete_job(&mut self, job_id: u64) -> Result<(), Error> {
@@ -3956,8 +4382,7 @@ impl BufloKernelTxRuntime {
 
     fn remaining_job_window(&self, job_id: u64) -> Result<Duration, Error> {
         let deadline_tai_ns = self.current_job(job_id)?.deadline_tai_ns;
-        let current_tai_ns = timed_egress::clock_tai_ns()
-            .map_err(|error| buflo_kernel_timed_error("deadline sample", error))?;
+        let current_tai_ns = buflo_decision_tai_ns("deadline sample")?;
         deadline_tai_ns
             .checked_sub(current_tai_ns)
             .filter(|remaining| *remaining != 0)
@@ -4003,11 +4428,9 @@ impl BufloKernelTxRuntime {
                 let expected_unused_post_main_datagrams = self
                     .runtime_contract
                     .max_post_main_datagrams
-                    .saturating_sub(
-                        self.current_job(active_job_id)
-                            .map(|job| buflo_kernel_consumed_post_main_datagram_count(&job.items))
-                            .unwrap_or(0),
-                    );
+                    .saturating_sub(self.current_job(active_job_id).map_or(0, |job| {
+                        buflo_kernel_consumed_post_main_datagram_count(&job.items)
+                    }));
                 match helper.abort_job(active_job_id, abort_reason) {
                     Ok(abort) => match self.current_job_mut(active_job_id) {
                         Ok(job) => {
@@ -5505,9 +5928,9 @@ impl RunnerWakeupMetrics {
         // legacy-metric exclusion. A validation failure must not erase the
         // helper/clock/packet evidence that explains the failed attempt.
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = 13;
+        self.schema_version = 14;
         self.semantics = format!(
-            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema13_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
+            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema14_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
         );
         if !self.legacy_buflo_metrics_neutral() {
             let detail =
@@ -5520,7 +5943,7 @@ impl RunnerWakeupMetrics {
                 })?;
             return Err(Error::SlotInvariant(detail));
         }
-        // Schema 13 retains the schema-10 fields for compatibility, but the
+        // Schema 14 retains the schema-10 fields for compatibility, but the
         // kernel path never observes the superseded user-space polling
         // source. Publish its neutral value only after proving that no legacy
         // exact-release metric was recorded.
@@ -8284,6 +8707,11 @@ struct Endpoint {
     socket: Socket,
     recv_buf: RecvBuf,
     client: Http3Client,
+    /// Greatest Instant supplied to Neqo for this endpoint. Kernel `BuFLO` may
+    /// prepare one packet at a short-lived future physical projection; clamp
+    /// later contemporaneous samples so transport time never regresses when
+    /// the CLOCK_TAI-to-MONOTONIC offset moves.
+    transport_instant_floor: Instant,
     pending: VecDeque<ApplicationRequest>,
     streams: HashMap<StreamId, StreamRecord>,
     /// Every application request send half opened on this endpoint. Entries
@@ -8322,6 +8750,25 @@ struct Endpoint {
     /// Inject one strict-path OS error without depending on host buffer state.
     #[cfg(test)]
     test_strict_socket_handoff_error: Option<i32>,
+}
+
+fn nondecreasing_transport_instant(floor: &mut Instant, candidate: Instant) -> Instant {
+    if candidate > *floor {
+        *floor = candidate;
+    }
+    *floor
+}
+
+impl Endpoint {
+    fn transport_instant(&mut self, candidate: Instant) -> Instant {
+        nondecreasing_transport_instant(&mut self.transport_instant_floor, candidate)
+    }
+}
+
+fn advance_endpoint_transport_floors(endpoints: &mut [Endpoint], release: Instant) {
+    for endpoint in endpoints {
+        _ = endpoint.transport_instant(release);
+    }
 }
 
 #[expect(
@@ -11224,6 +11671,66 @@ async fn execute_run_inner(
     let bound_ordinary_work = matches!(&spec.config.defense, DefenseConfig::Buflo(_));
 
     let mut loop_result: Result<(), Error> = async {
+        macro_rules! defense_elapsed_at {
+            ($observed_at:expr) => {{
+                #[cfg(target_os = "linux")]
+                {
+                    match (defense_start, buflo_kernel_tx.as_ref()) {
+                        (Some(_), Some(runtime)) => Some(runtime.defense_elapsed_now()?),
+                        (Some(started), None) => {
+                            Some($observed_at.saturating_duration_since(started))
+                        }
+                        (None, _) => None,
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    defense_start.map(|started| $observed_at.saturating_duration_since(started))
+                }
+            }};
+        }
+        macro_rules! runner_defense_clock {
+            () => {{
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(runtime) = buflo_kernel_tx.as_ref()
+                        && defense_start.is_some()
+                    {
+                        runtime.runner_defense_clock()?
+                    } else {
+                        RunnerDefenseClock::Monotonic
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    RunnerDefenseClock::Monotonic
+                }
+            }};
+        }
+        macro_rules! project_ordinary_buflo_guard {
+            ($guard:expr, $observed_at:expr) => {{
+                let guard = $guard;
+                #[cfg(target_os = "linux")]
+                {
+                    match (guard, defense_start, buflo_kernel_tx.as_ref()) {
+                        (Some(guard), Some(started), Some(runtime)) => Some(
+                            runtime
+                                .runner_defense_clock()?
+                                .project_buflo_ordinary_guard_hints(
+                                    started,
+                                    &guard,
+                                    $observed_at,
+                                )?,
+                        ),
+                        (guard, _, _) => guard.map(Into::into),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    guard.map(Into::into)
+                }
+            }};
+        }
         macro_rules! yield_to_exact_boundaries {
             ($runner:lifetime) => {
                 #[cfg(target_os = "linux")]
@@ -11293,8 +11800,7 @@ async fn execute_run_inner(
 
             yield_to_exact_boundaries!('runner);
 
-            let elapsed_before_http =
-                defense_start.map(|start| loop_now.saturating_duration_since(start));
+            let elapsed_before_http = defense_elapsed_at!(loop_now);
             for endpoint_index in 0..endpoints.len() {
                 yield_to_exact_boundaries!('runner);
                 // Socket activity is reduced into defense signals before a due
@@ -11386,8 +11892,7 @@ async fn execute_run_inner(
             // Refresh after input/HTTP processing: actions reduced below must
             // never be stamped before the observations that produced them.
             let barrier_now = now();
-            let barrier_elapsed =
-                defense_start.map(|start| barrier_now.saturating_duration_since(start));
+            let barrier_elapsed = defense_elapsed_at!(barrier_now);
             if let Some(barrier_elapsed) = barrier_elapsed {
                 let rolling_lifecycle_before_batch =
                     rolling_output_lifecycle_active(&controller, &endpoints);
@@ -11439,9 +11944,23 @@ async fn execute_run_inner(
                     )?;
                     yield_to_exact_boundaries!('runner);
                 }
-                let request_work_interrupt =
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?
-                        .map(|guard| guard.output_admission_at);
+                let request_work_guard =
+                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
+                #[cfg(target_os = "linux")]
+                let (request_work_interrupt, request_work_tai_interrupt_ns) =
+                    match (request_work_guard, buflo_kernel_tx.as_ref()) {
+                        (Some(guard), Some(runtime)) => (
+                            Some(runtime.output_admission_wake_hint(&guard)?),
+                            Some(runtime.output_admission_tai_ns(&guard)?),
+                        ),
+                        (None, Some(_)) => (None, None),
+                        (guard, None) => (guard.map(|guard| guard.output_admission_at), None),
+                    };
+                #[cfg(not(target_os = "linux"))]
+                let (request_work_interrupt, request_work_tai_interrupt_ns) = (
+                    request_work_guard.map(|guard| guard.output_admission_at),
+                    None,
+                );
                 let started_requests = dispatch_ready_requests(
                     &mut endpoints,
                     spec,
@@ -11450,6 +11969,7 @@ async fn execute_run_inner(
                     &mut traces,
                     controller.can_start_application_batch(),
                     request_work_interrupt,
+                    request_work_tai_interrupt_ns,
                 )?;
                 #[cfg(target_os = "linux")]
                 if defense_start.is_some()
@@ -11483,9 +12003,11 @@ async fn execute_run_inner(
                 // Flush output that was already available (including newly
                 // dispatched application requests) so its Wire signals precede
                 // the defense poll.
-                let output_guard =
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
-                let work_boundary = output_guard.map(BufloExactReleaseGuard::output_work_boundary);
+                let output_guard = project_ordinary_buflo_guard!(
+                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints,)?,
+                    now()
+                );
+                let work_boundary = output_guard.map(|guard| guard.work_boundary);
                 let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
@@ -11498,6 +12020,7 @@ async fn execute_run_inner(
                     work_boundary,
                     unshaped_handoff_interrupt,
                     None,
+                    runner_defense_clock!(),
                     OutputDriveCardinality::DrainAvailable,
                 )
                 .await?
@@ -11510,8 +12033,7 @@ async fn execute_run_inner(
             }
 
             let control_now = now();
-            let control_elapsed =
-                defense_start.map(|start| control_now.saturating_duration_since(start));
+            let control_elapsed = defense_elapsed_at!(control_now);
             if let Some(defense_elapsed) = control_elapsed {
                 handle_all_qcsd_observations(
                     &mut endpoints,
@@ -11622,9 +12144,11 @@ async fn execute_run_inner(
                 yield_to_exact_boundaries!('runner);
                 // Retain a post-action flush so newly scheduled packet targets can
                 // be placed on the wire without waiting for another loop turn.
-                let output_guard =
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
-                let work_boundary = output_guard.map(BufloExactReleaseGuard::output_work_boundary);
+                let output_guard = project_ordinary_buflo_guard!(
+                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints,)?,
+                    now()
+                );
+                let work_boundary = output_guard.map(|guard| guard.work_boundary);
                 let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
@@ -11637,6 +12161,7 @@ async fn execute_run_inner(
                     work_boundary,
                     unshaped_handoff_interrupt,
                     None,
+                    runner_defense_clock!(),
                     OutputDriveCardinality::DrainAvailable,
                 )
                 .await?
@@ -11648,8 +12173,7 @@ async fn execute_run_inner(
                 yield_to_exact_boundaries!('runner);
                 let endpoint = &mut endpoints[endpoint_index];
                 let input_now = now();
-                let input_elapsed =
-                    defense_start.map(|start| input_now.saturating_duration_since(start));
+                let input_elapsed = defense_elapsed_at!(input_now);
                 process_input(
                     endpoint,
                     &mut controller,
@@ -11682,6 +12206,15 @@ async fn execute_run_inner(
             if let Some(defense_start) = defense_start
                 && let Some(next_deadline) = controller.next_deadline()
             {
+                #[cfg(target_os = "linux")]
+                let controller_wakeup = if let Some(runtime) = buflo_kernel_tx.as_ref() {
+                    runtime.elapsed_wake_hint(next_deadline)?
+                } else {
+                    defense_start.checked_add(next_deadline).ok_or_else(|| {
+                        Error::DefenseExecution("controller wake deadline overflow".into())
+                    })?
+                };
+                #[cfg(not(target_os = "linux"))]
                 let controller_wakeup =
                     defense_start.checked_add(next_deadline).ok_or_else(|| {
                         Error::DefenseExecution("controller wake deadline overflow".into())
@@ -11693,20 +12226,29 @@ async fn execute_run_inner(
             }
             if let Some(guard) =
                 next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?
-                && guard.guard_at <= next_wakeup
             {
+                #[cfg(target_os = "linux")]
+                let guard_wakeup = if let Some(runtime) = buflo_kernel_tx.as_ref() {
+                    runtime.selection_wake_hint(&guard)?
+                } else {
+                    guard.guard_at
+                };
+                #[cfg(not(target_os = "linux"))]
+                let guard_wakeup = guard.guard_at;
                 // Wake before the ordinary defense deadline. Any simultaneous
                 // socket readiness may win this select, but the next loop turn
                 // enters the guard before processing that input.
-                next_wakeup = guard.guard_at;
-                controller_deadline_selected = false;
+                if guard_wakeup <= next_wakeup {
+                    next_wakeup = guard_wakeup;
+                    controller_deadline_selected = false;
+                }
             }
             #[cfg(target_os = "linux")]
             if let Some(runtime) = buflo_kernel_tx.as_ref()
                 && runtime.activation_start(defense_start)?.is_some()
                 && !runtime.tick_zero_staged()?
             {
-                let stage_at = runtime.tick_zero_stage_at()?;
+                let stage_at = runtime.tick_zero_selection_wake_hint()?;
                 if stage_at <= next_wakeup {
                     next_wakeup = stage_at;
                     controller_deadline_selected = false;
@@ -11749,6 +12291,10 @@ async fn execute_run_inner(
     }
     .await;
 
+    #[cfg(target_os = "linux")]
+    let buflo_kernel_terminal_elapsed = buflo_kernel_tx
+        .as_ref()
+        .map(BufloKernelTxRuntime::defense_elapsed_now);
     #[cfg(target_os = "linux")]
     if let Some(runtime) = buflo_kernel_tx.take() {
         let receipt = runtime.finish(loop_result.as_ref().err().map(ToString::to_string));
@@ -11822,6 +12368,14 @@ async fn execute_run_inner(
             ("error", MissedSlotReason::RunAborted)
         };
         let ended_at = now();
+        #[cfg(target_os = "linux")]
+        let terminal_elapsed = buflo_kernel_terminal_elapsed_or_fallback(
+            buflo_kernel_terminal_elapsed,
+            defense_start,
+            ended_at,
+            &mut cleanup_errors,
+        );
+        #[cfg(not(target_os = "linux"))]
         let terminal_elapsed = defense_start.map_or(Duration::ZERO, |started| {
             ended_at.saturating_duration_since(started)
         });
@@ -11848,16 +12402,16 @@ async fn execute_run_inner(
             endpoint.scheduled_outgoing.clear();
             endpoint.prearmed_outgoing.clear();
         }
-        let responses = finalized_responses.take().map_or_else(
-            || match collect_responses(&mut endpoints) {
-                Ok(responses) => responses,
-                Err(cleanup_error) => {
-                    cleanup_errors.push(format!("collect responses failed: {cleanup_error}"));
-                    Vec::new()
-                }
-            },
-            std::convert::identity,
-        );
+        let responses =
+            finalized_responses
+                .take()
+                .unwrap_or_else(|| match collect_responses(&mut endpoints) {
+                    Ok(responses) => responses,
+                    Err(cleanup_error) => {
+                        cleanup_errors.push(format!("collect responses failed: {cleanup_error}"));
+                        Vec::new()
+                    }
+                });
         if !trace_events_flushed && let Err(cleanup_error) = traces.flush_events() {
             cleanup_errors.push(format!("flush trace events failed: {cleanup_error}"));
         }
@@ -12226,6 +12780,7 @@ fn create_endpoints(
                 socket,
                 recv_buf: RecvBuf::default(),
                 client,
+                transport_instant_floor: start,
                 pending,
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
@@ -12282,6 +12837,11 @@ fn qcsd_connection_parameters(config: &QcsdConfig, remote_ip: IpAddr) -> Connect
         .pmtud(usize::from(config.max_udp_payload_size) > Pmtud::default_plpmtu(remote_ip))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "request dispatch keeps dependency, defense-admission, transport, and trace mutation atomic"
+)]
 fn dispatch_ready_requests(
     endpoints: &mut [Endpoint],
     spec: &RunSpec,
@@ -12290,6 +12850,7 @@ fn dispatch_ready_requests(
     traces: &mut TraceFiles,
     defense_batch_ready: bool,
     work_interrupt: Option<Instant>,
+    kernel_tai_interrupt_ns: Option<u64>,
 ) -> Result<usize, Error> {
     let application_stream_in_flight = has_in_flight_application_stream(
         endpoints
@@ -12305,9 +12866,24 @@ fn dispatch_ready_requests(
     );
     let mut started_requests = 0;
     for endpoint in endpoints {
+        let transport_at = endpoint.transport_instant(dispatch_at);
         let pending_count = endpoint.pending.len();
         for _ in 0..pending_count {
-            if work_interrupt.is_some_and(|interrupt| now() >= interrupt) {
+            #[cfg(target_os = "linux")]
+            let kernel_interrupted = if let Some(interrupt_tai_ns) = kernel_tai_interrupt_ns {
+                let current_tai_ns = buflo_decision_tai_ns("request-admission TAI sample")?;
+                buflo_kernel_tai_boundary_reached(current_tai_ns, interrupt_tai_ns)
+            } else {
+                false
+            };
+            #[cfg(not(target_os = "linux"))]
+            let kernel_interrupted = {
+                debug_assert!(kernel_tai_interrupt_ns.is_none());
+                false
+            };
+            let monotonic_interrupted = kernel_tai_interrupt_ns.is_none()
+                && work_interrupt.is_some_and(|interrupt| now() >= interrupt);
+            if kernel_interrupted || monotonic_interrupted {
                 return Ok(started_requests);
             }
             let Some(request) = endpoint.pending.pop_front() else {
@@ -12339,7 +12915,7 @@ fn dispatch_ready_requests(
                 .map(|(name, value)| Header::new(name.as_str(), value.as_str()))
                 .collect();
             let stream = match endpoint.client.fetch(
-                dispatch_at,
+                transport_at,
                 spec.method,
                 &request.url,
                 &headers,
@@ -12369,7 +12945,7 @@ fn dispatch_ready_requests(
                 request.expected_response_length,
             )?;
             let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream)?;
-            endpoint.client.stream_close_send(stream, dispatch_at)?;
+            endpoint.client.stream_close_send(stream, transport_at)?;
             endpoint.application_send_streams.insert(stream);
             dependencies.mark_in_flight(request.resource_id)?;
             started_requests += 1;
@@ -12563,6 +13139,7 @@ fn handle_http_events(
     traces: &mut TraceFiles,
     max_events: Option<usize>,
 ) -> Result<(), Error> {
+    let transport_at = endpoint.transport_instant(now);
     let mut handled_events = 0_usize;
     loop {
         if max_events.is_some_and(|limit| handled_events >= limit) {
@@ -12579,7 +13156,9 @@ fn handle_http_events(
         handled_events = handled_events.saturating_add(1);
         match event {
             Http3ClientEvent::AuthenticationNeeded => {
-                endpoint.client.authenticated(AuthenticationStatus::Ok, now);
+                endpoint
+                    .client
+                    .authenticated(AuthenticationStatus::Ok, transport_at);
             }
             Http3ClientEvent::StateChange(Http3State::Connected) => endpoint.connected = true,
             Http3ClientEvent::StateChange(Http3State::Closed(reason)) => {
@@ -12658,7 +13237,10 @@ fn handle_http_events(
                 }
                 let mut buffer = vec![0_u8; 32 * 1024];
                 loop {
-                    let (read, fin) = endpoint.client.read_data(now, stream_id, &mut buffer)?;
+                    let (read, fin) =
+                        endpoint
+                            .client
+                            .read_data(transport_at, stream_id, &mut buffer)?;
                     let mut too_large = false;
                     if let Some(record) = endpoint.streams.get_mut(&stream_id) {
                         record.bytes = record
@@ -13512,7 +14094,11 @@ fn cancel_uncommitted_prearms_on_abort(
                 .iter_mut()
                 .find(|endpoint| endpoint.id == action_endpoint)
                 .expect("runner preview endpoint inspected");
-            let outcome = match endpoint.client.apply_qcsd_action(now, action.clone()) {
+            let transport_at = endpoint.transport_instant(now);
+            let outcome = match endpoint
+                .client
+                .apply_qcsd_action(transport_at, action.clone())
+            {
                 Ok(None) => "abort_cleanup_applied",
                 Ok(Some(_)) => {
                     return Err(Error::SlotInvariant(format!(
@@ -14610,6 +15196,7 @@ fn apply_action(
         traces.event(now, endpoint_id, "action", "missing_endpoint", &action)?;
         return Ok(());
     };
+    let transport_at = endpoint.transport_instant(now);
     if let QcsdAction::CancelPrearmedPacket { packet, slot, .. } = &trace_action {
         let Some(index) = endpoint
             .prearmed_outgoing
@@ -14621,7 +15208,7 @@ fn apply_action(
                 slot.0
             )));
         };
-        endpoint.client.apply_qcsd_action(now, action)?;
+        endpoint.client.apply_qcsd_action(transport_at, action)?;
         _ = endpoint.prearmed_outgoing.remove(index);
         traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
         return Ok(());
@@ -14641,8 +15228,8 @@ fn apply_action(
             // Fixed/legacy targets never use the rolling adapter-release
             // selector. Avoid introducing a new overflow failure path for
             // their previously ignored `not_before_after_us` value.
-            not_before: now,
-            deadline: now
+            not_before: transport_at,
+            deadline: transport_at
                 .checked_add(Duration::from_micros(*deadline_after_us))
                 .ok_or_else(|| {
                     Error::SlotInvariant(format!(
@@ -14726,7 +15313,7 @@ fn apply_action(
             }
         }
     }
-    match endpoint.client.apply_qcsd_action(now, action) {
+    match endpoint.client.apply_qcsd_action(transport_at, action) {
         Ok(chaff_stream) => {
             if let QcsdAction::PrearmPacket {
                 packet,
@@ -14736,7 +15323,7 @@ fn apply_action(
                 ..
             } = &trace_action
             {
-                let not_before = now
+                let not_before = transport_at
                     .checked_add(Duration::from_micros(*not_before_after_us))
                     .ok_or_else(|| {
                         Error::SlotInvariant(format!(
@@ -14744,7 +15331,7 @@ fn apply_action(
                             slot.0
                         ))
                     })?;
-                let deadline = now
+                let deadline = transport_at
                     .checked_add(Duration::from_micros(*deadline_after_us))
                     .ok_or_else(|| {
                         Error::SlotInvariant(format!(
@@ -14786,7 +15373,7 @@ fn apply_action(
                     _ => unreachable!("only chaff actions return a stream"),
                 };
                 let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream_id)?;
-                endpoint.client.stream_close_send(stream_id, now)?;
+                endpoint.client.stream_close_send(stream_id, transport_at)?;
                 let qualification = chaff_manifest
                     .and_then(|manifest| manifest.qualification(resource_id))
                     .ok_or_else(|| {
@@ -14993,6 +15580,8 @@ struct BufloExactReleaseGuard {
 struct OutputWorkBoundary {
     admission_at: Instant,
     resume_at: Instant,
+    #[cfg(target_os = "linux")]
+    kernel_admission_tai_ns: Option<u64>,
 }
 
 impl OutputWorkBoundary {
@@ -15000,6 +15589,17 @@ impl OutputWorkBoundary {
         Self {
             admission_at,
             resume_at,
+            #[cfg(target_os = "linux")]
+            kernel_admission_tai_ns: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const fn kernel_tai(admission_at: Instant, resume_at: Instant, admission_tai_ns: u64) -> Self {
+        Self {
+            admission_at,
+            resume_at,
+            kernel_admission_tai_ns: Some(admission_tai_ns),
         }
     }
 
@@ -15008,11 +15608,77 @@ impl OutputWorkBoundary {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufloOrdinaryOutputGuard {
+    work_boundary: OutputWorkBoundary,
+    release: Instant,
+}
+
+impl From<BufloExactReleaseGuard> for BufloOrdinaryOutputGuard {
+    fn from(guard: BufloExactReleaseGuard) -> Self {
+        Self {
+            work_boundary: guard.output_work_boundary(),
+            release: guard.release,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn project_buflo_ordinary_guard_hints_from_sample(
+    start_tai_ns: u64,
+    packet_timestamp: Duration,
+    current_tai_ns: u64,
+    observed_at: Instant,
+) -> Result<BufloOrdinaryOutputGuard, Error> {
+    let release_tai_ns = start_tai_ns
+        .checked_add(duration_as_u64_nanos(packet_timestamp))
+        .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI release overflow".into()))?;
+    let admission_tai_ns = release_tai_ns
+        .checked_sub(duration_as_u64_nanos(
+            BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2),
+        ))
+        .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI admission underflow".into()))?;
+    let selection_tai_ns = release_tai_ns
+        .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+        .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI selection underflow".into()))?;
+    // One immutable TAI/physical sample projects the complete hint set. These
+    // Instants may wake or bound Neqo work, but direct CLOCK_TAI checks remain
+    // authoritative for admission and release.
+    let admission_at =
+        buflo_kernel_project_tai_hint(observed_at, current_tai_ns, admission_tai_ns)?;
+    let guard_at = buflo_kernel_project_tai_hint(observed_at, current_tai_ns, selection_tai_ns)?;
+    let release_at = buflo_kernel_project_tai_hint(observed_at, current_tai_ns, release_tai_ns)?;
+    if !(admission_at <= guard_at && guard_at <= release_at) {
+        return Err(Error::SlotInvariant(
+            "BuFLO projected ordinary-work guard lost its ordered boundaries".into(),
+        ));
+    }
+    Ok(BufloOrdinaryOutputGuard {
+        work_boundary: OutputWorkBoundary::kernel_tai(admission_at, guard_at, admission_tai_ns),
+        release: release_at,
+    })
+}
+
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "the small Copy boundary is reduced by value into one authoritative winner"
+)]
 fn earliest_output_work_boundary(
     current: Option<OutputWorkBoundary>,
     candidate: OutputWorkBoundary,
 ) -> OutputWorkBoundary {
     current.map_or(candidate, |current| {
+        #[cfg(target_os = "linux")]
+        if let (Some(current_tai), Some(candidate_tai)) = (
+            current.kernel_admission_tai_ns,
+            candidate.kernel_admission_tai_ns,
+        ) {
+            return if (candidate_tai, candidate.resume_at) < (current_tai, current.resume_at) {
+                candidate
+            } else {
+                current
+            };
+        }
         if (candidate.admission_at, candidate.resume_at) < (current.admission_at, current.resume_at)
         {
             candidate
@@ -15026,6 +15692,18 @@ impl BufloExactReleaseGuard {
     const fn output_work_boundary(self) -> OutputWorkBoundary {
         OutputWorkBoundary::new(self.output_admission_at, self.guard_at)
     }
+}
+
+fn buflo_adapter_window_is_normalized(
+    release: Instant,
+    deadline: Instant,
+    control_interval: Duration,
+) -> bool {
+    let Some(width) = deadline.checked_duration_since(release) else {
+        return false;
+    };
+    width == control_interval
+        || width.checked_add(Duration::from_micros(1)) == Some(control_interval)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -15986,6 +16664,7 @@ async fn dispatch_due_cs_exact_incoming_retry(
         Some(OutputWorkBoundary::new(retry.deadline, retry.deadline)),
         Some(retry.deadline),
         Some(retry.deadline),
+        RunnerDefenseClock::Monotonic,
         OutputDriveCardinality::OneDatagram,
     )
     .await?;
@@ -16077,11 +16756,12 @@ fn buflo_exact_incoming_slot_packets(
     clippy::too_many_lines,
     reason = "one fail-closed inventory validates endpoint, slot, timing, and adapter ownership before mutation"
 )]
-fn buflo_exact_incoming_identities(
+fn buflo_exact_incoming_identities_with_policy(
     guard: &BufloExactReleaseGuard,
     endpoints: &[Endpoint],
     controller: &QcsdController,
     defense_start: Instant,
+    kernel_tai_projected: bool,
     allowed_slots: Option<&BTreeMap<QcsdSlotId, Packet>>,
 ) -> Result<Vec<BufloExactIncomingIdentity>, Error> {
     let pending_slots: BTreeMap<_, _> = controller.pending_slots().into_iter().collect();
@@ -16168,51 +16848,65 @@ fn buflo_exact_incoming_identities(
                     slot.0, guard.slot.0
                 )));
             }
-            let nominal_release =
-                defense_start
-                    .checked_add(packet.timestamp())
+            if kernel_tai_projected {
+                let control_interval = controller.config().control_interval();
+                if !buflo_adapter_window_is_normalized(
+                    guard.release,
+                    guard.deadline,
+                    control_interval,
+                ) {
+                    return Err(Error::SlotInvariant(format!(
+                        "BuFLO kernel incoming slot {} projected adapter window was neither the control interval nor its one-microsecond normalization",
+                        slot.0
+                    )));
+                }
+            } else {
+                let nominal_release =
+                    defense_start
+                        .checked_add(packet.timestamp())
+                        .ok_or_else(|| {
+                            Error::DefenseExecution(format!(
+                                "BuFLO incoming slot {} release overflow",
+                                slot.0
+                            ))
+                        })?;
+                let release_skew = guard
+                    .release
+                    .checked_duration_since(nominal_release)
                     .ok_or_else(|| {
-                        Error::DefenseExecution(format!(
-                            "BuFLO incoming slot {} release overflow",
+                        Error::SlotInvariant(format!(
+                            "BuFLO incoming slot {} nominal release followed its paired adapter release",
                             slot.0
                         ))
                     })?;
-            let release_skew = guard
-                .release
-                .checked_duration_since(nominal_release)
-                .ok_or_else(|| {
-                    Error::SlotInvariant(format!(
-                        "BuFLO incoming slot {} nominal release followed its paired adapter release",
+                if release_skew >= Duration::from_micros(1) {
+                    return Err(Error::SlotInvariant(format!(
+                        "BuFLO incoming slot {} adapter release skew {release_skew:?} exceeded sub-microsecond normalization",
                         slot.0
-                    ))
-                })?;
-            if release_skew >= Duration::from_micros(1) {
-                return Err(Error::SlotInvariant(format!(
-                    "BuFLO incoming slot {} adapter release skew {release_skew:?} exceeded sub-microsecond normalization",
-                    slot.0
-                )));
-            }
-            let nominal_deadline = nominal_release
-                .checked_add(controller.config().control_interval())
-                .ok_or_else(|| {
-                    Error::DefenseExecution(format!(
-                        "BuFLO incoming slot {} deadline overflow",
-                        slot.0
-                    ))
-                })?;
-            let deadline_skew = nominal_deadline
-                .checked_duration_since(guard.deadline)
-                .ok_or_else(|| {
-                    Error::SlotInvariant(format!(
-                        "BuFLO incoming slot {} adapter deadline exceeded its nominal strict window",
-                        slot.0
-                    ))
-                })?;
-            if deadline_skew >= Duration::from_micros(1) || guard.release >= guard.deadline {
-                return Err(Error::SlotInvariant(format!(
-                    "BuFLO incoming slot {} adapter deadline skew {deadline_skew:?} fell outside its paired sub-microsecond strict window",
-                    slot.0,
-                )));
+                    )));
+                }
+                let nominal_deadline = nominal_release
+                    .checked_add(controller.config().control_interval())
+                    .ok_or_else(|| {
+                        Error::DefenseExecution(format!(
+                            "BuFLO incoming slot {} deadline overflow",
+                            slot.0
+                        ))
+                    })?;
+                let deadline_skew = nominal_deadline
+                    .checked_duration_since(guard.deadline)
+                    .ok_or_else(|| {
+                        Error::SlotInvariant(format!(
+                            "BuFLO incoming slot {} adapter deadline exceeded its nominal strict window",
+                            slot.0
+                        ))
+                    })?;
+                if deadline_skew >= Duration::from_micros(1) || guard.release >= guard.deadline {
+                    return Err(Error::SlotInvariant(format!(
+                        "BuFLO incoming slot {} adapter deadline skew {deadline_skew:?} fell outside its paired sub-microsecond strict window",
+                        slot.0,
+                    )));
+                }
             }
             let candidate = BufloExactIncomingIdentity {
                 endpoint_index,
@@ -16243,6 +16937,41 @@ fn buflo_exact_incoming_identities(
     Ok(captured)
 }
 
+fn buflo_exact_incoming_identities(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &[Endpoint],
+    controller: &QcsdController,
+    defense_start: Instant,
+    allowed_slots: Option<&BTreeMap<QcsdSlotId, Packet>>,
+) -> Result<Vec<BufloExactIncomingIdentity>, Error> {
+    buflo_exact_incoming_identities_with_policy(
+        guard,
+        endpoints,
+        controller,
+        defense_start,
+        false,
+        allowed_slots,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_exact_incoming_identities(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &[Endpoint],
+    controller: &QcsdController,
+    defense_start: Instant,
+    allowed_slots: Option<&BTreeMap<QcsdSlotId, Packet>>,
+) -> Result<Vec<BufloExactIncomingIdentity>, Error> {
+    buflo_exact_incoming_identities_with_policy(
+        guard,
+        endpoints,
+        controller,
+        defense_start,
+        true,
+        allowed_slots,
+    )
+}
+
 fn refresh_buflo_exact_incoming_identities(
     guard: &BufloExactReleaseGuard,
     endpoints: &[Endpoint],
@@ -16252,6 +16981,43 @@ fn refresh_buflo_exact_incoming_identities(
 ) -> Result<bool, Error> {
     let allowed_slots = buflo_exact_incoming_slot_packets(captured)?;
     let current = buflo_exact_incoming_identities(
+        guard,
+        endpoints,
+        controller,
+        defense_start,
+        Some(&allowed_slots),
+    )?;
+    let mut grew = false;
+    for candidate in current {
+        if captured.contains(&candidate) {
+            continue;
+        }
+        if controller
+            .terminal_slot_resolution_at(candidate.slot)
+            .is_some()
+        {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO terminal incoming slot {} staged a new adapter identity",
+                candidate.slot.0
+            )));
+        }
+        captured.push(candidate);
+        grew = true;
+    }
+    captured.sort_unstable_by_key(buflo_exact_incoming_identity_key);
+    Ok(grew)
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_buflo_kernel_exact_incoming_identities(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &[Endpoint],
+    controller: &QcsdController,
+    defense_start: Instant,
+    captured: &mut Vec<BufloExactIncomingIdentity>,
+) -> Result<bool, Error> {
+    let allowed_slots = buflo_exact_incoming_slot_packets(captured)?;
+    let current = buflo_kernel_exact_incoming_identities(
         guard,
         endpoints,
         controller,
@@ -16788,10 +17554,18 @@ fn stage_buflo_kernel_tick_zero(
                 .into(),
         ));
     }
-    if now() >= defense_start {
-        return Err(Error::DefenseExecution(
-            "BuFLO tick-zero staging reached or crossed its future defense epoch".into(),
-        ));
+    match runtime.tick_zero_selection_state()? {
+        BufloKernelTaiWindowState::Open => {}
+        BufloKernelTaiWindowState::Pending => {
+            return Err(Error::SlotInvariant(
+                "BuFLO tick-zero staging preceded its CLOCK_TAI selection cutoff".into(),
+            ));
+        }
+        BufloKernelTaiWindowState::Expired => {
+            return Err(Error::DefenseExecution(
+                "BuFLO tick-zero staging reached or crossed its CLOCK_TAI defense epoch".into(),
+            ));
+        }
     }
     handle_all_qcsd_observations(endpoints, controller, traces, Duration::ZERO)?;
     controller.flush_defense_observations();
@@ -16879,30 +17653,20 @@ fn next_buflo_kernel_guard(
     endpoints: &[Endpoint],
     runtime: &BufloKernelTxRuntime,
 ) -> Result<Option<BufloExactReleaseGuard>, Error> {
-    let Some(mut guard) = next_buflo_exact_release_guard(defense, controller, endpoints)? else {
+    let Some(guard) = next_buflo_exact_release_guard(defense, controller, endpoints)? else {
         return Ok(None);
     };
-    let epoch = runtime.epoch()?;
-    let release = epoch
-        .start
-        .checked_add(guard.packet.timestamp())
-        .ok_or_else(|| Error::DefenseExecution("BuFLO kernel release overflow".into()))?;
-    let deadline = release
-        .checked_add(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
-        .ok_or_else(|| Error::DefenseExecution("BuFLO kernel deadline overflow".into()))?;
-    if guard.release != release || guard.deadline != deadline {
+    _ = runtime.guard_tai_times(&guard)?;
+    if !buflo_adapter_window_is_normalized(
+        guard.release,
+        guard.deadline,
+        BUFLO_KERNEL_TX_SELECTION_CUTOFF,
+    ) {
         return Err(Error::DefenseExecution(format!(
-            "BuFLO kernel slot {} adapter window was not exactly anchored to the future epoch",
+            "BuFLO kernel slot {} adapter window did not retain the five-millisecond normalized width",
             guard.slot.0
         )));
     }
-    guard.output_admission_at = release
-        .checked_sub(BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2))
-        .ok_or_else(|| Error::DefenseExecution("BuFLO output-admission underflow".into()))?;
-    guard.guard_at = release
-        .checked_sub(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
-        .ok_or_else(|| Error::DefenseExecution("BuFLO selection-cutoff underflow".into()))?;
-    guard.active_wait_at = guard.guard_at;
     Ok(Some(guard))
 }
 
@@ -17035,7 +17799,7 @@ async fn drive_buflo_kernel_incoming_credit(
     traces: &mut TraceFiles,
     observation_clock: &QcsdObservationClock,
     defense_start: Instant,
-    main_sent_at: Instant,
+    main_physical_time: BufloKernelPhysicalTxTime,
     mut captured: Vec<BufloExactIncomingIdentity>,
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<(), Error> {
@@ -17055,14 +17819,14 @@ async fn drive_buflo_kernel_incoming_credit(
         runtime.resolve_credit_identity(job_id, candidate, "coalesced-in-main-finalized", None)?;
     }
     if captured.is_empty() {
-        reduce_buflo_exact_pair_output(
+        reduce_buflo_kernel_exact_pair_output(
             guard,
             endpoints,
             controller,
             chaff_manifest,
             traces,
             defense_start,
-            main_sent_at,
+            main_physical_time,
             &mut captured,
         )?;
         runtime.retain_credit_identities(job_id, &captured)?;
@@ -17071,16 +17835,32 @@ async fn drive_buflo_kernel_incoming_credit(
             return Ok(());
         }
     }
-    let phases = exact_incoming_retry_times(guard.release, guard.deadline).ok_or_else(|| {
-        Error::SlotInvariant(format!(
-            "BuFLO kernel slot {} lacked strict incoming retry phases",
-            guard.slot.0
-        ))
-    })?;
+    let (release_tai_ns, deadline_tai_ns) = {
+        let job = runtime.current_job(job_id)?;
+        (job.release_tai_ns, job.deadline_tai_ns)
+    };
     let mut sent_owners = BTreeSet::new();
     let mut retained_callback = None;
     loop {
-        refresh_buflo_exact_incoming_identities(
+        let current_tai_ns = runtime.current_tai_ns("incoming-credit phase sample")?;
+        let next_wake_tai_ns = match buflo_kernel_incoming_retry_step(
+            current_tai_ns,
+            release_tai_ns,
+            deadline_tai_ns,
+        )? {
+            BufloKernelIncomingRetryStep::Open { next_wake_tai_ns } => next_wake_tai_ns,
+            BufloKernelIncomingRetryStep::Pending => {
+                return Err(Error::DefenseExecution(format!(
+                    "BuFLO kernel job {job_id} CLOCK_TAI regressed before its release during incoming credit"
+                )));
+            }
+            BufloKernelIncomingRetryStep::Expired => {
+                return Err(Error::DefenseExecution(format!(
+                    "BuFLO kernel job {job_id} incoming credit exhausted its strict TAI window"
+                )));
+            }
+        };
+        refresh_buflo_kernel_exact_incoming_identities(
             guard,
             endpoints,
             controller,
@@ -17193,7 +17973,7 @@ async fn drive_buflo_kernel_incoming_credit(
                     ),
                 ));
             }
-            let (sent_at, carrier_item_id) = match runtime.transmit_incoming_credit(
+            let (physical_time, carrier_item_id) = match runtime.transmit_incoming_credit(
                 job_id,
                 endpoint_index,
                 owner,
@@ -17250,14 +18030,14 @@ async fn drive_buflo_kernel_incoming_credit(
                     return Err(error);
                 }
             }
-            if let Err(error) = finalize_prepared_output(
+            if let Err(error) = finalize_buflo_kernel_prepared_output(
                 &mut endpoints[endpoint_index],
                 controller,
                 traces,
                 observation_clock,
                 &prepared,
-                Some(defense_start),
-                sent_at,
+                defense_start,
+                physical_time,
             ) {
                 let detail = error.to_string();
                 let error = retain_buflo_prepared_output_failure(
@@ -17322,14 +18102,14 @@ async fn drive_buflo_kernel_incoming_credit(
                 }
             }
             sent_owners.insert(owner);
-            reduce_buflo_exact_pair_output(
+            reduce_buflo_kernel_exact_pair_output(
                 guard,
                 endpoints,
                 controller,
                 chaff_manifest,
                 traces,
                 defense_start,
-                sent_at,
+                physical_time,
                 &mut captured,
             )?;
             progressed = true;
@@ -17341,22 +18121,13 @@ async fn drive_buflo_kernel_incoming_credit(
         if progressed {
             continue;
         }
-        let current = now();
-        let fallback = phases
-            .into_iter()
-            .find(|phase| *phase > current)
-            .unwrap_or(guard.deadline);
+        let fallback = runtime.tai_wake_hint(next_wake_tai_ns)?;
         let wake_at = retained_callback
             .take()
             .into_iter()
-            .chain([fallback, guard.deadline])
+            .chain([fallback])
             .min()
-            .unwrap_or(guard.deadline);
-        if wake_at >= guard.deadline {
-            return Err(Error::DefenseExecution(format!(
-                "BuFLO kernel job {job_id} incoming credit exhausted its strict window"
-            )));
-        }
+            .unwrap_or(fallback);
         tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)).await;
     }
 }
@@ -17378,14 +18149,28 @@ async fn dispatch_buflo_kernel_release(
     defense_start: Instant,
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<(), Error> {
-    let current = now();
-    if current >= guard.release {
-        return Err(Error::DefenseExecution(format!(
-            "BuFLO kernel slot {} reached its release before immutable packet construction",
-            guard.slot.0
-        )));
+    match runtime.selection_state(guard)? {
+        BufloKernelTaiWindowState::Open => {}
+        BufloKernelTaiWindowState::Pending => {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel slot {} reached construction before its CLOCK_TAI selection cutoff",
+                guard.slot.0
+            )));
+        }
+        BufloKernelTaiWindowState::Expired => {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel slot {} reached its CLOCK_TAI release before immutable packet construction",
+                guard.slot.0
+            )));
+        }
     }
     let logical_elapsed = guard.packet.timestamp();
+    // Kernel dispatch intentionally advances every endpoint's Neqo clock to
+    // this globally ordered adapter release. The same action batch can prearm
+    // the next cell on a different origin, so one common base is required.
+    // Raw trace chronology remains contemporaneous monotonic time, and later
+    // transport calls clamp to this bounded floor until that clock catches up.
+    advance_endpoint_transport_floors(endpoints, guard.release);
     handle_all_qcsd_observations(endpoints, controller, traces, logical_elapsed)?;
     controller.flush_defense_observations();
     ensure_defense_realizable(controller)?;
@@ -17398,7 +18183,7 @@ async fn dispatch_buflo_kernel_release(
             controller,
             chaff_manifest,
             traces,
-            guard.release,
+            now(),
             logical_elapsed,
         )?;
     }
@@ -17410,11 +18195,11 @@ async fn dispatch_buflo_kernel_release(
     }
     let job_id = runtime.begin_job(guard)?;
     let captured_incoming_credit =
-        buflo_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
+        buflo_kernel_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
     runtime.retain_credit_identities(job_id, &captured_incoming_credit)?;
     let prepared = match prepare_output_once_with_evidence(
         &mut endpoints[guard.endpoint_index],
-        guard.release,
+        now(),
     )
     .await
     {
@@ -17484,7 +18269,7 @@ async fn dispatch_buflo_kernel_release(
             PreparedOutputFailure::from_prepared("main-validation", error, &prepared),
         ));
     }
-    let (sent_at, main_item_id) = match runtime.transmit_exact_main(
+    let (physical_time, main_item_id) = match runtime.transmit_exact_main(
         job_id,
         guard.endpoint_index,
         guard.endpoint,
@@ -17502,14 +18287,14 @@ async fn dispatch_buflo_kernel_release(
             ));
         }
     };
-    if let Err(error) = finalize_prepared_output(
+    if let Err(error) = finalize_buflo_kernel_prepared_output(
         &mut endpoints[guard.endpoint_index],
         controller,
         traces,
         observation_clock,
         &prepared,
-        Some(defense_start),
-        sent_at,
+        defense_start,
+        physical_time,
     ) {
         let detail = error.to_string();
         let error = retain_buflo_prepared_output_failure(
@@ -17588,7 +18373,7 @@ async fn dispatch_buflo_kernel_release(
         traces,
         observation_clock,
         defense_start,
-        sent_at,
+        physical_time,
         captured_incoming_credit,
         runtime,
     )
@@ -17617,9 +18402,14 @@ async fn dispatch_due_buflo_kernel_release(
         ));
     }
     if !runtime.tick_zero_staged()? {
-        let stage_at = runtime.tick_zero_stage_at()?;
-        if now() < stage_at {
-            return Ok(false);
+        match runtime.tick_zero_selection_state()? {
+            BufloKernelTaiWindowState::Pending => return Ok(false),
+            BufloKernelTaiWindowState::Open => {}
+            BufloKernelTaiWindowState::Expired => {
+                return Err(Error::DefenseExecution(
+                    "BuFLO tick-zero selection expired in CLOCK_TAI before staging".into(),
+                ));
+            }
         }
         stage_buflo_kernel_tick_zero(
             endpoints,
@@ -17633,8 +18423,25 @@ async fn dispatch_due_buflo_kernel_release(
     let Some(guard) = next_buflo_kernel_guard(defense, controller, endpoints, runtime)? else {
         return Ok(false);
     };
-    if now() < guard.guard_at {
-        return Ok(false);
+    match runtime.selection_state(&guard)? {
+        BufloKernelTaiWindowState::Pending
+            if buflo_kernel_pending_selection_is_clock_regression(
+                runtime.tick_zero_staged()?,
+                guard.packet.timestamp(),
+            ) =>
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO CLOCK_TAI regressed behind the staged tick-zero selection cutoff".into(),
+            ));
+        }
+        BufloKernelTaiWindowState::Pending => return Ok(false),
+        BufloKernelTaiWindowState::Open => {}
+        BufloKernelTaiWindowState::Expired => {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel slot {} selection expired in CLOCK_TAI before dispatch",
+                guard.slot.0
+            )));
+        }
     }
     dispatch_buflo_kernel_release(
         &guard,
@@ -18295,6 +19102,23 @@ where
     }
 }
 
+async fn await_unshaped_socket_retry_hint<F>(writable: F, wake_hint: Instant) -> Result<(), Error>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_hint));
+    tokio::pin!(timer);
+    tokio::pin!(writable);
+    tokio::select! {
+        biased;
+        () = &mut timer => Ok(()),
+        result = &mut writable => {
+            result?;
+            Ok(())
+        }
+    }
+}
+
 fn reduce_post_output_rolling_barrier(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
@@ -18347,16 +19171,50 @@ fn reduce_buflo_exact_pair_output(
     reduced_at: Instant,
     captured: &mut Vec<BufloExactIncomingIdentity>,
 ) -> Result<bool, Error> {
-    reduce_buflo_exact_pair_barrier(
+    let reduced_elapsed = reduced_at.saturating_duration_since(defense_start);
+    reduce_buflo_exact_pair_barrier_at_elapsed(
         guard,
         endpoints,
         controller,
         chaff_manifest,
         traces,
-        defense_start,
         reduced_at,
+        reduced_elapsed,
     )?;
     refresh_buflo_exact_incoming_identities(guard, endpoints, controller, defense_start, captured)
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the kernel reducer keeps physical chronology and TAI semantic time distinct"
+)]
+fn reduce_buflo_kernel_exact_pair_output(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    defense_start: Instant,
+    physical_time: BufloKernelPhysicalTxTime,
+    captured: &mut Vec<BufloExactIncomingIdentity>,
+) -> Result<bool, Error> {
+    reduce_buflo_exact_pair_barrier_at_elapsed(
+        guard,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        physical_time.observed_at,
+        physical_time.defense_elapsed,
+    )?;
+    refresh_buflo_kernel_exact_incoming_identities(
+        guard,
+        endpoints,
+        controller,
+        defense_start,
+        captured,
+    )
 }
 
 fn reduce_buflo_exact_pair_barrier(
@@ -18368,7 +19226,26 @@ fn reduce_buflo_exact_pair_barrier(
     defense_start: Instant,
     reduced_at: Instant,
 ) -> Result<(), Error> {
-    let reduced_elapsed = reduced_at.saturating_duration_since(defense_start);
+    reduce_buflo_exact_pair_barrier_at_elapsed(
+        guard,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        reduced_at,
+        reduced_at.saturating_duration_since(defense_start),
+    )
+}
+
+fn reduce_buflo_exact_pair_barrier_at_elapsed(
+    guard: &BufloExactReleaseGuard,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    reduced_at: Instant,
+    reduced_elapsed: Duration,
+) -> Result<(), Error> {
     let due_slots_before_output = BTreeSet::from([guard.slot]);
     if reduce_post_output_rolling_barrier(
         endpoints,
@@ -18411,28 +19288,44 @@ fn rolling_output_interrupt(
     controller: &QcsdController,
     endpoints: &[Endpoint],
     defense_start: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
+    observed_at: Instant,
 ) -> Result<Option<Instant>, Error> {
     if !rolling_output_lifecycle_active(controller, endpoints) {
         return Ok(None);
     }
+    let relative_deadlines = controller
+        .next_deadline()
+        .into_iter()
+        .chain(endpoints.iter().flat_map(|endpoint| {
+            endpoint
+                .prearmed_outgoing
+                .iter()
+                .map(|prearm| prearm.packet.timestamp())
+                .chain(
+                    endpoint
+                        .scheduled_outgoing
+                        .iter()
+                        .filter(|scheduled| scheduled.rolling_prearmed)
+                        .map(|scheduled| scheduled.packet.timestamp()),
+                )
+        }))
+        .collect::<Vec<_>>();
+    if defense_clock.uses_kernel_tai() {
+        let Some(started) = defense_start else {
+            return Err(Error::SlotInvariant(
+                "BuFLO kernel rolling output interrupt preceded defense activation".into(),
+            ));
+        };
+        return relative_deadlines
+            .into_iter()
+            .min()
+            .map(|deadline| defense_clock.project_elapsed_hint(started, deadline, observed_at))
+            .transpose();
+    }
     resolve_rolling_output_interrupt(
         defense_start,
-        controller
-            .next_deadline()
-            .into_iter()
-            .chain(endpoints.iter().flat_map(|endpoint| {
-                endpoint
-                    .prearmed_outgoing
-                    .iter()
-                    .map(|prearm| prearm.packet.timestamp())
-                    .chain(
-                        endpoint
-                            .scheduled_outgoing
-                            .iter()
-                            .filter(|scheduled| scheduled.rolling_prearmed)
-                            .map(|scheduled| scheduled.packet.timestamp()),
-                    )
-            })),
+        relative_deadlines,
         endpoints.iter().flat_map(|endpoint| {
             endpoint
                 .prearmed_outgoing
@@ -18475,6 +19368,7 @@ async fn drive_endpoint_output(
         None,
         None,
         None,
+        RunnerDefenseClock::Monotonic,
         false,
         OutputDriveCardinality::DrainAvailable,
         PostOutputRollingBarrier::Apply,
@@ -18514,6 +19408,7 @@ async fn drive_buflo_exact_release_output(
         Some(OutputWorkBoundary::new(deadline, deadline)),
         Some(deadline),
         Some(deadline),
+        RunnerDefenseClock::Monotonic,
         false,
         OutputDriveCardinality::OneDatagram,
         PostOutputRollingBarrier::DeferBufloExactPair,
@@ -18608,6 +19503,8 @@ async fn drive_buflo_exact_incoming_output_with_clock(
         Some(defense_start),
         Some(deadline),
         Some(deadline),
+        RunnerDefenseClock::Monotonic,
+        None,
         monotonic_clock,
     )
     .await?
@@ -18620,6 +19517,7 @@ async fn drive_buflo_exact_incoming_output_with_clock(
 #[expect(
     clippy::future_not_send,
     clippy::too_many_arguments,
+    clippy::large_types_passed_by_value,
     reason = "the current-thread output driver owns the exact-release interruption boundary"
 )]
 async fn drive_endpoint_output_until(
@@ -18633,6 +19531,7 @@ async fn drive_endpoint_output_until(
     work_boundary: Option<OutputWorkBoundary>,
     unshaped_handoff_interrupt: Option<Instant>,
     absolute_handoff_deadline: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
     cardinality: OutputDriveCardinality,
 ) -> Result<Option<Instant>, Error> {
     let mut monotonic_clock = now;
@@ -18647,6 +19546,7 @@ async fn drive_endpoint_output_until(
         work_boundary,
         unshaped_handoff_interrupt,
         absolute_handoff_deadline,
+        defense_clock,
         true,
         cardinality,
         PostOutputRollingBarrier::Apply,
@@ -18685,6 +19585,7 @@ async fn drive_endpoint_output_with_clock(
         None,
         None,
         None,
+        RunnerDefenseClock::Monotonic,
         false,
         OutputDriveCardinality::DrainAvailable,
         PostOutputRollingBarrier::Apply,
@@ -18699,6 +19600,7 @@ async fn drive_endpoint_output_with_clock(
 )]
 #[expect(
     clippy::too_many_arguments,
+    clippy::large_types_passed_by_value,
     reason = "the deterministic clock and interruption seams preserve output causality"
 )]
 #[expect(
@@ -18716,6 +19618,7 @@ async fn drive_endpoint_output_with_clock_until(
     work_boundary: Option<OutputWorkBoundary>,
     unshaped_handoff_interrupt: Option<Instant>,
     absolute_handoff_deadline: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
     interrupt_new_buflo_guards: bool,
     cardinality: OutputDriveCardinality,
     post_output_rolling_barrier: PostOutputRollingBarrier,
@@ -18728,7 +19631,14 @@ async fn drive_endpoint_output_with_clock_until(
         // reconcile every event due at that instant, apply its incoming
         // actions, and only then let transport observe target eligibility.
         let mut drive_now = monotonic_clock();
-        if let Some(wakeup) = work_boundary.and_then(|boundary| boundary.closed_wakeup(drive_now)) {
+        let mut sampled_drive_elapsed = if let Some(started) = defense_start {
+            Some(defense_clock.sample(started, drive_now)?)
+        } else {
+            None
+        };
+        if let Some(boundary) = work_boundary
+            && let Some(wakeup) = defense_clock.closed_output_wakeup(&boundary, drive_now)?
+        {
             return Ok(Some(wakeup));
         }
         let mut output_endpoint_index = endpoint_index;
@@ -18740,14 +19650,17 @@ async fn drive_endpoint_output_with_clock_until(
                 // slot outcome immediately before this origin's output turn.
                 // Reduce that production-ordered evidence before a rolling
                 // preview can be committed at its release boundary.
-                let observation_elapsed = drive_now.saturating_duration_since(started);
+                let observation_elapsed = sampled_drive_elapsed
+                    .unwrap_or_else(|| drive_now.saturating_duration_since(started));
                 handle_all_qcsd_observations(endpoints, controller, traces, observation_elapsed)?;
                 controller.flush_defense_observations();
                 ensure_defense_realizable(controller)?;
                 reduced_rolling_barrier = true;
                 drive_now = monotonic_clock();
+                sampled_drive_elapsed = Some(defense_clock.sample(started, drive_now)?);
             }
-            let drive_elapsed = drive_now.saturating_duration_since(started);
+            let drive_elapsed = sampled_drive_elapsed
+                .unwrap_or_else(|| drive_now.saturating_duration_since(started));
             let reconcile_staging = controller.has_fixed_schedule_staging()
                 || controller.has_rolling_outgoing_prearm()
                 || controller.has_due_rolling_reconciliation();
@@ -18772,18 +19685,26 @@ async fn drive_endpoint_output_with_clock_until(
                 if let Some(guard) =
                     next_buflo_exact_release_guard(&defense, controller, endpoints)?
                 {
+                    let ordinary_guard = if let Some(started) = defense_start {
+                        defense_clock
+                            .project_buflo_ordinary_guard_hints(started, &guard, drive_now)?
+                    } else {
+                        guard.into()
+                    };
                     work_boundary = Some(earliest_output_work_boundary(
                         work_boundary,
-                        guard.output_work_boundary(),
+                        ordinary_guard.work_boundary,
                     ));
                     unshaped_handoff_interrupt = unshaped_handoff_interrupt
                         .into_iter()
-                        .chain([guard.release])
+                        .chain([ordinary_guard.release])
                         .min();
                 }
                 if let Some(boundary) = work_boundary {
                     drive_now = monotonic_clock();
-                    if let Some(wakeup) = boundary.closed_wakeup(drive_now) {
+                    if let Some(wakeup) =
+                        defense_clock.closed_output_wakeup(&boundary, drive_now)?
+                    {
                         return Ok(Some(wakeup));
                     }
                 }
@@ -18839,7 +19760,34 @@ async fn drive_endpoint_output_with_clock_until(
         // boundaries would reject a successful syscall merely for finishing in
         // the reserved pre-release tail even though no new work can start there.
         let rolling_handoff_interrupt = if rolling_lifecycle_before_output {
-            rolling_output_interrupt(controller, endpoints, defense_start)?
+            rolling_output_interrupt(
+                controller,
+                endpoints,
+                defense_start,
+                defense_clock,
+                drive_now,
+            )?
+        } else {
+            None
+        };
+        let kernel_semantic_handoff_interrupt = if defense_clock.uses_kernel_tai() {
+            controller
+                .next_deadline()
+                .into_iter()
+                .chain(endpoints.iter().flat_map(|endpoint| {
+                    endpoint
+                        .prearmed_outgoing
+                        .iter()
+                        .map(|prearm| prearm.packet.timestamp())
+                        .chain(
+                            endpoint
+                                .scheduled_outgoing
+                                .iter()
+                                .filter(|scheduled| scheduled.rolling_prearmed)
+                                .map(|scheduled| scheduled.packet.timestamp()),
+                        )
+                }))
+                .min()
         } else {
             None
         };
@@ -18856,6 +19804,8 @@ async fn drive_endpoint_output_with_clock_until(
             defense_start,
             effective_unshaped_handoff_interrupt,
             absolute_handoff_deadline,
+            defense_clock,
+            kernel_semantic_handoff_interrupt,
             monotonic_clock,
         )
         .await?;
@@ -18883,7 +19833,7 @@ async fn drive_endpoint_output_with_clock_until(
             // endpoint's production-ordered observations before another
             // origin is allowed to cross a rolling release boundary.
             let observation_now = monotonic_clock();
-            let observation_elapsed = observation_now.saturating_duration_since(started);
+            let observation_elapsed = defense_clock.sample(started, observation_now)?;
             let has_new_due_rolling_target = reduce_post_output_rolling_barrier(
                 endpoints,
                 controller,
@@ -19002,13 +19952,14 @@ async fn prepare_output_once_with_evidence(
         endpoint.test_output_observations.push(observation);
         return Ok(PreparedOutputDrive::None);
     }
+    let transport_at = endpoint.transport_instant(drive_now);
     let output = endpoint
         .client
-        .process_multiple_output(drive_now, NonZeroUsize::MIN);
+        .process_multiple_output(transport_at, NonZeroUsize::MIN);
     let batch = match output {
         OutputBatch::DatagramBatch(batch) => batch,
         OutputBatch::Callback(delay) => {
-            let Some(wakeup) = absolute_wakeup(drive_now, delay) else {
+            let Some(wakeup) = absolute_wakeup(transport_at, delay) else {
                 return Err(PreparedOutputFailure::new(
                     "transport-callback-deadline",
                     Error::RunAborted("transport callback deadline overflow".into()),
@@ -19130,6 +20081,7 @@ async fn prepare_output_once_with_clock(
         .map_err(PreparedOutputFailure::into_error)
 }
 
+#[cfg(test)]
 fn finalize_prepared_output(
     endpoint: &mut Endpoint,
     controller: &mut QcsdController,
@@ -19139,7 +20091,59 @@ fn finalize_prepared_output(
     defense_start: Option<Instant>,
     sent_at: Instant,
 ) -> Result<(), Error> {
-    let wire_elapsed = defense_start.map(|started| sent_at.saturating_duration_since(started));
+    finalize_prepared_output_with_elapsed(
+        endpoint,
+        controller,
+        traces,
+        observation_clock,
+        prepared,
+        defense_start,
+        sent_at,
+        None,
+        sent_at,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn finalize_buflo_kernel_prepared_output(
+    endpoint: &mut Endpoint,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    prepared: &PreparedOutputMicrostep,
+    defense_start: Instant,
+    physical_time: BufloKernelPhysicalTxTime,
+) -> Result<(), Error> {
+    finalize_prepared_output_with_elapsed(
+        endpoint,
+        controller,
+        traces,
+        observation_clock,
+        prepared,
+        Some(defense_start),
+        physical_time.observed_at,
+        Some(physical_time.defense_elapsed),
+        physical_time.observed_at,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the prepared-output boundary keeps physical and semantic clocks explicit"
+)]
+fn finalize_prepared_output_with_elapsed(
+    endpoint: &mut Endpoint,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    prepared: &PreparedOutputMicrostep,
+    defense_start: Option<Instant>,
+    sent_at: Instant,
+    semantic_wire_elapsed: Option<Duration>,
+    receive_credit_handoff_at: Instant,
+) -> Result<(), Error> {
+    let wire_elapsed = semantic_wire_elapsed
+        .or_else(|| defense_start.map(|started| sent_at.saturating_duration_since(started)));
     for observation in &prepared.observations {
         let terminal = terminal_observation_slot(observation.observation());
         let terminal_us = match (terminal, wire_elapsed) {
@@ -19159,7 +20163,7 @@ fn finalize_prepared_output(
             traces,
             observation,
             terminal_us,
-            Some(sent_at),
+            Some(receive_credit_handoff_at),
         )?;
         if let (Some(slot), Some(at)) = (terminal, wire_elapsed) {
             require_controller_terminal_resolution(controller, slot, at)?;
@@ -19204,6 +20208,7 @@ fn finalize_prepared_output(
 )]
 #[expect(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the deterministic handoff clock is an explicit output-causality seam"
 )]
 async fn process_output_once_with_clock(
@@ -19215,6 +20220,8 @@ async fn process_output_once_with_clock(
     defense_start: Option<Instant>,
     unshaped_handoff_interrupt: Option<Instant>,
     absolute_handoff_deadline: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
+    semantic_handoff_interrupt: Option<Duration>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
     let prepared = match prepare_output_once_with_clock(endpoint, drive_now).await? {
@@ -19228,7 +20235,19 @@ async fn process_output_once_with_clock(
         .filter_map(|attribution| attribution.satisfied.map(|target| target.deadline))
         .collect();
     target_deadlines.extend(absolute_handoff_deadline);
-    let (sent_at, late_handoff) = loop {
+    let (sent_at, late_handoff, semantic_wire_elapsed) = loop {
+        if let (Some(started), Some(interrupt_elapsed)) =
+            (defense_start, semantic_handoff_interrupt)
+            && semantic_handoff_interrupt_crossed(
+                defense_clock.sample(started, monotonic_clock())?,
+                interrupt_elapsed,
+            )
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO ordinary socket handoff reached its CLOCK_TAI semantic interrupt before send"
+                    .into(),
+            ));
+        }
         #[cfg(test)]
         let force_socket_handoff_success = endpoint.test_force_socket_handoff_success;
         #[cfg(test)]
@@ -19236,7 +20255,10 @@ async fn process_output_once_with_clock(
         let socket_handoff_policy = endpoint.socket_handoff_policy;
         match attempt_socket_handoff_timestamped(
             &target_deadlines,
-            unshaped_handoff_interrupt,
+            hard_unshaped_handoff_interrupt(
+                defense_clock.uses_kernel_tai(),
+                unshaped_handoff_interrupt,
+            ),
             || {
                 #[cfg(test)]
                 if force_socket_handoff_success {
@@ -19252,19 +20274,46 @@ async fn process_output_once_with_clock(
             },
             &mut *monotonic_clock,
         )? {
-            SocketHandoff::Sent(sent_at) => break (sent_at, None),
+            SocketHandoff::Sent(sent_at) => {
+                let elapsed = match defense_start {
+                    Some(started) => Some(defense_clock.sample(started, sent_at)?),
+                    None => None,
+                };
+                break (sent_at, None, elapsed);
+            }
             SocketHandoff::SentLate {
                 sent_at,
                 deadline,
                 boundary,
-            } => break (sent_at, Some((deadline, boundary))),
+            } => {
+                let elapsed = match defense_start {
+                    Some(started) => Some(defense_clock.sample(started, sent_at)?),
+                    None => None,
+                };
+                break (sent_at, Some((deadline, boundary)), elapsed);
+            }
             SocketHandoff::RetryUnshaped => {
-                await_unshaped_socket_retry(endpoint.socket.writable(), unshaped_handoff_interrupt)
+                if let (Some(started), Some(interrupt_elapsed)) =
+                    (defense_start, semantic_handoff_interrupt)
+                {
+                    let hint_base = monotonic_clock();
+                    let wake_hint = defense_clock.project_elapsed_hint(
+                        started,
+                        interrupt_elapsed,
+                        hint_base,
+                    )?;
+                    await_unshaped_socket_retry_hint(endpoint.socket.writable(), wake_hint).await?;
+                } else {
+                    await_unshaped_socket_retry(
+                        endpoint.socket.writable(),
+                        unshaped_handoff_interrupt,
+                    )
                     .await?;
+                }
             }
         }
     };
-    finalize_prepared_output(
+    finalize_prepared_output_with_elapsed(
         endpoint,
         controller,
         traces,
@@ -19272,7 +20321,17 @@ async fn process_output_once_with_clock(
         &prepared,
         defense_start,
         sent_at,
+        semantic_wire_elapsed,
+        sent_at,
     )?;
+    if let (Some(wire_elapsed), Some(interrupt_elapsed)) =
+        (semantic_wire_elapsed, semantic_handoff_interrupt)
+        && semantic_handoff_interrupt_crossed(wire_elapsed, interrupt_elapsed)
+    {
+        return Err(Error::DefenseExecution(
+            "BuFLO ordinary socket handoff crossed its CLOCK_TAI semantic interrupt".into(),
+        ));
+    }
     if let Some((deadline, boundary)) = late_handoff {
         // The UDP syscall already succeeded, so first preserve every packet,
         // schedule, event, and controller observation caused by the datagram.
@@ -19291,6 +20350,7 @@ fn process_input(
     defense_elapsed: Option<Duration>,
     drain_socket: bool,
 ) -> Result<(), Error> {
+    let transport_at = endpoint.transport_instant(now);
     while let Some(datagrams) = endpoint
         .socket
         .recv(endpoint.local_addr, &mut endpoint.recv_buf)?
@@ -19316,7 +20376,7 @@ fn process_input(
                 traces.observation(Some(endpoint.id), &record)?;
                 controller.observe(record.into_observation(), at);
             }
-            endpoint.client.process_input(datagram, now);
+            endpoint.client.process_input(datagram, transport_at);
         }
         if !drain_socket {
             break;
@@ -19604,6 +20664,9 @@ fn elapsed_ns(start: Instant, instant: Instant) -> u64 {
 std::thread_local! {
     static TEST_MONOTONIC_NOW_OVERRIDE: std::cell::Cell<Option<Instant>> =
         const { std::cell::Cell::new(None) };
+    #[cfg(target_os = "linux")]
+    static TEST_BUFLO_DECISION_TAI_NS_OVERRIDE:
+        RefCell<Option<VecDeque<u64>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -19623,6 +20686,38 @@ impl TestMonotonicNowOverride {
 impl Drop for TestMonotonicNowOverride {
     fn drop(&mut self) {
         TEST_MONOTONIC_NOW_OVERRIDE.with(|clock| clock.set(self.previous));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct TestBufloDecisionTaiOverride {
+    previous: Option<VecDeque<u64>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestBufloDecisionTaiOverride {
+    fn fixed(value: u64) -> Self {
+        Self::sequence([value])
+    }
+
+    fn sequence(values: impl IntoIterator<Item = u64>) -> Self {
+        let values = values.into_iter().collect::<VecDeque<_>>();
+        assert!(
+            !values.is_empty(),
+            "a deterministic TAI sequence is required"
+        );
+        let previous =
+            TEST_BUFLO_DECISION_TAI_NS_OVERRIDE.with(|clock| clock.replace(Some(values)));
+        Self { previous }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestBufloDecisionTaiOverride {
+    fn drop(&mut self) {
+        TEST_BUFLO_DECISION_TAI_NS_OVERRIDE.with(|clock| {
+            _ = clock.replace(self.previous.take());
+        });
     }
 }
 
@@ -19688,16 +20783,16 @@ mod tests {
         PreparedOutputDrive, Preset, ProfileArg, QcsdRequestRole, QualificationAcknowledgement,
         QualifierStream, RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, RUNNER_WAKEUP_METRICS_SEMANTICS,
         RequestPolicyArg, ResourceRunState, ResponseQualificationMode,
-        ResponseQualificationRequest, RunCompletion, RunSpec, RunnerWakeupMetrics,
-        RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff, SocketHandoffBoundary,
-        SocketHandoffPolicy, StaticModeArg, StreamActivationStage, StreamRecord, StreamType,
-        SustainedResponseQualificationRequest, TerminalActionSemantics, TestMonotonicNowOverride,
-        TestOutputDrive, TrafficMorphingActivation, absolute_wakeup, action_failure_reason,
-        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
-        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
-        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
-        bounded_qualification_wait, buflo_exact_incoming_identities,
-        buflo_exact_incoming_identity_is_pending,
+        ResponseQualificationRequest, RunCompletion, RunSpec, RunnerDefenseClock,
+        RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
+        SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
+        StreamRecord, StreamType, SustainedResponseQualificationRequest, TerminalActionSemantics,
+        TestMonotonicNowOverride, TestOutputDrive, TrafficMorphingActivation, absolute_wakeup,
+        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
+        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
+        attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
+        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
+        buflo_exact_incoming_identities, buflo_exact_incoming_identity_is_pending,
         buflo_exact_release_failure_watchdog_cadence_validated,
         buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
         buflo_exact_release_wait_step, buflo_exact_release_zero_failure_watchdog_remainder_bound,
@@ -24013,6 +25108,36 @@ mod tests {
         stream
     }
 
+    fn stage_unshaped_runner_request_for_output(
+        endpoint: &mut super::Endpoint,
+        at: Instant,
+        port: u16,
+    ) {
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let request_url: http::Uri = format!("https://127.0.0.1:{port}/clock-seam")
+            .parse()
+            .expect("clock-seam request URI");
+        let transport_at = endpoint.transport_instant(at);
+        let stream = endpoint
+            .client
+            .fetch(
+                transport_at,
+                "GET",
+                &request_url,
+                &[],
+                neqo_http3::Priority::default(),
+            )
+            .expect("create clock-seam request stream");
+        endpoint
+            .client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(1))
+            .expect("register clock-seam request stream");
+        endpoint
+            .client
+            .stream_close_send(stream, transport_at)
+            .expect("close clock-seam request send side");
+    }
+
     fn outgoing_pair(packet: Packet) -> Packet {
         Packet::new(packet.timestamp(), Direction::Outgoing, 1_200)
             .expect("synthetic paired outgoing packet")
@@ -24430,6 +25555,7 @@ mod tests {
                 &mut traces,
                 controller.can_start_application_batch(),
                 None,
+                None,
             )
             .expect("blocked dispatch"),
             0
@@ -24457,12 +25583,64 @@ mod tests {
                 &mut traces,
                 controller.can_start_application_batch(),
                 Some(now()),
+                None,
             )
             .expect("expired work interrupt"),
             0
         );
         assert_eq!(endpoints[0].pending.len(), 1);
         assert!(endpoints[0].streams.is_empty());
+        #[cfg(target_os = "linux")]
+        {
+            let interrupt_tai_ns = 9_000_000_000_u64;
+            let _at_interrupt = super::TestBufloDecisionTaiOverride::fixed(interrupt_tai_ns);
+            assert_eq!(
+                dispatch_ready_requests(
+                    &mut endpoints,
+                    &spec,
+                    &mut dependencies,
+                    barrier_now,
+                    &mut traces,
+                    controller.can_start_application_batch(),
+                    Some(barrier_now + Duration::from_secs(1)),
+                    Some(interrupt_tai_ns),
+                )
+                .expect("CLOCK_TAI boundary blocks request admission"),
+                0
+            );
+        }
+        assert_eq!(endpoints[0].pending.len(), 1);
+        assert!(endpoints[0].streams.is_empty());
+        #[cfg(target_os = "linux")]
+        let post_handoff_dispatch = {
+            let interrupt_tai_ns = 9_000_000_000_u64;
+            let _before_interrupt =
+                super::TestBufloDecisionTaiOverride::fixed(interrupt_tai_ns - 1);
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                barrier_now,
+                &mut traces,
+                controller.can_start_application_batch(),
+                Some(now()),
+                Some(interrupt_tai_ns),
+            )
+            .expect("CLOCK_TAI authority ignores an expired monotonic wake hint")
+        };
+        #[cfg(not(target_os = "linux"))]
+        let post_handoff_dispatch = dispatch_ready_requests(
+            &mut endpoints,
+            &spec,
+            &mut dependencies,
+            barrier_now,
+            &mut traces,
+            controller.can_start_application_batch(),
+            None,
+            None,
+        )
+        .expect("post-handoff dispatch");
+        assert_eq!(post_handoff_dispatch, 1);
         assert_eq!(
             dispatch_ready_requests(
                 &mut endpoints,
@@ -24472,18 +25650,6 @@ mod tests {
                 &mut traces,
                 controller.can_start_application_batch(),
                 None,
-            )
-            .expect("post-handoff dispatch"),
-            1
-        );
-        assert_eq!(
-            dispatch_ready_requests(
-                &mut endpoints,
-                &spec,
-                &mut dependencies,
-                barrier_now,
-                &mut traces,
-                controller.can_start_application_batch(),
                 None,
             )
             .expect("duplicate dispatch probe"),
@@ -24632,6 +25798,7 @@ mod tests {
                 started,
                 &mut traces,
                 true,
+                None,
                 None,
             )
             .expect("dispatch request"),
@@ -26214,12 +27381,16 @@ mod tests {
                 _ => None,
             })
             .expect("incoming slot");
+        let selection_at = release
+            .checked_sub(Duration::from_millis(5))
+            .expect("release has one selection cutoff");
+        super::advance_endpoint_transport_floors(&mut endpoints, release);
         apply_action_batch(
             &mut endpoints,
             &mut controller,
             None,
             &mut traces,
-            release,
+            selection_at,
             tick,
             tick_actions,
         )
@@ -26253,6 +27424,43 @@ mod tests {
                 .expect("release has one adapter-window predecessor")
         );
         assert_eq!(guard.active_wait_at, guard.guard_at);
+        let next_prearm = endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.prearmed_outgoing.iter())
+            .find(|prearm| prearm.packet == next)
+            .expect("cross-endpoint next tick remains prearmed");
+        assert_eq!(
+            next_prearm.not_before,
+            release + tick,
+            "all action owners share the current exact release as their Neqo base",
+        );
+
+        let drifted_epoch = release
+            .checked_sub(tick + Duration::from_nanos(5_800_072))
+            .expect("synthetic epoch precedes the tick");
+        assert!(matches!(
+            buflo_exact_incoming_identities(
+                &guard,
+                &endpoints,
+                &controller,
+                drifted_epoch,
+                None,
+            ),
+            Err(Error::SlotInvariant(message))
+                if message.contains("adapter release skew")
+        ));
+        assert_eq!(
+            super::buflo_kernel_exact_incoming_identities(
+                &guard,
+                &endpoints,
+                &controller,
+                drifted_epoch,
+                None,
+            )
+            .expect("kernel identity validation is independent of stale epoch Instant")
+            .len(),
+            1,
+        );
 
         let _logical_now = TestMonotonicNowOverride::fixed(guard.release);
         let exact_release_evidence =
@@ -27138,6 +28346,7 @@ mod tests {
                 Some(OutputWorkBoundary::new(guard.deadline, guard.deadline)),
                 Some(guard.deadline),
                 Some(guard.deadline),
+                RunnerDefenseClock::Monotonic,
                 OutputDriveCardinality::OneDatagram,
             )
             .await
@@ -30562,6 +31771,137 @@ mod tests {
                 boundary: SocketHandoffBoundary::AdapterDeadline,
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn kernel_tai_output_path_rechecks_retry_and_ignores_stale_physical_interrupt() {
+        let output = trace_output_dir("kernel-tai-output-clock-seam");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        endpoint.socket_handoff_policy = SocketHandoffPolicy::CandidateFidelityStrict;
+        endpoint.test_strict_socket_handoff_error = Some(libc::EAGAIN);
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoint.id,
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let start_tai_ns = 70_000_000_000_u64;
+        let interrupt = Duration::from_millis(5);
+        let _tai = super::TestBufloDecisionTaiOverride::sequence([
+            start_tai_ns + 4_000_000,
+            start_tai_ns + 4_200_000,
+            start_tai_ns + 4_400_000,
+            start_tai_ns + 4_646_000,
+        ]);
+        let physical_after_interrupt = started + Duration::from_millis(12);
+        let _physical_now = TestMonotonicNowOverride::fixed(physical_after_interrupt);
+        let stale_expired_hint = started
+            .checked_sub(Duration::from_nanos(1))
+            .expect("started has a predecessor");
+        let mut monotonic_clock = || physical_after_interrupt;
+        assert_eq!(
+            super::process_output_once_with_clock(
+                &mut endpoint,
+                &mut controller,
+                &mut traces,
+                &observation_clock,
+                started,
+                Some(started),
+                Some(stale_expired_hint),
+                None,
+                RunnerDefenseClock::KernelTai {
+                    start: started,
+                    start_tai_ns,
+                },
+                Some(interrupt),
+                &mut monotonic_clock,
+            )
+            .await
+            .expect("TAI-open retry succeeds despite an expired monotonic hint"),
+            super::OutputDrive::Datagram,
+        );
+        assert_eq!(
+            endpoint.test_strict_socket_handoff_error, None,
+            "the production WouldBlock injection was consumed before the successful retry",
+        );
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 2, "one retried unshaped datagram");
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn kernel_tai_output_path_rejects_exact_semantic_interrupt_before_send() {
+        let output = trace_output_dir("kernel-tai-output-deadline");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        endpoint.test_force_socket_handoff_success = true;
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let start_tai_ns = 80_000_000_000_u64;
+        let interrupt = Duration::from_millis(5);
+        let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns + 5_000_000);
+        let future_physical_hint = started + Duration::from_secs(1);
+        let mut monotonic_clock = || started;
+        let error = super::process_output_once_with_clock(
+            &mut endpoint,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            started,
+            Some(started),
+            Some(future_physical_hint),
+            None,
+            RunnerDefenseClock::KernelTai {
+                start: started,
+                start_tai_ns,
+            },
+            Some(interrupt),
+            &mut monotonic_clock,
+        )
+        .await
+        .expect_err("the half-open CLOCK_TAI boundary rejects before socket handoff");
+        assert!(matches!(
+            error,
+            Error::DefenseExecution(message)
+                if message.contains("semantic interrupt before send")
+        ));
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(packets.lines().count(), 1, "no at-deadline datagram");
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
     #[tokio::test]
@@ -34786,6 +36126,7 @@ mod tests {
             Some(OutputWorkBoundary::new(output_admission_at, guard_at)),
             Some(release),
             None,
+            RunnerDefenseClock::Monotonic,
             true,
             OutputDriveCardinality::DrainAvailable,
             PostOutputRollingBarrier::Apply,
@@ -36161,7 +37502,7 @@ mod tests {
             super::clock_offset_bounds(&end.realtime),
         )
         .expect("online end intersection");
-        assert_eq!(mapping.schema_version, 4);
+        assert_eq!(mapping.schema_version, 5);
         assert_eq!(
             mapping.effective_envelope_semantics,
             super::BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS
@@ -36788,10 +38129,362 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_four_binds_etf_expiry_horizon() {
-        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 4);
-        assert_eq!(super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION, 4);
-        assert_eq!(super::BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION, 4);
+    fn buflo_kernel_tai_elapsed_reproduces_v110_timely_tx_despite_monotonic_drift() {
+        let start_tai_ns = 1_000_000_000_u64;
+        let release_tai_ns = start_tai_ns + 4_200_000_000;
+        let deadline_tai_ns = release_tai_ns + 5_000_000;
+        let timely_tx_upper_ns = start_tai_ns + 4_204_646_000;
+        let semantic_elapsed =
+            super::buflo_kernel_defense_elapsed_from_tai_upper(timely_tx_upper_ns, start_tai_ns)
+                .expect("TAI upper follows epoch");
+        let old_manufactured_controller_elapsed = Duration::from_micros(4_205_834);
+        let observed_mapping_drift = Duration::from_nanos(5_800_072);
+
+        assert_eq!(semantic_elapsed, Duration::from_micros(4_204_646));
+        assert!(old_manufactured_controller_elapsed >= Duration::from_millis(4_205));
+        assert_eq!(observed_mapping_drift, Duration::from_nanos(5_800_072));
+        assert!(super::buflo_kernel_interval_within_half_open_window(
+            timely_tx_upper_ns,
+            timely_tx_upper_ns,
+            release_tai_ns,
+            deadline_tai_ns,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_tai_half_open_deadline_accepts_minus_one_and_rejects_deadline() {
+        let release = 10_000_000_u64;
+        let deadline = release + 5_000_000;
+        assert_eq!(
+            super::buflo_kernel_tai_window_state(deadline - 1, release, deadline),
+            super::BufloKernelTaiWindowState::Open
+        );
+        assert!(super::buflo_kernel_interval_within_half_open_window(
+            deadline - 1,
+            deadline - 1,
+            release,
+            deadline,
+        ));
+        assert_eq!(
+            super::buflo_kernel_tai_window_state(deadline, release, deadline),
+            super::BufloKernelTaiWindowState::Expired
+        );
+        assert!(!super::buflo_kernel_interval_within_half_open_window(
+            deadline, deadline, release, deadline,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_cross_endpoint_retry_phases_and_expiry_are_tai_deterministic() {
+        let release = 20_000_000_u64;
+        let deadline = release + 5_000_000;
+        let phases = super::exact_incoming_retry_tai_times(release, deadline)
+            .expect("five millisecond window has strict retry phases");
+        assert_eq!(
+            phases,
+            [
+                release + 1_250_000,
+                release + 2_500_000,
+                release + 3_750_000
+            ]
+        );
+
+        for _endpoint in [QcsdEndpointId(0), QcsdEndpointId(7)] {
+            assert_eq!(
+                super::buflo_kernel_incoming_retry_step(release - 1, release, deadline)
+                    .expect("pending step"),
+                super::BufloKernelIncomingRetryStep::Pending
+            );
+            assert_eq!(
+                super::buflo_kernel_incoming_retry_step(release, release, deadline)
+                    .expect("open step"),
+                super::BufloKernelIncomingRetryStep::Open {
+                    next_wake_tai_ns: phases[0],
+                }
+            );
+            assert_eq!(
+                super::buflo_kernel_incoming_retry_step(deadline - 1, release, deadline)
+                    .expect("last in-window step"),
+                super::BufloKernelIncomingRetryStep::Open {
+                    next_wake_tai_ns: deadline,
+                }
+            );
+            assert_eq!(
+                super::buflo_kernel_incoming_retry_step(deadline, release, deadline)
+                    .expect("expired step"),
+                super::BufloKernelIncomingRetryStep::Expired
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_pre_epoch_elapsed_and_transport_floor_are_bounded() {
+        let start_tai_ns = 30_000_000_u64;
+        assert_eq!(
+            super::buflo_kernel_defense_elapsed_at_tai(start_tai_ns - 1, start_tai_ns),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            super::buflo_kernel_defense_elapsed_at_tai(start_tai_ns + 2_000_000, start_tai_ns,),
+            Duration::from_millis(2),
+        );
+
+        let physical = now();
+        assert_eq!(
+            super::buflo_kernel_project_tai_hint(
+                physical,
+                start_tai_ns - 10_000_000,
+                start_tai_ns,
+            )
+            .expect("pre-epoch hint"),
+            physical + Duration::from_millis(10),
+        );
+        let exact_release = physical + Duration::from_millis(5);
+        let mut endpoint_floors = [physical, physical + Duration::from_millis(1)];
+        for floor in &mut endpoint_floors {
+            assert_eq!(
+                super::nondecreasing_transport_instant(floor, exact_release),
+                exact_release,
+            );
+            assert_eq!(
+                super::nondecreasing_transport_instant(
+                    floor,
+                    physical + Duration::from_micros(100),
+                ),
+                exact_release,
+                "post-TX raw time cannot regress Neqo on either endpoint",
+            );
+            assert_eq!(
+                super::nondecreasing_transport_instant(floor, physical + Duration::from_millis(6),),
+                physical + Duration::from_millis(6),
+                "the floor releases as soon as monotonic time catches up",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_guard_projection_uses_one_sample_and_tai_remains_authoritative() {
+        let physical = now();
+        let start_tai_ns = 100_000_000_u64;
+        let current_tai_ns = start_tai_ns + 4_200_000;
+        let hints = super::project_buflo_ordinary_guard_hints_from_sample(
+            start_tai_ns,
+            Duration::from_millis(20),
+            current_tai_ns,
+            physical,
+        )
+        .expect("one-sample guard projection");
+        assert_eq!(
+            hints.work_boundary.admission_at,
+            physical + Duration::from_micros(5_800),
+        );
+        assert_eq!(
+            hints.work_boundary.resume_at,
+            physical + Duration::from_micros(10_800),
+        );
+        assert_eq!(hints.release, physical + Duration::from_micros(15_800));
+        assert_eq!(
+            hints.work_boundary.kernel_admission_tai_ns,
+            Some(start_tai_ns + 10_000_000),
+        );
+        let defense_clock = RunnerDefenseClock::KernelTai {
+            start: physical,
+            start_tai_ns,
+        };
+        {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns + 10_000_000 - 1);
+            assert_eq!(
+                defense_clock
+                    .closed_output_wakeup(
+                        &hints.work_boundary,
+                        physical + Duration::from_millis(20),
+                    )
+                    .expect("TAI admission check"),
+                None,
+                "an already-late physical hint cannot close ordinary work before TAI admission",
+            );
+        }
+        {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns + 10_000_000);
+            assert_eq!(
+                defense_clock
+                    .closed_output_wakeup(&hints.work_boundary, physical)
+                    .expect("TAI admission check"),
+                Some(hints.work_boundary.resume_at),
+                "the half-open TAI admission boundary closes work even when its physical hint is future",
+            );
+        }
+
+        let already_expired_physical_hint = physical
+            .checked_sub(Duration::from_nanos(1))
+            .expect("physical instant has a predecessor");
+        assert_eq!(
+            super::hard_unshaped_handoff_interrupt(true, Some(already_expired_physical_hint)),
+            None,
+            "a projected physical boundary is never a kernel hard rejection",
+        );
+        assert!(!super::buflo_kernel_tai_boundary_reached(
+            start_tai_ns + 9_999_999,
+            start_tai_ns + 10_000_000,
+        ));
+        assert!(super::buflo_kernel_tai_boundary_reached(
+            start_tai_ns + 10_000_000,
+            start_tai_ns + 10_000_000,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_handoff_uses_immediate_elapsed_and_retry_reprojects() {
+        let interrupt = Duration::from_millis(5);
+        let immediate_handoff = interrupt
+            .checked_sub(Duration::from_nanos(1))
+            .expect("interrupt has a predecessor");
+        let later_finalization = interrupt + Duration::from_millis(8);
+        assert!(!super::semantic_handoff_interrupt_crossed(
+            immediate_handoff,
+            interrupt,
+        ));
+        assert!(super::semantic_handoff_interrupt_crossed(
+            later_finalization,
+            interrupt,
+        ));
+
+        let target_tai_ns = 500_000_000_u64;
+        let first_physical = now();
+        let stale_hint = super::buflo_kernel_project_tai_hint(
+            first_physical,
+            target_tai_ns - 2_000_000,
+            target_tai_ns,
+        )
+        .expect("first retry hint");
+        let second_physical = first_physical + Duration::from_millis(3);
+        let fresh_hint = super::buflo_kernel_project_tai_hint(
+            second_physical,
+            target_tai_ns - 500_000,
+            target_tai_ns,
+        )
+        .expect("fresh retry hint");
+        assert_eq!(stale_hint, first_physical + Duration::from_millis(2));
+        assert_eq!(fresh_hint, second_physical + Duration::from_micros(500));
+        assert!(
+            fresh_hint > stale_hint,
+            "WouldBlock retry uses a new mapping"
+        );
+    }
+
+    #[test]
+    fn buflo_kernel_adapter_window_accepts_only_five_ms_normalizations() {
+        let release = now();
+        for width in [Duration::from_micros(4_999), Duration::from_millis(5)] {
+            assert!(super::buflo_adapter_window_is_normalized(
+                release,
+                release + width,
+                Duration::from_millis(5),
+            ));
+        }
+        for width in [Duration::from_micros(4_998), Duration::from_micros(5_001)] {
+            assert!(!super::buflo_adapter_window_is_normalized(
+                release,
+                release + width,
+                Duration::from_millis(5),
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_stable_clock_path_preserves_physical_and_semantic_elapsed() {
+        let start_tai_ns = 40_000_000_u64;
+        let elapsed = Duration::from_millis(3);
+        assert_eq!(
+            super::buflo_kernel_defense_elapsed_from_tai_upper(
+                start_tai_ns + 3_000_000,
+                start_tai_ns,
+            )
+            .expect("stable TAI elapsed"),
+            elapsed,
+        );
+        let physical = now();
+        assert_eq!(
+            super::buflo_kernel_project_tai_hint(
+                physical,
+                start_tai_ns + 1_000_000,
+                start_tai_ns + 3_000_000,
+            )
+            .expect("stable hint"),
+            physical + Duration::from_millis(2),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_backward_tai_step_after_tick_zero_fails_closed() {
+        let release_tai_ns = 90_000_000_u64;
+        let deadline_tai_ns = release_tai_ns + 5_000_000;
+        assert_eq!(
+            super::buflo_kernel_tai_window_state(release_tai_ns, release_tai_ns, deadline_tai_ns,),
+            super::BufloKernelTaiWindowState::Open,
+            "tick-zero staging can proceed only once CLOCK_TAI reaches release",
+        );
+        assert_eq!(
+            super::buflo_kernel_tai_window_state(
+                release_tai_ns - 1,
+                release_tai_ns,
+                deadline_tai_ns,
+            ),
+            super::BufloKernelTaiWindowState::Pending,
+            "a true backward CLOCK_TAI step is not silently treated as open",
+        );
+        assert_eq!(
+            super::buflo_kernel_incoming_retry_step(
+                release_tai_ns - 1,
+                release_tai_ns,
+                deadline_tai_ns,
+            )
+            .expect("retry state"),
+            super::BufloKernelIncomingRetryStep::Pending,
+            "the production incoming loop rejects Pending after the main TX",
+        );
+        assert!(super::buflo_kernel_pending_selection_is_clock_regression(
+            true,
+            Duration::ZERO,
+        ));
+        assert!(!super::buflo_kernel_pending_selection_is_clock_regression(
+            true,
+            Duration::from_millis(20),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_abort_clock_failure_still_totalizes_terminal_elapsed() {
+        let defense_start = now();
+        let ended_at = defense_start + Duration::from_millis(7);
+        let mut cleanup_errors = Vec::new();
+        let elapsed = super::buflo_kernel_terminal_elapsed_or_fallback(
+            Some(Err(Error::DefenseExecution(
+                "synthetic CLOCK_TAI snapshot failure".into(),
+            ))),
+            Some(defense_start),
+            ended_at,
+            &mut cleanup_errors,
+        );
+        assert_eq!(elapsed, Duration::from_millis(7));
+        assert_eq!(cleanup_errors.len(), 1);
+        assert!(cleanup_errors[0].contains("CLOCK_TAI elapsed failed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_schema_five_binds_tai_controller_and_etf_expiry_horizon() {
+        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 5);
+        assert_eq!(super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION, 5);
+        assert_eq!(super::BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION, 5);
 
         let delta_ns = duration_as_u64_nanos(super::BUFLO_KERNEL_TX_ETF_DELTA);
         assert_eq!(delta_ns, 4_500_000);
@@ -36801,13 +38494,19 @@ mod tests {
         }
         assert!(
             super::BUFLO_KERNEL_TX_SEMANTICS
-                .starts_with("client_only_buflo_kernel_timed_egress_v4;")
+                .starts_with("client_only_buflo_kernel_timed_egress_v5;")
         );
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
             "selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true;"
         ));
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
             "tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true;"
+        ));
+        assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
+            "kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true;"
+        ));
+        assert!(super::BUFLO_KERNEL_CLOCK_MAPPING_SEMANTICS.ends_with(
+            "physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI"
         ));
 
         let (_, qdisc, _) = synthetic_buflo_helper_contracts();
@@ -36839,7 +38538,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_four_serializes_before_arm_and_on_item_failure() {
+    fn buflo_kernel_schema_five_serializes_before_arm_and_on_item_failure() {
         let runtime_with_jobs = |jobs| {
             synthetic_buflo_kernel_runtime(
                 super::sample_buflo_kernel_clock_phase()
@@ -37083,11 +38782,11 @@ mod tests {
             "cleanup_errors": []
         });
         assert!(metrics.attach_buflo_kernel_tx_value(raw).is_err());
-        assert_eq!(metrics.schema_version, 13);
+        assert_eq!(metrics.schema_version, 14);
         assert!(
             metrics
                 .semantics
-                .contains("runner_schema13_retains_schema10_layout_for_non_kernel_metrics=true")
+                .contains("runner_schema14_retains_schema10_layout_for_non_kernel_metrics=true")
         );
         assert!(metrics.semantics.contains(&format!(
             "buflo_kernel_tx_raw_semantics={}",
@@ -37139,9 +38838,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn terminal_render_error_is_embedded_without_erasing_schema_thirteen_kernel_evidence() {
+    fn terminal_render_error_is_embedded_without_erasing_schema_fourteen_kernel_evidence() {
         let mut metrics = RunnerWakeupMetrics::new();
-        // Exercise schema-13 normalisation even on hosts whose production
+        // Exercise schema-14 normalisation even on hosts whose production
         // schema-10 default already uses the neutral fallback source.
         metrics.buflo_exact_release_active_wait_poll_source =
             BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE;
@@ -37224,7 +38923,7 @@ mod tests {
             receipt["terminal_evidence_render_errors"][0],
             render_errors[0]
         );
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 13);
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 14);
         assert_eq!(receipt["runner_wakeup_metrics"]["buflo_kernel_tx"], raw);
     }
 }
