@@ -1331,13 +1331,15 @@ const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 5;
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 6;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 5;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v5; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v6; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms; protected_selection_wait_applies_to_tick_zero_and_rolling_slots=true; protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; selection_window_is_half_open_release_minus_5ms_through_release=true; late_or_failed_selection_remains_fatal=true; selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; selection=release_minus_5ms; release=defense_start_plus_tick_times_20ms; entry_requires_admission<=entered_tai<selection; active_poll_runs_until_selection; pre_admission_calls_create_no_entry; first_entry_at_or_after_selection_is_selection_entry_late; selection_success_requires_selection<=completed_tai<release; completed_tai_is_immutable_selection_completion=true; confirmation_attempts=count_each_confirm_call_exactly_once; confirmation_phase_order=tick_zero_completed<=staging<=dispatch<release_or_rolling_completed<=dispatch<release; failed_confirmation_retains_prior_phase_evidence=true; exact_release_is_expired; every_recorded_wait_clock_read_attempt_is_counted; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; completed_job_release_tai_must_equal_entry_release_tai=true; consecutive_successful_samples_must_not_regress; failures_are_typed_and_fail_closed; no_early_packet_construction; no_window_extension; no_catch_up";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
 #[cfg(target_os = "linux")]
@@ -1708,6 +1710,65 @@ struct BufloKernelAggregateReceipt {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelProtectedSelectionFailureReceipt {
+    schema_version: u32,
+    slot: u64,
+    tick: u64,
+    tick_zero: bool,
+    kind: &'static str,
+    detail: String,
+    admission_tai_ns: u64,
+    selection_tai_ns: u64,
+    release_tai_ns: u64,
+    entered_tai_ns: Option<u64>,
+    previous_tai_ns: Option<u64>,
+    observed_tai_ns: Option<u64>,
+    clock_read_attempts: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelProtectedSelectionWaitEntry {
+    schema_version: u32,
+    slot: u64,
+    tick: u64,
+    tick_zero: bool,
+    admission_tai_ns: u64,
+    selection_tai_ns: u64,
+    release_tai_ns: u64,
+    entered_tai_ns: Option<u64>,
+    completed_tai_ns: Option<u64>,
+    staging_confirmed_tai_ns: Option<u64>,
+    dispatch_confirmed_tai_ns: Option<u64>,
+    clock_read_attempts: u64,
+    confirmation_attempts: u64,
+    wait_duration_ns: u64,
+    max_sample_gap_ns: u64,
+    entry_lateness_ns: u64,
+    outcome: &'static str,
+    failure: Option<BufloKernelProtectedSelectionFailureReceipt>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelProtectedSelectionWaitReceipt {
+    schema_version: u32,
+    semantics: &'static str,
+    entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
+    entry_count: usize,
+    completed_count: usize,
+    failed_count: usize,
+    clock_read_attempts: u64,
+    confirmation_attempts: u64,
+    total_wait_duration_ns: u64,
+    max_wait_duration_ns: u64,
+    max_sample_gap_ns: u64,
+    max_entry_lateness_ns: u64,
+    last_failure: Option<BufloKernelProtectedSelectionFailureReceipt>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct BufloKernelTxReceipt {
     schema_version: u32,
     semantics: &'static str,
@@ -1723,6 +1784,7 @@ struct BufloKernelTxReceipt {
     clock_mapping: Option<BufloKernelClockMapping>,
     runtime_contract: BufloKernelRuntimeContract,
     qdisc_contract: BufloKernelQdiscContract,
+    protected_selection_wait: BufloKernelProtectedSelectionWaitReceipt,
     jobs: Vec<BufloKernelJobReceipt>,
     aggregate: BufloKernelAggregateReceipt,
     terminal_errors: Vec<String>,
@@ -1757,6 +1819,28 @@ enum BufloKernelTaiWindowState {
     Pending,
     Open,
     Expired,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufloKernelProtectedSelectionIdentity {
+    slot: u64,
+    tick: u64,
+    tick_zero: bool,
+    admission_tai_ns: u64,
+    selection_tai_ns: u64,
+    release_tai_ns: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum BufloKernelProtectedSelectionStep {
+    PreAdmission,
+    Ready(BufloKernelProtectedSelectionWaitEntry),
+    Failed {
+        entry: BufloKernelProtectedSelectionWaitEntry,
+        error: Error,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -1962,6 +2046,7 @@ struct BufloKernelTxRuntime {
     clock_start: BufloKernelClockPhase,
     realtime_offset_intersection: Option<(i128, i128)>,
     epoch: Option<BufloKernelEpoch>,
+    protected_selection_wait_entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
     jobs: Vec<BufloKernelRawJob>,
     next_item_id: u64,
 }
@@ -2833,6 +2918,742 @@ const fn buflo_kernel_tai_window_state(
 }
 
 #[cfg(target_os = "linux")]
+fn buflo_kernel_selection_expired_detail(
+    identity: &BufloKernelProtectedSelectionIdentity,
+) -> String {
+    if identity.tick_zero {
+        "BuFLO tick-zero selection expired in CLOCK_TAI before staging".into()
+    } else {
+        format!(
+            "BuFLO kernel slot {} selection expired in CLOCK_TAI before dispatch",
+            identity.slot
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn buflo_kernel_protected_selection_failure(
+    identity: &BufloKernelProtectedSelectionIdentity,
+    kind: &'static str,
+    detail: String,
+    entered_tai_ns: Option<u64>,
+    previous_tai_ns: Option<u64>,
+    observed_tai_ns: Option<u64>,
+    clock_read_attempts: u64,
+) -> BufloKernelProtectedSelectionFailureReceipt {
+    BufloKernelProtectedSelectionFailureReceipt {
+        schema_version: 1,
+        slot: identity.slot,
+        tick: identity.tick,
+        tick_zero: identity.tick_zero,
+        kind,
+        detail,
+        admission_tai_ns: identity.admission_tai_ns,
+        selection_tai_ns: identity.selection_tai_ns,
+        release_tai_ns: identity.release_tai_ns,
+        entered_tai_ns,
+        previous_tai_ns,
+        observed_tai_ns,
+        clock_read_attempts,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the typed failure entry keeps every independently validated clock field explicit"
+)]
+fn buflo_kernel_failed_selection_entry(
+    identity: &BufloKernelProtectedSelectionIdentity,
+    entered_tai_ns: Option<u64>,
+    previous_tai_ns: Option<u64>,
+    observed_tai_ns: Option<u64>,
+    clock_read_attempts: u64,
+    wait_duration_ns: u64,
+    max_sample_gap_ns: u64,
+    kind: &'static str,
+    detail: String,
+) -> BufloKernelProtectedSelectionWaitEntry {
+    let failure = buflo_kernel_protected_selection_failure(
+        identity,
+        kind,
+        detail,
+        entered_tai_ns,
+        previous_tai_ns,
+        observed_tai_ns,
+        clock_read_attempts,
+    );
+    BufloKernelProtectedSelectionWaitEntry {
+        schema_version: 1,
+        slot: identity.slot,
+        tick: identity.tick,
+        tick_zero: identity.tick_zero,
+        admission_tai_ns: identity.admission_tai_ns,
+        selection_tai_ns: identity.selection_tai_ns,
+        release_tai_ns: identity.release_tai_ns,
+        entered_tai_ns,
+        completed_tai_ns: None,
+        staging_confirmed_tai_ns: None,
+        dispatch_confirmed_tai_ns: None,
+        clock_read_attempts,
+        confirmation_attempts: 0,
+        wait_duration_ns,
+        max_sample_gap_ns,
+        entry_lateness_ns: entered_tai_ns.map_or(0, |entered| {
+            entered.saturating_sub(identity.admission_tai_ns)
+        }),
+        outcome: "failed",
+        failure: Some(failure),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear loop retains every authoritative CLOCK_TAI outcome without hiding a miss"
+)]
+fn buflo_kernel_protected_selection_wait_with_clock(
+    identity: &BufloKernelProtectedSelectionIdentity,
+    mut clock: impl FnMut() -> Result<u64, Error>,
+) -> BufloKernelProtectedSelectionStep {
+    let mut clock_read_attempts = 1;
+    let entered_tai_ns = match clock() {
+        Ok(current_tai_ns) if current_tai_ns < identity.admission_tai_ns => {
+            return BufloKernelProtectedSelectionStep::PreAdmission;
+        }
+        Ok(current_tai_ns) => current_tai_ns,
+        Err(error) => {
+            let detail = format!(
+                "BuFLO kernel protected selection initial CLOCK_TAI read failed for slot {}: {error}",
+                identity.slot
+            );
+            return BufloKernelProtectedSelectionStep::Failed {
+                entry: buflo_kernel_failed_selection_entry(
+                    identity,
+                    None,
+                    None,
+                    None,
+                    clock_read_attempts,
+                    0,
+                    0,
+                    "clock-read-error",
+                    detail.clone(),
+                ),
+                error: Error::DefenseExecution(detail),
+            };
+        }
+    };
+    if entered_tai_ns >= identity.release_tai_ns {
+        let detail = buflo_kernel_selection_expired_detail(identity);
+        return BufloKernelProtectedSelectionStep::Failed {
+            entry: buflo_kernel_failed_selection_entry(
+                identity,
+                Some(entered_tai_ns),
+                Some(entered_tai_ns),
+                Some(entered_tai_ns),
+                clock_read_attempts,
+                0,
+                0,
+                "selection-expired",
+                detail.clone(),
+            ),
+            error: Error::DefenseExecution(detail),
+        };
+    }
+    if entered_tai_ns >= identity.selection_tai_ns {
+        let detail = format!(
+            "BuFLO kernel slot {} entered its protected CLOCK_TAI wait at or after the selection boundary",
+            identity.slot
+        );
+        return BufloKernelProtectedSelectionStep::Failed {
+            entry: buflo_kernel_failed_selection_entry(
+                identity,
+                Some(entered_tai_ns),
+                Some(entered_tai_ns),
+                Some(entered_tai_ns),
+                clock_read_attempts,
+                0,
+                0,
+                "selection-entry-late",
+                detail.clone(),
+            ),
+            error: Error::DefenseExecution(detail),
+        };
+    }
+
+    let mut current_tai_ns = entered_tai_ns;
+    let mut max_sample_gap_ns = 0;
+    while current_tai_ns < identity.selection_tai_ns {
+        std::hint::spin_loop();
+        clock_read_attempts = clock_read_attempts.saturating_add(1);
+        let next_tai_ns = match clock() {
+            Ok(value) => value,
+            Err(error) => {
+                let detail = format!(
+                    "BuFLO kernel protected selection CLOCK_TAI read failed for slot {}: {error}",
+                    identity.slot
+                );
+                return BufloKernelProtectedSelectionStep::Failed {
+                    entry: buflo_kernel_failed_selection_entry(
+                        identity,
+                        Some(entered_tai_ns),
+                        Some(current_tai_ns),
+                        None,
+                        clock_read_attempts,
+                        current_tai_ns.saturating_sub(entered_tai_ns),
+                        max_sample_gap_ns,
+                        "clock-read-error",
+                        detail.clone(),
+                    ),
+                    error: Error::DefenseExecution(detail),
+                };
+            }
+        };
+        if next_tai_ns < current_tai_ns {
+            let detail = format!(
+                "BuFLO kernel protected selection CLOCK_TAI regressed for slot {} from {current_tai_ns} to {next_tai_ns}",
+                identity.slot
+            );
+            return BufloKernelProtectedSelectionStep::Failed {
+                entry: buflo_kernel_failed_selection_entry(
+                    identity,
+                    Some(entered_tai_ns),
+                    Some(current_tai_ns),
+                    Some(next_tai_ns),
+                    clock_read_attempts,
+                    current_tai_ns.saturating_sub(entered_tai_ns),
+                    max_sample_gap_ns,
+                    "clock-regression",
+                    detail.clone(),
+                ),
+                error: Error::DefenseExecution(detail),
+            };
+        }
+        let previous_tai_ns = current_tai_ns;
+        max_sample_gap_ns = max_sample_gap_ns.max(next_tai_ns - current_tai_ns);
+        current_tai_ns = next_tai_ns;
+        if current_tai_ns >= identity.release_tai_ns {
+            let detail = buflo_kernel_selection_expired_detail(identity);
+            return BufloKernelProtectedSelectionStep::Failed {
+                entry: buflo_kernel_failed_selection_entry(
+                    identity,
+                    Some(entered_tai_ns),
+                    Some(previous_tai_ns),
+                    Some(current_tai_ns),
+                    clock_read_attempts,
+                    current_tai_ns.saturating_sub(entered_tai_ns),
+                    max_sample_gap_ns,
+                    "selection-expired",
+                    detail.clone(),
+                ),
+                error: Error::DefenseExecution(detail),
+            };
+        }
+    }
+    BufloKernelProtectedSelectionStep::Ready(BufloKernelProtectedSelectionWaitEntry {
+        schema_version: 1,
+        slot: identity.slot,
+        tick: identity.tick,
+        tick_zero: identity.tick_zero,
+        admission_tai_ns: identity.admission_tai_ns,
+        selection_tai_ns: identity.selection_tai_ns,
+        release_tai_ns: identity.release_tai_ns,
+        entered_tai_ns: Some(entered_tai_ns),
+        completed_tai_ns: Some(current_tai_ns),
+        staging_confirmed_tai_ns: None,
+        dispatch_confirmed_tai_ns: None,
+        clock_read_attempts,
+        confirmation_attempts: 0,
+        wait_duration_ns: current_tai_ns.saturating_sub(entered_tai_ns),
+        max_sample_gap_ns,
+        entry_lateness_ns: entered_tai_ns.saturating_sub(identity.admission_tai_ns),
+        outcome: "selection-reached",
+        failure: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "dispatch confirmation mutates the already-retained entry for every typed clock outcome"
+)]
+fn buflo_kernel_confirm_protected_selection_with_clock(
+    entry: &mut BufloKernelProtectedSelectionWaitEntry,
+    mut clock: impl FnMut() -> Result<u64, Error>,
+) -> Result<(), Error> {
+    entry.confirmation_attempts = entry.confirmation_attempts.checked_add(1).ok_or_else(|| {
+        Error::SlotInvariant(format!(
+            "BuFLO kernel slot {} protected selection confirmation-attempt counter overflowed",
+            entry.slot
+        ))
+    })?;
+    if entry.outcome != "selection-reached" || entry.failure.is_some() {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO kernel slot {} protected selection entry was not ready for dispatch confirmation",
+            entry.slot
+        )));
+    }
+    let confirmation_phase = match (entry.tick_zero, entry.confirmation_attempts) {
+        (true, 1) => "staging",
+        (true, 2) | (false, 1) => "dispatch",
+        _ => {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel slot {} protected selection confirmation attempt {} was invalid for its phase",
+                entry.slot, entry.confirmation_attempts
+            )));
+        }
+    };
+    let phase_shape_valid = match confirmation_phase {
+        "dispatch" if entry.tick_zero => {
+            entry.staging_confirmed_tai_ns.is_some() && entry.dispatch_confirmed_tai_ns.is_none()
+        }
+        "staging" | "dispatch" => {
+            entry.staging_confirmed_tai_ns.is_none() && entry.dispatch_confirmed_tai_ns.is_none()
+        }
+        _ => false,
+    };
+    if !phase_shape_valid {
+        return Err(Error::SlotInvariant(format!(
+            "BuFLO kernel slot {} protected selection {confirmation_phase} confirmation did not follow its phase evidence",
+            entry.slot
+        )));
+    }
+    let identity = BufloKernelProtectedSelectionIdentity {
+        slot: entry.slot,
+        tick: entry.tick,
+        tick_zero: entry.tick_zero,
+        admission_tai_ns: entry.admission_tai_ns,
+        selection_tai_ns: entry.selection_tai_ns,
+        release_tai_ns: entry.release_tai_ns,
+    };
+    let previous_tai_ns = if confirmation_phase == "dispatch" && entry.tick_zero {
+        entry.staging_confirmed_tai_ns
+    } else {
+        entry.completed_tai_ns
+    }
+    .ok_or_else(|| {
+        Error::SlotInvariant(format!(
+            "BuFLO kernel slot {} protected selection entry lacked its prior sample",
+            entry.slot
+        ))
+    })?;
+    entry.clock_read_attempts = entry.clock_read_attempts.checked_add(1).ok_or_else(|| {
+        Error::SlotInvariant(format!(
+            "BuFLO kernel slot {} protected selection clock-read counter overflowed",
+            entry.slot
+        ))
+    })?;
+    let current_tai_ns = match clock() {
+        Ok(value) => value,
+        Err(error) => {
+            let detail = format!(
+                "BuFLO kernel protected selection {confirmation_phase}-confirmation CLOCK_TAI read failed for slot {}: {error}",
+                entry.slot
+            );
+            entry.outcome = "failed";
+            entry.failure = Some(buflo_kernel_protected_selection_failure(
+                &identity,
+                "clock-read-error",
+                detail.clone(),
+                entry.entered_tai_ns,
+                Some(previous_tai_ns),
+                None,
+                entry.clock_read_attempts,
+            ));
+            return Err(Error::DefenseExecution(detail));
+        }
+    };
+    if current_tai_ns < previous_tai_ns {
+        let detail = format!(
+            "BuFLO kernel protected selection CLOCK_TAI regressed for slot {} from {previous_tai_ns} to {current_tai_ns}",
+            entry.slot
+        );
+        entry.outcome = "failed";
+        entry.failure = Some(buflo_kernel_protected_selection_failure(
+            &identity,
+            "clock-regression",
+            detail.clone(),
+            entry.entered_tai_ns,
+            Some(previous_tai_ns),
+            Some(current_tai_ns),
+            entry.clock_read_attempts,
+        ));
+        return Err(Error::DefenseExecution(detail));
+    }
+    if current_tai_ns >= entry.release_tai_ns {
+        let detail = buflo_kernel_selection_expired_detail(&identity);
+        entry.outcome = "failed";
+        entry.failure = Some(buflo_kernel_protected_selection_failure(
+            &identity,
+            "selection-expired",
+            detail.clone(),
+            entry.entered_tai_ns,
+            Some(previous_tai_ns),
+            Some(current_tai_ns),
+            entry.clock_read_attempts,
+        ));
+        return Err(Error::DefenseExecution(detail));
+    }
+    if current_tai_ns < entry.selection_tai_ns {
+        let detail = format!(
+            "BuFLO kernel slot {} dispatch confirmation preceded its CLOCK_TAI selection boundary",
+            entry.slot
+        );
+        entry.outcome = "failed";
+        entry.failure = Some(buflo_kernel_protected_selection_failure(
+            &identity,
+            "clock-regression",
+            detail.clone(),
+            entry.entered_tai_ns,
+            Some(previous_tai_ns),
+            Some(current_tai_ns),
+            entry.clock_read_attempts,
+        ));
+        return Err(Error::DefenseExecution(detail));
+    }
+    if confirmation_phase == "staging" {
+        entry.staging_confirmed_tai_ns = Some(current_tai_ns);
+    } else {
+        entry.dispatch_confirmed_tai_ns = Some(current_tai_ns);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the receipt builder independently recomputes every serialized protected-wait invariant"
+)]
+fn build_buflo_kernel_protected_selection_wait_receipt(
+    entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
+    defense_start_tai_ns: Option<u64>,
+) -> (BufloKernelProtectedSelectionWaitReceipt, bool) {
+    let window_ns = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
+    let cadence_ns = duration_as_u64_nanos(Duration::from_millis(20));
+    let mut valid = entries.iter().enumerate().all(|(index, entry)| {
+        let expected_slot = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(2));
+        let ordered_boundaries = entry
+            .admission_tai_ns
+            .checked_add(window_ns)
+            .is_some_and(|selection| selection == entry.selection_tai_ns)
+            && entry
+                .selection_tai_ns
+                .checked_add(window_ns)
+                .is_some_and(|release| release == entry.release_tai_ns);
+        let epoch_cadence_valid = defense_start_tai_ns.is_some_and(|start_tai_ns| {
+            entry
+                .tick
+                .checked_mul(cadence_ns)
+                .and_then(|offset| start_tai_ns.checked_add(offset))
+                == Some(entry.release_tai_ns)
+        });
+        let entered_lateness_valid =
+            entry
+                .entered_tai_ns
+                .map_or(entry.entry_lateness_ns == 0, |entered| {
+                    entered >= entry.admission_tai_ns
+                        && entered.saturating_sub(entry.admission_tai_ns) == entry.entry_lateness_ns
+                });
+        let completed_selection_valid = entry.completed_tai_ns.is_some_and(|completed| {
+            completed >= entry.selection_tai_ns
+                && completed < entry.release_tai_ns
+                && entry.entered_tai_ns.is_some_and(|entered| {
+                    entered >= entry.admission_tai_ns
+                        && entered < entry.selection_tai_ns
+                        && completed.saturating_sub(entered) == entry.wait_duration_ns
+                })
+        });
+        let clock_read_attempts_valid = if entry.completed_tai_ns.is_some() {
+            entry
+                .confirmation_attempts
+                .checked_add(2)
+                .is_some_and(|minimum| entry.clock_read_attempts >= minimum)
+        } else {
+            entry.clock_read_attempts > 0
+        };
+        let staging_order_valid = entry.staging_confirmed_tai_ns.is_none_or(|staging| {
+            entry
+                .completed_tai_ns
+                .is_some_and(|completed| staging >= completed && staging < entry.release_tai_ns)
+        });
+        let dispatch_order_valid = entry.dispatch_confirmed_tai_ns.is_none_or(|dispatch| {
+            entry
+                .staging_confirmed_tai_ns
+                .or(entry.completed_tai_ns)
+                .is_some_and(|previous| dispatch >= previous && dispatch < entry.release_tai_ns)
+        });
+        let phase_shape_valid = match (entry.tick_zero, entry.confirmation_attempts, entry.outcome)
+        {
+            (true | false, 0, _) | (true | false, 1, "failed") => {
+                entry.staging_confirmed_tai_ns.is_none()
+                    && entry.dispatch_confirmed_tai_ns.is_none()
+            }
+            (true, 2, "selection-reached") => {
+                entry.staging_confirmed_tai_ns.is_some()
+                    && entry.dispatch_confirmed_tai_ns.is_some()
+            }
+            (true, 1, "selection-reached") | (true, 2, "failed") => {
+                entry.staging_confirmed_tai_ns.is_some()
+                    && entry.dispatch_confirmed_tai_ns.is_none()
+            }
+            (false, 1, "selection-reached") => {
+                entry.staging_confirmed_tai_ns.is_none()
+                    && entry.dispatch_confirmed_tai_ns.is_some()
+            }
+            _ => false,
+        };
+        let failure_identity_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
+            failure.schema_version == 1
+                && failure.slot == entry.slot
+                && failure.tick == entry.tick
+                && failure.tick_zero == entry.tick_zero
+                && matches!(
+                    failure.kind,
+                    "selection-entry-late"
+                        | "selection-expired"
+                        | "clock-regression"
+                        | "clock-read-error"
+                )
+                && !failure.detail.is_empty()
+                && failure.admission_tai_ns == entry.admission_tai_ns
+                && failure.selection_tai_ns == entry.selection_tai_ns
+                && failure.release_tai_ns == entry.release_tai_ns
+                && failure.entered_tai_ns == entry.entered_tai_ns
+                && failure.clock_read_attempts == entry.clock_read_attempts
+        };
+        let wait_failure_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
+            entry.confirmation_attempts == 0
+                && entry.completed_tai_ns.is_none()
+                && match failure.kind {
+                    "selection-entry-late" => entry.entered_tai_ns.is_some_and(|entered| {
+                        entered >= entry.selection_tai_ns
+                            && entered < entry.release_tai_ns
+                            && failure.previous_tai_ns == Some(entered)
+                            && failure.observed_tai_ns == Some(entered)
+                            && entry.wait_duration_ns == 0
+                    }),
+                    "selection-expired" => entry.entered_tai_ns.is_some_and(|entered| {
+                        failure.observed_tai_ns.is_some_and(|observed| {
+                            observed >= entry.release_tai_ns
+                                && observed >= entered
+                                && failure.previous_tai_ns.is_some()
+                                && observed.saturating_sub(entered) == entry.wait_duration_ns
+                        })
+                    }),
+                    "clock-regression" => entry.entered_tai_ns.is_some_and(|entered| {
+                        failure
+                            .previous_tai_ns
+                            .zip(failure.observed_tai_ns)
+                            .is_some_and(|(previous, observed)| {
+                                previous >= entered
+                                    && observed < previous
+                                    && previous.saturating_sub(entered) == entry.wait_duration_ns
+                            })
+                    }),
+                    "clock-read-error" => match (
+                        entry.entered_tai_ns,
+                        failure.previous_tai_ns,
+                        failure.observed_tai_ns,
+                    ) {
+                        (None, None, None) => {
+                            entry.clock_read_attempts == 1 && entry.wait_duration_ns == 0
+                        }
+                        (Some(entered), Some(previous), None) => {
+                            previous >= entered
+                                && previous.saturating_sub(entered) == entry.wait_duration_ns
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+        };
+        let confirmation_failure_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
+            let expected_previous = if entry.tick_zero && entry.confirmation_attempts == 2 {
+                entry.staging_confirmed_tai_ns
+            } else {
+                entry.completed_tai_ns
+            };
+            entry.confirmation_attempts > 0
+                && completed_selection_valid
+                && failure.kind != "selection-entry-late"
+                && failure.previous_tai_ns == expected_previous
+                && match failure.kind {
+                    "selection-expired" => failure.observed_tai_ns.is_some_and(|observed| {
+                        observed >= entry.release_tai_ns
+                            && expected_previous.is_some_and(|previous| observed >= previous)
+                    }),
+                    "clock-regression" => failure.observed_tai_ns.is_some_and(|observed| {
+                        expected_previous.is_some_and(|previous| observed < previous)
+                    }),
+                    "clock-read-error" => failure.observed_tai_ns.is_none(),
+                    _ => false,
+                }
+        };
+        let outcome_valid = match entry.outcome {
+            "selection-reached" => entry.failure.is_none() && completed_selection_valid,
+            "failed" => entry.failure.as_ref().is_some_and(|failure| {
+                failure_identity_valid(failure)
+                    && (wait_failure_valid(failure) || confirmation_failure_valid(failure))
+            }),
+            _ => false,
+        };
+        entry.schema_version == 1
+            && expected_slot == Some(entry.slot)
+            && entry.tick == u64::try_from(index).unwrap_or(u64::MAX)
+            && entry.tick_zero == (index == 0)
+            && ordered_boundaries
+            && epoch_cadence_valid
+            && entered_lateness_valid
+            && clock_read_attempts_valid
+            && entry.confirmation_attempts <= if entry.tick_zero { 2 } else { 1 }
+            && entry.max_sample_gap_ns <= entry.wait_duration_ns
+            && staging_order_valid
+            && dispatch_order_valid
+            && phase_shape_valid
+            && outcome_valid
+    });
+    valid &= entries.is_empty() || defense_start_tai_ns.is_some();
+    let failed_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.outcome == "failed")
+        .collect();
+    let completed_count = entries
+        .iter()
+        .filter(|entry| entry.outcome == "selection-reached")
+        .count();
+    let failed_count = failed_entries.len();
+    valid &= completed_count
+        .checked_add(failed_count)
+        .is_some_and(|count| count == entries.len())
+        && failed_count <= 1
+        && failed_entries
+            .first()
+            .is_none_or(|failed| entries.last() == Some(*failed));
+    let clock_read_attempts = entries
+        .iter()
+        .try_fold(0_u64, |total, entry| {
+            total.checked_add(entry.clock_read_attempts)
+        })
+        .unwrap_or_else(|| {
+            valid = false;
+            u64::MAX
+        });
+    let confirmation_attempts = entries
+        .iter()
+        .try_fold(0_u64, |total, entry| {
+            total.checked_add(entry.confirmation_attempts)
+        })
+        .unwrap_or_else(|| {
+            valid = false;
+            u64::MAX
+        });
+    let total_wait_duration_ns = entries
+        .iter()
+        .try_fold(0_u64, |total, entry| {
+            total.checked_add(entry.wait_duration_ns)
+        })
+        .unwrap_or_else(|| {
+            valid = false;
+            u64::MAX
+        });
+    let last_failure = failed_entries
+        .last()
+        .and_then(|entry| entry.failure.clone());
+    valid &= (failed_count == 1) == last_failure.is_some();
+    let receipt = BufloKernelProtectedSelectionWaitReceipt {
+        schema_version: 1,
+        semantics: BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS,
+        entry_count: entries.len(),
+        completed_count,
+        failed_count,
+        clock_read_attempts,
+        confirmation_attempts,
+        total_wait_duration_ns,
+        max_wait_duration_ns: entries
+            .iter()
+            .map(|entry| entry.wait_duration_ns)
+            .max()
+            .unwrap_or(0),
+        max_sample_gap_ns: entries
+            .iter()
+            .map(|entry| entry.max_sample_gap_ns)
+            .max()
+            .unwrap_or(0),
+        max_entry_lateness_ns: entries
+            .iter()
+            .map(|entry| entry.entry_lateness_ns)
+            .max()
+            .unwrap_or(0),
+        entries,
+        last_failure,
+    };
+    (receipt, valid)
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_protected_selection_job_binding_valid(
+    receipt: &BufloKernelProtectedSelectionWaitReceipt,
+    jobs: &[BufloKernelJobReceipt],
+    epoch_present: bool,
+    primary_error_present: bool,
+) -> bool {
+    if !epoch_present {
+        return receipt.entries.is_empty() && jobs.is_empty();
+    }
+    let window_ns = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
+    let jobs_bound = jobs.iter().enumerate().all(|(index, job)| {
+        receipt.entries.get(index).is_some_and(|entry| {
+            entry.slot == job.tick.saturating_mul(2)
+                && entry.tick == job.tick
+                && entry.outcome == "selection-reached"
+                && entry.release_tai_ns == job.release_tai_ns
+                && job.release_tai_ns.checked_add(window_ns) == Some(job.deadline_tai_ns)
+                && job.release_monotonic_ns.checked_add(window_ns)
+                    == Some(job.deadline_monotonic_ns)
+                && entry.confirmation_attempts == if entry.tick_zero { 2 } else { 1 }
+                && if entry.tick_zero {
+                    entry
+                        .completed_tai_ns
+                        .zip(entry.staging_confirmed_tai_ns)
+                        .zip(entry.dispatch_confirmed_tai_ns)
+                        .is_some_and(|((completed, staging), dispatch)| {
+                            completed <= staging
+                                && staging <= dispatch
+                                && dispatch < entry.release_tai_ns
+                        })
+                } else {
+                    entry.staging_confirmed_tai_ns.is_none()
+                        && entry
+                            .completed_tai_ns
+                            .zip(entry.dispatch_confirmed_tai_ns)
+                            .is_some_and(|(completed, dispatch)| {
+                                completed <= dispatch && dispatch < entry.release_tai_ns
+                            })
+                }
+        })
+    });
+    let cardinality_valid =
+        receipt.entry_count >= jobs.len() && receipt.entry_count <= jobs.len().saturating_add(1);
+    let terminal_entry_valid = receipt.entries.get(jobs.len()).is_none_or(|entry| {
+        primary_error_present
+            && entry.tick == u64::try_from(jobs.len()).unwrap_or(u64::MAX)
+            && entry.slot == entry.tick.saturating_mul(2)
+            && if entry.outcome == "selection-reached" && !entry.tick_zero {
+                entry.confirmation_attempts == 1
+            } else {
+                entry.confirmation_attempts <= if entry.tick_zero { 2 } else { 1 }
+            }
+    });
+    let success_cardinality_valid = primary_error_present
+        || (receipt.entry_count == jobs.len()
+            && receipt.completed_count == jobs.len()
+            && receipt.failed_count == 0);
+    jobs_bound && cardinality_valid && terminal_entry_valid && success_cardinality_valid
+}
+
+#[cfg(target_os = "linux")]
 const fn buflo_kernel_tai_boundary_reached(current_tai_ns: u64, boundary_tai_ns: u64) -> bool {
     current_tai_ns >= boundary_tai_ns
 }
@@ -2948,15 +3769,6 @@ fn buflo_kernel_incoming_retry_step(
     }
 }
 
-#[cfg(target_os = "linux")]
-const fn buflo_kernel_pending_selection_is_clock_regression(
-    tick_zero_staged: bool,
-    packet_timestamp: Duration,
-) -> bool {
-    tick_zero_staged && packet_timestamp.is_zero()
-}
-
-#[cfg(target_os = "linux")]
 const fn buflo_kernel_provisional_envelope_contains_final(
     provisional_lower: u64,
     provisional_upper: u64,
@@ -3226,7 +4038,7 @@ impl BufloKernelTxRuntime {
             prebuild_selection_cutoff_lead_ns: duration_as_u64_nanos(
                 BUFLO_KERNEL_TX_SELECTION_CUTOFF,
             ),
-            prebuild_selection_semantics: "application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; client_only_adaptation; paper_equivalent=false",
+            prebuild_selection_semantics: "CLOCK_TAI_protected_wait_enters_during_release_minus_10ms_to_release_minus_5ms; application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; late_wait_entry_and_release_expiry_fail_closed; client_only_adaptation; paper_equivalent=false",
             post_main_inventory_semantics: "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram",
             max_post_main_datagrams: helper.max_post_main_datagrams(),
         };
@@ -3241,6 +4053,7 @@ impl BufloKernelTxRuntime {
             clock_start,
             realtime_offset_intersection: None,
             epoch: None,
+            protected_selection_wait_entries: Vec::new(),
             jobs: Vec::new(),
             next_item_id: 0,
         })
@@ -3349,36 +4162,101 @@ impl BufloKernelTxRuntime {
         Ok((selection_tai_ns, release_tai_ns, deadline_tai_ns))
     }
 
-    fn selection_state(
+    fn protected_selection_identity(
         &self,
         guard: &BufloExactReleaseGuard,
-    ) -> Result<BufloKernelTaiWindowState, Error> {
+    ) -> Result<BufloKernelProtectedSelectionIdentity, Error> {
         let (selection_tai_ns, release_tai_ns, _) = self.guard_tai_times(guard)?;
-        Ok(buflo_kernel_tai_window_state(
-            self.current_tai_ns("selection TAI sample")?,
+        let admission_tai_ns = release_tai_ns
+            .checked_sub(duration_as_u64_nanos(
+                BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2),
+            ))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO TAI admission underflow".into()))?;
+        Ok(BufloKernelProtectedSelectionIdentity {
+            slot: guard.slot.0,
+            tick: guard.slot.0 / 2,
+            tick_zero: guard.slot.0 == 0 && guard.packet.timestamp().is_zero(),
+            admission_tai_ns,
             selection_tai_ns,
             release_tai_ns,
-        ))
+        })
     }
 
-    fn tick_zero_selection_state(&self) -> Result<BufloKernelTaiWindowState, Error> {
-        let epoch = self.epoch()?;
-        let selection_tai_ns = epoch
-            .start_tai_ns
+    fn tick_zero_protected_selection_identity(
+        &self,
+    ) -> Result<BufloKernelProtectedSelectionIdentity, Error> {
+        let release_tai_ns = self.epoch()?.start_tai_ns;
+        let selection_tai_ns = release_tai_ns
             .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
             .ok_or_else(|| {
                 Error::DefenseExecution("BuFLO tick-zero TAI cutoff underflow".into())
             })?;
-        Ok(buflo_kernel_tai_window_state(
-            self.current_tai_ns("tick-zero selection TAI sample")?,
+        let admission_tai_ns = release_tai_ns
+            .checked_sub(duration_as_u64_nanos(
+                BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2),
+            ))
+            .ok_or_else(|| {
+                Error::DefenseExecution("BuFLO tick-zero TAI admission underflow".into())
+            })?;
+        Ok(BufloKernelProtectedSelectionIdentity {
+            slot: 0,
+            tick: 0,
+            tick_zero: true,
+            admission_tai_ns,
             selection_tai_ns,
-            epoch.start_tai_ns,
-        ))
+            release_tai_ns,
+        })
     }
 
-    fn selection_wake_hint(&self, guard: &BufloExactReleaseGuard) -> Result<Instant, Error> {
-        let (selection_tai_ns, _, _) = self.guard_tai_times(guard)?;
-        self.tai_wake_hint(selection_tai_ns)
+    fn wait_for_protected_selection(
+        &mut self,
+        identity: &BufloKernelProtectedSelectionIdentity,
+    ) -> Result<bool, Error> {
+        if self
+            .protected_selection_wait_entries
+            .iter()
+            .any(|entry| entry.slot == identity.slot)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel slot {} entered its protected selection wait more than once",
+                identity.slot
+            )));
+        }
+        match buflo_kernel_protected_selection_wait_with_clock(identity, || {
+            buflo_decision_tai_ns("protected selection CLOCK_TAI sample")
+        }) {
+            BufloKernelProtectedSelectionStep::PreAdmission => Ok(false),
+            BufloKernelProtectedSelectionStep::Ready(entry) => {
+                self.protected_selection_wait_entries.push(entry);
+                Ok(true)
+            }
+            BufloKernelProtectedSelectionStep::Failed { entry, error } => {
+                self.protected_selection_wait_entries.push(entry);
+                Err(error)
+            }
+        }
+    }
+
+    fn confirm_protected_selection(&mut self, slot: u64) -> Result<(), Error> {
+        let entry = self
+            .protected_selection_wait_entries
+            .last_mut()
+            .filter(|entry| entry.slot == slot)
+            .ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "BuFLO kernel slot {slot} lacked a protected selection wait entry"
+                ))
+            })?;
+        buflo_kernel_confirm_protected_selection_with_clock(entry, || {
+            buflo_decision_tai_ns("protected selection dispatch confirmation")
+        })
+    }
+
+    fn protected_selection_wake_hint(
+        &self,
+        guard: &BufloExactReleaseGuard,
+    ) -> Result<Instant, Error> {
+        self.output_admission_wake_hint(guard)
     }
 
     fn output_admission_wake_hint(&self, guard: &BufloExactReleaseGuard) -> Result<Instant, Error> {
@@ -3394,15 +4272,17 @@ impl BufloKernelTxRuntime {
             .ok_or_else(|| Error::DefenseExecution("BuFLO TAI admission underflow".into()))
     }
 
-    fn tick_zero_selection_wake_hint(&self) -> Result<Instant, Error> {
-        let selection_tai_ns = self
+    fn tick_zero_protected_selection_wake_hint(&self) -> Result<Instant, Error> {
+        let admission_tai_ns = self
             .epoch()?
             .start_tai_ns
-            .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+            .checked_sub(duration_as_u64_nanos(
+                BUFLO_KERNEL_TX_SELECTION_CUTOFF.saturating_mul(2),
+            ))
             .ok_or_else(|| {
-                Error::DefenseExecution("BuFLO tick-zero TAI cutoff underflow".into())
+                Error::DefenseExecution("BuFLO tick-zero TAI admission underflow".into())
             })?;
-        self.tai_wake_hint(selection_tai_ns)
+        self.tai_wake_hint(admission_tai_ns)
     }
 
     fn elapsed_wake_hint(&self, elapsed: Duration) -> Result<Instant, Error> {
@@ -4444,6 +5324,8 @@ impl BufloKernelTxRuntime {
         let mut cleanup_errors = Vec::new();
         let mut terminal_errors = Vec::new();
         let epoch = self.epoch;
+        let protected_selection_wait_entries =
+            mem::take(&mut self.protected_selection_wait_entries);
         if epoch.is_none() {
             cleanup_errors.push("BuFLO kernel epoch was never armed".into());
         }
@@ -4880,6 +5762,26 @@ impl BufloKernelTxRuntime {
                 terminal_outcome: if job_complete { "complete" } else { "failed" }.into(),
             });
         }
+        let (protected_selection_wait, protected_selection_wait_structurally_valid) =
+            build_buflo_kernel_protected_selection_wait_receipt(
+                protected_selection_wait_entries,
+                epoch.map(|epoch| epoch.start_tai_ns),
+            );
+        let protected_selection_wait_job_binding_valid =
+            buflo_kernel_protected_selection_job_binding_valid(
+                &protected_selection_wait,
+                &jobs,
+                epoch.is_some(),
+                primary_error.is_some(),
+            );
+        if !protected_selection_wait_structurally_valid
+            || !protected_selection_wait_job_binding_valid
+        {
+            terminal_errors.push(
+                "BuFLO protected selection-wait evidence was incomplete or inconsistent with kernel jobs"
+                    .into(),
+            );
+        }
         let flat_items: Vec<_> = jobs.iter().flat_map(|job| job.items.iter()).collect();
         let transmitted_item_count = flat_items
             .iter()
@@ -5008,6 +5910,7 @@ impl BufloKernelTxRuntime {
             clock_mapping: mapping,
             runtime_contract: self.runtime_contract,
             qdisc_contract: self.qdisc_contract,
+            protected_selection_wait,
             jobs,
             aggregate,
             terminal_errors,
@@ -5969,9 +6872,9 @@ impl RunnerWakeupMetrics {
         // legacy-metric exclusion. A validation failure must not erase the
         // helper/clock/packet evidence that explains the failed attempt.
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = 14;
+        self.schema_version = 15;
         self.semantics = format!(
-            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema14_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
+            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; runner_schema15_retains_schema10_layout_for_non_kernel_metrics=true; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; buflo_kernel_protected_selection_wait_semantics={BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
         );
         if !self.legacy_buflo_metrics_neutral() {
             let detail =
@@ -5984,7 +6887,7 @@ impl RunnerWakeupMetrics {
                 })?;
             return Err(Error::SlotInvariant(detail));
         }
-        // Schema 14 retains the schema-10 fields for compatibility, but the
+        // Schema 15 retains the schema-10 fields for compatibility, but the
         // kernel path never observes the superseded user-space polling
         // source. Publish its neutral value only after proving that no legacy
         // exact-release metric was recorded.
@@ -12270,15 +13173,16 @@ async fn execute_run_inner(
             {
                 #[cfg(target_os = "linux")]
                 let guard_wakeup = if let Some(runtime) = buflo_kernel_tx.as_ref() {
-                    runtime.selection_wake_hint(&guard)?
+                    runtime.protected_selection_wake_hint(&guard)?
                 } else {
                     guard.guard_at
                 };
                 #[cfg(not(target_os = "linux"))]
                 let guard_wakeup = guard.guard_at;
-                // Wake before the ordinary defense deadline. Any simultaneous
-                // socket readiness may win this select, but the next loop turn
-                // enters the guard before processing that input.
+                // Wake at the existing output-admission boundary so the next
+                // loop turn enters the CLOCK_TAI protected wait before any
+                // simultaneous socket readiness can consume the selection
+                // headroom.
                 if guard_wakeup <= next_wakeup {
                     next_wakeup = guard_wakeup;
                     controller_deadline_selected = false;
@@ -12289,7 +13193,7 @@ async fn execute_run_inner(
                 && runtime.activation_start(defense_start)?.is_some()
                 && !runtime.tick_zero_staged()?
             {
-                let stage_at = runtime.tick_zero_selection_wake_hint()?;
+                let stage_at = runtime.tick_zero_protected_selection_wake_hint()?;
                 if stage_at <= next_wakeup {
                     next_wakeup = stage_at;
                     controller_deadline_selected = false;
@@ -17595,19 +18499,7 @@ fn stage_buflo_kernel_tick_zero(
                 .into(),
         ));
     }
-    match runtime.tick_zero_selection_state()? {
-        BufloKernelTaiWindowState::Open => {}
-        BufloKernelTaiWindowState::Pending => {
-            return Err(Error::SlotInvariant(
-                "BuFLO tick-zero staging preceded its CLOCK_TAI selection cutoff".into(),
-            ));
-        }
-        BufloKernelTaiWindowState::Expired => {
-            return Err(Error::DefenseExecution(
-                "BuFLO tick-zero staging reached or crossed its CLOCK_TAI defense epoch".into(),
-            ));
-        }
-    }
+    runtime.confirm_protected_selection(0)?;
     handle_all_qcsd_observations(endpoints, controller, traces, Duration::ZERO)?;
     controller.flush_defense_observations();
     ensure_defense_realizable(controller)?;
@@ -18190,21 +19082,7 @@ async fn dispatch_buflo_kernel_release(
     defense_start: Instant,
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<(), Error> {
-    match runtime.selection_state(guard)? {
-        BufloKernelTaiWindowState::Open => {}
-        BufloKernelTaiWindowState::Pending => {
-            return Err(Error::SlotInvariant(format!(
-                "BuFLO kernel slot {} reached construction before its CLOCK_TAI selection cutoff",
-                guard.slot.0
-            )));
-        }
-        BufloKernelTaiWindowState::Expired => {
-            return Err(Error::DefenseExecution(format!(
-                "BuFLO kernel slot {} reached its CLOCK_TAI release before immutable packet construction",
-                guard.slot.0
-            )));
-        }
-    }
+    runtime.confirm_protected_selection(guard.slot.0)?;
     let logical_elapsed = guard.packet.timestamp();
     // Kernel dispatch intentionally advances every endpoint's Neqo clock to
     // this globally ordered adapter release. The same action batch can prearm
@@ -18443,14 +19321,9 @@ async fn dispatch_due_buflo_kernel_release(
         ));
     }
     if !runtime.tick_zero_staged()? {
-        match runtime.tick_zero_selection_state()? {
-            BufloKernelTaiWindowState::Pending => return Ok(false),
-            BufloKernelTaiWindowState::Open => {}
-            BufloKernelTaiWindowState::Expired => {
-                return Err(Error::DefenseExecution(
-                    "BuFLO tick-zero selection expired in CLOCK_TAI before staging".into(),
-                ));
-            }
+        let identity = runtime.tick_zero_protected_selection_identity()?;
+        if !runtime.wait_for_protected_selection(&identity)? {
+            return Ok(false);
         }
         stage_buflo_kernel_tick_zero(
             endpoints,
@@ -18464,24 +19337,10 @@ async fn dispatch_due_buflo_kernel_release(
     let Some(guard) = next_buflo_kernel_guard(defense, controller, endpoints, runtime)? else {
         return Ok(false);
     };
-    match runtime.selection_state(&guard)? {
-        BufloKernelTaiWindowState::Pending
-            if buflo_kernel_pending_selection_is_clock_regression(
-                runtime.tick_zero_staged()?,
-                guard.packet.timestamp(),
-            ) =>
-        {
-            return Err(Error::DefenseExecution(
-                "BuFLO CLOCK_TAI regressed behind the staged tick-zero selection cutoff".into(),
-            ));
-        }
-        BufloKernelTaiWindowState::Pending => return Ok(false),
-        BufloKernelTaiWindowState::Open => {}
-        BufloKernelTaiWindowState::Expired => {
-            return Err(Error::DefenseExecution(format!(
-                "BuFLO kernel slot {} selection expired in CLOCK_TAI before dispatch",
-                guard.slot.0
-            )));
+    if guard.slot.0 != 0 {
+        let identity = runtime.protected_selection_identity(&guard)?;
+        if !runtime.wait_for_protected_selection(&identity)? {
+            return Ok(false);
         }
     }
     dispatch_buflo_kernel_release(
@@ -38775,14 +39634,600 @@ mod tests {
             super::BufloKernelIncomingRetryStep::Pending,
             "the production incoming loop rejects Pending after the main TX",
         );
-        assert!(super::buflo_kernel_pending_selection_is_clock_regression(
-            true,
-            Duration::ZERO,
+    }
+
+    #[cfg(target_os = "linux")]
+    const SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS: u64 = 20_000_000;
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_protected_selection_identity(
+        slot: u64,
+        tick_zero: bool,
+    ) -> super::BufloKernelProtectedSelectionIdentity {
+        let tick = slot / 2;
+        let release_tai_ns = SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS
+            .checked_add(tick.saturating_mul(20_000_000))
+            .expect("synthetic protected-selection release");
+        super::BufloKernelProtectedSelectionIdentity {
+            slot,
+            tick,
+            tick_zero,
+            admission_tai_ns: release_tai_ns - 10_000_000,
+            selection_tai_ns: release_tai_ns - 5_000_000,
+            release_tai_ns,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_protected_selection_pre_admission_creates_no_entry() {
+        let identity = synthetic_protected_selection_identity(2, false);
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            Ok(identity.admission_tai_ns - 1)
+        });
+        assert!(matches!(
+            step,
+            super::BufloKernelProtectedSelectionStep::PreAdmission
         ));
-        assert!(!super::buflo_kernel_pending_selection_is_clock_regression(
-            true,
-            Duration::from_millis(20),
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_protected_selection_waits_from_exact_admission_to_selection() {
+        let identity = synthetic_protected_selection_identity(2, false);
+        let mut samples = VecDeque::from([
+            identity.admission_tai_ns,
+            identity.selection_tai_ns - 1,
+            identity.selection_tai_ns,
+        ]);
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            Ok(samples.pop_front().expect("scripted CLOCK_TAI sample"))
+        });
+        let super::BufloKernelProtectedSelectionStep::Ready(entry) = step else {
+            panic!("admission-to-selection wait did not become ready");
+        };
+        assert_eq!(entry.clock_read_attempts, 3);
+        assert_eq!(entry.entered_tai_ns, Some(identity.admission_tai_ns));
+        assert_eq!(entry.completed_tai_ns, Some(identity.selection_tai_ns));
+        assert_eq!(entry.confirmation_attempts, 0);
+        assert_eq!(entry.wait_duration_ns, 5_000_000);
+        assert_eq!(entry.max_sample_gap_ns, 4_999_999);
+        assert_eq!(entry.entry_lateness_ns, 0);
+        assert_eq!(entry.outcome, "selection-reached");
+        assert!(entry.failure.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_protected_selection_boundary_entries_fail_closed() {
+        let identity = synthetic_protected_selection_identity(2, false);
+        let cases = [
+            (identity.selection_tai_ns, "selection-entry-late"),
+            (identity.release_tai_ns - 1, "selection-entry-late"),
+            (identity.release_tai_ns, "selection-expired"),
+        ];
+        for (sample, expected_kind) in cases {
+            let step =
+                super::buflo_kernel_protected_selection_wait_with_clock(&identity, || Ok(sample));
+            let super::BufloKernelProtectedSelectionStep::Failed { entry, error } = step else {
+                panic!("boundary sample {sample} was accepted");
+            };
+            assert!(matches!(error, Error::DefenseExecution(_)));
+            assert_eq!(
+                entry.failure.as_ref().map(|failure| failure.kind),
+                Some(expected_kind)
+            );
+        }
+
+        let mut samples =
+            VecDeque::from([identity.selection_tai_ns - 1, identity.selection_tai_ns]);
+        assert!(matches!(
+            super::buflo_kernel_protected_selection_wait_with_clock(&identity, || Ok(samples
+                .pop_front()
+                .expect("scripted CLOCK_TAI sample")),),
+            super::BufloKernelProtectedSelectionStep::Ready(_)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_protected_selection_records_regression_and_clock_failure() {
+        let identity = synthetic_protected_selection_identity(2, false);
+        let mut regression = VecDeque::from([
+            Ok(identity.admission_tai_ns),
+            Ok(identity.admission_tai_ns - 1),
+        ]);
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            regression.pop_front().expect("scripted CLOCK_TAI result")
+        });
+        let super::BufloKernelProtectedSelectionStep::Failed { entry, .. } = step else {
+            panic!("CLOCK_TAI regression was accepted");
+        };
+        let failure = entry.failure.expect("typed regression failure");
+        assert_eq!(failure.kind, "clock-regression");
+        assert_eq!(failure.previous_tai_ns, Some(identity.admission_tai_ns));
+        assert_eq!(failure.observed_tai_ns, Some(identity.admission_tai_ns - 1));
+
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            Err(Error::DefenseExecution(
+                "synthetic CLOCK_TAI failure".into(),
+            ))
+        });
+        let super::BufloKernelProtectedSelectionStep::Failed { entry, .. } = step else {
+            panic!("CLOCK_TAI read failure was accepted");
+        };
+        let failure = entry.failure.expect("typed clock-read failure");
+        assert_eq!(failure.kind, "clock-read-error");
+        assert_eq!(failure.entered_tai_ns, None);
+        assert_eq!(failure.previous_tai_ns, None);
+        assert_eq!(failure.observed_tai_ns, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_protected_selection_confirmation_rejects_exact_release() {
+        let identity = synthetic_protected_selection_identity(2, false);
+        let mut samples = VecDeque::from([identity.admission_tai_ns, identity.selection_tai_ns]);
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            Ok(samples.pop_front().expect("scripted CLOCK_TAI sample"))
+        });
+        let super::BufloKernelProtectedSelectionStep::Ready(mut entry) = step else {
+            panic!("protected wait did not reach selection");
+        };
+        let error = super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+            Ok(identity.release_tai_ns)
+        })
+        .expect_err("exact release must expire the half-open selection window");
+        assert!(matches!(error, Error::DefenseExecution(_)));
+        assert_eq!(entry.confirmation_attempts, 1);
+        assert_eq!(entry.completed_tai_ns, Some(identity.selection_tai_ns));
+        assert!(entry.staging_confirmed_tai_ns.is_none());
+        assert!(entry.dispatch_confirmed_tai_ns.is_none());
+        let failure = entry.failure.expect("typed exact-release failure");
+        assert_eq!(failure.kind, "selection-expired");
+        assert_eq!(failure.previous_tai_ns, Some(identity.selection_tai_ns));
+        assert_eq!(failure.observed_tai_ns, Some(identity.release_tai_ns));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_failed_confirmation_retains_completed_phase_evidence() {
+        let identity = synthetic_protected_selection_identity(0, true);
+        let mut first_phase = synthetic_ready_protected_selection_entry(0, true, &[]);
+        let completed_tai_ns = first_phase.completed_tai_ns;
+        super::buflo_kernel_confirm_protected_selection_with_clock(&mut first_phase, || {
+            Err(Error::DefenseExecution(
+                "synthetic staging CLOCK_TAI failure".into(),
+            ))
+        })
+        .expect_err("staging confirmation clock failure must fail closed");
+        assert_eq!(first_phase.confirmation_attempts, 1);
+        assert_eq!(first_phase.completed_tai_ns, completed_tai_ns);
+        assert!(first_phase.staging_confirmed_tai_ns.is_none());
+        assert!(first_phase.dispatch_confirmed_tai_ns.is_none());
+        assert!(
+            super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![first_phase.clone()],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1
+        );
+        let mut first_phase_under_count = first_phase;
+        first_phase_under_count.clock_read_attempts = 2;
+        first_phase_under_count
+            .failure
+            .as_mut()
+            .expect("typed staging confirmation failure")
+            .clock_read_attempts = 2;
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![first_phase_under_count],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1,
+            "a completed entry with one confirmation and fewer than three clock reads was accepted",
+        );
+
+        let mut second_phase =
+            synthetic_ready_protected_selection_entry(0, true, &[identity.selection_tai_ns + 100]);
+        let completed_tai_ns = second_phase.completed_tai_ns;
+        let staging_tai_ns = second_phase.staging_confirmed_tai_ns;
+        super::buflo_kernel_confirm_protected_selection_with_clock(&mut second_phase, || {
+            Err(Error::DefenseExecution(
+                "synthetic dispatch CLOCK_TAI failure".into(),
+            ))
+        })
+        .expect_err("dispatch confirmation clock failure must fail closed");
+        assert_eq!(second_phase.confirmation_attempts, 2);
+        assert_eq!(second_phase.completed_tai_ns, completed_tai_ns);
+        assert_eq!(second_phase.staging_confirmed_tai_ns, staging_tai_ns);
+        assert!(second_phase.dispatch_confirmed_tai_ns.is_none());
+        let (receipt, valid) = super::build_buflo_kernel_protected_selection_wait_receipt(
+            vec![second_phase.clone()],
+            Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+        );
+        assert!(valid);
+        assert_eq!(receipt.confirmation_attempts, 2);
+
+        let mut second_phase_under_count = second_phase.clone();
+        second_phase_under_count.clock_read_attempts = 3;
+        second_phase_under_count
+            .failure
+            .as_mut()
+            .expect("typed dispatch confirmation failure")
+            .clock_read_attempts = 3;
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![second_phase_under_count],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1,
+            "a completed entry with two confirmations and fewer than four clock reads was accepted",
+        );
+
+        let mut missing_staging = second_phase;
+        missing_staging.staging_confirmed_tai_ns = None;
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![missing_staging],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_tick_zero_protected_selection_receipt_serializes_exact_aggregates() {
+        let identity = synthetic_protected_selection_identity(0, true);
+        let mut samples = VecDeque::from([identity.admission_tai_ns, identity.selection_tai_ns]);
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            Ok(samples.pop_front().expect("scripted CLOCK_TAI sample"))
+        });
+        let super::BufloKernelProtectedSelectionStep::Ready(mut entry) = step else {
+            panic!("tick-zero protected wait did not reach selection");
+        };
+        super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+            Ok(identity.selection_tai_ns + 100)
+        })
+        .expect("tick-zero staging confirmation inside the half-open window");
+        super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+            Ok(identity.selection_tai_ns + 200)
+        })
+        .expect("tick-zero dispatch confirmation inside the half-open window");
+        let (receipt, valid) = super::build_buflo_kernel_protected_selection_wait_receipt(
+            vec![entry],
+            Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+        );
+        assert!(valid);
+        assert_eq!(receipt.entry_count, 1);
+        assert_eq!(receipt.completed_count, 1);
+        assert_eq!(receipt.failed_count, 0);
+        assert_eq!(receipt.clock_read_attempts, 4);
+        assert_eq!(receipt.confirmation_attempts, 2);
+        assert_eq!(receipt.total_wait_duration_ns, 5_000_000);
+        assert_eq!(receipt.max_wait_duration_ns, 5_000_000);
+        assert_eq!(receipt.max_sample_gap_ns, 5_000_000);
+        assert_eq!(receipt.max_entry_lateness_ns, 0);
+        assert!(receipt.last_failure.is_none());
+        let serialized = serde_json::to_value(receipt).expect("serialize protected wait receipt");
+        assert_eq!(serialized["entries"][0]["tick_zero"], true);
+        assert_eq!(
+            serialized["entries"][0]["completed_tai_ns"],
+            identity.selection_tai_ns,
+        );
+        assert_eq!(
+            serialized["entries"][0]["staging_confirmed_tai_ns"],
+            identity.selection_tai_ns + 100,
+        );
+        assert_eq!(
+            serialized["entries"][0]["dispatch_confirmed_tai_ns"],
+            identity.selection_tai_ns + 200,
+        );
+        assert_eq!(
+            serialized["semantics"],
+            super::BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_protected_selection_receipt_requires_order_and_terminal_failure() {
+        let first_identity = synthetic_protected_selection_identity(0, true);
+        let mut first_samples = VecDeque::from([
+            first_identity.admission_tai_ns,
+            first_identity.selection_tai_ns,
+        ]);
+        let super::BufloKernelProtectedSelectionStep::Ready(first) =
+            super::buflo_kernel_protected_selection_wait_with_clock(&first_identity, || {
+                Ok(first_samples
+                    .pop_front()
+                    .expect("scripted CLOCK_TAI sample"))
+            })
+        else {
+            panic!("tick-zero protected wait did not become ready");
+        };
+        let second_identity = synthetic_protected_selection_identity(2, false);
+        let super::BufloKernelProtectedSelectionStep::Failed { entry: second, .. } =
+            super::buflo_kernel_protected_selection_wait_with_clock(&second_identity, || {
+                Ok(second_identity.selection_tai_ns)
+            })
+        else {
+            panic!("late second entry was accepted");
+        };
+        let (receipt, valid) = super::build_buflo_kernel_protected_selection_wait_receipt(
+            vec![first.clone(), second.clone()],
+            Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+        );
+        assert!(valid);
+        assert_eq!(receipt.entry_count, 2);
+        assert_eq!(receipt.completed_count, 1);
+        assert_eq!(receipt.failed_count, 1);
+        assert_eq!(
+            receipt.last_failure.as_ref().map(|failure| failure.kind),
+            Some("selection-entry-late")
+        );
+
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![second, first],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1,
+            "a nonterminal or out-of-order failure was accepted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_protected_selection_job(
+        tick: u64,
+        release_tai_ns: u64,
+    ) -> super::BufloKernelJobReceipt {
+        super::BufloKernelJobReceipt {
+            schema_version: 1,
+            job_id: tick,
+            tick,
+            release_monotonic_ns: release_tai_ns,
+            release_tai_ns,
+            deadline_monotonic_ns: release_tai_ns + 5_000_000,
+            deadline_tai_ns: release_tai_ns + 5_000_000,
+            items: Vec::new(),
+            credit_identities: Vec::new(),
+            prepared_output_failure: None,
+            helper_job_close: None,
+            helper_job_abort: None,
+            terminal_error: None,
+            terminal_outcome: "complete".into(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn synthetic_ready_protected_selection_entry(
+        slot: u64,
+        tick_zero: bool,
+        confirmation_samples: &[u64],
+    ) -> super::BufloKernelProtectedSelectionWaitEntry {
+        let identity = synthetic_protected_selection_identity(slot, tick_zero);
+        let mut wait_samples =
+            VecDeque::from([identity.admission_tai_ns, identity.selection_tai_ns]);
+        let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+            super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                Ok(wait_samples
+                    .pop_front()
+                    .expect("scripted CLOCK_TAI wait sample"))
+            })
+        else {
+            panic!("synthetic protected-selection wait did not become ready");
+        };
+        for sample in confirmation_samples {
+            super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || Ok(*sample))
+                .expect("synthetic confirmation remains in the half-open selection window");
+        }
+        entry
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one mutation matrix keeps epoch, job, phase, and confirmation bindings together"
+    )]
+    fn buflo_kernel_protected_selection_receipt_binds_epoch_jobs_and_confirmation_phases() {
+        let tick_zero_identity = synthetic_protected_selection_identity(0, true);
+        let rolling_identity = synthetic_protected_selection_identity(2, false);
+        let tick_zero = synthetic_ready_protected_selection_entry(
+            0,
+            true,
+            &[
+                tick_zero_identity.selection_tai_ns + 100,
+                tick_zero_identity.selection_tai_ns + 200,
+            ],
+        );
+        let rolling = synthetic_ready_protected_selection_entry(
+            2,
+            false,
+            &[rolling_identity.selection_tai_ns + 100],
+        );
+        let (receipt, structurally_valid) =
+            super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![tick_zero.clone(), rolling.clone()],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            );
+        assert!(structurally_valid);
+        assert_eq!(receipt.confirmation_attempts, 3);
+        let jobs = vec![
+            synthetic_protected_selection_job(0, tick_zero_identity.release_tai_ns),
+            synthetic_protected_selection_job(1, rolling_identity.release_tai_ns),
+        ];
+        assert!(
+            super::buflo_kernel_protected_selection_job_binding_valid(&receipt, &jobs, true, false,),
+            "the exact epoch, release, and tick-zero/rolling confirmation counts must bind",
+        );
+
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![tick_zero, rolling],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS + 1),
+            )
+            .1,
+            "a one-nanosecond epoch/cadence discrepancy was accepted",
+        );
+
+        let mut wrong_release_jobs = jobs.clone();
+        wrong_release_jobs[1].release_tai_ns += 1;
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &receipt,
+                &wrong_release_jobs,
+                true,
+                false,
+            ),
+            "a completed job release differing by one nanosecond was accepted",
+        );
+
+        let mut wrong_deadline_jobs = jobs.clone();
+        wrong_deadline_jobs[1].deadline_tai_ns += 1;
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &receipt,
+                &wrong_deadline_jobs,
+                true,
+                false,
+            ),
+            "a completed job deadline differing from release plus five milliseconds was accepted",
+        );
+
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &receipt, &jobs, false, false,
+            ),
+            "protected-wait entries and jobs were accepted without an armed epoch",
+        );
+        let (empty_receipt, empty_valid) =
+            super::build_buflo_kernel_protected_selection_wait_receipt(Vec::new(), None);
+        assert!(empty_valid);
+        assert!(super::buflo_kernel_protected_selection_job_binding_valid(
+            &empty_receipt,
+            &[],
+            false,
+            true,
+        ));
+
+        let mut wrong_tick_zero_attempts = receipt.clone();
+        wrong_tick_zero_attempts.entries[0].confirmation_attempts = 1;
+        wrong_tick_zero_attempts.confirmation_attempts = 2;
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &wrong_tick_zero_attempts,
+                &jobs,
+                true,
+                false,
+            ),
+            "a job-bound tick-zero entry with only one confirmation was accepted",
+        );
+
+        let mut wrong_rolling_attempts = receipt.clone();
+        wrong_rolling_attempts.entries[1].confirmation_attempts = 0;
+        wrong_rolling_attempts.confirmation_attempts = 2;
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &wrong_rolling_attempts,
+                &jobs,
+                true,
+                false,
+            ),
+            "a job-bound rolling entry without exactly one confirmation was accepted",
+        );
+
+        let mut reversed_tick_zero_phases = receipt.clone();
+        reversed_tick_zero_phases.entries[0].staging_confirmed_tai_ns = reversed_tick_zero_phases
+            .entries[0]
+            .dispatch_confirmed_tai_ns
+            .and_then(|dispatch| dispatch.checked_add(1));
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                reversed_tick_zero_phases.entries,
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1,
+            "tick-zero dispatch preceding staging was accepted",
+        );
+
+        let mut rolling_staging = receipt;
+        rolling_staging.entries[1].staging_confirmed_tai_ns =
+            rolling_staging.entries[1].completed_tai_ns;
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                rolling_staging.entries,
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1,
+            "a rolling entry carrying staging-confirmation evidence was accepted",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_terminal_no_job_confirmation_attempts_are_phase_bounded() {
+        let tick_zero_identity = synthetic_protected_selection_identity(0, true);
+        let tick_zero = synthetic_ready_protected_selection_entry(
+            0,
+            true,
+            &[
+                tick_zero_identity.selection_tai_ns + 100,
+                tick_zero_identity.selection_tai_ns + 200,
+            ],
+        );
+        let rolling_identity = synthetic_protected_selection_identity(2, false);
+        let rolling = synthetic_ready_protected_selection_entry(
+            2,
+            false,
+            &[rolling_identity.selection_tai_ns + 100],
+        );
+        let (receipt, structurally_valid) =
+            super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![tick_zero, rolling],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            );
+        assert!(structurally_valid);
+        let jobs = vec![synthetic_protected_selection_job(
+            0,
+            tick_zero_identity.release_tai_ns,
+        )];
+        assert!(super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt, &jobs, true, true,
+        ));
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &receipt, &jobs, true, false,
+            ),
+            "an extra no-job entry was accepted without a primary terminal error",
+        );
+
+        let mut zero_attempt_rolling = receipt.clone();
+        zero_attempt_rolling.entries[1].confirmation_attempts = 0;
+        zero_attempt_rolling.confirmation_attempts = 2;
+        assert!(
+            !super::buflo_kernel_protected_selection_job_binding_valid(
+                &zero_attempt_rolling,
+                &jobs,
+                true,
+                true,
+            ),
+            "a selection-reached rolling terminal entry without its dispatch confirmation was accepted",
+        );
+
+        let mut excess_attempt_rolling = receipt;
+        excess_attempt_rolling.entries[1].confirmation_attempts = 2;
+        excess_attempt_rolling.confirmation_attempts = 4;
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                excess_attempt_rolling.entries,
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            )
+            .1,
+            "a rolling terminal entry with two confirmation attempts was accepted",
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -38806,8 +40251,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_five_binds_tai_controller_and_etf_expiry_horizon() {
-        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 5);
+    fn buflo_kernel_schema_six_binds_protected_selection_and_etf_expiry_horizon() {
+        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 6);
         assert_eq!(super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION, 5);
         assert_eq!(super::BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION, 5);
 
@@ -38819,8 +40264,17 @@ mod tests {
         }
         assert!(
             super::BUFLO_KERNEL_TX_SEMANTICS
-                .starts_with("client_only_buflo_kernel_timed_egress_v5;")
+                .starts_with("client_only_buflo_kernel_timed_egress_v6;")
         );
+        assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
+            "protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms;"
+        ));
+        assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
+            "protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1;"
+        ));
+        assert!(super::BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS.contains(
+            "completed_tai_is_immutable_selection_completion=true; confirmation_attempts=count_each_confirm_call_exactly_once; confirmation_phase_order=tick_zero_completed<=staging<=dispatch<release_or_rolling_completed<=dispatch<release; failed_confirmation_retains_prior_phase_evidence=true;"
+        ));
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
             "selection_cutoff=release_minus_5ms; etf_delta=4.5ms; etf_expiry_precedes_minimum_half_open_deadline_by_499us_or_more=true;"
         ));
@@ -38856,6 +40310,7 @@ mod tests {
             clock_start,
             realtime_offset_intersection: realtime_offset_intersection.copied(),
             epoch: None,
+            protected_selection_wait_entries: Vec::new(),
             jobs,
             next_item_id,
         }
@@ -38863,7 +40318,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_five_serializes_before_arm_and_on_item_failure() {
+    fn buflo_kernel_schema_six_serializes_before_arm_and_on_item_failure() {
         let runtime_with_jobs = |jobs| {
             synthetic_buflo_kernel_runtime(
                 super::sample_buflo_kernel_clock_phase()
@@ -39107,11 +40562,11 @@ mod tests {
             "cleanup_errors": []
         });
         assert!(metrics.attach_buflo_kernel_tx_value(raw).is_err());
-        assert_eq!(metrics.schema_version, 14);
+        assert_eq!(metrics.schema_version, 15);
         assert!(
             metrics
                 .semantics
-                .contains("runner_schema14_retains_schema10_layout_for_non_kernel_metrics=true")
+                .contains("runner_schema15_retains_schema10_layout_for_non_kernel_metrics=true")
         );
         assert!(metrics.semantics.contains(&format!(
             "buflo_kernel_tx_raw_semantics={}",
@@ -39248,7 +40703,7 @@ mod tests {
             receipt["terminal_evidence_render_errors"][0],
             render_errors[0]
         );
-        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 14);
+        assert_eq!(receipt["runner_wakeup_metrics"]["schema_version"], 15);
         assert_eq!(receipt["runner_wakeup_metrics"]["buflo_kernel_tx"], raw);
     }
 }
