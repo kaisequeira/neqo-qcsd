@@ -36787,27 +36787,39 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn synthetic_buflo_kernel_runtime(
+        clock_start: super::BufloKernelClockPhase,
+        realtime_offset_intersection: Option<(i128, i128)>,
+        jobs: Vec<super::BufloKernelRawJob>,
+    ) -> super::BufloKernelTxRuntime {
+        let next_item_id = u64::try_from(jobs.iter().map(|job| job.items.len()).sum::<usize>())
+            .expect("small synthetic inventory");
+        let (runtime_contract, qdisc_contract, endpoint_tuples) =
+            synthetic_buflo_helper_contracts();
+        super::BufloKernelTxRuntime {
+            helper: None,
+            runtime_contract,
+            qdisc_contract,
+            endpoint_tuples,
+            clock_start,
+            realtime_offset_intersection,
+            epoch: None,
+            jobs,
+            next_item_id,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn buflo_kernel_nested_schema_two_serializes_before_arm_and_on_item_failure() {
-        let runtime_with_jobs = |jobs: Vec<super::BufloKernelRawJob>| {
-            let next_item_id = u64::try_from(jobs.iter().map(|job| job.items.len()).sum::<usize>())
-                .expect("small synthetic inventory");
-            let (runtime_contract, qdisc_contract, endpoint_tuples) =
-                synthetic_buflo_helper_contracts();
-            super::BufloKernelTxRuntime {
-                helper: None,
-                runtime_contract,
-                qdisc_contract,
-                endpoint_tuples,
-                clock_start: super::sample_buflo_kernel_clock_phase()
+        let runtime_with_jobs = |jobs| {
+            synthetic_buflo_kernel_runtime(
+                super::sample_buflo_kernel_clock_phase()
                     .expect("sample synthetic runtime start clocks"),
-                realtime_offset_intersection: None,
-                epoch: None,
+                None,
                 jobs,
-                next_item_id,
-            }
+            )
         };
-
         let failed_before_arm =
             runtime_with_jobs(Vec::new()).finish(Some("synthetic pre-arm failure".into()));
         let failed_before_arm_json =
@@ -36852,20 +36864,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn buflo_kernel_online_realtime_intersection_updates_and_fails_closed() {
-        let runtime = |clock_start: super::BufloKernelClockPhase, realtime_offset_intersection| {
-            let (runtime_contract, qdisc_contract, endpoint_tuples) =
-                synthetic_buflo_helper_contracts();
-            super::BufloKernelTxRuntime {
-                helper: None,
-                runtime_contract,
-                qdisc_contract,
-                endpoint_tuples,
-                clock_start,
-                realtime_offset_intersection,
-                epoch: None,
-                jobs: Vec::new(),
-                next_item_id: 0,
-            }
+        let runtime = |clock_start, realtime_offset_intersection| {
+            synthetic_buflo_kernel_runtime(clock_start, realtime_offset_intersection, Vec::new())
         };
         let start = synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10);
         let first = synthetic_buflo_clock_phase_with_offsets(300_000, 10_004, 500_000, 8, 8);
