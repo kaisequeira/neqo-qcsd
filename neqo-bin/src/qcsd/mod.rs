@@ -6124,6 +6124,22 @@ fn scheduler_contract_matches(evidence: &ProcessSchedulerEvidence) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn process_affinity_cpus() -> Result<Vec<usize>, Error> {
+    // SAFETY: A zeroed cpu_set_t is a valid destination for sched_getaffinity.
+    let mut affinity: libc::cpu_set_t = unsafe { mem::zeroed() };
+    // SAFETY: `affinity` and its exact size describe a valid writable buffer.
+    if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut affinity) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok((0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| {
+            // SAFETY: `cpu` is bounded by CPU_SETSIZE and `affinity` is initialized.
+            unsafe { libc::CPU_ISSET(*cpu, &affinity) }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
 fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     let policy = {
         // SAFETY: Querying the current process does not dereference pointers.
@@ -6138,18 +6154,7 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
     if unsafe { libc::sched_getparam(0, &raw mut parameters) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
-    // SAFETY: A zeroed cpu_set_t is a valid destination for sched_getaffinity.
-    let mut affinity: libc::cpu_set_t = unsafe { mem::zeroed() };
-    // SAFETY: `affinity` and its exact size describe a valid writable buffer.
-    if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &raw mut affinity) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    let affinity_cpus = (0..libc::CPU_SETSIZE as usize)
-        .filter(|cpu| {
-            // SAFETY: `cpu` is bounded by CPU_SETSIZE and `affinity` is initialized.
-            unsafe { libc::CPU_ISSET(*cpu, &affinity) }
-        })
-        .collect::<Vec<_>>();
+    let affinity_cpus = process_affinity_cpus()?;
     // SAFETY: A zeroed rlimit is a valid destination for getrlimit.
     let mut rtprio: libc::rlimit = unsafe { mem::zeroed() };
     // SAFETY: `rtprio` is a valid writable rlimit for the RLIMIT_RTPRIO query.
