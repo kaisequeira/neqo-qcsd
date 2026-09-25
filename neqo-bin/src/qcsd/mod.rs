@@ -1287,6 +1287,99 @@ const fn run_error_class(error: &Error) -> &'static str {
 
 const QCSD_CLIENT_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-cpu10-v1";
 const QCSD_CLIENT_ETF_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-cpu10-etf-helper-cpu11-v1";
+const QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-portable-etf-helper-v3";
+const QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT: &str = "qcsd-client-rr1-portable-etf-helper-v4";
+
+fn is_etf_scheduler_contract(value: &str) -> bool {
+    matches!(
+        value,
+        QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
+            | QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT
+            | QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT
+    )
+}
+
+fn portable_scheduler_cpus_from_values(client: &str, helper: &str) -> Option<(usize, usize)> {
+    if ![client, helper]
+        .into_iter()
+        .all(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let client_cpu = client.parse::<usize>().ok()?;
+    let helper_cpu = helper.parse::<usize>().ok()?;
+    (client_cpu >= 1
+        && client_cpu.checked_add(1) == Some(helper_cpu)
+        && client_cpu.to_string() == client
+        && helper_cpu.to_string() == helper)
+        .then_some((client_cpu, helper_cpu))
+}
+
+fn portable_scheduler_cpus_from_cpuset(cpuset: &str) -> Option<(usize, usize)> {
+    let (client, helper) = cpuset.split_once('-')?;
+    portable_scheduler_cpus_from_values(client, helper)
+}
+
+fn sparse_scheduler_cpus_from_values(client: &str, helper: &str) -> Option<(usize, usize)> {
+    if ![client, helper]
+        .into_iter()
+        .all(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let client_cpu = client.parse::<usize>().ok()?;
+    let helper_cpu = helper.parse::<usize>().ok()?;
+    (client_cpu >= 1
+        && helper_cpu > client_cpu
+        && client_cpu.to_string() == client
+        && helper_cpu.to_string() == helper)
+        .then_some((client_cpu, helper_cpu))
+}
+
+fn sparse_scheduler_cpus_from_cpuset(cpuset: &str) -> Option<(usize, usize)> {
+    if let Some((client, helper)) = cpuset.split_once(',') {
+        return sparse_scheduler_cpus_from_values(client, helper);
+    }
+    let (client, helper) = cpuset.split_once('-')?;
+    let selected = sparse_scheduler_cpus_from_values(client, helper)?;
+    (selected.0.checked_add(1) == Some(selected.1)).then_some(selected)
+}
+
+fn scheduler_contract_cpus(
+    contract: &str,
+    cgroup_effective_cpuset: Option<&str>,
+) -> Option<(usize, usize)> {
+    match contract {
+        QCSD_CLIENT_SCHEDULER_CONTRACT | QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
+            if cgroup_effective_cpuset == Some("10-11") =>
+        {
+            Some((10, 11))
+        }
+        QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT => {
+            portable_scheduler_cpus_from_cpuset(cgroup_effective_cpuset?)
+        }
+        QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT => {
+            sparse_scheduler_cpus_from_cpuset(cgroup_effective_cpuset?)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn requested_portable_scheduler_cpus(contract: &str) -> Result<(usize, usize), Error> {
+    let client = std::env::var("QCSD_CAPTURE_CLIENT_CPU").map_err(|_| {
+        Error::RunAborted("portable client scheduler CPU is missing or invalid UTF-8".into())
+    })?;
+    let helper = std::env::var("QCSD_CAPTURE_ORCHESTRATOR_CPU").map_err(|_| {
+        Error::RunAborted("portable orchestrator scheduler CPU is missing or invalid UTF-8".into())
+    })?;
+    let selected = if contract == QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT {
+        sparse_scheduler_cpus_from_values(&client, &helper)
+    } else {
+        portable_scheduler_cpus_from_values(&client, &helper)
+    };
+    selected.ok_or_else(|| Error::RunAborted("portable scheduler CPU indices are invalid".into()))
+}
 
 fn requested_scheduler_contract() -> Result<Option<String>, Error> {
     match std::env::var("QCSD_CAPTURE_SCHEDULER_CONTRACT") {
@@ -2425,6 +2518,16 @@ fn buflo_kernel_helper_evidence_complete(
     let Some(socket) = shutdown.socket_state.as_ref() else {
         return false;
     };
+    let scheduler_contract = runtime.scheduler_contract;
+    if !is_etf_scheduler_contract(scheduler_contract) {
+        return false;
+    }
+    let Some((_, helper_cpu)) = scheduler_contract_cpus(
+        scheduler_contract,
+        runtime.scheduler_initial.cgroup_effective_cpuset.as_deref(),
+    ) else {
+        return false;
+    };
     let privilege = &runtime.privilege_drop;
     let privilege_valid = privilege.schema_version == 1
         && privilege.uid[0] != 0
@@ -2443,9 +2546,8 @@ fn buflo_kernel_helper_evidence_complete(
         .all(|value| value.len() == 16 && value.bytes().all(|byte| byte == b'0'))
         && privilege.no_new_privileges;
     runtime.schema_version == 1
-        && runtime.scheduler_contract == QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
         && runtime.scheduler_initial.schema_version == 1
-        && runtime.scheduler_initial.contract.as_deref() == Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT)
+        && runtime.scheduler_initial.contract.as_deref() == Some(scheduler_contract)
         && runtime.scheduler_initial.contract_valid
         && scheduler_contract_matches(&runtime.scheduler_initial)
         && runtime
@@ -2464,9 +2566,9 @@ fn buflo_kernel_helper_evidence_complete(
             == "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram"
         && runtime.max_post_main_datagrams == endpoint_count
         && thread.schema_version == 1
-        && thread.contract_name == QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
-        && thread.target_cpu == 11
-        && thread.observed_affinity == [11]
+        && thread.contract_name == scheduler_contract
+        && thread.target_cpu == helper_cpu
+        && thread.observed_affinity == [helper_cpu]
         && thread.scheduler_policy == libc::SCHED_RR
         && thread.scheduler_policy_name == "SCHED_RR"
         && thread.scheduler_priority == 1
@@ -3876,12 +3978,13 @@ fn process_scheduler_ready_for_network_execution(
     evidence.contract_valid
         && scheduler_contract_matches(evidence)
         && match evidence.contract.as_deref() {
-            Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT)
-                if defense_retains_etf_setup_privileges(defense) =>
+            Some(contract)
+                if is_etf_scheduler_contract(contract)
+                    && defense_retains_etf_setup_privileges(defense) =>
             {
                 evidence.effective_capabilities_hex.as_deref() == Some("0000000000001100")
             }
-            Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT) => {
+            Some(contract) if is_etf_scheduler_contract(contract) => {
                 evidence.effective_capabilities_hex.as_deref() == Some("0000000000000000")
             }
             _ => true,
@@ -3892,7 +3995,10 @@ fn prepare_process_scheduler_for_network_execution(
     defense: &DefenseConfig,
     initial: ProcessSchedulerEvidence,
 ) -> Result<ProcessSchedulerEvidence, Error> {
-    let etf_requested = initial.contract.as_deref() == Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT);
+    let etf_requested = initial
+        .contract
+        .as_deref()
+        .is_some_and(is_etf_scheduler_contract);
     if !etf_requested || defense_retains_etf_setup_privileges(defense) {
         if !process_scheduler_ready_for_network_execution(&initial, defense) {
             return Err(Error::RunAborted(
@@ -3941,11 +4047,33 @@ impl BufloKernelTxRuntime {
         endpoints: &[Endpoint],
         scheduler_initial: ProcessSchedulerEvidence,
     ) -> Result<Self, Error> {
-        if scheduler_initial.contract.as_deref() != Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT) {
-            return Err(Error::RunAborted(
-                "BuFLO kernel timing requires the ETF scheduler contract".into(),
-            ));
-        }
+        let scheduler_contract = match scheduler_initial.contract.as_deref() {
+            Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT) => QCSD_CLIENT_ETF_SCHEDULER_CONTRACT,
+            Some(QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT) => {
+                QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT
+            }
+            Some(QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT) => {
+                QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT
+            }
+            _ => {
+                return Err(Error::RunAborted(
+                    "BuFLO kernel timing requires the ETF scheduler contract".into(),
+                ));
+            }
+        };
+        let (_, helper_cpu) = scheduler_contract_cpus(
+            scheduler_contract,
+            scheduler_initial.cgroup_effective_cpuset.as_deref(),
+        )
+        .ok_or_else(|| Error::RunAborted("ETF scheduler CPU partition is invalid".into()))?;
+        let helper_contract = if matches!(
+            scheduler_contract,
+            QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT | QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT
+        ) {
+            timed_egress::HelperThreadContract::portable_etf_helper(scheduler_contract, helper_cpu)
+        } else {
+            timed_egress::HelperThreadContract::RR1_CPU11_V1
+        };
         let interface = std::env::var("QCSD_CAPTURE_ETF_INTERFACE").map_err(|_| {
             Error::RunAborted(
                 "QCSD_CAPTURE_ETF_INTERFACE is required by the ETF scheduler contract".into(),
@@ -4011,7 +4139,7 @@ impl BufloKernelTxRuntime {
         let clock_start = sample_buflo_kernel_clock_phase()?;
         let helper = timed_egress::TimedEgressHelper::spawn_after_privilege_drop(
             active,
-            timed_egress::HelperThreadContract::RR1_CPU11_V1,
+            helper_contract,
             inventory,
         )
         .map_err(|error| buflo_kernel_timed_error("helper setup", error))?;
@@ -4057,7 +4185,7 @@ impl BufloKernelTxRuntime {
         };
         let runtime_contract = BufloKernelRuntimeContract {
             schema_version: 1,
-            scheduler_contract: QCSD_CLIENT_ETF_SCHEDULER_CONTRACT,
+            scheduler_contract,
             scheduler_initial,
             socket_setup,
             privilege_drop,
@@ -5956,31 +6084,36 @@ impl BufloKernelTxRuntime {
 
 fn scheduler_contract_matches(evidence: &ProcessSchedulerEvidence) -> bool {
     evidence.contract.as_deref().is_none_or(|value| {
+        let Some((client_cpu, _)) =
+            scheduler_contract_cpus(value, evidence.cgroup_effective_cpuset.as_deref())
+        else {
+            return false;
+        };
         let capability_phase_valid = match value {
             QCSD_CLIENT_SCHEDULER_CONTRACT => {
                 evidence.effective_capabilities_hex.as_deref() == Some("0000000000000000")
             }
-            QCSD_CLIENT_ETF_SCHEDULER_CONTRACT => matches!(
-                evidence.effective_capabilities_hex.as_deref(),
-                // The first observation precedes socket setup.  The completed
-                // run is rewritten only after the timed-egress lifecycle has
-                // validated an irrevocable all-set/bounding/ambient drop.
-                Some("0000000000001100" | "0000000000000000")
-            ),
+            QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
+            | QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT
+            | QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT => {
+                matches!(
+                    evidence.effective_capabilities_hex.as_deref(),
+                    // The first observation precedes socket setup.  The completed
+                    // run is rewritten only after the timed-egress lifecycle has
+                    // validated an irrevocable all-set/bounding/ambient drop.
+                    Some("0000000000001100" | "0000000000000000")
+                )
+            }
             _ => false,
         };
-        matches!(
-            value,
-            QCSD_CLIENT_SCHEDULER_CONTRACT | QCSD_CLIENT_ETF_SCHEDULER_CONTRACT
-        ) && evidence.source == "linux-sched-and-procfs-v1"
+        evidence.source == "linux-sched-and-procfs-v1"
             && evidence.policy == "SCHED_RR"
             && evidence.priority == 1
-            && evidence.affinity_cpus == [10]
+            && evidence.affinity_cpus == [client_cpu]
             && evidence.rlimit_rtprio.soft == 1
             && evidence.rlimit_rtprio.hard == 1
             && evidence.no_new_privileges == Some(true)
             && capability_phase_valid
-            && evidence.cgroup_effective_cpuset.as_deref() == Some("10-11")
             && evidence.affinity_scope
                 == "qcsd_container_affinity_partition_not_physical_cpu_isolation"
     })
@@ -6049,6 +6182,22 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let contract = requested_scheduler_contract()?;
+    if matches!(
+        contract.as_deref(),
+        Some(
+            QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT | QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT
+        )
+    ) {
+        let selected_contract = contract.as_deref().unwrap_or_default();
+        let selected = requested_portable_scheduler_cpus(selected_contract)?;
+        if scheduler_contract_cpus(selected_contract, cgroup_effective_cpuset.as_deref())
+            != Some(selected)
+        {
+            return Err(Error::RunAborted(
+                "portable client scheduler CPUs differ from the effective cgroup cpuset".into(),
+            ));
+        }
+    }
     let mut evidence = ProcessSchedulerEvidence {
         schema_version: 1,
         source: "linux-sched-and-procfs-v1",
@@ -12625,8 +12774,10 @@ async fn execute_run_inner(
     )?;
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let scheduler_initial = process_scheduler.clone();
-    let etf_scheduler_requested =
-        scheduler_initial.contract.as_deref() == Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT);
+    let etf_scheduler_requested = scheduler_initial
+        .contract
+        .as_deref()
+        .is_some_and(is_etf_scheduler_contract);
     if !process_scheduler_ready_for_network_execution(&scheduler_initial, &spec.config.defense) {
         return Err(Error::RunAborted(
             "client scheduler evidence changed before network execution".into(),
@@ -23697,6 +23848,48 @@ mod tests {
             &etf,
             &DefenseConfig::None
         ));
+    }
+
+    #[test]
+    fn portable_scheduler_contract_requires_two_selected_cpus_and_matching_capabilities() {
+        let evidence = super::ProcessSchedulerEvidence {
+            schema_version: 1,
+            source: "linux-sched-and-procfs-v1",
+            policy: "SCHED_RR".into(),
+            priority: 1,
+            affinity_cpus: vec![1],
+            rlimit_rtprio: super::RealtimePriorityLimit { soft: 1, hard: 1 },
+            no_new_privileges: Some(true),
+            effective_capabilities_hex: Some("0000000000001100".into()),
+            cgroup_effective_cpuset: Some("1-2".into()),
+            affinity_scope: "qcsd_container_affinity_partition_not_physical_cpu_isolation",
+            contract: Some(super::QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT.into()),
+            contract_valid: true,
+        };
+        let buflo = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: "buflo.json".into(),
+        });
+        assert!(super::process_scheduler_ready_for_network_execution(
+            &evidence, &buflo
+        ));
+        for cpuset in ["0-2", "1,2", "1-3"] {
+            let mut changed = evidence.clone();
+            changed.cgroup_effective_cpuset = Some(cpuset.into());
+            assert!(!super::scheduler_contract_matches(&changed));
+        }
+        let mut changed = evidence.clone();
+        changed.affinity_cpus = vec![10];
+        assert!(!super::scheduler_contract_matches(&changed));
+        assert_eq!(
+            super::portable_scheduler_cpus_from_values("1", "2"),
+            Some((1, 2))
+        );
+        for (client, helper) in [("0", "1"), ("01", "2"), ("1", "3"), ("1", "02")] {
+            assert_eq!(
+                super::portable_scheduler_cpus_from_values(client, helper),
+                None
+            );
+        }
     }
 
     #[test]
@@ -40885,6 +41078,70 @@ mod tests {
                 "malformed helper contract case {index} was accepted"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_helper_completion_accepts_portable_cpu_partition() {
+        let (mut runtime, qdisc, endpoints) = synthetic_buflo_helper_contracts();
+        runtime.scheduler_contract = super::QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT;
+        runtime.scheduler_initial.contract =
+            Some(super::QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT.into());
+        runtime.scheduler_initial.affinity_cpus = vec![1];
+        runtime.scheduler_initial.cgroup_effective_cpuset = Some("1-2".into());
+        runtime.helper_thread.contract_name =
+            super::QCSD_CLIENT_PORTABLE_ETF_SCHEDULER_CONTRACT.into();
+        runtime.helper_thread.target_cpu = 2;
+        runtime.helper_thread.observed_affinity = vec![2];
+        assert!(super::buflo_kernel_helper_evidence_complete(
+            &runtime,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+        ));
+        runtime.helper_thread.target_cpu = 11;
+        assert!(!super::buflo_kernel_helper_evidence_complete(
+            &runtime,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_helper_completion_accepts_sparse_cpu_partition() {
+        let (mut runtime, qdisc, endpoints) = synthetic_buflo_helper_contracts();
+        runtime.scheduler_contract = super::QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT;
+        runtime.scheduler_initial.contract =
+            Some(super::QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT.into());
+        runtime.scheduler_initial.affinity_cpus = vec![4];
+        runtime.scheduler_initial.cgroup_effective_cpuset = Some("4,7".into());
+        runtime.helper_thread.contract_name =
+            super::QCSD_CLIENT_SPARSE_ETF_SCHEDULER_CONTRACT.into();
+        runtime.helper_thread.target_cpu = 7;
+        runtime.helper_thread.observed_affinity = vec![7];
+        assert!(super::buflo_kernel_helper_evidence_complete(
+            &runtime,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+        ));
+        runtime.scheduler_initial.cgroup_effective_cpuset = Some("4-7".into());
+        assert!(!super::buflo_kernel_helper_evidence_complete(
+            &runtime,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+        ));
     }
 
     #[cfg(target_os = "linux")]

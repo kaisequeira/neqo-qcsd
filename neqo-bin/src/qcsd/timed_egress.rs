@@ -1414,6 +1414,15 @@ impl HelperThreadContract {
         expected_scheduler_policy: libc::SCHED_RR,
         expected_scheduler_priority: 1,
     };
+
+    pub const fn portable_etf_helper(name: &'static str, target_cpu: usize) -> Self {
+        Self {
+            name,
+            target_cpu,
+            expected_scheduler_policy: libc::SCHED_RR,
+            expected_scheduler_priority: 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
