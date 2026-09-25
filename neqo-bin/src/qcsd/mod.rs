@@ -23886,7 +23886,7 @@ mod tests {
             changed.cgroup_effective_cpuset = Some(cpuset.into());
             assert!(!super::scheduler_contract_matches(&changed));
         }
-        let mut changed = evidence.clone();
+        let mut changed = evidence;
         changed.affinity_cpus = vec![10];
         assert!(!super::scheduler_contract_matches(&changed));
         assert_eq!(
