@@ -2499,6 +2499,26 @@ fn buflo_kernel_socket_setup_complete(
 }
 
 #[cfg(target_os = "linux")]
+fn buflo_kernel_privilege_drop_valid(privilege: &timed_egress::PrivilegeDropReceipt) -> bool {
+    privilege.schema_version == 1
+        && privilege.uid[0] != 0
+        && privilege.uid.iter().all(|value| *value == privilege.uid[0])
+        && privilege.gid[0] != 0
+        && privilege.gid.iter().all(|value| *value == privilege.gid[0])
+        && privilege.supplementary_groups.is_empty()
+        && [
+            &privilege.cap_inheritable,
+            &privilege.cap_permitted,
+            &privilege.cap_effective,
+            &privilege.cap_bounding,
+            &privilege.cap_ambient,
+        ]
+        .into_iter()
+        .all(|value| value.len() == 16 && value.bytes().all(|byte| byte == b'0'))
+        && privilege.no_new_privileges
+}
+
+#[cfg(target_os = "linux")]
 fn buflo_kernel_helper_evidence_complete(
     runtime: &BufloKernelRuntimeContract,
     qdisc: &BufloKernelQdiscContract,
@@ -2529,22 +2549,6 @@ fn buflo_kernel_helper_evidence_complete(
         return false;
     };
     let privilege = &runtime.privilege_drop;
-    let privilege_valid = privilege.schema_version == 1
-        && privilege.uid[0] != 0
-        && privilege.uid.iter().all(|value| *value == privilege.uid[0])
-        && privilege.gid[0] != 0
-        && privilege.gid.iter().all(|value| *value == privilege.gid[0])
-        && privilege.supplementary_groups.is_empty()
-        && [
-            &privilege.cap_inheritable,
-            &privilege.cap_permitted,
-            &privilege.cap_effective,
-            &privilege.cap_bounding,
-            &privilege.cap_ambient,
-        ]
-        .into_iter()
-        .all(|value| value.len() == 16 && value.bytes().all(|byte| byte == b'0'))
-        && privilege.no_new_privileges;
     runtime.schema_version == 1
         && runtime.scheduler_initial.schema_version == 1
         && runtime.scheduler_initial.contract.as_deref() == Some(scheduler_contract)
@@ -2573,7 +2577,7 @@ fn buflo_kernel_helper_evidence_complete(
         && thread.scheduler_policy_name == "SCHED_RR"
         && thread.scheduler_priority == 1
         && thread.thread_id > 0
-        && privilege_valid
+        && buflo_kernel_privilege_drop_valid(privilege)
         && thread.privilege == *privilege
         && thread.endpoint_socket_count == endpoint_count
         && thread.credit_owner_capacity == endpoint_count
