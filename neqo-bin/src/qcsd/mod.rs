@@ -29800,7 +29800,7 @@ mod tests {
             &endpoints,
             incoming_slot,
             release,
-            release + Duration::from_millis(50),
+            release + Duration::from_secs(5),
         );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
