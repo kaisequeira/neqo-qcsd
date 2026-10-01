@@ -29965,6 +29965,8 @@ mod tests {
         endpoints[0].test_force_socket_handoff_success = true;
         endpoints[1].test_force_socket_handoff_success = true;
         let release = now();
+        // Fixture work must not consume the synthetic 50 ms handoff window.
+        let _logical_now = TestMonotonicNowOverride::fixed(release);
         let guard = synthetic_paired_buflo_guard(
             &mut controller,
             &mut actions,
