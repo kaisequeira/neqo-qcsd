@@ -62,6 +62,9 @@ use trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles
 
 const NEQO_BASE_COMMIT: &str = "8a04d065c2d35c8e8fd804f91c7081ab6bb60b89";
 const PUBLISHED_QCSD_COMMIT: &str = "39e293fb384dd341156eedd1e4b833d24904b1f6";
+// The local QUIC transport parameter limits what peers may send to this client.
+// It is independent of the QCSD send ceiling and defense packet size.
+const QCSD_INCOMING_UDP_PAYLOAD_LIMIT: u16 = 65_527;
 const SUSTAINED_QUALIFICATION_REQUESTS: usize = 40;
 const SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS: usize = 5;
 const SUSTAINED_QUALIFICATION_WAVES: usize =
@@ -9628,6 +9631,11 @@ struct PrefixPackSpec {
     /// The historical schema-two format remains byte-for-byte accepted.
     source_walkie_talkie_schema_version: Option<u32>,
     numeric_profile_derivation: Option<String>,
+    /// Prospective class-study schema four proves chaff capacity on the root
+    /// origin while binding, but not requesting, the other graph resources.
+    qualification_scope: Option<String>,
+    primary_origin: Option<String>,
+    unproven_application_resources: Option<Vec<UnprovenApplicationResource>>,
     workload_id: String,
     packet_size: u16,
     max_stream_data_excess: u64,
@@ -9641,6 +9649,17 @@ struct PrefixPackSpec {
     required_chaff_streams: usize,
     stream_activation_stages: Vec<StreamActivationStage>,
     numeric_profile: PrefixNumericProfile,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct UnprovenApplicationResource {
+    resource_id: u32,
+    url: String,
+    status: u16,
+    bytes: u64,
+    body_sha256: String,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -10431,7 +10450,8 @@ async fn qualify_chaff_response(
         Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8))),
         local_addr,
         remote_addr,
-        ConnectionParameters::default().max_udp_payload_size(u64::from(packet_size)),
+        ConnectionParameters::default()
+            .max_udp_payload_size(u64::from(QCSD_INCOMING_UDP_PAYLOAD_LIMIT)),
         started,
     )?;
     let mut client = Http3Client::new_with_conn(
@@ -10486,7 +10506,7 @@ async fn qualify_chaff_response(
             }
             while let Some(datagrams) = socket.recv(local_addr, &mut recv_buf)? {
                 for datagram in datagrams {
-                    incoming.observe(datagram.len(), packet_size);
+                    incoming.observe(datagram.len(), QCSD_INCOMING_UDP_PAYLOAD_LIMIT);
                     packet_observations.push(QualificationPacketObservation {
                         sequence: next_packet_sequence,
                         phase: if opened { "qualification" } else { "handshake" },
@@ -10741,7 +10761,7 @@ async fn qualify_chaff_response(
     let ended_unix_ns = unix_nanos();
     let receipt = match mode {
         ResponseQualificationMode::Legacy => json!({
-            "schema_version": 2,
+            "schema_version": 4,
             "artifact_type": "qcsd-chaff-response-qualification",
             "invocation_id": format!("{}-{local_addr}", started_unix_ns),
             "neqo_version": env!("CARGO_PKG_VERSION"),
@@ -10758,6 +10778,8 @@ async fn qualify_chaff_response(
             "request_stream_bytes": request_stream_bytes,
             "max_response_bytes": max_response_bytes,
             "udp_payload_ceiling": packet_size,
+            "incoming_udp_payload_limit": QCSD_INCOMING_UDP_PAYLOAD_LIMIT,
+            "outgoing_udp_payload_ceiling": packet_size,
             "started_unix_ns": started_unix_ns,
             "ended_unix_ns": ended_unix_ns,
             "completion_status": if legacy_passed { "complete" } else { "error" },
@@ -10782,7 +10804,7 @@ async fn qualify_chaff_response(
             "passed": legacy_passed,
         }),
         ResponseQualificationMode::SustainedIdentity => json!({
-            "schema_version": 3,
+            "schema_version": 5,
             "artifact_type": "qcsd-chaff-response-qualification",
             "invocation_id": format!("{}-{local_addr}", started_unix_ns),
             "neqo_version": env!("CARGO_PKG_VERSION"),
@@ -10803,6 +10825,8 @@ async fn qualify_chaff_response(
             "request_stream_bytes": request_stream_bytes,
             "max_response_bytes": max_response_bytes,
             "udp_payload_ceiling": packet_size,
+            "incoming_udp_payload_limit": QCSD_INCOMING_UDP_PAYLOAD_LIMIT,
+            "outgoing_udp_payload_ceiling": packet_size,
             "started_unix_ns": started_unix_ns,
             "ended_unix_ns": ended_unix_ns,
             "completion_status": if sustained_classifiable { "complete" } else { "error" },
@@ -11233,6 +11257,7 @@ async fn qualify_chaff_prefix(
                 .into(),
         ));
     }
+    validate_prefix_runtime_full_graph(&prefix_spec, &application_source, &runtime_workload)?;
     let application_origin = application.origin().expect("validated root origin");
     for resource_id in prefix_spec
         .stream_activation_stages
@@ -11309,7 +11334,7 @@ async fn qualify_chaff_prefix(
     let local_addr = socket.local_addr()?;
     let params = ConnectionParameters::default()
         .max_stream_data(StreamType::BiDi, false, 0)
-        .max_udp_payload_size(u64::from(prefix_spec.packet_size));
+        .max_udp_payload_size(u64::from(QCSD_INCOMING_UDP_PAYLOAD_LIMIT));
     let transport = Connection::new_client(
         &host,
         &["h3"],
@@ -11363,7 +11388,7 @@ async fn qualify_chaff_prefix(
             }
             while let Some(datagrams) = socket.recv(local_addr, &mut recv_buf)? {
                 for datagram in datagrams {
-                    incoming.observe(datagram.len(), prefix_spec.packet_size);
+                    incoming.observe(datagram.len(), QCSD_INCOMING_UDP_PAYLOAD_LIMIT);
                     packet_observations.push(QualificationPacketObservation {
                         sequence: next_packet_sequence,
                         phase: if qualification_started {
@@ -11727,7 +11752,7 @@ async fn qualify_chaff_prefix(
         .or_else(|| final_observation_result.as_ref().err())
         .map(ToString::to_string);
     let mut receipt = json!({
-        "schema_version": 2,
+        "schema_version": if prefix_spec.schema_version == 4 { 4 } else { 3 },
         "artifact_type": "qcsd-chaff-prefix-pack-qualification",
         "invocation_id": format!("{}-{local_addr}", started_unix_ns),
         "neqo_version": env!("CARGO_PKG_VERSION"),
@@ -11743,6 +11768,8 @@ async fn qualify_chaff_prefix(
         "numeric_profile_sha256": prefix_spec.numeric_profile_sha256,
         "source_walkie_talkie_artifact_sha256": prefix_spec.source_walkie_talkie_artifact_sha256,
         "packet_size": prefix_spec.packet_size,
+        "incoming_udp_payload_limit": QCSD_INCOMING_UDP_PAYLOAD_LIMIT,
+        "outgoing_udp_payload_ceiling": prefix_spec.packet_size,
         "max_stream_data_excess": prefix_spec.max_stream_data_excess,
         "maximum_receiver_continuation_reserve_horizon": prefix_spec.maximum_receiver_continuation_reserve_horizon,
         "required_chaff_survivors": prefix_spec.required_chaff_survivors,
@@ -11794,6 +11821,12 @@ async fn qualify_chaff_prefix(
         ));
     };
     receipt_object.extend(completion);
+    if prefix_spec.schema_version == 4 {
+        receipt_object.insert(
+            "qualification_scope".into(),
+            json!("primary-origin-capacity-v1"),
+        );
+    }
     receipt_object.insert(
         "qpack_decoder_stream_id".into(),
         json!(qpack_decoder_stream_id),
@@ -11922,7 +11955,28 @@ fn load_chaff_core(path: &Path) -> Result<(QualifiedChaffCore, String), Error> {
 
 fn load_prefix_pack_spec(path: &Path) -> Result<(PrefixPackSpec, String), Error> {
     let bytes = fs::read(path)?;
-    let spec: PrefixPackSpec = serde_json::from_slice(&bytes)?;
+    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let fields = raw
+        .as_object()
+        .ok_or_else(|| Error::Argument("prefix-pack specification must be a JSON object".into()))?;
+    let prospective_fields = [
+        "qualification_scope",
+        "primary_origin",
+        "unproven_application_resources",
+    ];
+    let schema_four = fields
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(4);
+    if prospective_fields
+        .iter()
+        .any(|field| fields.contains_key(*field) != schema_four)
+    {
+        return Err(Error::Argument(
+            "prefix-pack scope fields must be present exactly for schema four".into(),
+        ));
+    }
+    let spec: PrefixPackSpec = serde_json::from_value(raw)?;
     Ok((spec, sha256(&bytes)?))
 }
 
@@ -11956,18 +12010,31 @@ fn validate_prefix_pack_spec(spec: &PrefixPackSpec) -> Result<(), Error> {
     let historical = spec.schema_version == 2
         && spec.artifact_type == "qcsd-walkie-talkie-prefix-pack-spec"
         && spec.source_walkie_talkie_schema_version.is_none()
-        && spec.numeric_profile_derivation.is_none();
-    let class_study = spec.schema_version == 3
-        && spec.artifact_type == "qcsd-class-study-walkie-talkie-prefix-pack-spec"
+        && spec.numeric_profile_derivation.is_none()
+        && spec.qualification_scope.is_none()
+        && spec.primary_origin.is_none()
+        && spec.unproven_application_resources.is_none();
+    let class_study_common = spec.artifact_type
+        == "qcsd-class-study-walkie-talkie-prefix-pack-spec"
         && spec.source_walkie_talkie_schema_version == Some(6)
         && spec.numeric_profile_derivation.as_deref()
             == Some("schema-six-runtime-bursts-verbatim-no-additional-sender-framing");
-    let numeric_domain: &[u8] = if class_study {
+    let class_study = spec.schema_version == 3
+        && class_study_common
+        && spec.qualification_scope.is_none()
+        && spec.primary_origin.is_none()
+        && spec.unproven_application_resources.is_none();
+    let primary_origin_study = spec.schema_version == 4
+        && class_study_common
+        && spec.qualification_scope.as_deref() == Some("primary-origin-capacity-v1")
+        && spec.primary_origin.is_some()
+        && spec.unproven_application_resources.is_some();
+    let numeric_domain: &[u8] = if class_study || primary_origin_study {
         b"qcsd-class-study-walkie-talkie-numeric-profile-v1\0"
     } else {
         b"qcsd-walkie-talkie-numeric-profile-v1\0"
     };
-    if !(historical || class_study)
+    if !(historical || class_study || primary_origin_study)
         || spec.workload_id.trim().is_empty()
         || spec.packet_size != 1_200
         || spec.max_stream_data_excess != 1_000
@@ -12095,12 +12162,69 @@ fn validate_prefix_capacity_plan(spec: &PrefixPackSpec) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_prefix_runtime_full_graph(
+    spec: &PrefixPackSpec,
+    frozen: &ResourceManifest,
+    runtime: &ResourceManifest,
+) -> Result<(), Error> {
+    if spec.schema_version != 4 {
+        return Ok(());
+    }
+    let frozen_ids: BTreeSet<_> = frozen
+        .resources
+        .iter()
+        .map(|resource| resource.id)
+        .collect();
+    let runtime_ids: BTreeSet<_> = runtime
+        .resources
+        .iter()
+        .map(|resource| resource.id)
+        .collect();
+    if frozen.resources.len() != runtime.resources.len()
+        || frozen_ids.len() != frozen.resources.len()
+        || runtime_ids.len() != runtime.resources.len()
+        || frozen_ids != runtime_ids
+    {
+        return Err(Error::Argument(
+            "runtime workload does not cover the exact frozen prefix resource IDs".into(),
+        ));
+    }
+    for source in &frozen.resources {
+        let resource = runtime
+            .resources
+            .iter()
+            .find(|resource| resource.id == source.id)
+            .expect("matching frozen and runtime resource ID sets");
+        if (
+            &resource.url,
+            &resource.kind,
+            resource.chaff_priority,
+            resource.known_valid,
+            &resource.depends_on,
+            &resource.headers,
+        ) != (
+            &source.url,
+            &source.kind,
+            source.chaff_priority,
+            source.known_valid,
+            &source.depends_on,
+            &source.headers,
+        ) {
+            return Err(Error::Argument(format!(
+                "runtime prefix resource {} differs from the frozen full application graph",
+                source.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_prefix_prepared_response_binding(
     spec: &PrefixPackSpec,
     workload: &ResourceManifest,
     expected: &BTreeMap<u32, PreparedExpectedResponse>,
 ) -> Result<(), Error> {
-    let application_batches = application_resource_batches(workload)?;
+    let application_batches = prefix_application_batches(spec, workload, expected)?;
     let application = workload
         .resources
         .iter()
@@ -12153,6 +12277,80 @@ fn validate_prefix_prepared_response_binding(
         }
     }
     Ok(())
+}
+
+fn prefix_application_batches(
+    spec: &PrefixPackSpec,
+    workload: &ResourceManifest,
+    expected: &BTreeMap<u32, PreparedExpectedResponse>,
+) -> Result<Vec<Vec<u32>>, Error> {
+    let full_batches = application_resource_batches(workload)?;
+    if spec.schema_version != 4 {
+        return Ok(full_batches);
+    }
+    let root = workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == spec.application_resource_id)
+        .ok_or_else(|| Error::Argument("application navigation root is absent".into()))?;
+    let primary_origin = root
+        .origin()
+        .ok_or_else(|| Error::Argument("application navigation root origin is invalid".into()))?;
+    if spec.primary_origin.as_deref() != Some(primary_origin.as_str()) {
+        return Err(Error::Argument(
+            "prefix primary origin differs from the frozen navigation root".into(),
+        ));
+    }
+    let mut projected = vec![Vec::new(); spec.stream_activation_stages.len()];
+    let mut proven = BTreeSet::<u32>::new();
+    for (stage_index, batch) in full_batches.iter().enumerate() {
+        if let Some(stage) = projected.get_mut(stage_index) {
+            for resource_id in batch {
+                let resource = workload
+                    .resources
+                    .iter()
+                    .find(|resource| resource.id == *resource_id)
+                    .expect("validated dependency batch resource");
+                if resource.origin().as_deref() == Some(primary_origin.as_str()) {
+                    stage.push(*resource_id);
+                    proven.insert(*resource_id);
+                }
+            }
+        }
+    }
+    let mut resources: Vec<_> = workload.resources.iter().collect();
+    resources.sort_unstable_by_key(|resource| resource.id);
+    let mut unproven = Vec::new();
+    for resource in resources {
+        if proven.contains(&resource.id) {
+            continue;
+        }
+        let response = expected.get(&resource.id).ok_or_else(|| {
+            Error::Argument(format!(
+                "unproven application resource {} lacks a prepared response identity",
+                resource.id
+            ))
+        })?;
+        let reason = if resource.origin().as_deref() == Some(primary_origin.as_str()) {
+            "outside-prefix-components"
+        } else {
+            "secondary-origin"
+        };
+        unproven.push(UnprovenApplicationResource {
+            resource_id: resource.id,
+            url: resource.url.clone(),
+            status: response.status,
+            bytes: response.bytes,
+            body_sha256: response.body_sha256.clone(),
+            reason: reason.into(),
+        });
+    }
+    if spec.unproven_application_resources.as_deref() != Some(unproven.as_slice()) {
+        return Err(Error::Argument(
+            "prefix unproven-resource ledger differs from the full frozen application graph".into(),
+        ));
+    }
+    Ok(projected)
 }
 
 fn application_resource_batches(workload: &ResourceManifest) -> Result<Vec<Vec<u32>>, Error> {
@@ -13852,7 +14050,12 @@ fn create_endpoints(
             .url
             .parse()
             .map_err(|_| Error::Argument(format!("invalid URL: {}", resource.url)))?;
-        let authority = url.authority().expect("validated");
+        let canonical_origin: Uri = resource
+            .origin()
+            .ok_or_else(|| Error::Argument(format!("invalid URL: {}", resource.url)))?
+            .parse()
+            .map_err(|_| Error::Argument(format!("invalid URL: {}", resource.url)))?;
+        let authority = canonical_origin.authority().expect("validated");
         grouped
             .entry((
                 authority.host().to_owned(),
@@ -13898,15 +14101,11 @@ fn create_endpoints(
                 Http3Parameters::default().max_concurrent_push_streams(0),
             );
             let endpoint_id = QcsdEndpointId(u64::try_from(index).unwrap_or(u64::MAX));
-            let origin: Uri = format!(
-                "https://{}",
-                pending
-                    .front()
-                    .expect("nonempty")
-                    .url
-                    .authority()
-                    .expect("validated")
-            )
+            let origin: Uri = if port == 443 {
+                format!("https://{host}")
+            } else {
+                format!("https://{host}:{port}")
+            }
             .parse()
             .map_err(|_| Error::Argument("invalid origin".into()))?;
             let shape_stream_sends = shapes_stream_sends(&spec.config.defense);
@@ -13979,7 +14178,7 @@ fn qcsd_connection_parameters(config: &QcsdConfig, remote_ip: IpAddr) -> Connect
     // discovery; enabling it from the shared run config applies one policy to
     // every defense, including the undefended baseline.
     params
-        .max_udp_payload_size(u64::from(config.max_udp_payload_size))
+        .max_udp_payload_size(u64::from(QCSD_INCOMING_UDP_PAYLOAD_LIMIT))
         .pmtud(usize::from(config.max_udp_payload_size) > Pmtud::default_plpmtu(remote_ip))
 }
 
@@ -21703,6 +21902,8 @@ fn render_run_json(
         "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
         "migration_commit": option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"),
         "resolved_configuration": spec.config,
+        "incoming_udp_payload_limit": QCSD_INCOMING_UDP_PAYLOAD_LIMIT,
+        "outgoing_udp_payload_ceiling": spec.config.max_udp_payload_size,
         "defense_parameters": spec.defense_parameters,
         "seed": spec.seed,
         "method": spec.method,
@@ -21930,12 +22131,13 @@ mod tests {
         RunnerWakeupMetrics, RuntimeChaffManifest, ScheduledOutgoing, Socket, SocketHandoff,
         SocketHandoffBoundary, SocketHandoffPolicy, StaticModeArg, StreamActivationStage,
         StreamRecord, StreamType, SustainedResponseQualificationRequest, TerminalActionSemantics,
-        TestMonotonicNowOverride, TestOutputDrive, TrafficMorphingActivation, absolute_wakeup,
-        action_failure_reason, activate_traffic_morphing, application_send_halves_peer_confirmed,
-        apply_action_batch, apply_queued_actions, attempt_socket_handoff,
-        attempt_socket_handoff_timestamped, await_unshaped_socket_retry,
-        bind_qualified_chaff_stream_limits, bounded_qualification_wait,
-        buflo_exact_incoming_identities, buflo_exact_incoming_identity_is_pending,
+        TestMonotonicNowOverride, TestOutputDrive, TrafficMorphingActivation,
+        UnprovenApplicationResource, absolute_wakeup, action_failure_reason,
+        activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
+        apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
+        await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
+        bounded_qualification_wait, buflo_exact_incoming_identities,
+        buflo_exact_incoming_identity_is_pending,
         buflo_exact_release_failure_watchdog_cadence_validated,
         buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
         buflo_exact_release_wait_step, buflo_exact_release_zero_failure_watchdog_remainder_bound,
@@ -21958,10 +22160,10 @@ mod tests {
         handle_http_events, has_in_flight_application_stream, is_candidate_defense,
         is_public_network_address, late_socket_handoff_error, next_buflo_exact_release_guard,
         normalize_rolling_prearm_window, now, pending_receive_identity_is_reconciled,
-        prefix_numeric_profile_sha256, prefix_receipts_pass, prefix_targetless_stream_bytes,
-        preflight_receive_actions_with, prepare_chaff_cancellation, prepare_output_once_with_clock,
-        projected_ael, projected_identity_chaff_headers, qcsd_connection_parameters,
-        qualification_content_encoding, ready_request_batch,
+        prefix_application_batches, prefix_numeric_profile_sha256, prefix_receipts_pass,
+        prefix_targetless_stream_bytes, preflight_receive_actions_with, prepare_chaff_cancellation,
+        prepare_output_once_with_clock, projected_ael, projected_identity_chaff_headers,
+        qcsd_connection_parameters, qualification_content_encoding, ready_request_batch,
         reconcile_buflo_exact_incoming_output_error, record_adapter_action_error,
         record_buflo_authoritative_sample, record_receive_limit_error, record_terminal_action,
         refresh_buflo_exact_incoming_identities, register_action_batch, remaining_wakeup_delay,
@@ -21973,6 +22175,7 @@ mod tests {
         trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_chaff_cancellation_target,
         validate_chaff_manifest_defense, validate_prefix_capacity_plan, validate_prefix_pack_spec,
+        validate_prefix_prepared_response_binding, validate_prefix_runtime_full_graph,
         validate_qualified_chaff_binding, validate_terminal_chaff_receive_identities,
         validate_walkie_talkie_chaff_precondition, wait_for_activity_until,
         wait_for_buflo_exact_release_with_clocks, walkie_talkie_qualification_binding_matches,
@@ -23993,6 +24196,11 @@ mod tests {
         assert_eq!(receipt["error"], serde_json::Value::Null);
         assert_eq!(receipt["error_class"], serde_json::Value::Null);
         assert_eq!(receipt["workload_hash_sha256"], "frozen-workload-hash");
+        assert_eq!(receipt["incoming_udp_payload_limit"], 65_527);
+        assert_eq!(
+            receipt["outgoing_udp_payload_ceiling"],
+            receipt["resolved_configuration"]["max_udp_payload_size"]
+        );
         assert_runner_wakeup_receipt(&receipt["runner_wakeup_metrics"]);
         assert_eq!(receipt["process_scheduler"]["schema_version"], 1);
         assert!(receipt["process_scheduler"]["policy"].is_string());
@@ -32018,6 +32226,29 @@ mod tests {
     }
 
     #[test]
+    fn qualification_packet_stats_allow_public_site_incoming_without_relaxing_outgoing() {
+        let mut incoming = super::PacketDirectionStats {
+            packet_count: 0,
+            observed_udp_payload_max: 0,
+            oversized_packet_count: 0,
+        };
+        incoming.observe(1_452, super::QCSD_INCOMING_UDP_PAYLOAD_LIMIT);
+        assert_eq!(incoming.packet_count, 1);
+        assert_eq!(incoming.observed_udp_payload_max, 1_452);
+        assert_eq!(incoming.oversized_packet_count, 0);
+
+        let mut outgoing = super::PacketDirectionStats {
+            packet_count: 0,
+            observed_udp_payload_max: 0,
+            oversized_packet_count: 0,
+        };
+        outgoing.observe(1_200, 1_200);
+        assert_eq!(outgoing.oversized_packet_count, 0);
+        outgoing.observe(1_452, 1_200);
+        assert_eq!(outgoing.oversized_packet_count, 1);
+    }
+
+    #[test]
     fn sustained_response_qualification_preserves_nonidentity_content_encoding_evidence() {
         assert_eq!(
             sustained_qualification_content_encoding(&[]).expect("absent encoding"),
@@ -33865,7 +34096,7 @@ mod tests {
     }
 
     #[test]
-    fn qcsd_runner_discovers_only_above_the_fixed_path_payload() {
+    fn qcsd_runner_advertises_receive_limit_and_discovers_only_above_send_path_payload() {
         let mut config = QcsdConfig {
             max_udp_payload_size: 1_200,
             ..QcsdConfig::default()
@@ -33874,8 +34105,8 @@ mod tests {
         let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let ipv4_params = qcsd_connection_parameters(&config, ipv4);
         let ipv6_params = qcsd_connection_parameters(&config, ipv6);
-        assert_eq!(ipv4_params.get_max_udp_payload_size(), 1_200);
-        assert_eq!(ipv6_params.get_max_udp_payload_size(), 1_200);
+        assert_eq!(ipv4_params.get_max_udp_payload_size(), 65_527);
+        assert_eq!(ipv6_params.get_max_udp_payload_size(), 65_527);
         assert!(!ipv4_params.pmtud_enabled());
         assert!(!ipv6_params.pmtud_enabled());
 
@@ -33894,6 +34125,10 @@ mod tests {
         assert!(qcsd_connection_parameters(&config, ipv6).pmtud_enabled());
 
         config.max_udp_payload_size = 1_450;
+        assert_eq!(
+            qcsd_connection_parameters(&config, ipv4).get_max_udp_payload_size(),
+            65_527
+        );
         assert!(qcsd_connection_parameters(&config, ipv4).pmtud_enabled());
         assert!(qcsd_connection_parameters(&config, ipv6).pmtud_enabled());
 
@@ -37728,6 +37963,9 @@ mod tests {
             artifact_type: "qcsd-walkie-talkie-prefix-pack-spec".into(),
             source_walkie_talkie_schema_version: None,
             numeric_profile_derivation: None,
+            qualification_scope: None,
+            primary_origin: None,
+            unproven_application_resources: None,
             workload_id: "capacity-test".into(),
             packet_size: 1_200,
             max_stream_data_excess: 1_000,
@@ -37817,7 +38055,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_spec_accepts_both_frozen_schema_two_and_class_study_schema_three() {
+    fn prefix_spec_accepts_historical_and_prospective_schemas() {
         let mut historical = two_stage_prefix_spec();
         historical.numeric_profile_sha256 = prefix_numeric_profile_sha256(
             &historical.numeric_profile,
@@ -37839,8 +38077,233 @@ mod tests {
         .expect("class-study numeric hash");
         validate_prefix_pack_spec(&class_study).expect("class-study schema three");
 
+        let mut prospective = two_stage_prefix_spec();
+        prospective.schema_version = 4;
+        prospective.artifact_type = "qcsd-class-study-walkie-talkie-prefix-pack-spec".into();
+        prospective.source_walkie_talkie_schema_version = Some(6);
+        prospective.numeric_profile_derivation =
+            Some("schema-six-runtime-bursts-verbatim-no-additional-sender-framing".into());
+        prospective.qualification_scope = Some("primary-origin-capacity-v1".into());
+        prospective.primary_origin = Some("https://primary.example".into());
+        prospective.unproven_application_resources = Some(Vec::new());
+        prospective.numeric_profile_sha256 = prefix_numeric_profile_sha256(
+            &prospective.numeric_profile,
+            b"qcsd-class-study-walkie-talkie-numeric-profile-v1\0",
+        )
+        .expect("prospective class-study numeric hash");
+        validate_prefix_pack_spec(&prospective).expect("prospective class-study schema four");
+        prospective.unproven_application_resources = None;
+        assert!(validate_prefix_pack_spec(&prospective).is_err());
+
         class_study.numeric_profile_derivation = Some("double-framed".into());
         assert!(validate_prefix_pack_spec(&class_study).is_err());
+    }
+
+    #[test]
+    fn prospective_prefix_scope_requires_exact_primary_origin_and_unproven_ledger() {
+        let mut root = request(0, "https://primary.example", Vec::new());
+        root.kind = "Document".into();
+        let secondary = request(1, "https://secondary.example", vec![0]);
+        let mut late_primary = request(2, "https://primary.example", vec![1]);
+        late_primary.headers = vec![
+            ("accept".into(), "*/*".into()),
+            ("accept-encoding".into(), "identity".into()),
+            ("accept-language".into(), "en-US".into()),
+        ];
+        let late_secondary = request(3, "https://secondary.example", vec![2]);
+        let workload = ResourceManifest {
+            resources: vec![root, secondary, late_primary, late_secondary],
+        };
+        let responses = [(0, 500_u64), (1, 1_400_u64), (2, 2_000_u64), (3, 100_u64)]
+            .into_iter()
+            .map(|(resource_id, bytes)| {
+                (
+                    resource_id,
+                    PreparedExpectedResponse {
+                        resource_id,
+                        status: 200,
+                        bytes,
+                        body_sha256: "a".repeat(64),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut spec = two_stage_prefix_spec();
+        spec.schema_version = 4;
+        spec.artifact_type = "qcsd-class-study-walkie-talkie-prefix-pack-spec".into();
+        spec.source_walkie_talkie_schema_version = Some(6);
+        spec.numeric_profile_derivation =
+            Some("schema-six-runtime-bursts-verbatim-no-additional-sender-framing".into());
+        spec.qualification_scope = Some("primary-origin-capacity-v1".into());
+        spec.primary_origin = Some("https://primary.example".into());
+        spec.application_resource_id = 0;
+        spec.selected_chaff_resource_id = 2;
+        spec.selected_chaff_body_bytes = 2_000;
+        spec.stream_activation_stages[0].application_body_floor_bytes = 500;
+        spec.stream_activation_stages[1]
+            .application_resource_ids
+            .clear();
+        spec.stream_activation_stages[1].application_body_floor_bytes = 0;
+        spec.unproven_application_resources = Some(vec![
+            UnprovenApplicationResource {
+                resource_id: 1,
+                url: "https://secondary.example/1".into(),
+                status: 200,
+                bytes: 1_400,
+                body_sha256: "a".repeat(64),
+                reason: "secondary-origin".into(),
+            },
+            UnprovenApplicationResource {
+                resource_id: 2,
+                url: "https://primary.example/2".into(),
+                status: 200,
+                bytes: 2_000,
+                body_sha256: "a".repeat(64),
+                reason: "outside-prefix-components".into(),
+            },
+            UnprovenApplicationResource {
+                resource_id: 3,
+                url: "https://secondary.example/3".into(),
+                status: 200,
+                bytes: 100,
+                body_sha256: "a".repeat(64),
+                reason: "secondary-origin".into(),
+            },
+        ]);
+        assert_eq!(
+            prefix_application_batches(&spec, &workload, &responses)
+                .expect("primary projection retains original component depths"),
+            vec![vec![0], vec![]]
+        );
+        validate_prefix_prepared_response_binding(&spec, &workload, &responses)
+            .expect("projected stage and exact unproven ledger bind the frozen source");
+
+        let mut tampered = spec;
+        tampered.primary_origin = Some("https://secondary.example".into());
+        assert!(prefix_application_batches(&tampered, &workload, &responses).is_err());
+        tampered.primary_origin = Some("https://primary.example".into());
+        tampered
+            .unproven_application_resources
+            .as_mut()
+            .expect("ledger")
+            .swap(0, 1);
+        assert!(prefix_application_batches(&tampered, &workload, &responses).is_err());
+        tampered
+            .unproven_application_resources
+            .as_mut()
+            .expect("ledger")
+            .swap(0, 1);
+        tampered
+            .unproven_application_resources
+            .as_mut()
+            .expect("ledger")[0]
+            .reason = "outside-prefix-components".into();
+        assert!(prefix_application_batches(&tampered, &workload, &responses).is_err());
+    }
+
+    #[test]
+    fn prospective_prefix_scope_uses_canonical_https_origin() {
+        let mut root = request(0, "https://PRIMARY.EXAMPLE:443", Vec::new());
+        root.kind = "Document".into();
+        let mut same_origin = request(1, "https://primary.example", vec![0]);
+        same_origin.headers = vec![
+            ("accept".into(), "*/*".into()),
+            ("accept-encoding".into(), "gzip, br".into()),
+            ("accept-language".into(), "en-AU".into()),
+        ];
+        let other_port = request(2, "https://primary.example:8443", vec![0]);
+        let other_host = request(3, "https://other.example", vec![0]);
+        let workload = ResourceManifest {
+            resources: vec![root, same_origin, other_port, other_host],
+        };
+        let responses = [(0, 500_u64), (1, 10_000_u64), (2, 20_000_u64), (3, 100_u64)]
+            .into_iter()
+            .map(|(resource_id, bytes)| {
+                (
+                    resource_id,
+                    PreparedExpectedResponse {
+                        resource_id,
+                        status: 200,
+                        bytes,
+                        body_sha256: "a".repeat(64),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut spec = two_stage_prefix_spec();
+        spec.schema_version = 4;
+        spec.artifact_type = "qcsd-class-study-walkie-talkie-prefix-pack-spec".into();
+        spec.source_walkie_talkie_schema_version = Some(6);
+        spec.numeric_profile_derivation =
+            Some("schema-six-runtime-bursts-verbatim-no-additional-sender-framing".into());
+        spec.qualification_scope = Some("primary-origin-capacity-v1".into());
+        spec.primary_origin = Some("https://primary.example".into());
+        spec.application_resource_id = 0;
+        spec.selected_chaff_resource_id = 1;
+        spec.selected_chaff_body_bytes = 10_000;
+        spec.stream_activation_stages[0].application_body_floor_bytes = 500;
+        spec.stream_activation_stages[1].application_resource_ids = vec![1];
+        spec.stream_activation_stages[1].application_body_floor_bytes = 10_000;
+        spec.unproven_application_resources = Some(vec![
+            UnprovenApplicationResource {
+                resource_id: 2,
+                url: "https://primary.example:8443/2".into(),
+                status: 200,
+                bytes: 20_000,
+                body_sha256: "a".repeat(64),
+                reason: "secondary-origin".into(),
+            },
+            UnprovenApplicationResource {
+                resource_id: 3,
+                url: "https://other.example/3".into(),
+                status: 200,
+                bytes: 100,
+                body_sha256: "a".repeat(64),
+                reason: "secondary-origin".into(),
+            },
+        ]);
+        assert_eq!(
+            prefix_application_batches(&spec, &workload, &responses)
+                .expect("case and default port denote the root origin"),
+            vec![vec![0], vec![1]]
+        );
+        validate_prefix_prepared_response_binding(&spec, &workload, &responses)
+            .expect("selected chaff and projected stages use the canonical origin");
+        spec.primary_origin = Some("https://primary.example:8443".into());
+        assert!(prefix_application_batches(&spec, &workload, &responses).is_err());
+    }
+
+    #[test]
+    fn prospective_prefix_runtime_binds_excluded_resources_to_frozen_graph() {
+        let frozen = ResourceManifest {
+            resources: vec![
+                request(0, "https://primary.example", Vec::new()),
+                request(1, "https://secondary.example", vec![0]),
+            ],
+        };
+        let mut spec = two_stage_prefix_spec();
+        spec.schema_version = 4;
+        validate_prefix_runtime_full_graph(&spec, &frozen, &frozen)
+            .expect("identical full graph is accepted");
+
+        let mut changed = frozen.clone();
+        changed.resources[1].url = "https://secondary.example/changed".into();
+        assert!(validate_prefix_runtime_full_graph(&spec, &frozen, &changed).is_err());
+        changed = frozen.clone();
+        changed.resources[1]
+            .headers
+            .push(("accept".into(), "*/*".into()));
+        assert!(validate_prefix_runtime_full_graph(&spec, &frozen, &changed).is_err());
+        changed = frozen.clone();
+        changed.resources.pop();
+        assert!(validate_prefix_runtime_full_graph(&spec, &frozen, &changed).is_err());
+        changed = frozen.clone();
+        changed.resources[1].id = 2;
+        assert!(validate_prefix_runtime_full_graph(&spec, &frozen, &changed).is_err());
+
+        let historical = two_stage_prefix_spec();
+        validate_prefix_runtime_full_graph(&historical, &frozen, &changed)
+            .expect("historical runtime binding is unchanged");
     }
 
     #[test]

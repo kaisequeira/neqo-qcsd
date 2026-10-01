@@ -427,13 +427,36 @@ impl Resource {
     pub fn effective_length(&self) -> u64 {
         self.content_length.unwrap_or(1).max(self.data_length)
     }
-    /// Normalized `https://authority` used for exact same-origin routing.
+    /// Canonical HTTPS origin used for same-origin routing. Host names are
+    /// case-insensitive and an explicit default port denotes the same origin.
     #[must_use]
     pub fn origin(&self) -> Option<String> {
-        let remainder = self.url.strip_prefix("https://")?;
-        let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-        let authority = &remainder[..authority_end];
-        (!authority.is_empty()).then(|| format!("https://{authority}"))
+        let url: http::Uri = self.url.parse().ok()?;
+        if url.scheme_str()? != "https" {
+            return None;
+        }
+        let authority = url.authority()?;
+        if authority.as_str().contains('@') {
+            return None;
+        }
+        let host = authority.host();
+        if host.is_empty() {
+            return None;
+        }
+        let port = authority.port_u16();
+        if authority.port().is_some() && port.is_none() {
+            return None;
+        }
+        let host = host.to_ascii_lowercase();
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        Some(match port {
+            None | Some(443) => format!("https://{host}"),
+            Some(port) => format!("https://{host}:{port}"),
+        })
     }
 
     pub(crate) fn type_rank(&self) -> u8 {
@@ -1284,7 +1307,7 @@ impl ResourceManifest {
 mod tests {
     use super::{
         ChaffManifest, ChaffQualification, ExpectedChaffResponse,
-        IdentityChaffRequestHeaderPrimitive, QualifiedChaffResource, ResourceManifest,
+        IdentityChaffRequestHeaderPrimitive, QualifiedChaffResource, Resource, ResourceManifest,
         ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
         ResponseOnlyChaffQualificationV4, ResponseOnlyQualifiedChaffResource,
         ResponseOnlyQualifiedChaffResourceV4, sanitize_chaff_headers,
@@ -1298,6 +1321,33 @@ mod tests {
         ],
         "links": [{"source":0,"target":1}]
     }"#;
+
+    #[test]
+    fn resource_origin_normalizes_https_host_and_default_port() {
+        let mut resource = Resource {
+            id: 0,
+            url: "https://EXAMPLE.COM:443/path".into(),
+            kind: "Document".into(),
+            content_length: None,
+            data_length: 0,
+            chaff_priority: false,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        assert_eq!(resource.origin().as_deref(), Some("https://example.com"));
+        resource.url = "https://example.com/path".into();
+        assert_eq!(resource.origin().as_deref(), Some("https://example.com"));
+        resource.url = "https://EXAMPLE.COM:8443/path".into();
+        assert_eq!(
+            resource.origin().as_deref(),
+            Some("https://example.com:8443")
+        );
+        resource.url = "https://other.example/path".into();
+        assert_eq!(resource.origin().as_deref(), Some("https://other.example"));
+        resource.url = "https://user@example.com/path".into();
+        assert_eq!(resource.origin(), None);
+    }
 
     fn qualified_manifest() -> ChaffManifest {
         ChaffManifest {

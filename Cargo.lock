@@ -771,6 +771,7 @@ dependencies = [
 name = "neqo-csdef"
 version = "0.30.0"
 dependencies = [
+ "http",
  "serde",
  "serde_json",
  "thiserror",

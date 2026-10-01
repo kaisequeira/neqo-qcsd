@@ -816,8 +816,29 @@ impl Http3Client {
 }
 
 fn same_origin(target: &http::Uri, origin: &(String, String)) -> bool {
-    target.scheme_str() == Some(origin.0.as_str())
-        && target.authority().map(http::uri::Authority::as_str) == Some(origin.1.as_str())
+    if target.scheme_str() != Some(origin.0.as_str()) || origin.0 != "https" {
+        return false;
+    }
+    let Some(target_authority) = target.authority() else {
+        return false;
+    };
+    let Ok(origin_authority) = origin.1.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    if target_authority.as_str().contains('@') || origin_authority.as_str().contains('@') {
+        return false;
+    }
+    let target_port = target_authority.port_u16();
+    let origin_port = origin_authority.port_u16();
+    if (target_authority.port().is_some() && target_port.is_none())
+        || (origin_authority.port().is_some() && origin_port.is_none())
+    {
+        return false;
+    }
+    target_authority
+        .host()
+        .eq_ignore_ascii_case(origin_authority.host())
+        && target_port.unwrap_or(443) == origin_port.unwrap_or(443)
 }
 
 fn strict_chaff_headers(headers: Vec<(String, String)>) -> Vec<Header> {
@@ -834,10 +855,22 @@ mod tests {
     use super::{same_origin, strict_chaff_headers};
 
     #[test]
-    fn chaff_is_limited_to_the_exact_origin() {
+    fn chaff_is_limited_to_the_https_origin() {
         let origin = ("https".to_owned(), "example.com".to_owned());
         assert!(same_origin(
             &"https://example.com/a".parse().expect("URI"),
+            &origin
+        ));
+        assert!(same_origin(
+            &"https://EXAMPLE.COM:443/a".parse().expect("URI"),
+            &origin
+        ));
+        assert!(same_origin(
+            &"https://example.com/a".parse().expect("URI"),
+            &("https".to_owned(), "EXAMPLE.COM:443".to_owned())
+        ));
+        assert!(!same_origin(
+            &"https://example.com:8443/a".parse().expect("URI"),
             &origin
         ));
         assert!(!same_origin(
