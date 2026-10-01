@@ -29666,7 +29666,7 @@ mod tests {
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[expect(
         clippy::too_many_lines,
         reason = "the two-origin retry regression proves independent callbacks for two physical owners of one logical pair"
@@ -29794,13 +29794,16 @@ mod tests {
             endpoint.test_force_socket_handoff_success = true;
         }
         let release = now();
+        // Keep the synthetic handoff inside its real 50 ms deadline even if
+        // fixture I/O is delayed by other tests running in the build.
+        let _logical_now = TestMonotonicNowOverride::fixed(release);
         let guard = synthetic_paired_buflo_guard(
             &mut controller,
             &mut actions,
             &endpoints,
             incoming_slot,
             release,
-            release + Duration::from_secs(5),
+            release + Duration::from_millis(50),
         );
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         apply_action_batch(
