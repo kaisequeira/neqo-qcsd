@@ -1017,6 +1017,16 @@ impl Defense for CsBuflo {
                 && self.direction_complete(Direction::Incoming))
     }
 
+    fn is_incoming_complete(&self) -> bool {
+        // After onLoad, a latched incoming stop forbids new opportunities,
+        // even while previously advertised credit is still being consumed.
+        // The controller may then grant its bounded parser-only bridge for a
+        // final HTTP/3 frame header without crediting those extra bytes to a
+        // scheduled cell. A pre-onLoad quiet stop remains provisional.
+        self.is_complete()
+            || (self.application_complete() && self.termination_stop_active(Direction::Incoming))
+    }
+
     fn is_outgoing_complete(&self) -> bool {
         self.event_guard_triggered || self.direction_complete(Direction::Outgoing)
     }
@@ -2265,6 +2275,14 @@ mod tests {
         });
         assert!(defense.termination_stop_latched[INCOMING]);
         assert!(!defense.direction_complete(Direction::Incoming));
+        assert!(
+            defense.is_incoming_complete(),
+            "an irreversible stop permits the bounded terminal parser bridge before credit drains"
+        );
+        assert!(
+            !defense.is_complete(),
+            "the last scheduled cell still needs exact credit consumption"
+        );
         assert_eq!(defense.next_event(Duration::from_micros(3)), None);
         assert_eq!(defense.next_event_at(), None);
         assert_eq!(defense.scheduled[INCOMING], 2);
@@ -2315,6 +2333,7 @@ mod tests {
             EventOutcome::Satisfied { observed: 600 },
         );
         assert!(defense.direction_complete(Direction::Incoming));
+        assert!(defense.is_incoming_complete());
         assert!(defense.is_complete());
         assert_eq!(
             defense.termination_stop_crossing_total_bytes[INCOMING], 0,
@@ -2475,6 +2494,10 @@ mod tests {
             EventOutcome::Satisfied { observed: 600 },
         );
         assert!(defense.termination_stop_latched[INCOMING]);
+        assert!(
+            !defense.is_incoming_complete(),
+            "a pre-onLoad quiet stop can be invalidated by later natural traffic"
+        );
 
         defense.observe_application_bytes(Duration::from_micros(2_000_003), Direction::Incoming, 1);
         assert_eq!(defense.padding_targets[INCOMING], None);

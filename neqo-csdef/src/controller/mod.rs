@@ -12290,6 +12290,131 @@ mod tests {
     }
 
     #[test]
+    fn cs_buflo_stopped_incoming_schedule_bridges_final_two_byte_parser_tail() {
+        let (mut controller, endpoint, stream, slot, _) = advertised_tail_controller(
+            DefenseMode::ChaffAndShape,
+            1_000,
+            &[(114, 116)],
+            Trace::default(),
+        );
+        let mut defense = CsBuflo::from_parameters(
+            CsBufloParameters {
+                schema_version: 1,
+                packet_size: 600,
+                initial_interval_us: 8_192,
+                minimum_interval_us: 4_096,
+                maximum_interval_us: 32_768,
+                initial_adaptation_boundary_bytes: 16_384,
+                quiet_time_us: 2_000_000,
+                outgoing_padding_mode: CsBufloPaddingMode::Total,
+                incoming_padding_mode: CsBufloPaddingMode::Payload,
+                timing_sample_limit: 1_000,
+                jitter_denominator: 100,
+                jitter_max_numerator: 200,
+                early_termination: CsBufloEarlyTermination::Local,
+                max_events: 1_000,
+                implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+                paper_equivalent: false,
+            },
+            42,
+        );
+        defense.observe_application_bytes(Duration::ZERO, Direction::Incoming, 1_000);
+        let at = Duration::from_secs(1);
+        let packet = (0..2)
+            .filter_map(|_| defense.next_event(at))
+            .find(|event| event.direction() == Direction::Incoming)
+            .expect("one incoming opportunity");
+        defense.observe(DefenseSignal {
+            at,
+            kind: SignalKind::IncomingCreditScheduled { slot, packet },
+        });
+        defense.observe(DefenseSignal {
+            at,
+            kind: SignalKind::IncomingCreditAdvertised { slot, packet },
+        });
+        defense.observe(DefenseSignal {
+            at,
+            kind: SignalKind::ApplicationComplete,
+        });
+        defense.observe(DefenseSignal {
+            at: at + Duration::from_micros(1),
+            kind: SignalKind::PayloadBytes {
+                direction: Direction::Incoming,
+                bytes: 24,
+                cover: true,
+            },
+        });
+        assert!(defense.is_incoming_complete());
+        assert!(!defense.is_complete());
+        assert!(defense.diagnostics().cs_buflo_incoming_termination_stop_latched);
+
+        // Preserve the exact 600-byte cell: 598 bytes have been consumed and
+        // its final two advertised bytes sit in a pristine frame-header tail.
+        controller.pending_slots.insert(slot, packet);
+        let ledger = controller
+            .incoming_credit_ledger
+            .get_mut(&slot)
+            .expect("scheduled credit ledger");
+        ledger.packet = packet;
+        ledger.advertised = 600;
+        ledger.consumed = 598;
+        controller.scheduled_incoming_requested_bytes = 600;
+        controller.scheduled_incoming_advertised_bytes = 600;
+        controller.scheduled_incoming_consumed_bytes = 598;
+        controller.defense = Box::new(defense);
+
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            at + Duration::from_micros(2),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::LeaseParserReceive {
+                endpoint: observed_endpoint,
+                stream: observed_stream,
+                absolute_limit: 132,
+                increase: 16,
+                owner: None,
+            }) if observed_endpoint == endpoint && observed_stream == stream
+        ));
+        assert!(controller.next_action().is_none());
+        assert_eq!(controller.defense_diagnostics().scheduled_incoming_unresolved_bytes, 2);
+
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: 132,
+                slot: None,
+            },
+            at + Duration::from_micros(3),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 3,
+            },
+            at + Duration::from_micros(4),
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::SlotSatisfied { slot: observed, .. }) if observed == slot
+        ));
+        assert!(controller.next_action().is_none());
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 600);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 600);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
     fn terminal_parser_bridge_requires_complete_contiguous_advertised_ownership() {
         for advertised_ranges in [&[(114, 115)][..], &[(114, 115), (116, 117)][..]] {
             let (mut controller, endpoint, stream, slot, packet) = advertised_tail_controller(
