@@ -10,7 +10,7 @@
 use std::arch::asm;
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File},
     io::{self, Write as _},
     mem,
@@ -400,6 +400,9 @@ enum Command {
         /// Exact frozen prepared source whose raw bytes bind qualified chaff.
         #[arg(long, requires = "workload")]
         application_workload_source: Option<PathBuf>,
+        /// Explicit response completion policy for a pre-prepared stability or baseline run.
+        #[arg(long, value_enum, requires = "workload", conflicts_with = "urls")]
+        application_response_policy: Option<ApplicationResponsePolicy>,
         /// Complete custom configuration for thesis defenses and imported runs.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -513,6 +516,7 @@ impl Args {
                 urls,
                 workload,
                 application_workload_source,
+                application_response_policy,
                 config,
                 preset,
                 profile,
@@ -563,6 +567,12 @@ impl Args {
                     .as_deref()
                     .map(load_application_workload_source)
                     .transpose()?;
+                let application_response_policy = resolve_application_response_policy(
+                    application_response_policy,
+                    application_workload_source
+                        .as_ref()
+                        .map(|(_, _, _, policy)| *policy),
+                )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
                     (Some(manifest), Some(raw_hash))
@@ -607,6 +617,7 @@ impl Args {
                     workload,
                     workload_hash,
                     application_workload_source,
+                    application_response_policy,
                     config,
                     defense_parameters,
                     chaff_manifest,
@@ -1177,6 +1188,152 @@ fn bind_qualified_chaff_stream_limits(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ApplicationResponsePolicy {
+    #[default]
+    #[value(name = "http-2xx-only-v1")]
+    Http2xxOnly,
+    #[value(name = "completed-terminal-http-errors-v1")]
+    CompletedTerminalHttpErrors,
+}
+
+impl ApplicationResponsePolicy {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Http2xxOnly => "http-2xx-only-v1",
+            Self::CompletedTerminalHttpErrors => "completed-terminal-http-errors-v1",
+        }
+    }
+
+    fn from_preparation(preparation: &serde_json::Value) -> Result<Self, Error> {
+        match preparation.get("application_response_policy") {
+            None => Ok(Self::default()),
+            Some(serde_json::Value::String(value)) if value == Self::Http2xxOnly.name() => {
+                Ok(Self::Http2xxOnly)
+            }
+            Some(serde_json::Value::String(value))
+                if value == Self::CompletedTerminalHttpErrors.name() =>
+            {
+                Ok(Self::CompletedTerminalHttpErrors)
+            }
+            Some(_) => Err(Error::Argument(
+                "prepared application response policy is invalid".into(),
+            )),
+        }
+    }
+
+    fn permits_terminal_error(self, workload: &ResourceManifest, resource_id: u32) -> bool {
+        self == Self::CompletedTerminalHttpErrors
+            && resource_id != 0
+            && workload.resources.iter().any(|resource| {
+                resource.id == resource_id
+                    && !resource.known_valid
+                    && !resource.chaff_priority
+                    && !resource.depends_on.is_empty()
+            })
+            && !workload
+                .resources
+                .iter()
+                .any(|resource| resource.depends_on.contains(&resource_id))
+    }
+
+    fn validate_workload(self, workload: &ResourceManifest) -> Result<(), Error> {
+        if self == Self::Http2xxOnly {
+            return Ok(());
+        }
+        if !workload.resources.iter().any(|resource| {
+            resource.id == 0
+                && resource.kind == "Document"
+                && resource.known_valid
+                && resource.depends_on.is_empty()
+        }) {
+            return Err(Error::Argument(
+                "terminal HTTP error policy requires a known-valid Document navigation root 0"
+                    .into(),
+            ));
+        }
+        for resource in &workload.resources {
+            if !resource.known_valid && !self.permits_terminal_error(workload, resource.id) {
+                return Err(Error::Argument(format!(
+                    "terminal HTTP error policy cannot admit non-primary dependency or chaff resource {}",
+                    resource.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_source_binding(
+        self,
+        runtime: &ResourceManifest,
+        source: &ResourceManifest,
+    ) -> Result<(), Error> {
+        if self == Self::Http2xxOnly {
+            return Ok(());
+        }
+        let runtime_ids: HashSet<_> = runtime
+            .resources
+            .iter()
+            .map(|resource| resource.id)
+            .collect();
+        let source_ids: HashSet<_> = source
+            .resources
+            .iter()
+            .map(|resource| resource.id)
+            .collect();
+        if runtime_ids != source_ids || runtime.resources.len() != source.resources.len() {
+            return Err(Error::Argument(
+                "terminal HTTP error runtime does not cover the frozen full application graph"
+                    .into(),
+            ));
+        }
+        for resource in &runtime.resources {
+            let frozen = source
+                .resources
+                .iter()
+                .find(|frozen| frozen.id == resource.id)
+                .ok_or_else(|| Error::Argument("frozen application resource is absent".into()))?;
+            if (
+                &resource.url,
+                &resource.kind,
+                resource.chaff_priority,
+                resource.known_valid,
+                &resource.depends_on,
+                &resource.headers,
+            ) != (
+                &frozen.url,
+                &frozen.kind,
+                frozen.chaff_priority,
+                frozen.known_valid,
+                &frozen.depends_on,
+                &frozen.headers,
+            ) {
+                return Err(Error::Argument(format!(
+                    "terminal HTTP error runtime resource {} differs from the frozen full application graph",
+                    resource.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolve_application_response_policy(
+    requested: Option<ApplicationResponsePolicy>,
+    prepared: Option<ApplicationResponsePolicy>,
+) -> Result<ApplicationResponsePolicy, Error> {
+    if let Some(prepared) = prepared {
+        if requested.is_some_and(|requested| requested != prepared) {
+            return Err(Error::Argument(
+                "CLI application response policy differs from the frozen prepared source".into(),
+            ));
+        }
+        Ok(prepared)
+    } else {
+        Ok(requested.unwrap_or_default())
+    }
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
@@ -1185,7 +1342,9 @@ struct RunSpec {
         ResourceManifest,
         String,
         BTreeMap<u32, PreparedExpectedResponse>,
+        ApplicationResponsePolicy,
     )>,
+    application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
     defense_parameters: Option<DefenseParameterProvenance>,
     chaff_manifest: Option<RuntimeChaffManifest>,
@@ -9964,6 +10123,7 @@ async fn probe(
     }
     let head = execute_run(RunSpec {
         method: "HEAD",
+        application_response_policy: ApplicationResponsePolicy::default(),
         workload_hash: manifest_hash(&head_manifest)?,
         workload: head_manifest,
         application_workload_source: None,
@@ -10002,6 +10162,7 @@ async fn probe(
         execute_run(RunSpec {
             method: "GET",
             workload_hash: manifest_hash(&fallback_manifest)?,
+            application_response_policy: ApplicationResponsePolicy::default(),
             workload: fallback_manifest,
             application_workload_source: None,
             config: QcsdConfig::default(),
@@ -10383,7 +10544,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses) =
+    let (workload, workload_hash, expected_responses, _) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -11196,7 +11357,7 @@ async fn qualify_chaff_prefix(
     output_dir: &Path,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let (application_source, application_source_sha256, prepared_expected_responses) =
+    let (application_source, application_source_sha256, prepared_expected_responses, _) =
         load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
@@ -11891,6 +12052,7 @@ fn load_application_workload_source(
         ResourceManifest,
         String,
         BTreeMap<u32, PreparedExpectedResponse>,
+        ApplicationResponsePolicy,
     ),
     Error,
 > {
@@ -11902,6 +12064,12 @@ fn load_application_workload_source(
                 .into(),
         ));
     }
+    let policy = ApplicationResponsePolicy::from_preparation(&source.preparation)?;
+    let manifest = ResourceManifest {
+        resources: source.resources,
+    };
+    manifest.validate()?;
+    policy.validate_workload(&manifest)?;
     let expected = source
         .preparation
         .get("expected_responses")
@@ -11914,7 +12082,15 @@ fn load_application_workload_source(
     let expected: Vec<PreparedExpectedResponse> = serde_json::from_value(expected)?;
     let mut by_id = BTreeMap::new();
     for response in expected {
-        if !(200..300).contains(&response.status)
+        let successful_identity = (200..300).contains(&response.status)
+            && (policy == ApplicationResponsePolicy::Http2xxOnly
+                || manifest.resources.iter().any(|resource| {
+                    resource.id == response.resource_id && resource.known_valid
+                }));
+        let allowed_status = successful_identity
+            || ((400..600).contains(&response.status)
+                && policy.permits_terminal_error(&manifest, response.resource_id));
+        if !allowed_status
             || !lower_hex_sha256(&response.body_sha256)
             || by_id.insert(response.resource_id, response).is_some()
         {
@@ -11928,11 +12104,19 @@ fn load_application_workload_source(
             "prepared expected response identities are empty".into(),
         ));
     }
-    let manifest = ResourceManifest {
-        resources: source.resources,
-    };
-    manifest.validate()?;
-    Ok((manifest, sha256(&bytes)?, by_id))
+    if by_id.keys().copied().collect::<HashSet<_>>()
+        != manifest
+            .resources
+            .iter()
+            .map(|resource| resource.id)
+            .collect::<HashSet<_>>()
+    {
+        return Err(Error::Argument(
+            "prepared expected response identities must cover every application resource exactly"
+                .into(),
+        ));
+    }
+    Ok((manifest, sha256(&bytes)?, by_id, policy))
 }
 
 fn load_chaff_manifest(path: &Path) -> Result<(RuntimeChaffManifest, String), Error> {
@@ -12504,6 +12688,21 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     // developer invocations still serialize their unconstrained observation.
     let initial_process_scheduler = process_scheduler_evidence()?;
     spec.workload.validate()?;
+    spec.application_response_policy
+        .validate_workload(&spec.workload)?;
+    if spec
+        .application_workload_source
+        .as_ref()
+        .is_some_and(|(_, _, _, policy)| *policy != spec.application_response_policy)
+    {
+        return Err(Error::Argument(
+            "run application response policy differs from its frozen prepared source".into(),
+        ));
+    }
+    if let Some((source, _, _, _)) = &spec.application_workload_source {
+        spec.application_response_policy
+            .validate_source_binding(&spec.workload, source)?;
+    }
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
         validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
@@ -12702,7 +12901,8 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash, expected_responses)) = &spec.application_workload_source else {
+    let Some((source, source_hash, expected_responses, _)) = &spec.application_workload_source
+    else {
         return Err(Error::Argument(
             "qualified chaff requires an exact application workload source binding".into(),
         ));
@@ -14515,7 +14715,7 @@ fn handle_http_events(
                     {
                         record.outcome = "endpoint_closed";
                     }
-                    finish_stream(endpoint, stream_id)?;
+                    finish_stream(endpoint, stream_id, Some(spec))?;
                 }
                 while let Some(request) = endpoint.pending.pop_front() {
                     endpoint
@@ -14564,14 +14764,14 @@ fn handle_http_events(
                     }
                 }
                 if known_chaff_mismatch {
-                    finish_stream(endpoint, stream_id)?;
+                    finish_stream(endpoint, stream_id, Some(spec))?;
                     return Err(Error::RunAborted(format!(
                         "chaff response headers on stream {} contradict its qualified identity",
                         stream_id.as_u64()
                     )));
                 }
                 if fin {
-                    finish_stream(endpoint, stream_id)?;
+                    finish_stream(endpoint, stream_id, Some(spec))?;
                 }
             }
             Http3ClientEvent::DataReadable { stream_id } => {
@@ -14622,7 +14822,7 @@ fn handle_http_events(
                         if let Some(record) = endpoint.streams.get_mut(&stream_id) {
                             record.outcome = "response_limit";
                         }
-                        finish_stream(endpoint, stream_id)?;
+                        finish_stream(endpoint, stream_id, Some(spec))?;
                         if chaff_overflow {
                             return Err(Error::RunAborted(format!(
                                 "chaff response on stream {} exceeded its qualified body length",
@@ -14632,7 +14832,7 @@ fn handle_http_events(
                         break;
                     }
                     if fin {
-                        finish_stream(endpoint, stream_id)?;
+                        finish_stream(endpoint, stream_id, Some(spec))?;
                         break;
                     }
                     if read == 0 {
@@ -14652,7 +14852,7 @@ fn handle_http_events(
                 {
                     record.outcome = "reset";
                 }
-                finish_stream(endpoint, stream_id)?;
+                finish_stream(endpoint, stream_id, Some(spec))?;
             }
             _ => {}
         }
@@ -14660,14 +14860,18 @@ fn handle_http_events(
     Ok(())
 }
 
-fn finish_stream(endpoint: &mut Endpoint, stream_id: StreamId) -> Result<(), Error> {
+fn finish_stream(
+    endpoint: &mut Endpoint,
+    stream_id: StreamId,
+    spec: Option<&RunSpec>,
+) -> Result<(), Error> {
     endpoint
         .deferred_data_readable
         .retain(|candidate| *candidate != stream_id);
     if let Some(mut record) = endpoint.streams.remove(&stream_id) {
         let mut result = Ok(());
         if record.role == QcsdRequestRole::Application {
-            let state = finish_application_record(&mut record);
+            let state = finish_application_record(&mut record, spec);
             endpoint
                 .retired_applications
                 .push((record.resource_id, state));
@@ -14776,11 +14980,30 @@ fn chaff_response_result(record: &StreamRecord) -> Result<ChaffResponseResult, E
     })
 }
 
-fn finish_application_record(record: &mut StreamRecord) -> ResourceRunState {
-    let succeeded = record.complete
+fn finish_application_record(
+    record: &mut StreamRecord,
+    spec: Option<&RunSpec>,
+) -> ResourceRunState {
+    let terminal_error_completed = record.role == QcsdRequestRole::Application
+        && record.outcome == "in_flight"
+        && u64::try_from(record.body.len()).ok() == Some(record.bytes)
+        && record
+            .content_length
+            .is_none_or(|length| length == record.bytes)
         && record
             .status
-            .is_some_and(|status| (200..300).contains(&status));
+            .is_some_and(|status| (400..600).contains(&status))
+        && spec.is_some_and(|spec| {
+            spec.method == "GET"
+                && spec
+                    .application_response_policy
+                    .permits_terminal_error(&spec.workload, record.resource_id)
+        });
+    let succeeded = record.complete
+        && (record
+            .status
+            .is_some_and(|status| (200..300).contains(&status))
+            || terminal_error_completed);
     if succeeded {
         record.outcome = "succeeded";
         ResourceRunState::Succeeded
@@ -16801,7 +17024,7 @@ fn apply_action(
                     )));
                 }
                 record.outcome = chaff_cancellation_receipt_outcome(cancellation_reason);
-                finish_stream(endpoint, stream_id)?;
+                finish_stream(endpoint, stream_id, None)?;
             }
             traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
         }
@@ -21908,8 +22131,9 @@ fn render_run_json(
         "seed": spec.seed,
         "method": spec.method,
         "request_policy": spec.request_policy,
+        "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _)| hash),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _)| hash),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -22114,9 +22338,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ActivityWake, ApplicationBatchLifecycle, Args, BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE,
-        BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL, BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE,
-        BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
+        ActivityWake, ApplicationBatchLifecycle, ApplicationResponsePolicy, Args,
+        BUFLO_EXACT_RELEASE_ACTIVE_WAIT_POLL_SOURCE, BUFLO_EXACT_RELEASE_ACTIVE_WAIT_TAIL,
+        BUFLO_EXACT_RELEASE_INSTANT_POLL_SOURCE, BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE,
         BUFLO_EXACT_RELEASE_SPIN_INTERRUPTION_THRESHOLD, BufloExactReleaseCandidate,
         BufloExactReleaseGuard, BufloExactReleasePhase, BufloExactReleasePollClock,
         BufloExactReleaseTimingHistogram, BufloExactReleaseWaitEvidence,
@@ -22512,6 +22736,7 @@ mod tests {
             },
             workload_hash: "local-et-real-receive-rollback".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config,
             defense_parameters: None,
             chaff_manifest: None,
@@ -22714,7 +22939,7 @@ mod tests {
             .get_mut(&neqo_transport::StreamId::new(stream.0))
             .expect("tracked chaff stream")
             .outcome = "local_early_termination_cancelled";
-        finish_stream(&mut endpoint, neqo_transport::StreamId::new(stream.0))
+        finish_stream(&mut endpoint, neqo_transport::StreamId::new(stream.0), None)
             .expect("retire chaff record");
         assert!(endpoint.streams.is_empty());
         assert!(endpoint.client.qcsd_has_pending_defense_control());
@@ -22988,6 +23213,7 @@ mod tests {
             },
             workload_hash: "unexpected-endpoint-close".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config,
             defense_parameters: None,
             chaff_manifest: None,
@@ -23759,7 +23985,13 @@ mod tests {
             method: "GET",
             workload: source.clone(),
             workload_hash: "runtime".into(),
-            application_workload_source: Some((source.clone(), "e".repeat(64), expected)),
+            application_workload_source: Some((
+                source.clone(),
+                "e".repeat(64),
+                expected,
+                ApplicationResponsePolicy::default(),
+            )),
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
                 defense: DefenseConfig::Front(FrontConfig::default()),
                 ..QcsdConfig::default()
@@ -23932,6 +24164,7 @@ mod tests {
             workload: workload.clone(),
             workload_hash: "preflight".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
                 use_empty_resources,
                 defense: DefenseConfig::WalkieTalkie(WalkieTalkieConfig {
@@ -24160,6 +24393,7 @@ mod tests {
             },
             workload_hash: "frozen-workload-hash".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig::default(),
             defense_parameters: None,
             chaff_manifest: None,
@@ -24509,6 +24743,7 @@ mod tests {
             },
             workload_hash: "activation-test".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config,
             defense_parameters: None,
             chaff_manifest: None,
@@ -26344,6 +26579,7 @@ mod tests {
             workload: ResourceManifest { resources },
             workload_hash: "rolling-abort-runner".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config,
             defense_parameters: None,
             chaff_manifest: None,
@@ -27088,6 +27324,7 @@ mod tests {
             workload: workload.clone(),
             workload_hash: "same-barrier-local-et-dependent".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
                 defense: DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
                     parameters: "test-only-cs-buflo.json".into(),
@@ -27379,6 +27616,7 @@ mod tests {
             workload: workload.clone(),
             workload_hash: "bounded-data-readable".into(),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
                 defense: DefenseConfig::None,
                 tail_wait_us: 0,
@@ -32080,10 +32318,458 @@ mod tests {
     fn application_404_is_a_failed_resource() {
         let mut record = application(Some(404), true);
         assert_eq!(
-            finish_application_record(&mut record),
+            finish_application_record(&mut record, None),
             ResourceRunState::Failed
         );
         assert_eq!(record.outcome, "failed");
+    }
+
+    fn terminal_http_error_spec(policy: ApplicationResponsePolicy) -> RunSpec {
+        let mut root = request(0, "https://example.com", Vec::new());
+        root.kind = "Document".into();
+        let mut leaf = request(1, "https://api.example.com", vec![0]);
+        leaf.known_valid = false;
+        RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: vec![root, leaf],
+            },
+            workload_hash: "a".repeat(64),
+            application_workload_source: None,
+            application_response_policy: policy,
+            config: QcsdConfig::default(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 7,
+            output_dir: PathBuf::from("/unused-policy-test-output"),
+            max_response_bytes: 1_024,
+            timeout_seconds: 30,
+        }
+    }
+
+    fn terminal_http_error_source() -> serde_json::Value {
+        let spec = terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        json!({
+            "resources": spec.workload.resources,
+            "preparation": {
+                "application_response_policy": spec.application_response_policy.name(),
+                "expected_responses": [
+                    { "resource_id": 0, "status": 200, "bytes": 1_200, "body_sha256": "a".repeat(64) },
+                    { "resource_id": 1, "status": 401, "bytes": 157, "body_sha256": "b".repeat(64) }
+                ]
+            }
+        })
+    }
+
+    fn assert_terminal_http_error_source(value: &serde_json::Value, valid: bool) {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("application-response-policy-source");
+        let path = output.join("prepared.json");
+        fs::write(&path, serde_json::to_vec(value).expect("serialize source"))
+            .expect("write source");
+        let result = super::load_application_workload_source(&path);
+        assert_eq!(result.is_ok(), valid, "source: {value}; result: {result:?}");
+        fs::remove_dir_all(output).expect("remove policy source test directory");
+    }
+
+    #[test]
+    fn application_response_policy_complete_leaf_errors_preserve_identity_and_finish_graph() {
+        test_fixture::fixture_init();
+        let spec = terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        spec.application_response_policy
+            .validate_workload(&spec.workload)
+            .expect("eligible graph");
+        for status in [400, 401, 403, 404, 429, 500, 599] {
+            let mut record = application(Some(status), true);
+            record.body = b"unauthenticated".to_vec();
+            record.bytes = u64::try_from(record.body.len()).expect("body length");
+            record.content_length = Some(record.bytes);
+            assert_eq!(
+                finish_application_record(&mut record, Some(&spec)),
+                ResourceRunState::Succeeded
+            );
+            assert_eq!(record.status, Some(status));
+            assert_eq!(record.outcome, "succeeded");
+            assert!(!spec.workload.resources[1].known_valid);
+            let response = super::response_result(&record).expect("raw response receipt");
+            assert_eq!(response.status, Some(status));
+            assert_eq!(response.bytes, record.bytes);
+            assert_eq!(
+                response.body_sha256,
+                sha256(b"unauthenticated").expect("body identity")
+            );
+            let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("graph");
+            dependencies.mark_in_flight(0).expect("primary dispatched");
+            dependencies.mark_succeeded(0).expect("primary completed");
+            dependencies
+                .mark_in_flight(record.resource_id)
+                .expect("terminal resource dispatched");
+            dependencies
+                .mark_succeeded(record.resource_id)
+                .expect("terminal response completed");
+            assert!(dependencies.is_successful());
+        }
+    }
+
+    #[test]
+    fn application_response_policy_default_rejects_complete_leaf_401() {
+        let spec = terminal_http_error_spec(ApplicationResponsePolicy::default());
+        let mut record = application(Some(401), true);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        assert_eq!(record.status, Some(401));
+        assert_eq!(record.outcome, "failed");
+    }
+
+    #[test]
+    fn application_response_policy_rejects_incomplete_redirect_and_nonterminal_statuses() {
+        let spec = terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        for (status, complete) in [
+            (Some(401), false),
+            (Some(302), true),
+            (Some(399), true),
+            (Some(600), true),
+            (None, true),
+        ] {
+            let mut record = application(status, complete);
+            assert_eq!(
+                finish_application_record(&mut record, Some(&spec)),
+                ResourceRunState::Failed
+            );
+            assert_eq!(record.status, status);
+        }
+    }
+
+    #[test]
+    fn application_response_policy_rejects_truncated_canceled_and_head_error_responses() {
+        let mut spec =
+            terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        for outcome in ["response_limit", "reset", "endpoint_closed", "canceled"] {
+            let mut record = application(Some(401), true);
+            record.outcome = outcome;
+            assert_eq!(
+                finish_application_record(&mut record, Some(&spec)),
+                ResourceRunState::Failed
+            );
+            assert_eq!(record.outcome, outcome);
+        }
+        let mut record = application(Some(401), true);
+        record.bytes = 157;
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        let mut record = application(Some(401), true);
+        record.content_length = Some(157);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        spec.method = "HEAD";
+        let mut record = application(Some(401), true);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+    }
+
+    #[test]
+    fn application_response_policy_rejects_primary_known_valid_dependency_or_chaff_errors() {
+        let mut spec =
+            terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        let mut primary = application(Some(401), true);
+        primary.resource_id = 0;
+        assert_eq!(
+            finish_application_record(&mut primary, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        spec.workload.resources[1].known_valid = true;
+        let mut record = application(Some(401), true);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        spec.workload.resources[1].known_valid = false;
+        spec.workload
+            .resources
+            .push(request(2, "https://api.example.com", vec![1]));
+        assert!(
+            spec.application_response_policy
+                .validate_workload(&spec.workload)
+                .is_err()
+        );
+        let mut record = application(Some(401), true);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        spec.workload.resources.pop();
+        spec.workload.resources[1].chaff_priority = true;
+        assert!(
+            spec.application_response_policy
+                .validate_workload(&spec.workload)
+                .is_err()
+        );
+        let mut record = application(Some(401), true);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        let mut record = chaff(b"qualified body", true);
+        record.resource_id = 1;
+        record.status = Some(401);
+        assert_eq!(
+            finish_application_record(&mut record, Some(&spec)),
+            ResourceRunState::Failed
+        );
+        record.outcome = "in_flight";
+        assert!(finish_chaff_record(&mut record, neqo_transport::StreamId::new(4)).is_err());
+    }
+
+    #[test]
+    fn application_response_policy_requires_document_root_and_dependent_terminal_leaves() {
+        let policy = ApplicationResponsePolicy::CompletedTerminalHttpErrors;
+        for mutation in 0..4 {
+            let mut spec = terminal_http_error_spec(policy);
+            match mutation {
+                0 => spec.workload.resources[0].kind = "Other".into(),
+                1 => spec.workload.resources[0].known_valid = false,
+                2 => {
+                    spec.workload.resources.remove(0);
+                }
+                3 => spec.workload.resources[1].depends_on.clear(),
+                _ => unreachable!("bounded mutation"),
+            }
+            assert!(policy.validate_workload(&spec.workload).is_err());
+        }
+    }
+
+    #[test]
+    fn application_response_policy_source_keeps_false_leaf_status_and_full_identities() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("application-response-policy-source-identity");
+        let path = output.join("prepared.json");
+        let value = terminal_http_error_source();
+        let bytes = serde_json::to_vec(&value).expect("serialize source");
+        fs::write(&path, &bytes).expect("write source");
+        let (manifest, digest, expected, policy) =
+            super::load_application_workload_source(&path).expect("policy source");
+        assert_eq!(
+            policy,
+            ApplicationResponsePolicy::CompletedTerminalHttpErrors
+        );
+        assert_eq!(digest, sha256(&bytes).expect("raw source identity"));
+        assert!(!manifest.resources[1].known_valid);
+        assert_eq!(expected.len(), manifest.resources.len());
+        assert_eq!(expected[&1].status, 401);
+        assert_eq!(expected[&1].bytes, 157);
+        assert_eq!(expected[&1].body_sha256, "b".repeat(64));
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[test]
+    fn application_response_policy_source_default_stays_2xx_only() {
+        let mut value = terminal_http_error_source();
+        value["preparation"]
+            .as_object_mut()
+            .expect("metadata")
+            .remove("application_response_policy");
+        assert_terminal_http_error_source(&value, false);
+        value["preparation"]["expected_responses"][1]["status"] = json!(200);
+        assert_terminal_http_error_source(&value, true);
+    }
+
+    #[test]
+    fn application_response_policy_source_rejects_2xx_with_false_probe_qualification() {
+        let mut value = terminal_http_error_source();
+        value["preparation"]["expected_responses"][1]["status"] = json!(200);
+        assert_terminal_http_error_source(&value, false);
+        value["resources"][1]["known_valid"] = json!(true);
+        assert_terminal_http_error_source(&value, true);
+    }
+
+    #[test]
+    fn application_response_policy_source_rejects_unknown_or_malformed_policy() {
+        for policy in [json!("other-policy"), json!(null), json!(true), json!(4)] {
+            let mut value = terminal_http_error_source();
+            value["preparation"]["application_response_policy"] = policy;
+            assert_terminal_http_error_source(&value, false);
+        }
+    }
+
+    #[test]
+    fn application_response_policy_source_rejects_error_primary_redirect_or_chaff_marked_leaf() {
+        for mutation in 0..5 {
+            let mut value = terminal_http_error_source();
+            match mutation {
+                0 => value["preparation"]["expected_responses"][0]["status"] = json!(401),
+                1 => value["preparation"]["expected_responses"][1]["status"] = json!(302),
+                2 => value["resources"][1]["known_valid"] = json!(true),
+                3 => value["resources"][1]["chaff_priority"] = json!(true),
+                4 => value["resources"][1]["depends_on"] = json!([]),
+                _ => unreachable!("bounded mutation"),
+            }
+            assert_terminal_http_error_source(&value, false);
+        }
+    }
+
+    #[test]
+    fn application_response_policy_source_requires_exact_expected_response_id_coverage() {
+        for mutation in 0..3 {
+            let mut value = terminal_http_error_source();
+            let rows = value["preparation"]["expected_responses"]
+                .as_array_mut()
+                .expect("rows");
+            match mutation {
+                0 => {
+                    rows.pop();
+                }
+                1 => {
+                    let mut extra = rows[0].clone();
+                    extra["resource_id"] = json!(99);
+                    rows.push(extra);
+                }
+                2 => rows.push(rows[0].clone()),
+                _ => unreachable!("bounded mutation"),
+            }
+            assert_terminal_http_error_source(&value, false);
+        }
+    }
+
+    #[test]
+    fn application_response_policy_runtime_source_binding_preserves_every_request() {
+        let policy = ApplicationResponsePolicy::CompletedTerminalHttpErrors;
+        let source = terminal_http_error_spec(policy).workload;
+        policy
+            .validate_source_binding(&source, &source)
+            .expect("exact graph");
+        for mutation in 0..6 {
+            let mut runtime = source.clone();
+            match mutation {
+                0 => {
+                    runtime.resources.pop();
+                }
+                1 => runtime.resources[1].url = "https://api.example.com/replaced".into(),
+                2 => runtime.resources[1].known_valid = true,
+                3 => runtime.resources[1].depends_on.clear(),
+                4 => runtime.resources[1]
+                    .headers
+                    .push(("accept".into(), "text/plain".into())),
+                5 => runtime.resources[1].chaff_priority = true,
+                _ => unreachable!("bounded mutation"),
+            }
+            assert!(policy.validate_source_binding(&runtime, &source).is_err());
+        }
+        let mut empty_length_runtime = source.clone();
+        empty_length_runtime.resources[1].data_length = 0;
+        empty_length_runtime.resources[1].content_length = Some(0);
+        policy
+            .validate_source_binding(&empty_length_runtime, &source)
+            .expect("request graph remains exact when declared shaping lengths change");
+    }
+
+    #[test]
+    fn application_response_policy_cli_resolves_frozen_source_and_rejects_mismatch() {
+        let strict = ApplicationResponsePolicy::default();
+        let opt_in = ApplicationResponsePolicy::CompletedTerminalHttpErrors;
+        assert_eq!(
+            super::resolve_application_response_policy(None, None).expect("default"),
+            strict
+        );
+        assert_eq!(
+            super::resolve_application_response_policy(Some(opt_in), None)
+                .expect("baseline opt-in"),
+            opt_in
+        );
+        assert_eq!(
+            super::resolve_application_response_policy(None, Some(opt_in))
+                .expect("source-derived policy"),
+            opt_in
+        );
+        assert_eq!(
+            super::resolve_application_response_policy(Some(opt_in), Some(opt_in))
+                .expect("matching policy"),
+            opt_in
+        );
+        assert!(super::resolve_application_response_policy(Some(strict), Some(opt_in)).is_err());
+        assert!(super::resolve_application_response_policy(Some(opt_in), Some(strict)).is_err());
+    }
+
+    #[test]
+    fn application_response_policy_cli_accepts_exact_opt_in_and_requires_workload() {
+        let parse = |policy| {
+            Args::try_parse_from([
+                "neqo-qcsd-client",
+                "run",
+                "--workload",
+                "workload.json",
+                "--application-response-policy",
+                policy,
+                "--seed",
+                "7",
+                "--output-dir",
+                "output",
+                "--max-response-bytes",
+                "4096",
+            ])
+        };
+        for policy in ["http-2xx-only-v1", "completed-terminal-http-errors-v1"] {
+            assert!(parse(policy).is_ok());
+        }
+        assert!(parse("completed_terminal_http_errors_v1").is_err());
+        assert!(
+            Args::try_parse_from([
+                "neqo-qcsd-client",
+                "run",
+                "https://example.com/",
+                "--application-response-policy",
+                "completed-terminal-http-errors-v1",
+                "--seed",
+                "7",
+                "--output-dir",
+                "output",
+                "--max-response-bytes",
+                "4096",
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn application_response_policy_run_receipt_records_explicit_default_or_opt_in() {
+        let (runtime, _, _) = synthetic_buflo_helper_contracts();
+        for policy in [
+            ApplicationResponsePolicy::default(),
+            ApplicationResponsePolicy::CompletedTerminalHttpErrors,
+        ] {
+            let spec = terminal_http_error_spec(policy);
+            let bytes = super::render_run_json(
+                &spec,
+                &[],
+                &[],
+                &[],
+                &runtime.scheduler_initial,
+                &[],
+                1,
+                &RunCompletion {
+                    ended_unix_ns: Some(2),
+                    status: "complete",
+                    error: None,
+                    error_class: None,
+                    defense_start_monotonic_ns: None,
+                    application_completion_monotonic_ns: Some(2),
+                    defense_diagnostics: None,
+                    runner_wakeup_metrics: None,
+                },
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt");
+            assert_eq!(receipt["application_response_policy"], policy.name());
+        }
     }
 
     #[test]
@@ -32093,7 +32779,7 @@ mod tests {
             .response_headers
             .push(("location".into(), "https://other.example/".into()));
         assert_eq!(
-            finish_application_record(&mut record),
+            finish_application_record(&mut record, None),
             ResourceRunState::Failed
         );
         assert_eq!(record.url, "https://example.com/resource");
@@ -32104,7 +32790,7 @@ mod tests {
     fn reset_application_is_a_failed_resource() {
         let mut record = application(Some(200), false);
         assert_eq!(
-            finish_application_record(&mut record),
+            finish_application_record(&mut record, None),
             ResourceRunState::Failed
         );
         assert_eq!(record.outcome, "failed");
@@ -39185,6 +39871,7 @@ mod tests {
             },
             workload_hash: "00".repeat(32),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig::default(),
             defense_parameters: None,
             chaff_manifest: None,
@@ -41728,6 +42415,7 @@ mod tests {
             },
             workload_hash: "00".repeat(32),
             application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig::default(),
             defense_parameters: None,
             chaff_manifest: None,
