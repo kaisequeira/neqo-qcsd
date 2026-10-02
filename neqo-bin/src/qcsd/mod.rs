@@ -10034,6 +10034,9 @@ struct Endpoint {
     /// the CLOCK_TAI-to-MONOTONIC offset moves.
     transport_instant_floor: Instant,
     pending: VecDeque<ApplicationRequest>,
+    /// A peer stream limit is temporary admission backpressure. Keep pending
+    /// resources untouched until HTTP/3 reports fresh request-stream credit.
+    application_stream_limit_blocked: bool,
     streams: HashMap<StreamId, StreamRecord>,
     /// Every application request send half opened on this endpoint. Entries
     /// remain after response retirement so candidate-defense completion can
@@ -12084,9 +12087,10 @@ fn load_application_workload_source(
     for response in expected {
         let successful_identity = (200..300).contains(&response.status)
             && (policy == ApplicationResponsePolicy::Http2xxOnly
-                || manifest.resources.iter().any(|resource| {
-                    resource.id == response.resource_id && resource.known_valid
-                }));
+                || manifest
+                    .resources
+                    .iter()
+                    .any(|resource| resource.id == response.resource_id && resource.known_valid));
         let allowed_status = successful_identity
             || ((400..600).contains(&response.status)
                 && policy.permits_terminal_error(&manifest, response.resource_id));
@@ -14327,6 +14331,7 @@ fn create_endpoints(
                 client,
                 transport_instant_floor: start,
                 pending,
+                application_stream_limit_blocked: false,
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
                 chaff_send_streams: BTreeSet::new(),
@@ -14450,7 +14455,7 @@ fn dispatch_ready_requests(
                 )?;
                 continue;
             }
-            if !ready.contains(&request.resource_id) {
+            if endpoint.application_stream_limit_blocked || !ready.contains(&request.resource_id) {
                 endpoint.pending.push_back(request);
                 continue;
             }
@@ -14467,6 +14472,22 @@ fn dispatch_ready_requests(
                 Priority::default(),
             ) {
                 Ok(stream) => stream,
+                Err(neqo_http3::Error::StreamLimit) => {
+                    // No request stream was created. Preserve both graph order
+                    // and Pending dependency state; receive/output processing
+                    // continues and RequestsCreatable wakes this endpoint.
+                    let resource_id = request.resource_id;
+                    endpoint.pending.push_front(request);
+                    endpoint.application_stream_limit_blocked = true;
+                    traces.event(
+                        dispatch_at,
+                        Some(endpoint.id),
+                        "application_request",
+                        "stream_limit_blocked",
+                        &resource_id,
+                    )?;
+                    break;
+                }
                 Err(error) => {
                     dependencies.mark_failed(request.resource_id)?;
                     endpoint.completed.push(application_record(
@@ -14706,6 +14727,18 @@ fn handle_http_events(
                     .authenticated(AuthenticationStatus::Ok, transport_at);
             }
             Http3ClientEvent::StateChange(Http3State::Connected) => endpoint.connected = true,
+            Http3ClientEvent::RequestsCreatable => {
+                if endpoint.application_stream_limit_blocked {
+                    endpoint.application_stream_limit_blocked = false;
+                    traces.event(
+                        now,
+                        Some(endpoint.id),
+                        "application_request",
+                        "stream_limit_released",
+                        &"peer request-stream credit available",
+                    )?;
+                }
+            }
             Http3ClientEvent::StateChange(Http3State::Closed(reason)) => {
                 endpoint.connected = false;
                 let streams: Vec<_> = endpoint.streams.keys().copied().collect();
@@ -27304,6 +27337,279 @@ mod tests {
         drop(endpoints);
         drop(server);
         fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    fn application_stream_limit_spec(output: PathBuf, resources: Vec<Resource>) -> RunSpec {
+        RunSpec {
+            method: "GET",
+            workload: ResourceManifest { resources },
+            workload_hash: "application-stream-limit-regression".into(),
+            application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
+            config: QcsdConfig::default(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 7,
+            output_dir: output,
+            max_response_bytes: 16,
+            timeout_seconds: 1,
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the real peer regression checks queue, dependency, stream-credit and response lifecycle together"
+    )]
+    async fn application_stream_limit_preserves_pending_and_resumes_on_peer_credit() {
+        let output = trace_output_dir("application-stream-limit-peer-credit");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let origin = "https://127.0.0.1:4433";
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![
+                request(1, origin, Vec::new()),
+                request(2, origin, Vec::new()),
+                request(3, origin, vec![2]),
+            ],
+        );
+        let mut endpoints = create_endpoints(&spec, started, &observation_clock).expect("endpoint");
+        let mut server = test_fixture::http3_server_with_params(
+            neqo_http3::Http3Parameters::default().connection_parameters(
+                super::ConnectionParameters::default().max_streams(StreamType::BiDi, 1),
+            ),
+        );
+        let trailing = test_fixture::connect_peers(&mut endpoints[0].client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, server_output);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+            .expect("consume initial connection and credit events");
+        let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("dependencies");
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                None,
+                None
+            )
+            .expect("first dispatch"),
+            1
+        );
+        assert!(endpoints[0].application_stream_limit_blocked);
+        assert_eq!(
+            endpoints[0]
+                .pending
+                .iter()
+                .map(|request| request.resource_id)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(dependencies.state(2), Some(ResourceRunState::Pending));
+        assert_eq!(dependencies.state(3), Some(ResourceRunState::Pending));
+        assert!(endpoints[0].completed.is_empty());
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                None,
+                None
+            )
+            .expect("blocked endpoint is not resubmitted"),
+            0
+        );
+
+        for expected_id in 1..=3 {
+            test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+            let stream = server
+                .events()
+                .find_map(|event| match event {
+                    neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                        assert!(fin);
+                        Some(stream)
+                    }
+                    _ => None,
+                })
+                .expect("server receives the admitted request");
+            stream
+                .send_headers(&[
+                    neqo_common::Header::new(":status", "200"),
+                    neqo_common::Header::new("content-length", "1"),
+                ])
+                .expect("response headers");
+            assert_eq!(stream.send_data(b"x", started).expect("response body"), 1);
+            stream.stream_close_send(started).expect("response FIN");
+            test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+            handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+                .expect("retire response and process actual peer credit");
+            assert_eq!(
+                endpoints[0].retired_applications,
+                [(expected_id, ResourceRunState::Succeeded)]
+            );
+            for (resource_id, _) in endpoints[0].retired_applications.drain(..) {
+                dependencies
+                    .mark_succeeded(resource_id)
+                    .expect("retire dependency");
+            }
+            // Reading FIN and acknowledging the completed stream may produce
+            // the peer's MAX_STREAMS in a subsequent exchange.
+            for _ in 0..10 {
+                if !endpoints[0].application_stream_limit_blocked {
+                    break;
+                }
+                test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+                handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+                    .expect("consume actual RequestsCreatable");
+            }
+            assert!(!endpoints[0].application_stream_limit_blocked);
+            assert_eq!(
+                dispatch_ready_requests(
+                    &mut endpoints,
+                    &spec,
+                    &mut dependencies,
+                    started,
+                    &mut traces,
+                    false,
+                    None,
+                    None
+                )
+                .expect("defense batch barrier still blocks fresh peer credit"),
+                0
+            );
+            assert_eq!(
+                dispatch_ready_requests(
+                    &mut endpoints,
+                    &spec,
+                    &mut dependencies,
+                    started,
+                    &mut traces,
+                    true,
+                    None,
+                    None
+                )
+                .expect("resume after both peer credit and batch admission"),
+                usize::from(expected_id < 3)
+            );
+        }
+        assert!(dependencies.is_successful());
+        assert!(endpoints[0].pending.is_empty());
+        assert_eq!(endpoints[0].completed.len(), 3);
+        assert!(
+            endpoints[0].completed.iter().all(|record| record.complete
+                && record.outcome == "succeeded"
+                && record.body == b"x")
+        );
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert_eq!(events.matches(",application_request,started,").count(), 3);
+        assert_eq!(
+            events
+                .matches(",application_request,stream_limit_blocked,")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .matches(",application_request,stream_limit_released,")
+                .count(),
+            1
+        );
+        assert!(!events.contains(",application_request,failed,"));
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn application_stream_limit_still_retires_skipped_dependencies() {
+        let output = trace_output_dir("application-stream-limit-skipped-dependency");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let origin = "https://127.0.0.1:4433";
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, origin, Vec::new()), request(2, origin, vec![1])],
+        );
+        let mut endpoints = create_endpoints(&spec, started, &clock).expect("endpoint");
+        let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("dependencies");
+        dependencies.mark_failed(1).expect("parent failure");
+        endpoints[0].pending.retain(|request| request.resource_id == 2);
+        endpoints[0].application_stream_limit_blocked = true;
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                None,
+                None
+            )
+            .expect("retire skipped dependency without opening a stream"),
+            0
+        );
+        assert!(endpoints[0].application_stream_limit_blocked);
+        assert!(endpoints[0].pending.is_empty());
+        assert_eq!(dependencies.state(2), Some(ResourceRunState::SkippedDependency));
+        assert_eq!(endpoints[0].completed.len(), 1);
+        assert_eq!(endpoints[0].completed[0].resource_id, 2);
+        assert_eq!(endpoints[0].completed[0].outcome, "skipped_dependency");
+        drop(traces);
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn application_stream_limit_does_not_defer_other_fetch_errors() {
+        let output = trace_output_dir("application-stream-limit-terminal-fetch-error");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let mut spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        spec.method = "CONNECT"; // Http3Client::fetch returns exact InvalidInput.
+        let mut endpoints = create_endpoints(&spec, started, &clock).expect("endpoint");
+        let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("dependencies");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                None,
+                None
+            )
+            .expect("terminal fetch error retains existing failure path"),
+            0
+        );
+        assert_eq!(dependencies.state(1), Some(ResourceRunState::Failed));
+        assert!(!endpoints[0].application_stream_limit_blocked);
+        assert!(endpoints[0].pending.is_empty());
+        assert_eq!(endpoints[0].completed.len(), 1);
+        assert_eq!(endpoints[0].completed[0].outcome, "request_error");
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert_eq!(events.matches(",application_request,failed,").count(), 1);
+        assert!(!events.contains("stream_limit_blocked"));
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove test directory");
     }
 
     #[tokio::test]
