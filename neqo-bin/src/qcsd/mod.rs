@@ -29518,6 +29518,7 @@ mod tests {
         endpoints[1].test_observation_on_next_output =
             Some(observation_clock.record(QcsdObservation::EgressBacklog { pending: true }));
         let release = now();
+        let _logical_now = TestMonotonicNowOverride::fixed(release);
         let guard = synthetic_paired_buflo_guard(
             &mut controller,
             &mut actions,
@@ -33215,7 +33216,9 @@ mod tests {
 
     #[test]
     fn target_socket_backpressure_aborts_without_retrying_committed_datagram() {
-        let deadline = now() + Duration::from_millis(5);
+        let at = now();
+        let _logical_now = TestMonotonicNowOverride::fixed(at);
+        let deadline = at + Duration::from_millis(5);
         let mut attempts = 0;
         let error = attempt_socket_handoff(
             &[deadline],
@@ -37951,7 +37954,9 @@ mod tests {
 
     #[test]
     fn qualification_wait_is_capped_by_its_inner_deadline() {
-        let deadline = now() + Duration::from_millis(25);
+        let at = now();
+        let _logical_now = TestMonotonicNowOverride::fixed(at);
+        let deadline = at + Duration::from_millis(25);
         let bounded = bounded_qualification_wait(Duration::from_secs(60), deadline, 30)
             .expect("positive remaining deadline");
         assert!(bounded <= Duration::from_millis(25));
