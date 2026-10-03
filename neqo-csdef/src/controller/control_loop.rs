@@ -42,6 +42,9 @@ pub(super) struct PendingClaim {
     pub endpoint: QcsdEndpointId,
     pub stream: QcsdStreamId,
     pub remaining: u64,
+    /// Legacy framing claims debit the per-stream allowance. A due-cell DATA
+    /// continuation is reserved exclusively by its actual incoming slot.
+    pub reservation_debited: bool,
 }
 
 #[derive(Debug, Default)]

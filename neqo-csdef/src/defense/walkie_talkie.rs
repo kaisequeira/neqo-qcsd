@@ -1617,6 +1617,7 @@ impl Defense for WalkieTalkie {
             | SignalKind::ReceiveCreditRequested { .. }
             | SignalKind::IncomingCreditScheduled { .. }
             | SignalKind::IncomingCreditAdvertised { .. }
+            | SignalKind::TerminalPrimaryPartial { .. }
             | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::Resolved { .. } => {}
         }

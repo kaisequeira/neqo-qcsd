@@ -28,7 +28,10 @@ pub use config::{
     CsBufloParameters, DefenseConfig, FrontConfig, QcsdConfig, QcsdImplementationScope,
     TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
 };
-pub use controller::{QcsdController, QcsdReceiveCancellation, QcsdReceiveCancellationPlan};
+pub use controller::{
+    QcsdController, QcsdReceiveCancellation, QcsdReceiveCancellationPlan,
+    TerminalPrimaryPartialCellDiagnostics,
+};
 pub use defense::{
     Buflo, BufloIncomingStartupDiagnostics, BurstPair, Capacity, CapacityAdjustment, CsBuflo,
     CsBufloRateTransitionDiagnostics, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal,

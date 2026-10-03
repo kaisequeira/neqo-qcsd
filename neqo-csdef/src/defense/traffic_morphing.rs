@@ -713,6 +713,7 @@ impl Defense for TrafficMorphing {
             | SignalKind::TerminalCellCapacityExhausted { .. }
             | SignalKind::IncomingCreditScheduled { .. }
             | SignalKind::IncomingCreditAdvertised { .. }
+            | SignalKind::TerminalPrimaryPartial { .. }
             | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::Capacity(_) => {}
         }

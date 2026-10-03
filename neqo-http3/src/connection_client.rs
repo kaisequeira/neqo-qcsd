@@ -4229,6 +4229,445 @@ mod tests {
     }
 
     #[cfg(feature = "qcsd")]
+    fn qcsd_buffered_peer_controller(cell_size: u16) -> QcsdController {
+        use neqo_csdef::{
+            Buflo, BufloConfig, BufloParameters, CsBuflo, CsBufloConfig, CsBufloEarlyTermination,
+            CsBufloPaddingMode, CsBufloParameters, Defense, DefenseConfig, QcsdImplementationScope,
+        };
+
+        let (selection, defense): (DefenseConfig, Box<dyn Defense>) = if cell_size == 1_200 {
+            (
+                DefenseConfig::Buflo(BufloConfig {
+                    parameters: "programmatic-peer-test".into(),
+                }),
+                Box::new(Buflo::from_parameters(BufloParameters {
+                    schema_version: 1,
+                    interval_us: 5_000,
+                    minimum_duration_us: 20_000,
+                    packet_size: cell_size,
+                    max_events: 100,
+                    implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+                    paper_equivalent: false,
+                })),
+            )
+        } else {
+            assert_eq!(cell_size, 600);
+            (
+                DefenseConfig::CsBuflo(CsBufloConfig {
+                    parameters: "programmatic-peer-test".into(),
+                }),
+                Box::new(CsBuflo::from_parameters(
+                    CsBufloParameters {
+                        schema_version: 1,
+                        packet_size: cell_size,
+                        initial_interval_us: 8_192,
+                        minimum_interval_us: 4_096,
+                        maximum_interval_us: 32_768,
+                        initial_adaptation_boundary_bytes: 16_384,
+                        quiet_time_us: 2_000_000,
+                        outgoing_padding_mode: CsBufloPaddingMode::Total,
+                        incoming_padding_mode: CsBufloPaddingMode::Payload,
+                        timing_sample_limit: 1_000,
+                        jitter_denominator: 100,
+                        // Isolate the actual owned credit transition at the
+                        // initial due instant; cadence jitter has separate
+                        // ordinary CS-BuFLO coverage in its defense tests.
+                        jitter_max_numerator: 0,
+                        early_termination: CsBufloEarlyTermination::Local,
+                        max_events: 1_000,
+                        implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+                        paper_equivalent: false,
+                    },
+                    42,
+                )),
+            )
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1_016,
+                // Isolate the scheduled continuation after the unowned
+                // allowance is exhausted. The prefix here is actual initial
+                // transport credit; this fixture does not model its startup.
+                max_stream_data_excess: 0,
+                max_udp_payload_size: 1_200,
+                defense: selection,
+                ..QcsdConfig::default()
+            },
+            None,
+            defense,
+        )
+        .expect("normal BuFLO/CS-BuFLO controller with programmatic parameters");
+        controller
+            .enable_terminal_primary_partial_cell_policy()
+            .expect("prospective owned-primary policy");
+        controller
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one actual HTTP/3 peer checks a buffered DATA write, owned wire credit, and short FIN accounting"
+    )]
+    fn qcsd_real_peer_owned_cell_unblocks_buffered_data(cell_size: u16) {
+        fixture_init();
+        let mut at = now();
+        let parameters = Http3Parameters::default()
+            .max_table_size_encoder(0)
+            .max_table_size_decoder(0);
+        let mut client = Http3Client::new(
+            DEFAULT_SERVER_NAME,
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            DEFAULT_ADDR,
+            DEFAULT_ADDR,
+            parameters.clone().connection_parameters(
+                ConnectionParameters::default().max_stream_data(StreamType::BiDi, false, 1_016),
+            ),
+            at,
+        )
+        .expect("create the local HTTP/3 client");
+        let mut server = Http3Server::new(
+            at,
+            DEFAULT_KEYS,
+            DEFAULT_ALPN_H3,
+            anti_replay(),
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            parameters,
+            None,
+        )
+        .expect("create the local HTTP/3 server");
+        let outgoing = qcsd_connect_http3_pair(&mut client, &mut server, at);
+        drop(server.process(outgoing, at));
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        client
+            .enable_qcsd(
+                QcsdEndpointId(7),
+                &Uri::from_static("https://something.com/"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .unwrap();
+        let mut controller = qcsd_buffered_peer_controller(cell_size);
+        let stream = client
+            .fetch(
+                at,
+                "GET",
+                &Uri::from_static("https://something.com/"),
+                &[],
+                Priority::default(),
+            )
+            .unwrap();
+        client.stream_close_send(stream, at).unwrap();
+        client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, None)
+            .expect("register an unknown response extent");
+        let qcsd_stream = QcsdStreamId(stream.as_u64());
+        for observation in drain_qcsd_observations(&mut client) {
+            controller.observe(observation, Duration::ZERO);
+        }
+        controller
+            .bind_terminal_primary_stream(QcsdEndpointId(7), qcsd_stream, 0)
+            .expect("actual primary stream");
+        for action in controller.drain_actions() {
+            assert!(matches!(action, QcsdAction::ConfigureManualReceive { .. }));
+            client.apply_qcsd_action(at, action).unwrap();
+        }
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let response = server
+            .events()
+            .find_map(|event| match event {
+                crate::Http3ServerEvent::Headers {
+                    stream: request, ..
+                } if request.stream_id() == stream => Some(request),
+                _ => None,
+            })
+            .expect("real server decoded the request");
+
+        response
+            .send_headers(&[
+                Header::new(":status", "200"),
+                Header::new("content-type", "text/html"),
+            ])
+            .unwrap();
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let raw_bytes = |observations: &[QcsdObservation]| {
+            observations
+                .iter()
+                .filter_map(|observation| match observation {
+                    QcsdObservation::BytesRead {
+                        stream: observed,
+                        bytes,
+                        ..
+                    } if *observed == qcsd_stream => Some(*bytes),
+                    _ => None,
+                })
+                .sum::<u64>()
+        };
+        let header_observations = drain_qcsd_observations(&mut client);
+        let headers_bytes = header_observations
+            .iter()
+            .find_map(|observation| match observation {
+                QcsdObservation::ResponseHeaders {
+                    stream: observed,
+                    frame_bytes,
+                    status: Some(200),
+                    content_length: None,
+                    ..
+                } if *observed == qcsd_stream => Some(*frame_bytes),
+                _ => None,
+            })
+            .expect("real HEADERS with no body length");
+        assert_eq!(raw_bytes(&header_observations), headers_bytes);
+        assert!(headers_bytes < 950);
+        assert!(!header_observations.iter().any(|observation| matches!(
+            observation, QcsdObservation::DataFrame { stream: observed, .. }
+                if *observed == qcsd_stream
+        )));
+        assert!(header_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::HeaderProgress {
+                stream: observed, min_remaining: 1, awaiting_data_frame: true, ..
+            } if *observed == qcsd_stream
+        )));
+        for observation in header_observations {
+            controller.observe(observation, Duration::ZERO);
+        }
+        assert!(controller.next_action().is_none());
+
+        // Complete one real DATA frame so the parser's next pristine boundary
+        // has a typed DATA state, with three bytes of retained initial credit.
+        let first_body = vec![b'x'; usize::try_from(1_013 - headers_bytes - 3).unwrap()];
+        assert!((64..16_384).contains(&first_body.len()));
+        assert_eq!(
+            response.send_data(&first_body, at).unwrap(),
+            first_body.len()
+        );
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let mut first_received = vec![0; first_body.len()];
+        assert_eq!(
+            client.read_data(at, stream, &mut first_received).unwrap(),
+            (first_body.len(), false)
+        );
+        assert_eq!(first_received, first_body);
+        let first_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(headers_bytes + raw_bytes(&first_observations), 1_013);
+        assert!(first_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::DataFrame { stream: observed, frame_header_bytes: 3, data_bytes, .. }
+                if *observed == qcsd_stream && *data_bytes == u64::try_from(first_body.len()).unwrap()
+        )));
+        assert!(first_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::HeaderProgress {
+                stream: observed, min_remaining: 1, awaiting_data_frame: true, ..
+            } if *observed == qcsd_stream
+        )));
+        for observation in first_observations {
+            controller.observe(observation, Duration::ZERO);
+        }
+        assert!(controller.next_action().is_none());
+        assert_eq!(response.available().unwrap(), 3);
+
+        // This peer application buffers its next 256-byte chunk and waits
+        // for a real writable event for its complete three-byte DATA header
+        // plus payload. Three bytes suffice for another peer's one-octet DATA
+        // frame, but do not satisfy this legitimate application write policy.
+        let pending_body = [b'y'; 256];
+        let wire_chunk = pending_body.len() + 3;
+        server.events().for_each(drop);
+        response
+            .conn
+            .borrow_mut()
+            .stream_set_writable_event_low_watermark(
+                stream,
+                std::num::NonZeroUsize::new(wire_chunk).unwrap(),
+            )
+            .unwrap();
+        let mut pending_wire = Encoder::default();
+        HFrame::Data {
+            len: u64::try_from(pending_body.len()).unwrap(),
+        }
+        .encode(&mut pending_wire);
+        pending_wire.encode(pending_body);
+        assert_eq!(pending_wire.len(), wire_chunk);
+        // An actual atomic write of a complete, valid DATA frame cannot fit.
+        // The transport retains no DATA from this attempt and reports its
+        // current blocked frontier to the client in a real peer datagram.
+        assert!(
+            !response
+                .conn
+                .borrow_mut()
+                .stream_send_atomic(stream, pending_wire.as_ref())
+                .unwrap()
+        );
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        assert!(!server.events().any(|event| matches!(
+            event, crate::Http3ServerEvent::DataWritable { stream: writable }
+                if writable.stream_id() == stream
+        )));
+        let mut body = [0; 256];
+        assert_eq!(client.read_data(at, stream, &mut body).unwrap(), (0, false));
+        let blocked_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(raw_bytes(&blocked_observations), 0);
+        assert!(!blocked_observations.iter().any(|observation| matches!(
+            observation, QcsdObservation::DataFrame { stream: observed, .. }
+                if *observed == qcsd_stream
+        )));
+        assert!(blocked_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::StreamDataBlocked { stream: observed, blocked_at: 1_016, .. }
+                if *observed == qcsd_stream
+        )));
+        for observation in blocked_observations {
+            controller.observe(observation, Duration::ZERO);
+        }
+        assert!(controller.next_action().is_none());
+
+        // Poll the ordinary defense's first due cell only after establishing
+        // the real peer boundary. No body extent or blocked offset is invented.
+        controller.poll(Duration::ZERO);
+        let leases: Vec<_> = controller
+            .drain_actions()
+            .filter(|action| {
+                matches!(
+                    action, QcsdAction::LeaseParserReceive { stream: observed, owner: Some(_), .. }
+                        if *observed == qcsd_stream
+                )
+            })
+            .collect();
+        assert_eq!(leases.len(), 1);
+        let lease = leases.into_iter().next().unwrap();
+        let owner = match &lease {
+            QcsdAction::LeaseParserReceive {
+                absolute_limit,
+                increase,
+                owner: Some(owner),
+                ..
+            } => {
+                assert_eq!(*increase, u64::from(cell_size));
+                assert_eq!(*absolute_limit, 1_016 + u64::from(cell_size));
+                assert_eq!(owner.packet.length(), cell_size);
+                assert_eq!(owner.packet.direction(), Direction::Incoming);
+                *owner
+            }
+            _ => unreachable!("filtered scheduled DATA continuation"),
+        };
+        client.apply_qcsd_action(at, lease).unwrap();
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let advertised_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(raw_bytes(&advertised_observations), 0);
+        assert!(advertised_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::ReceiveLimitAdvertised { stream: observed, absolute_limit, slot: None, .. }
+                if *observed == qcsd_stream && *absolute_limit == 1_016 + u64::from(cell_size)
+        )));
+        for observation in advertised_observations {
+            controller.observe(observation, Duration::ZERO);
+        }
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            diagnostics.scheduled_incoming_requested_bytes,
+            u64::from(cell_size)
+        );
+        assert_eq!(
+            diagnostics.scheduled_incoming_advertised_bytes,
+            u64::from(cell_size)
+        );
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        let writable = server
+            .events()
+            .find_map(|event| match event {
+                crate::Http3ServerEvent::DataWritable { stream: writable }
+                    if writable.stream_id() == stream =>
+                {
+                    Some(writable)
+                }
+                _ => None,
+            })
+            .expect("actual full-cell wire credit crosses the peer's writable threshold");
+        assert_eq!(writable.available().unwrap(), usize::from(cell_size) + 3);
+        assert_eq!(
+            writable.send_data(&pending_body, at).unwrap(),
+            pending_body.len()
+        );
+        assert_eq!(
+            writable.available().unwrap(),
+            usize::from(cell_size) - pending_body.len()
+        );
+        writable.stream_close_send(at).unwrap();
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        assert_eq!(
+            client.read_data(at, stream, &mut body).unwrap(),
+            (256, true)
+        );
+        assert_eq!(body, pending_body);
+        let final_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(
+            raw_bytes(&final_observations),
+            u64::try_from(wire_chunk).unwrap()
+        );
+        assert!(final_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::DataFrame { stream: observed, frame_header_bytes: 3, data_bytes: 256, .. }
+                if *observed == qcsd_stream
+        )));
+        assert!(final_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::StreamFinished { stream: observed, finish: QcsdStreamFinish::Fin, .. }
+                if *observed == qcsd_stream
+        )));
+        for observation in final_observations {
+            controller.observe(observation, Duration::ZERO);
+        }
+        let outcomes: Vec<_> = controller.drain_actions().collect();
+        assert!(!outcomes.iter().any(|action| matches!(
+            action, QcsdAction::SlotSatisfied { slot, .. } if *slot == owner.slot
+        )));
+        assert!(outcomes.iter().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed { slot, reason: neqo_csdef::MissedSlotReason::ReceiveCreditRetired, .. }
+                if *slot == owner.slot
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            diagnostics.scheduled_incoming_requested_bytes,
+            u64::from(cell_size)
+        );
+        assert_eq!(
+            diagnostics.scheduled_incoming_advertised_bytes,
+            u64::from(cell_size)
+        );
+        // The retained three bytes pay the DATA frame header. Only the 256
+        // payload bytes overlap this scheduled owner's newly advertised range.
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 256);
+        assert_eq!(
+            diagnostics.scheduled_incoming_retired_bytes,
+            u64::from(cell_size) - 256
+        );
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        let partial = controller
+            .terminal_primary_partial_cell()
+            .expect("actual buffered-peer short FIN proof");
+        assert_eq!(
+            (partial.consumed_bytes, partial.retired_bytes),
+            (256, u64::from(cell_size) - 256)
+        );
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_buflo_owned_full_cell_unblocks_buffered_data_and_retires_short_fin() {
+        qcsd_real_peer_owned_cell_unblocks_buffered_data(1_200);
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_cs_buflo_owned_full_cell_unblocks_buffered_data_and_retires_short_fin() {
+        qcsd_real_peer_owned_cell_unblocks_buffered_data(600);
+    }
+
+    #[cfg(feature = "qcsd")]
     #[test]
     fn qcsd_observes_final_data_zero_data_and_fin_in_raw_causal_order() {
         let (mut client, mut server) = connect();

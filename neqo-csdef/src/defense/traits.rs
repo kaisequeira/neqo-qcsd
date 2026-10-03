@@ -117,6 +117,18 @@ pub enum SignalKind {
     /// can retry these bytes without confusing `MAX_STREAM_DATA` with observed
     /// application or reviewed-chaff payload.
     ReceiveCreditRetired { bytes: u64 },
+    /// One source-bound primary FIN retired part of a fully advertised cell.
+    ///
+    /// Only the controller may produce this signal after proving the unique
+    /// primary stream, actual successful nonempty response, FIN, and exact
+    /// positive owned-credit split. The raw terminal observation remains a
+    /// receive-credit-retired miss; this never reports a full realized cell.
+    TerminalPrimaryPartial {
+        slot: QcsdSlotId,
+        packet: Packet,
+        consumed: u64,
+        retired: u64,
+    },
     /// Releasable receive capacity aggregated across all endpoints.
     Capacity(Capacity),
     /// Whether any client STREAM frame remains pending across all endpoints.
@@ -154,6 +166,19 @@ pub enum SignalKind {
     ApplicationBatchCompleted,
     /// Every application request has completed.
     ApplicationComplete,
+}
+
+pub(super) fn terminal_primary_partial_split_valid(
+    packet: Packet,
+    cell_bytes: u16,
+    consumed: u64,
+    retired: u64,
+) -> bool {
+    packet.direction() == Direction::Incoming
+        && packet.length() == cell_bytes
+        && consumed > 0
+        && retired > 0
+        && consumed.checked_add(retired) == Some(u64::from(cell_bytes))
 }
 
 /// One timestamped observation delivered to a defense.

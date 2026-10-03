@@ -9,7 +9,10 @@ use super::{
     BufloIncomingStartupDiagnostics, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal,
     EventOutcome, SignalKind,
 };
-use crate::{BufloConfig, BufloParameters, Direction, Packet, QcsdChaffCancellationReason, Result};
+use crate::{
+    BufloConfig, BufloParameters, Direction, Packet, QcsdChaffCancellationReason, QcsdSlotId,
+    Result,
+};
 
 /// Clean-room, client-only `BuFLO` schedule adaptation.
 ///
@@ -43,6 +46,7 @@ pub struct Buflo {
     event_guard_triggered: bool,
     catch_up_failure_triggered: bool,
     realization_failed: bool,
+    terminal_primary_partial: Option<QcsdSlotId>,
     schedule_stop_latched: bool,
     schedule_stop_latched_at_us: u64,
     schedule_stop_available_bytes: u64,
@@ -91,6 +95,7 @@ impl Buflo {
             event_guard_triggered: false,
             catch_up_failure_triggered: false,
             realization_failed: false,
+            terminal_primary_partial: None,
             schedule_stop_latched: false,
             schedule_stop_latched_at_us: 0,
             schedule_stop_available_bytes: 0,
@@ -350,6 +355,29 @@ impl Defense for Buflo {
                 required,
             } => self.latch_schedule_stop(available, required),
             SignalKind::Resolved { packet, outcome } => self.record_outcome(packet, outcome),
+            SignalKind::TerminalPrimaryPartial {
+                slot,
+                packet,
+                consumed,
+                retired,
+            } => {
+                if self.terminal_primary_partial.is_some()
+                    || self.terminal_incoming >= self.scheduled_incoming
+                    || packet.timestamp() > signal.at
+                    || !super::traits::terminal_primary_partial_split_valid(
+                        packet,
+                        self.parameters.packet_size,
+                        consumed,
+                        retired,
+                    )
+                {
+                    self.realization_failed = true;
+                } else {
+                    self.terminal_primary_partial = Some(slot);
+                    self.missed_incoming = self.missed_incoming.saturating_add(1);
+                    self.terminal_incoming = self.terminal_incoming.saturating_add(1);
+                }
+            }
             _ => {}
         }
         // Terminal closure is irreversible.  Reduce all prerequisite signals
@@ -546,6 +574,104 @@ mod tests {
             max_events: 100,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+        }
+    }
+
+    #[test]
+    fn terminal_primary_partial_keeps_one_miss_and_allows_honest_terminal_drain() {
+        let mut params = parameters();
+        params.minimum_duration_us = 0;
+        let mut defense = Buflo::from_parameters(params);
+        let outgoing = defense.next_event(Duration::ZERO).expect("outgoing");
+        let incoming = defense.next_event(Duration::ZERO).expect("incoming");
+        defense.observe(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::Resolved {
+                packet: outgoing,
+                outcome: crate::EventOutcome::Satisfied { observed: 1_200 },
+            },
+        });
+        defense.observe(DefenseSignal {
+            at: Duration::ZERO,
+            kind: SignalKind::TerminalPrimaryPartial {
+                slot: crate::QcsdSlotId(1),
+                packet: incoming,
+                consumed: 1_199,
+                retired: 1,
+            },
+        });
+        let before = defense.diagnostics();
+        assert_eq!(before.buflo_scheduled_incoming_cells, 1);
+        assert_eq!(defense.terminal_incoming - defense.missed_incoming, 0);
+        assert_eq!(before.buflo_missed_incoming_cells, 1);
+        assert_eq!(defense.terminal_incoming, 1);
+        assert!(defense.terminal_failure().is_none());
+        assert!(!defense.is_complete());
+        for kind in [
+            SignalKind::ApplicationComplete,
+            SignalKind::TerminalCellCapacityExhausted {
+                available: 0,
+                required: 1_200,
+            },
+            SignalKind::EgressBacklog { pending: false },
+        ] {
+            defense.observe(DefenseSignal {
+                at: Duration::ZERO,
+                kind,
+            });
+        }
+        assert!(defense.is_complete());
+        assert_eq!(defense.terminal_incoming - defense.missed_incoming, 0);
+        assert_eq!(defense.diagnostics().buflo_missed_incoming_cells, 1);
+    }
+
+    #[test]
+    fn terminal_primary_partial_rejects_bad_split_second_partial_and_ordinary_miss() {
+        for invalid in 0..5 {
+            let mut defense = Buflo::from_parameters(parameters());
+            defense.next_event(Duration::ZERO).expect("outgoing");
+            let incoming = defense.next_event(Duration::ZERO).expect("incoming");
+            let signal = SignalKind::TerminalPrimaryPartial {
+                slot: crate::QcsdSlotId(1),
+                packet: incoming,
+                consumed: if invalid == 0 { 0 } else { 1_199 },
+                retired: if invalid == 1 {
+                    0
+                } else if invalid == 2 {
+                    2
+                } else {
+                    1
+                },
+            };
+            if invalid == 4 {
+                defense.observe(DefenseSignal {
+                    at: Duration::ZERO,
+                    kind: SignalKind::Resolved {
+                        packet: incoming,
+                        outcome: crate::EventOutcome::Missed(
+                            crate::MissedSlotReason::ReceiveCreditRetired,
+                        ),
+                    },
+                });
+            } else {
+                defense.observe(DefenseSignal {
+                    at: Duration::ZERO,
+                    kind: signal,
+                });
+                if invalid == 3 {
+                    defense.observe(DefenseSignal {
+                        at: Duration::ZERO,
+                        kind: signal,
+                    });
+                }
+            }
+            assert!(defense.terminal_failure().is_some(), "invalid {invalid}");
+            assert_eq!(
+                defense
+                    .terminal_incoming
+                    .saturating_sub(defense.missed_incoming),
+                0
+            );
         }
     }
 

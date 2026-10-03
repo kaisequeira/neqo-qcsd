@@ -721,6 +721,70 @@ impl ReceiveState {
         self.parser_lease(pristine_data_boundary, backing, terminal_advertised_tail)
     }
 
+    /// A live unknown DATA frontier can reserve an actual due-cell quantum.
+    /// The cell, rather than the unowned parser allowance, owns these bytes.
+    /// No estimate of the next frame or response body is introduced.
+    pub(crate) fn owned_data_continuation_capacity(
+        &self,
+        blocked_at: Option<u64>,
+        due_quantum: u64,
+    ) -> u64 {
+        if due_quantum == 0 {
+            return 0;
+        }
+        match self {
+            Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_exhausted,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } if *parser_lease_exhausted
+                && *requested_limit == *advertised_limit
+                && *known_limit <= *requested_limit
+                && *consumed <= *requested_limit
+                && blocked_at == Some(*requested_limit)
+                && *pending_parser_boundary == Some(*consumed)
+                && *last_parser_lease_boundary != Some(*consumed)
+                && requested_limit.checked_add(due_quantum).is_some() =>
+            {
+                due_quantum
+            }
+            _ => 0,
+        }
+    }
+
+    /// Materialize only the exact quantum previously reserved by a due cell.
+    /// It does not debit or replenish the lifetime unowned parser allowance.
+    pub(crate) fn owned_data_continuation(
+        &mut self,
+        blocked_at: Option<u64>,
+        due_quantum: u64,
+    ) -> Option<(u64, u64, bool)> {
+        if self.owned_data_continuation_capacity(blocked_at, due_quantum) != due_quantum
+            || due_quantum == 0
+        {
+            return None;
+        }
+        let Self::ReceivingData {
+            requested_limit,
+            consumed,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        *requested_limit = requested_limit.checked_add(due_quantum)?;
+        *last_parser_lease_boundary = Some(*consumed);
+        *pending_parser_boundary = None;
+        Some((*requested_limit, due_quantum, true))
+    }
+
     /// Bounded parser continuation that can be owned by a due scheduled cell.
     ///
     /// This does not advertise credit or relax the unowned lifetime allowance.
@@ -1292,6 +1356,71 @@ mod tests {
             state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
             0
         );
+    }
+
+    #[test]
+    fn owned_data_quantum_is_independent_of_unowned_budget_and_rechecks_frontier() {
+        for quantum in [600, 1_200] {
+            let mut state = recorded_primary_parser_tail();
+            let ReceiveState::ReceivingData {
+                reservation_available,
+                ..
+            } = &mut state
+            else {
+                unreachable!()
+            };
+            *reservation_available = 0;
+            for proof in [None, Some(1_015), Some(1_017)] {
+                assert_eq!(state.owned_data_continuation_capacity(proof, quantum), 0);
+                assert_eq!(state.owned_data_continuation(proof, quantum), None);
+            }
+            assert_eq!(
+                state.owned_data_continuation_capacity(Some(1_016), quantum),
+                quantum
+            );
+            assert_eq!(
+                state.owned_data_continuation(Some(1_016), quantum),
+                Some((1_016 + quantum, quantum, true))
+            );
+            assert_eq!(
+                state.owned_data_continuation(Some(1_016), quantum),
+                None,
+                "one boundary cannot reserve twice"
+            );
+            let ReceiveState::ReceivingData {
+                parser_lease_capacity,
+                parser_lease_used,
+                reservation_available,
+                known_limit,
+                ..
+            } = &state
+            else {
+                unreachable!()
+            };
+            assert_eq!((*parser_lease_capacity, *parser_lease_used), (1_000, 1_000));
+            assert_eq!(*reservation_available, 0);
+            assert!(
+                *known_limit <= 1_016,
+                "unknown bytes were not fabricated as exact extent"
+            );
+            assert_eq!(
+                state.cancel_parser_lease(1_016 + quantum, quantum, false),
+                true
+            );
+            assert_eq!(
+                state.owned_data_continuation_capacity(Some(1_016), quantum),
+                quantum,
+                "canceled unadvertised ownership may retry"
+            );
+            state.advertised(1_016);
+            state.bytes_read(1);
+            state.header_progress(1, true);
+            assert_eq!(
+                state.owned_data_continuation(Some(1_016), quantum),
+                Some((1_016 + quantum, quantum, true)),
+                "a fully consumed zero tail has the same due-cell route"
+            );
+        }
     }
 
     #[test]

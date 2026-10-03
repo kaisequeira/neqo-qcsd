@@ -29,17 +29,17 @@ use futures::{
 use http::Uri;
 use neqo_common::{Header, datagram, event::Provider as _};
 use neqo_csdef::{
-    BufloParameters, ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics,
-    DefenseKind, DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet,
-    QcsdAction, QcsdChaffCancellationReason, QcsdChaffRequestId, QcsdConfig, QcsdController,
-    QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdPrearmCancellationReason,
-    QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
-    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
-    QcsdSlotOutcome, QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
-    ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
-    ResponseOnlyChaffQualificationV4, StaticMode, TimestampedQcsdObservation,
-    TrafficMorphingEgress, WalkieTalkie, WalkieTalkieQualificationBinding, derive,
-    normalize_content_encoding, sanitize_chaff_headers,
+    BufloParameters, ChaffManifest, ChaffQualification, CsBufloParameters, DefenseConfig,
+    DefenseDiagnostics, DefenseKind, DependencyTracker, Direction, ExpectedChaffResponse,
+    MissedSlotReason, Packet, QcsdAction, QcsdChaffCancellationReason, QcsdChaffRequestId,
+    QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
+    QcsdPrearmCancellationReason, QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
+    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy,
+    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamTransmission, Resource,
+    ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
+    ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4, StaticMode,
+    TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
+    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -571,7 +571,7 @@ impl Args {
                     application_response_policy,
                     application_workload_source
                         .as_ref()
-                        .map(|(_, _, _, policy, _, _, _, _, _)| *policy),
+                        .map(|(_, _, _, policy, _, _, _, _, _, _)| *policy),
                 )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
@@ -928,6 +928,8 @@ struct DefenseParameterProvenance {
     /// Retention avoids introducing parameter-file reads into receipt rendering.
     #[serde(skip)]
     buflo_parameters: Option<BufloParameters>,
+    #[serde(skip)]
+    cs_buflo_parameters: Option<CsBufloParameters>,
 }
 
 fn defense_parameter_provenance(
@@ -999,6 +1001,16 @@ fn defense_parameter_provenance(
     } else {
         None
     };
+    let cs_buflo_parameters = if matches!(config.defense, DefenseConfig::CsBuflo(_)) {
+        // Raw provenance remains available for legacy receipts. The new
+        // source-bound policy separately requires successfully parsed values;
+        // controller construction still validates the actual parameter file.
+        std::str::from_utf8(&contents)
+            .ok()
+            .and_then(|text| CsBufloParameters::from_json(text, config.max_udp_payload_size).ok())
+    } else {
+        None
+    };
     Ok(Some(DefenseParameterProvenance {
         kind,
         path: path.to_string(),
@@ -1009,6 +1021,7 @@ fn defense_parameter_provenance(
         reference_tcp_write_size_bytes: reference_write,
         reference_nominal_tcp_packet_size_bytes: reference_packet,
         buflo_parameters,
+        cs_buflo_parameters,
     }))
 }
 
@@ -1557,6 +1570,46 @@ impl FrontCapturePolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TerminalPrimaryPartialCellPolicy {
+    #[default]
+    Legacy,
+    RapidV5OneOwnedFinPartial,
+}
+
+impl TerminalPrimaryPartialCellPolicy {
+    const RAPID_V5_NAME: &'static str =
+        "rapid-v5-one-owned-terminal-primary-partial-incoming-cell-v1";
+
+    fn from_preparation(
+        preparation: &serde_json::Value,
+        application: ApplicationResponsePolicy,
+        primary: PrimaryDocumentIdentityPolicy,
+        origin: &QualifiedChaffOriginPolicy,
+    ) -> Result<Self, Error> {
+        match preparation.get("terminal_primary_partial_cell_policy") {
+            None => Ok(Self::Legacy),
+            Some(serde_json::Value::String(policy)) if policy == Self::RAPID_V5_NAME => {
+                if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+                    || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+                    || !matches!(
+                        origin,
+                        QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+                    )
+                {
+                    return Err(Error::Argument(
+                        "terminal-primary partial cell requires bound variable-primary, terminal-HTTP, and prepared-approved-origin policies".into(),
+                    ));
+                }
+                Ok(Self::RapidV5OneOwnedFinPartial)
+            }
+            Some(_) => Err(Error::Argument(
+                "prepared terminal-primary partial-cell policy is invalid".into(),
+            )),
+        }
+    }
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
@@ -1571,6 +1624,7 @@ struct RunSpec {
         BufloIncomingCreditReleasePolicy,
         TamarawCapturePolicy,
         FrontCapturePolicy,
+        TerminalPrimaryPartialCellPolicy,
     )>,
     application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
@@ -1585,8 +1639,18 @@ struct RunSpec {
 }
 
 fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, source_hash, _, prepared_application, chaff_origin, primary, policy, _, _)) =
-        &spec.application_workload_source
+    let Some((
+        source,
+        source_hash,
+        _,
+        prepared_application,
+        chaff_origin,
+        primary,
+        policy,
+        _,
+        _,
+        _,
+    )) = &spec.application_workload_source
     else {
         return Ok(());
     };
@@ -1637,7 +1701,7 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
         || !spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|(_, _, _, _, _, _, policy, _, _)| policy.name().is_some())
+            .is_some_and(|(_, _, _, _, _, _, policy, _, _, _)| policy.name().is_some())
         || validate_buflo_incoming_credit_release_policy(spec).is_err()
     {
         return None;
@@ -1655,7 +1719,7 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
 }
 
 fn validate_tamaraw_capture_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, hash, _, application, origin, primary, _, policy, _)) =
+    let Some((source, hash, _, application, origin, primary, _, policy, _, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -1722,7 +1786,7 @@ fn tamaraw_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
 }
 
 fn validate_front_capture_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, hash, _, application, origin, primary, _, _, policy)) =
+    let Some((source, hash, _, application, origin, primary, _, _, policy, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -1788,6 +1852,113 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
     }))
 }
 
+fn terminal_primary_partial_cell_size(spec: &RunSpec) -> Option<u16> {
+    match spec.config.defense {
+        DefenseConfig::Tamaraw(_) | DefenseConfig::Buflo(_) => Some(1_200),
+        DefenseConfig::CsBuflo(_) => Some(600),
+        _ => None,
+    }
+}
+
+fn validate_terminal_primary_partial_cell_policy(spec: &RunSpec) -> Result<(), Error> {
+    let Some((source, hash, _, application, origin, primary, _, tamaraw, _, policy)) =
+        &spec.application_workload_source
+    else {
+        return Ok(());
+    };
+    if *policy == TerminalPrimaryPartialCellPolicy::Legacy {
+        return Ok(());
+    }
+    if !lower_hex_sha256(hash)
+        || *application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+        || spec.application_response_policy != *application
+        || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+        || !matches!(
+            origin,
+            QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+        )
+    {
+        return Err(Error::Argument(
+            "terminal-primary partial cell is not bound to the frozen prepared application policies".into(),
+        ));
+    }
+    spec.application_response_policy
+        .validate_source_binding(&spec.workload, source)?;
+    if terminal_primary_partial_cell_size(spec).is_none() {
+        return Ok(());
+    }
+    let valid_mode = match &spec.config.defense {
+        DefenseConfig::Tamaraw(parameters) => {
+            *tamaraw == TamarawCapturePolicy::RapidV5OwnedRetry
+                && parameters.packet_size == 1_200
+                && parameters.incoming_interval_us == 5_000
+                && parameters.outgoing_interval_us == 20_000
+                && parameters.modulo == 100
+        }
+        DefenseConfig::Buflo(config) => spec.defense_parameters.as_ref().is_some_and(|proof| {
+            proof.kind == "buflo"
+                && proof.path == config.parameters
+                && lower_hex_sha256(&proof.sha256)
+                && proof.buflo_parameters.as_ref().is_some_and(|parameters| {
+                    parameters.packet_size == 1_200 && parameters.interval_us == 20_000
+                })
+        }),
+        DefenseConfig::CsBuflo(config) => spec.defense_parameters.as_ref().is_some_and(|proof| {
+            proof.kind == "cs_buflo"
+                && proof.path == config.parameters
+                && lower_hex_sha256(&proof.sha256)
+                && proof
+                    .cs_buflo_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| {
+                        parameters.packet_size == 600
+                            && parameters.initial_interval_us == 8_192
+                            && parameters.minimum_interval_us == 4_096
+                            && parameters.maximum_interval_us == 32_768
+                    })
+        }),
+        _ => false,
+    };
+    if !valid_mode
+        || spec.config.control_interval_us != 5_000
+        || spec.config.max_udp_payload_size != 1_200
+        || spec.config.drop_unsatisfied_events
+    {
+        return Err(Error::Argument(
+            "terminal-primary partial cell requires the bound fixed Tamaraw/BuFLO1200 or CS-BuFLO600 parameters and unchanged retrying controller".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn terminal_primary_partial_cell_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
+    let cell_size = terminal_primary_partial_cell_size(spec)?;
+    if !spec
+        .application_workload_source
+        .as_ref()
+        .is_some_and(|source| {
+            source.9 == TerminalPrimaryPartialCellPolicy::RapidV5OneOwnedFinPartial
+        })
+        || validate_terminal_primary_partial_cell_policy(spec).is_err()
+    {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "source": "bound-preparation-v1",
+        "policy": TerminalPrimaryPartialCellPolicy::RAPID_V5_NAME,
+        "cell_size": cell_size,
+        "maximum_partial_cells": 1,
+        "primary_resource_index": 0,
+        "require_unique_stream": true,
+        "require_fin": true,
+        "require_nonempty_successful_primary": true,
+        "require_full_advertisement": true,
+        "require_exact_positive_split": true,
+        "retired_credit_reassignment": false,
+    }))
+}
+
 struct RunCompletion<'a> {
     ended_unix_ns: Option<u128>,
     status: &'a str,
@@ -1797,6 +1968,7 @@ struct RunCompletion<'a> {
     application_completion_monotonic_ns: Option<u64>,
     defense_diagnostics: Option<DefenseDiagnostics>,
     runner_wakeup_metrics: Option<RunnerWakeupMetrics>,
+    terminal_primary_partial_cell: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4636,6 +4808,38 @@ fn prepare_process_scheduler_for_network_execution(
 }
 
 #[cfg(target_os = "linux")]
+fn reserve_buflo_kernel_receipt_vectors(
+    timeout_seconds: u64,
+) -> Result<
+    (
+        Vec<BufloKernelProtectedSelectionWaitEntry>,
+        Vec<BufloKernelRawJob>,
+    ),
+    Error,
+> {
+    // The process timeout bounds every possible 20 ms release, including
+    // tick zero. Reserve before arming so retaining a selection or job cannot
+    // relocate its accumulated history inside the protected build window.
+    let releases =
+        Duration::from_secs(timeout_seconds).as_nanos() / Duration::from_millis(20).as_nanos() + 1;
+    let capacity = usize::try_from(releases)
+        .map_err(|_| Error::RunAborted("BuFLO kernel receipt timeout capacity overflow".into()))?;
+    let mut selections = Vec::new();
+    selections.try_reserve_exact(capacity).map_err(|error| {
+        Error::RunAborted(format!(
+            "BuFLO kernel selection receipt reservation failed before arm: {error}"
+        ))
+    })?;
+    let mut jobs = Vec::new();
+    jobs.try_reserve_exact(capacity).map_err(|error| {
+        Error::RunAborted(format!(
+            "BuFLO kernel job receipt reservation failed before arm: {error}"
+        ))
+    })?;
+    Ok((selections, jobs))
+}
+
+#[cfg(target_os = "linux")]
 impl BufloKernelTxRuntime {
     #[expect(
         clippy::too_many_lines,
@@ -4644,6 +4848,7 @@ impl BufloKernelTxRuntime {
     fn initialise(
         endpoints: &[Endpoint],
         scheduler_initial: ProcessSchedulerEvidence,
+        timeout_seconds: u64,
     ) -> Result<Self, Error> {
         let scheduler_contract = match scheduler_initial.contract.as_deref() {
             Some(QCSD_CLIENT_ETF_SCHEDULER_CONTRACT) => QCSD_CLIENT_ETF_SCHEDULER_CONTRACT,
@@ -4672,6 +4877,8 @@ impl BufloKernelTxRuntime {
         } else {
             timed_egress::HelperThreadContract::RR1_CPU11_V1
         };
+        let (protected_selection_wait_entries, jobs) =
+            reserve_buflo_kernel_receipt_vectors(timeout_seconds)?;
         let interface = std::env::var("QCSD_CAPTURE_ETF_INTERFACE").map_err(|_| {
             Error::RunAborted(
                 "QCSD_CAPTURE_ETF_INTERFACE is required by the ETF scheduler contract".into(),
@@ -4810,8 +5017,8 @@ impl BufloKernelTxRuntime {
             clock_start,
             realtime_offset_intersection: None,
             epoch: None,
-            protected_selection_wait_entries: Vec::new(),
-            jobs: Vec::new(),
+            protected_selection_wait_entries,
+            jobs,
             next_item_id: 0,
         })
     }
@@ -10632,6 +10839,8 @@ struct Endpoint {
     /// Only the source-bound prospective policy publishes the controller's
     /// separate defense-clock reduction time for real chaff ACK observations.
     buflo_ack_start_enabled: bool,
+    terminal_primary_partial_enabled: bool,
+    terminal_primary_partial_recorded: bool,
     /// Greatest Instant supplied to Neqo for this endpoint. Kernel `BuFLO` may
     /// prepare one packet at a short-lived future physical projection; clamp
     /// later contemporaneous samples so transport time never regresses when
@@ -11162,7 +11371,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _, _) =
+    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _, _, _) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -11986,6 +12195,7 @@ async fn qualify_chaff_prefix(
         _,
         _,
         _,
+        _,
     ) = load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
@@ -12686,6 +12896,7 @@ fn load_application_workload_source(
         BufloIncomingCreditReleasePolicy,
         TamarawCapturePolicy,
         FrontCapturePolicy,
+        TerminalPrimaryPartialCellPolicy,
     ),
     Error,
 > {
@@ -12775,6 +12986,12 @@ fn load_application_workload_source(
         primary_policy,
         &origin_policy,
     )?;
+    let terminal_primary_partial_policy = TerminalPrimaryPartialCellPolicy::from_preparation(
+        &source.preparation,
+        policy,
+        primary_policy,
+        &origin_policy,
+    )?;
     Ok((
         manifest,
         sha256(&bytes)?,
@@ -12785,6 +13002,7 @@ fn load_application_workload_source(
         buflo_incoming_policy,
         tamaraw_policy,
         front_policy,
+        terminal_primary_partial_policy,
     ))
 }
 
@@ -13359,22 +13577,21 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     spec.workload.validate()?;
     spec.application_response_policy
         .validate_workload(&spec.workload)?;
-    if spec
-        .application_workload_source
-        .as_ref()
-        .is_some_and(|(_, _, _, policy, _, _, _, _, _)| *policy != spec.application_response_policy)
-    {
+    if spec.application_workload_source.as_ref().is_some_and(
+        |(_, _, _, policy, _, _, _, _, _, _)| *policy != spec.application_response_policy,
+    ) {
         return Err(Error::Argument(
             "run application response policy differs from its frozen prepared source".into(),
         ));
     }
-    if let Some((source, _, _, _, _, _, _, _, _)) = &spec.application_workload_source {
+    if let Some((source, _, _, _, _, _, _, _, _, _)) = &spec.application_workload_source {
         spec.application_response_policy
             .validate_source_binding(&spec.workload, source)?;
     }
     validate_buflo_incoming_credit_release_policy(&spec)?;
     validate_tamaraw_capture_policy(&spec)?;
     validate_front_capture_policy(&spec)?;
+    validate_terminal_primary_partial_cell_policy(&spec)?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
         validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
@@ -13411,6 +13628,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
             application_completion_monotonic_ns: None,
             defense_diagnostics: None,
             runner_wakeup_metrics: None,
+            terminal_primary_partial_cell: None,
         },
     );
     atomic_write(&spec.output_dir.join("run.json"), &running_bytes)?;
@@ -13459,6 +13677,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
                 application_completion_monotonic_ns: None,
                 defense_diagnostics: None,
                 runner_wakeup_metrics: None,
+                terminal_primary_partial_cell: None,
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -13573,7 +13792,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _, _)) =
+    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _, _, _)) =
         &spec.application_workload_source
     else {
         return Err(Error::Argument(
@@ -13875,6 +14094,9 @@ async fn execute_run_inner(
     {
         controller.enable_tamaraw_rapid_capture_policy()?;
     }
+    if terminal_primary_partial_cell_policy_receipt(spec).is_some() {
+        controller.enable_terminal_primary_partial_cell_policy()?;
+    }
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let scheduler_initial = process_scheduler.clone();
     let etf_scheduler_requested = scheduler_initial
@@ -13889,7 +14111,13 @@ async fn execute_run_inner(
     #[cfg(target_os = "linux")]
     let mut buflo_kernel_tx = (etf_scheduler_requested
         && matches!(&spec.config.defense, DefenseConfig::Buflo(_)))
-    .then(|| BufloKernelTxRuntime::initialise(&endpoints, scheduler_initial.clone()))
+    .then(|| {
+        BufloKernelTxRuntime::initialise(
+            &endpoints,
+            scheduler_initial.clone(),
+            spec.timeout_seconds,
+        )
+    })
     .transpose()?;
     #[cfg(not(target_os = "linux"))]
     if etf_scheduler_requested {
@@ -14725,6 +14953,9 @@ async fn execute_run_inner(
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
+                terminal_primary_partial_cell: controller
+                    .terminal_primary_partial_cell()
+                    .map(|proof| json!(proof)),
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -14776,6 +15007,9 @@ async fn execute_run_inner(
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
+                terminal_primary_partial_cell: controller
+                    .terminal_primary_partial_cell()
+                    .map(|proof| json!(proof)),
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -14810,6 +15044,9 @@ async fn execute_run_inner(
                 .map(|instant| elapsed_ns(process_start, instant)),
             defense_diagnostics: Some(controller.defense_diagnostics()),
             runner_wakeup_metrics: Some(runner_wakeup_metrics.clone()),
+            terminal_primary_partial_cell: controller
+                .terminal_primary_partial_cell()
+                .map(|proof| json!(proof)),
         },
     );
     let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -14855,6 +15092,9 @@ async fn execute_run_inner(
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
+                terminal_primary_partial_cell: controller
+                    .terminal_primary_partial_cell()
+                    .map(|proof| json!(proof)),
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -14920,7 +15160,7 @@ fn expected_application_response_length(
 fn application_response_length_hint(spec: &RunSpec, resource: &Resource) -> Option<u64> {
     let variable_primary = resource.id == 0
         && spec.application_workload_source.as_ref().is_some_and(
-            |(_, _, _, _, _, policy, _, _, _)| {
+            |(_, _, _, _, _, policy, _, _, _, _)| {
                 *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
             },
         );
@@ -15114,6 +15354,11 @@ fn create_endpoint_inventory(
                         .is_some_and(|source| {
                             source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
                         }),
+                terminal_primary_partial_enabled: terminal_primary_partial_cell_policy_receipt(
+                    spec,
+                )
+                .is_some(),
+                terminal_primary_partial_recorded: false,
                 transport_instant_floor: start,
                 pending,
                 application_stream_limit_blocked: false,
@@ -15899,7 +16144,7 @@ fn finish_application_record(
         && record.resource_id == 0
         && spec.is_some_and(|spec| {
             spec.application_workload_source.as_ref().is_some_and(
-                |(_, _, _, _, _, policy, _, _, _)| {
+                |(_, _, _, _, _, policy, _, _, _, _)| {
                     *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
                 },
             )
@@ -16244,7 +16489,7 @@ fn built_outgoing_datagrams_for(
 )]
 fn record_qcsd_observation(
     endpoint: &mut Endpoint,
-    controller: &QcsdController,
+    controller: &mut QcsdController,
     traces: &mut TraceFiles,
     record: &TimestampedQcsdObservation,
     terminal_defense_elapsed_us: Option<u64>,
@@ -16252,6 +16497,43 @@ fn record_qcsd_observation(
     controller_defense_elapsed: Option<Duration>,
 ) -> Result<(), Error> {
     let observation = record.observation();
+    if endpoint.terminal_primary_partial_enabled
+        && let QcsdObservation::StreamOpened {
+            endpoint: opened_endpoint,
+            stream,
+            role: QcsdRequestRole::Application,
+            ..
+        } = observation
+        && *opened_endpoint == endpoint.id
+        && let Some(application) = endpoint.streams.get(&StreamId::new(stream.0))
+        && application.resource_id == 0
+        && application.role == QcsdRequestRole::Application
+    {
+        controller.bind_terminal_primary_stream(endpoint.id, *stream, application.resource_id)?;
+        let produced_at = endpoint
+            .receive_loop
+            .origin
+            .checked_add(Duration::from_nanos(record.produced_monotonic_ns()))
+            .ok_or_else(|| {
+                Error::SlotInvariant("terminal-primary stream production timestamp overflow".into())
+            })?;
+        traces.event(
+            produced_at,
+            Some(endpoint.id),
+            "terminal_primary_stream_binding",
+            "bound",
+            &json!({
+                "schema_version": 1,
+                "source": "native-dispatched-primary-resource-stream-v1",
+                "resource_id": application.resource_id,
+                "endpoint": endpoint.id.0,
+                "stream": stream.0,
+                "production_sequence": record.sequence(),
+                "production_monotonic_ns": record.produced_monotonic_ns(),
+                "observation": observation,
+            }),
+        )?;
+    }
     if terminal_observation_slot(observation).is_some() != terminal_defense_elapsed_us.is_some() {
         return Err(Error::SlotInvariant(
             "terminal observation and controller-resolution timestamp differ".into(),
@@ -16427,6 +16709,53 @@ fn record_qcsd_observation(
                 "observation": observation,
             }),
         )?;
+    }
+    if endpoint.terminal_primary_partial_enabled
+        && !endpoint.terminal_primary_partial_recorded
+        && let Some(proof) = controller.terminal_primary_partial_cell()
+        && proof.endpoint == endpoint.id.0
+        && matches!(observation, QcsdObservation::StreamFinished { stream, finish: neqo_csdef::QcsdStreamFinish::Fin, .. } if stream.0 == proof.stream)
+    {
+        let reduced_at = controller_defense_elapsed.ok_or_else(|| {
+            Error::SlotInvariant(
+                "terminal-primary FIN lacks its actual controller reduction clock".into(),
+            )
+        })?;
+        let reduced_us = duration_as_trace_micros(reduced_at);
+        if reduced_us != proof.fin_at_us {
+            return Err(Error::SlotInvariant(
+                "terminal-primary FIN reduction clock differs from its actual ledger".into(),
+            ));
+        }
+        let produced_at = endpoint
+            .receive_loop
+            .origin
+            .checked_add(Duration::from_nanos(record.produced_monotonic_ns()))
+            .ok_or_else(|| {
+                Error::SlotInvariant("terminal-primary FIN production timestamp overflow".into())
+            })?;
+        traces.event(
+            produced_at,
+            Some(endpoint.id),
+            "terminal_primary_fin_reduction",
+            "controller_reduced",
+            &json!({
+                "schema_version": 1,
+                "source": "native-controller-defense-elapsed-us-v1",
+                "production_sequence": record.sequence(),
+                "production_monotonic_ns": record.produced_monotonic_ns(),
+                "controller_defense_elapsed_us": reduced_us,
+                "observation": observation,
+            }),
+        )?;
+        traces.event(
+            produced_at,
+            Some(endpoint.id),
+            "terminal_primary_partial_cell",
+            "partial",
+            proof,
+        )?;
+        endpoint.terminal_primary_partial_recorded = true;
     }
     Ok(())
 }
@@ -20253,9 +20582,28 @@ fn validate_buflo_kernel_main(
         || attribution.composition.lateness_us != 0
         || !qcsd_composition_exact_wire_accounting(&attribution.composition, 1_200)
     {
+        let built_production =
+            prepared
+                .observations
+                .iter()
+                .find_map(|record| match record.observation() {
+                    QcsdObservation::ClassifiedDatagram {
+                        direction: Direction::Outgoing,
+                        composition: Some(composition),
+                        ..
+                    } if *composition == attribution.composition => {
+                        Some((record.sequence(), record.produced_monotonic_ns()))
+                    }
+                    _ => None,
+                });
         return Err(Error::DefenseExecution(format!(
-            "BuFLO kernel slot {} built a mismatched target attribution",
-            guard.slot.0
+            "BuFLO kernel slot {} built a mismatched target attribution: expected_slot={} expected_udp_bytes=1200 satisfied_slot={} satisfied_observed_bytes={} datagram_observed_bytes={} composition={:?} built_production_sequence_and_monotonic_ns={built_production:?}",
+            guard.slot.0,
+            guard.slot.0,
+            satisfied.slot.0,
+            satisfied.observed_size,
+            attribution.observed,
+            attribution.composition,
         )));
     }
     Ok(())
@@ -23157,8 +23505,8 @@ fn render_run_json(
         "request_policy": spec.request_policy,
         "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _, _)| hash),
-        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _, _)| *policy).name(),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _, _, _)| hash),
+        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _, _, _)| *policy).name(),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -23187,6 +23535,12 @@ fn render_run_json(
     }
     if let Some(policy) = front_capture_policy_receipt(spec) {
         run["front_capture_policy"] = policy;
+    }
+    if let Some(policy) = terminal_primary_partial_cell_policy_receipt(spec) {
+        run["terminal_primary_partial_cell_policy"] = policy;
+        if let Some(proof) = &completion.terminal_primary_partial_cell {
+            run["terminal_primary_partial_cell"] = proof.clone();
+        }
     }
     serde_json::to_vec_pretty(&run)
         .expect("serializing a fully materialized serde_json::Value to Vec cannot fail")
@@ -25029,6 +25383,7 @@ mod tests {
                 super::BufloIncomingCreditReleasePolicy::default(),
                 super::TamarawCapturePolicy::default(),
                 super::FrontCapturePolicy::default(),
+                super::TerminalPrimaryPartialCellPolicy::default(),
             )),
             application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
@@ -25118,6 +25473,7 @@ mod tests {
             super::BufloIncomingCreditReleasePolicy::default(),
             super::TamarawCapturePolicy::default(),
             super::FrontCapturePolicy::default(),
+            super::TerminalPrimaryPartialCellPolicy::default(),
         ));
         spec.chaff_manifest = Some(
             response_only_chaff_manifest_v4(
@@ -25141,7 +25497,7 @@ mod tests {
         .expect("legacy metadata does not opt into approved origins");
         assert_eq!(policy, super::QualifiedChaffOriginPolicy::PrimaryOrigin);
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, _, _, _, _, _) =
+        let (source, _, expected, _, _, _, _, _, _, _) =
             spec.application_workload_source.as_ref().unwrap();
         assert!(
             super::selected_identity_chaff_resource(
@@ -25225,7 +25581,7 @@ mod tests {
             json!(["https://example.com", "https://api.example.com"]);
         let bytes = serde_json::to_vec(&value).expect("serialize opt-in source");
         fs::write(&path, &bytes).expect("write source");
-        let (source, digest, expected, _, policy, _, _, _, _) =
+        let (source, digest, expected, _, policy, _, _, _, _, _) =
             super::load_application_workload_source(&path).expect("load bound opt-in source");
         assert_eq!(digest, sha256(&bytes).expect("exact raw-source hash"));
         assert_eq!(source.resources.len(), 2);
@@ -25245,7 +25601,7 @@ mod tests {
     #[test]
     fn qualified_chaff_origin_policy_accepts_only_approved_auxiliary_identity_resource() {
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, policy, _, _, _, _) =
+        let (source, _, expected, _, policy, _, _, _, _, _) =
             spec.application_workload_source.as_mut().unwrap();
         let (resource, response) = super::selected_identity_chaff_resource(
             source,
@@ -25649,6 +26005,7 @@ mod tests {
             application_completion_monotonic_ns: None,
             defense_diagnostics: None,
             runner_wakeup_metrics: None,
+            terminal_primary_partial_cell: None,
         };
         let authorized = super::receive_loop_completion_authorized(&completion, &[]);
         let receipt = receive_loop.receipt(authorized);
@@ -25835,6 +26192,7 @@ mod tests {
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
+                terminal_primary_partial_cell: None,
             },
         )
         .expect("write run receipt");
@@ -29125,7 +29483,7 @@ mod tests {
         controller.observe(legacy.observation().clone(), Duration::from_micros(90_000));
         super::record_qcsd_observation(
             &mut endpoint,
-            &controller,
+            &mut controller,
             &mut traces,
             &legacy,
             None,
@@ -29145,7 +29503,7 @@ mod tests {
         );
         super::record_qcsd_observation(
             &mut endpoint,
-            &controller,
+            &mut controller,
             &mut traces,
             &application,
             None,
@@ -29161,7 +29519,7 @@ mod tests {
         assert!(
             super::record_qcsd_observation(
                 &mut endpoint,
-                &controller,
+                &mut controller,
                 &mut traces,
                 &missing,
                 None,
@@ -29181,7 +29539,7 @@ mod tests {
         controller.observe(bound.observation().clone(), reduced_at);
         super::record_qcsd_observation(
             &mut endpoint,
-            &controller,
+            &mut controller,
             &mut traces,
             &bound,
             None,
@@ -29229,6 +29587,404 @@ mod tests {
         assert_eq!(events.matches("buflo_incoming_startup_ready").count(), 0);
         drop(endpoint);
         fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the FIN binding oracle follows actual dispatch, owned credit, controller reduction and persisted trace clocks"
+    )]
+    async fn terminal_primary_fin_binding_preserves_production_and_actual_reduction_clocks() {
+        for case in 0..3 {
+            let output = trace_output_dir(&format!("terminal-primary-fin-clock-{case}"));
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let mut endpoint = connected_runner_endpoint(&output, started, &clock);
+            drop(endpoint.client.qcsd_timestamped_observations());
+            let url = http::Uri::from_static("https://127.0.0.1:4433/primary");
+            let stream = endpoint
+                .client
+                .fetch(started, "GET", &url, &[], neqo_http3::Priority::default())
+                .expect("dispatch an actual primary request stream");
+            endpoint
+                .client
+                .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(1))
+                .expect("register the source-bound positive primary floor");
+            endpoint.streams.insert(
+                stream,
+                super::application_record(
+                    &super::ApplicationRequest {
+                        resource_id: 0,
+                        url,
+                        headers: Vec::new(),
+                        expected_response_length: Some(1),
+                    },
+                    QcsdRequestRole::Application,
+                    "in_flight",
+                ),
+            );
+            let opened = endpoint
+                .client
+                .qcsd_timestamped_observations()
+                .into_iter()
+                .find(|record| {
+                    matches!(record.observation(), QcsdObservation::StreamOpened {
+                    stream: opened_stream,
+                    expected_response_length: Some(1),
+                    ..
+                } if opened_stream.0 == stream.as_u64())
+                })
+                .expect("the dispatched request produces the exact StreamOpened record");
+            let endpoint_id = endpoint.id;
+            let stream_id = QcsdStreamId(stream.as_u64());
+            let config = QcsdConfig {
+                defense: DefenseConfig::Tamaraw(TamarawConfig {
+                    incoming_interval_us: 5_000,
+                    outgoing_interval_us: 20_000,
+                    packet_size: 1_200,
+                    modulo: 100,
+                }),
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                max_udp_payload_size: 1_200,
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            };
+            let mut controller = QcsdController::with_defense(
+                config,
+                None,
+                Box::new(RollingOutgoingSequence {
+                    events: VecDeque::from([
+                        Packet::new(Duration::from_micros(5_000), Direction::Incoming, 1_200)
+                            .expect("owned due cell"),
+                        Packet::new(Duration::from_micros(10_000), Direction::Incoming, 1_200)
+                            .expect("later untouched cell"),
+                    ]),
+                    exact_incoming_window: false,
+                }),
+            )
+            .expect("controller");
+            controller
+                .enable_tamaraw_rapid_capture_policy()
+                .expect("owned retry policy");
+            endpoint.terminal_primary_partial_enabled = case != 1;
+            if endpoint.terminal_primary_partial_enabled {
+                controller
+                    .enable_terminal_primary_partial_cell_policy()
+                    .expect("prospective primary policy");
+            }
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint: endpoint_id,
+                    origin: "https://127.0.0.1:4433".into(),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(opened.observation().clone(), Duration::ZERO);
+            let mut traces = TraceFiles::new(&output, started).expect("trace files");
+            super::record_qcsd_observation(
+                &mut endpoint,
+                &mut controller,
+                &mut traces,
+                &opened,
+                None,
+                None,
+                Some(Duration::ZERO),
+            )
+            .expect("bind actual dispatched resource0");
+            controller.drain_actions().for_each(drop);
+
+            for observation in [
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    blocked_at: 16,
+                },
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    absolute_limit: 1_000,
+                    slot: None,
+                },
+                QcsdObservation::ResponseHeaders {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    frame_bytes: 553,
+                    status: Some(200),
+                    content_length: None,
+                },
+                QcsdObservation::DataFrame {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    frame_header_bytes: 3,
+                    data_bytes: 444,
+                },
+                QcsdObservation::BytesRead {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    bytes: 1_000,
+                },
+                QcsdObservation::HeaderProgress {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    absolute_limit: 1_016,
+                    slot: None,
+                },
+                QcsdObservation::DataFrame {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    frame_header_bytes: 2,
+                    data_bytes: 13,
+                },
+                QcsdObservation::BytesRead {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    bytes: 15,
+                },
+                QcsdObservation::HeaderProgress {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    blocked_at: 1_016,
+                },
+            ] {
+                controller.observe(observation, Duration::ZERO);
+            }
+            controller.drain_actions().for_each(drop);
+            let mut owned_slot = None;
+            if case == 0 {
+                let due = Duration::from_micros(5_000);
+                controller.poll(due);
+                let (absolute_limit, owner) = controller
+                    .drain_actions()
+                    .find_map(|action| match action {
+                        QcsdAction::LeaseParserReceive {
+                            endpoint: actual_endpoint,
+                            stream: actual_stream,
+                            absolute_limit,
+                            increase: 1_200,
+                            owner: Some(owner),
+                            ..
+                        } if actual_endpoint == endpoint_id && actual_stream == stream_id => {
+                            Some((absolute_limit, owner))
+                        }
+                        _ => None,
+                    })
+                    .expect("the actual due cell owns a full primary continuation");
+                assert_eq!(absolute_limit, 2_216);
+                owned_slot = Some(owner.slot);
+                traces
+                    .register_incoming_action(
+                        started + due,
+                        endpoint_id,
+                        stream_id,
+                        absolute_limit,
+                        owner.packet,
+                        owner.slot,
+                    )
+                    .expect("register actual physical owner");
+                let advertised = clock.record_at(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: endpoint_id,
+                        stream: stream_id,
+                        absolute_limit,
+                        slot: None,
+                    },
+                    started + due,
+                );
+                controller.observe(advertised.observation().clone(), due);
+                super::record_qcsd_observation(
+                    &mut endpoint,
+                    &mut controller,
+                    &mut traces,
+                    &advertised,
+                    None,
+                    Some(started + due),
+                    Some(due),
+                )
+                .expect("persist the full owned advertisement after its actual handoff");
+                for observation in [
+                    QcsdObservation::BytesRead {
+                        endpoint: endpoint_id,
+                        stream: stream_id,
+                        bytes: 3,
+                    },
+                    QcsdObservation::DataFrame {
+                        endpoint: endpoint_id,
+                        stream: stream_id,
+                        frame_header_bytes: 3,
+                        data_bytes: 137,
+                    },
+                    QcsdObservation::BytesRead {
+                        endpoint: endpoint_id,
+                        stream: stream_id,
+                        bytes: 137,
+                    },
+                ] {
+                    controller.observe(observation, due);
+                }
+            }
+            let produced_at =
+                Duration::from_nanos(opened.produced_monotonic_ns()) + Duration::from_micros(5_400);
+            let reduced_at = produced_at + Duration::from_nanos(200_123);
+            let fin = clock.record_at(
+                QcsdObservation::StreamFinished {
+                    endpoint: endpoint_id,
+                    stream: stream_id,
+                    finish: QcsdStreamFinish::Fin,
+                },
+                started + produced_at,
+            );
+            controller.observe(fin.observation().clone(), reduced_at);
+            let partial = controller.terminal_primary_partial_cell().copied();
+            assert_eq!(partial.is_some(), case == 0);
+            super::record_qcsd_observation(
+                &mut endpoint,
+                &mut controller,
+                &mut traces,
+                &fin,
+                None,
+                None,
+                Some(reduced_at),
+            )
+            .expect("record actual FIN without replacing its clock");
+            if let Some(proof) = partial {
+                assert_eq!(proof.fin_at_us, duration_as_trace_micros(reduced_at));
+                assert_eq!(
+                    (
+                        proof.advertised_bytes,
+                        proof.consumed_bytes,
+                        proof.retired_bytes
+                    ),
+                    (1_200, 139, 1_061),
+                    "one old unowned tail byte remains outside the due cell"
+                );
+                let action = controller.drain_actions().find(|action| matches!(action,
+                    QcsdAction::SlotMissed { slot, reason: MissedSlotReason::ReceiveCreditRetired, .. }
+                        if Some(*slot) == owned_slot)).expect("the partial remains an actual missed slot");
+                record_terminal_action(
+                    &mut traces,
+                    started + reduced_at,
+                    duration_as_trace_micros(reduced_at),
+                    Some(proof.fin_at_us),
+                    "applied",
+                    TerminalActionSemantics::OpportunityResolution,
+                    &action,
+                )
+                .expect("persist actual FIN retirement at its controller reduction boundary");
+                traces
+                    .ensure_no_pending_slots()
+                    .expect("one actual terminal ledger");
+            }
+            drop(traces);
+            let events = fs::read_to_string(output.join("events.csv")).expect("events");
+            let details_for = |event: &str| {
+                events
+                    .lines()
+                    .filter(|line| line.split(',').nth(2) == Some(event))
+                    .map(|line| {
+                        let raw = line.splitn(5, ',').nth(4).expect("details column");
+                        let last_quote = raw.rfind('"').expect("closing JSON quote");
+                        serde_json::from_str::<serde_json::Value>(
+                            &raw[1..last_quote].replace("\"\"", "\""),
+                        )
+                        .expect("reopen exact event JSON")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                details_for("terminal_primary_stream_binding"),
+                if case == 1 {
+                    vec![]
+                } else {
+                    vec![json!({
+                        "schema_version": 1,
+                        "source": "native-dispatched-primary-resource-stream-v1",
+                        "resource_id": 0,
+                        "endpoint": endpoint_id.0,
+                        "stream": stream_id.0,
+                        "production_sequence": opened.sequence(),
+                        "production_monotonic_ns": opened.produced_monotonic_ns(),
+                        "observation": opened.observation(),
+                    })]
+                }
+            );
+            let reduction = details_for("terminal_primary_fin_reduction");
+            let partial_events = details_for("terminal_primary_partial_cell");
+            if let Some(proof) = partial {
+                assert_eq!(
+                    reduction,
+                    vec![json!({
+                        "schema_version": 1,
+                        "source": "native-controller-defense-elapsed-us-v1",
+                        "production_sequence": fin.sequence(),
+                        "production_monotonic_ns": fin.produced_monotonic_ns(),
+                        "controller_defense_elapsed_us": proof.fin_at_us,
+                        "observation": fin.observation(),
+                    })]
+                );
+                assert_eq!(
+                    partial_events,
+                    vec![serde_json::to_value(proof).expect("typed DTO")]
+                );
+                let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+                let mut rows = schedule.lines();
+                let header = rows
+                    .next()
+                    .expect("schedule header")
+                    .split(',')
+                    .collect::<Vec<_>>();
+                let row = rows
+                    .next()
+                    .expect("actual partial schedule row")
+                    .split(',')
+                    .collect::<Vec<_>>();
+                let time_column = header
+                    .iter()
+                    .position(|key| *key == "terminal_defense_elapsed_us")
+                    .expect("terminal controller clock column");
+                assert_eq!(
+                    row[time_column].parse::<u64>().expect("terminal time"),
+                    proof.fin_at_us
+                );
+                assert!(schedule.contains("ReceiveCreditRetired"));
+            } else {
+                assert!(reduction.is_empty());
+                assert!(
+                    partial_events.is_empty(),
+                    "legacy and no-owned-partial paths emit no proof"
+                );
+            }
+            let mut raw_fin = serde_json::to_value(fin.observation()).expect("raw FIN");
+            raw_fin["production_sequence"] = json!(fin.sequence());
+            raw_fin["production_monotonic_ns"] = json!(fin.produced_monotonic_ns());
+            assert_eq!(
+                details_for("observation")
+                    .iter()
+                    .filter(|raw| **raw == raw_fin)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                fin.produced_monotonic_ns(),
+                duration_as_u64_nanos(produced_at)
+            );
+            assert!(fin.produced_monotonic_ns() < duration_as_u64_nanos(reduced_at));
+            drop(endpoint);
+            fs::remove_dir_all(output).expect("remove test directory");
+        }
     }
 
     #[tokio::test]
@@ -34560,6 +35316,332 @@ mod tests {
         value
     }
 
+    fn terminal_primary_partial_cell_spec(mode: u8) -> RunSpec {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("terminal-primary-partial-policy-source");
+        let source_path = output.join("prepared.json");
+        let mut source = tamaraw_capture_policy_source();
+        source["preparation"]["terminal_primary_partial_cell_policy"] =
+            json!(super::TerminalPrimaryPartialCellPolicy::RAPID_V5_NAME);
+        let raw = serde_json::to_vec(&source).expect("prepared policy bytes");
+        fs::write(&source_path, &raw).expect("write prepared source");
+        let bound = super::load_application_workload_source(&source_path).expect("bound opt-in");
+        assert_eq!(bound.1, sha256(&raw).expect("exact prepared bytes"));
+        let mut spec =
+            terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        spec.workload = bound.0.clone();
+        spec.application_workload_source = Some(bound);
+        spec.max_response_bytes = 1_048_576;
+        spec.config = QcsdConfig {
+            max_udp_payload_size: 1_200,
+            control_interval_us: 5_000,
+            drop_unsatisfied_events: false,
+            ..QcsdConfig::default()
+        };
+        spec.config.defense = match mode {
+            0 => DefenseConfig::Tamaraw(TamarawConfig {
+                incoming_interval_us: 5_000,
+                outgoing_interval_us: 20_000,
+                packet_size: 1_200,
+                modulo: 100,
+            }),
+            1 => {
+                let path = output.join("buflo.json");
+                fs::write(&path, serde_json::to_vec(&json!({
+                    "schema_version": 1, "interval_us": 20_000, "minimum_duration_us": 1_000_000,
+                    "packet_size": 1_200, "max_events": 1_000,
+                    "implementation_scope": "client_only_quic", "paper_equivalent": false,
+                })).expect("parameters")).expect("write parameters");
+                DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                    parameters: path.to_str().expect("path").into(),
+                })
+            }
+            2 => {
+                let path = output.join("cs-buflo.json");
+                fs::write(&path, serde_json::to_vec(&json!({
+                    "schema_version": 1, "packet_size": 600, "initial_interval_us": 8_192,
+                    "minimum_interval_us": 4_096, "maximum_interval_us": 32_768,
+                    "initial_adaptation_boundary_bytes": 16_384, "quiet_time_us": 2_000_000,
+                    "outgoing_padding_mode": "total", "incoming_padding_mode": "payload",
+                    "timing_sample_limit": 1_000, "jitter_denominator": 100, "jitter_max_numerator": 200,
+                    "early_termination": "local", "max_events": 1_000,
+                    "implementation_scope": "client_only_quic", "paper_equivalent": false,
+                })).expect("parameters")).expect("write parameters");
+                DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                    parameters: path.to_str().expect("path").into(),
+                })
+            }
+            3 => DefenseConfig::Front(FrontConfig::default()),
+            4 => DefenseConfig::None,
+            _ => unreachable!("bounded test mode"),
+        };
+        spec.defense_parameters =
+            defense_parameter_provenance(&spec.config).expect("same-byte parameter identity");
+        fs::remove_dir_all(output).expect("no render-time IO");
+        spec
+    }
+
+    #[test]
+    fn terminal_primary_partial_cell_policy_rejects_malformed_and_unbound_source() {
+        use super::TerminalPrimaryPartialCellPolicy as Policy;
+        let legacy = Policy::from_preparation(
+            &json!({}),
+            ApplicationResponsePolicy::default(),
+            super::PrimaryDocumentIdentityPolicy::default(),
+            &super::QualifiedChaffOriginPolicy::default(),
+        )
+        .expect("absent policy preserves legacy");
+        assert_eq!(legacy, Policy::Legacy);
+        let origin = super::QualifiedChaffOriginPolicy::PreparedApprovedOrigins(
+            ["https://example.com".to_owned()].into_iter().collect(),
+        );
+        for value in [
+            serde_json::Value::Null,
+            json!(true),
+            json!(1),
+            json!({}),
+            json!("unknown"),
+        ] {
+            assert!(
+                Policy::from_preparation(
+                    &json!({"terminal_primary_partial_cell_policy": value}),
+                    ApplicationResponsePolicy::CompletedTerminalHttpErrors,
+                    super::PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody,
+                    &origin
+                )
+                .is_err()
+            );
+        }
+        for mutation in 0..3 {
+            let mut source = tamaraw_capture_policy_source();
+            source["preparation"]["terminal_primary_partial_cell_policy"] =
+                json!(Policy::RAPID_V5_NAME);
+            match mutation {
+                0 => {
+                    source["preparation"]
+                        .as_object_mut()
+                        .expect("metadata")
+                        .remove("primary_document_identity_policy");
+                }
+                1 => {
+                    source["preparation"]
+                        .as_object_mut()
+                        .expect("metadata")
+                        .remove("qualified_chaff_origin_policy");
+                }
+                _ => {
+                    source["preparation"]
+                        .as_object_mut()
+                        .expect("metadata")
+                        .remove("application_response_policy");
+                }
+            }
+            test_fixture::fixture_init();
+            let output = trace_output_dir("terminal-primary-partial-unbound-source");
+            let path = output.join("prepared.json");
+            fs::write(&path, serde_json::to_vec(&source).expect("source")).expect("write source");
+            assert!(
+                super::load_application_workload_source(&path).is_err(),
+                "mutation {mutation}"
+            );
+            fs::remove_dir_all(output).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn terminal_primary_partial_cell_policy_marker_is_mode_specific_and_never_invents_fin() {
+        for mode in 0..5 {
+            let spec = terminal_primary_partial_cell_spec(mode);
+            super::validate_terminal_primary_partial_cell_policy(&spec)
+                .expect("source-bound contract");
+            let run = buflo_incoming_credit_release_policy_run(&spec);
+            assert!(run.get("terminal_primary_partial_cell").is_none());
+            if mode < 3 {
+                assert_eq!(
+                    run["terminal_primary_partial_cell_policy"],
+                    json!({
+                        "schema_version": 1, "source": "bound-preparation-v1",
+                        "policy": super::TerminalPrimaryPartialCellPolicy::RAPID_V5_NAME,
+                        "cell_size": if mode == 2 { 600 } else { 1_200 },
+                        "maximum_partial_cells": 1, "primary_resource_index": 0,
+                        "require_unique_stream": true, "require_fin": true,
+                        "require_nonempty_successful_primary": true, "require_full_advertisement": true,
+                        "require_exact_positive_split": true, "retired_credit_reassignment": false,
+                    })
+                );
+            } else {
+                assert!(run.get("terminal_primary_partial_cell_policy").is_none());
+            }
+            if let Some(proof) = &spec.defense_parameters {
+                let serialized = serde_json::to_value(proof).expect("historical receipt");
+                assert!(serialized.get("buflo_parameters").is_none());
+                assert!(serialized.get("cs_buflo_parameters").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_primary_partial_cell_policy_rejects_wrong_runtime_parameters_and_binding() {
+        for mode in 0..3 {
+            for mutation in 0..12 {
+                let mut spec = terminal_primary_partial_cell_spec(mode);
+                match mutation {
+                    0 => spec.config.control_interval_us = 10_000,
+                    1 => spec.config.max_udp_payload_size = 1_500,
+                    2 => spec.config.drop_unsatisfied_events = true,
+                    3 => {
+                        spec.application_workload_source.as_mut().expect("source").1 =
+                            "invalid".into()
+                    }
+                    4 => {
+                        spec.application_workload_source.as_mut().expect("source").4 =
+                            super::QualifiedChaffOriginPolicy::PrimaryOrigin
+                    }
+                    5 => {
+                        spec.application_workload_source.as_mut().expect("source").5 =
+                            super::PrimaryDocumentIdentityPolicy::ExactResponseBody
+                    }
+                    6 => spec.application_response_policy = ApplicationResponsePolicy::Http2xxOnly,
+                    7 => spec.workload.resources[0].url = "https://changed.example.com/".into(),
+                    8..=11 => match &mut spec.config.defense {
+                        DefenseConfig::Tamaraw(parameters) => match mutation {
+                            8 => parameters.packet_size = 600,
+                            9 => parameters.incoming_interval_us = 10_000,
+                            10 => parameters.modulo = 50,
+                            _ => {
+                                spec.application_workload_source.as_mut().expect("source").7 =
+                                    super::TamarawCapturePolicy::Legacy
+                            }
+                        },
+                        DefenseConfig::Buflo(parameters) => match mutation {
+                            8 => parameters.parameters = "other.json".into(),
+                            9 => {
+                                spec.defense_parameters
+                                    .as_mut()
+                                    .expect("proof")
+                                    .buflo_parameters
+                                    .as_mut()
+                                    .expect("parsed")
+                                    .packet_size = 600
+                            }
+                            10 => {
+                                spec.defense_parameters
+                                    .as_mut()
+                                    .expect("proof")
+                                    .buflo_parameters
+                                    .as_mut()
+                                    .expect("parsed")
+                                    .interval_us = 10_000
+                            }
+                            _ => spec.defense_parameters = None,
+                        },
+                        DefenseConfig::CsBuflo(parameters) => match mutation {
+                            8 => parameters.parameters = "other.json".into(),
+                            9 => {
+                                spec.defense_parameters
+                                    .as_mut()
+                                    .expect("proof")
+                                    .cs_buflo_parameters
+                                    .as_mut()
+                                    .expect("parsed")
+                                    .packet_size = 1_200
+                            }
+                            10 => {
+                                spec.defense_parameters
+                                    .as_mut()
+                                    .expect("proof")
+                                    .cs_buflo_parameters
+                                    .as_mut()
+                                    .expect("parsed")
+                                    .minimum_interval_us = 2_048
+                            }
+                            _ => spec.defense_parameters = None,
+                        },
+                        _ => unreachable!("paced modes only"),
+                    },
+                    _ => unreachable!("bounded mutation"),
+                }
+                assert!(
+                    super::validate_terminal_primary_partial_cell_policy(&spec).is_err(),
+                    "mode {mode} mutation {mutation}"
+                );
+                assert!(super::terminal_primary_partial_cell_policy_receipt(&spec).is_none());
+            }
+        }
+        let mut legacy = terminal_primary_partial_cell_spec(1);
+        legacy
+            .application_workload_source
+            .as_mut()
+            .expect("source")
+            .9 = super::TerminalPrimaryPartialCellPolicy::Legacy;
+        legacy.config.control_interval_us = 10_000;
+        super::validate_terminal_primary_partial_cell_policy(&legacy)
+            .expect("no new gate without opt-in");
+        assert!(super::terminal_primary_partial_cell_policy_receipt(&legacy).is_none());
+    }
+
+    #[test]
+    fn terminal_primary_partial_cell_receipt_retains_exact_dto_only_for_bound_paced_policy() {
+        let mut spec = terminal_primary_partial_cell_spec(1);
+        let proof = neqo_csdef::TerminalPrimaryPartialCellDiagnostics {
+            schema_version: 1,
+            source: "native-owned-terminal-primary-fin-v1",
+            policy: super::TerminalPrimaryPartialCellPolicy::RAPID_V5_NAME,
+            resource_id: 0,
+            endpoint: 3,
+            stream: 0,
+            slot: 5,
+            target_us: 40_000,
+            cell_bytes: 1_200,
+            requested_bytes: 1_200,
+            advertised_bytes: 1_200,
+            consumed_bytes: 1_199,
+            retired_bytes: 1,
+            fin_at_us: 40_100,
+            status: 200,
+            body_bytes: 58_383,
+        };
+        let completion = RunCompletion {
+            ended_unix_ns: Some(2),
+            status: "complete",
+            error: None,
+            error_class: None,
+            defense_start_monotonic_ns: Some(0),
+            application_completion_monotonic_ns: Some(50_000_000),
+            defense_diagnostics: None,
+            runner_wakeup_metrics: None,
+            terminal_primary_partial_cell: Some(json!(proof)),
+        };
+        let scheduler = super::process_scheduler_evidence().expect("scheduler");
+        let render = |spec: &RunSpec| -> serde_json::Value {
+            serde_json::from_slice(&super::render_run_json(
+                spec,
+                &[],
+                &[],
+                &[],
+                &scheduler,
+                &[],
+                1,
+                &completion,
+            ))
+            .expect("receipt JSON")
+        };
+        let run = render(&spec);
+        assert_eq!(run["terminal_primary_partial_cell"], json!(proof));
+        assert_eq!(
+            run["terminal_primary_partial_cell"]
+                .as_object()
+                .expect("DTO")
+                .len(),
+            16
+        );
+        spec.application_workload_source.as_mut().expect("source").9 =
+            super::TerminalPrimaryPartialCellPolicy::Legacy;
+        let run = render(&spec);
+        assert!(run.get("terminal_primary_partial_cell_policy").is_none());
+        assert!(run.get("terminal_primary_partial_cell").is_none());
+    }
+
     fn variable_primary_document_spec() -> RunSpec {
         test_fixture::fixture_init();
         let output = trace_output_dir("variable-primary-document-source");
@@ -35166,6 +36248,7 @@ mod tests {
                 application_completion_monotonic_ns: None,
                 defense_diagnostics: None,
                 runner_wakeup_metrics: None,
+                terminal_primary_partial_cell: None,
             },
         );
         serde_json::from_slice(&bytes).expect("run receipt")
@@ -35692,7 +36775,7 @@ mod tests {
         let value = terminal_http_error_source();
         let bytes = serde_json::to_vec(&value).expect("serialize source");
         fs::write(&path, &bytes).expect("write source");
-        let (manifest, digest, expected, policy, _, _, _, _, _) =
+        let (manifest, digest, expected, policy, _, _, _, _, _, _) =
             super::load_application_workload_source(&path).expect("policy source");
         assert_eq!(
             policy,
@@ -35901,6 +36984,7 @@ mod tests {
                     application_completion_monotonic_ns: Some(2),
                     defense_diagnostics: None,
                     runner_wakeup_metrics: None,
+                    terminal_primary_partial_cell: None,
                 },
             );
             let receipt: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt");
@@ -37681,6 +38765,145 @@ mod tests {
         assert!(packets.contains(",satisfied,"));
         drop(endpoints);
         fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one real prepared-output fixture compares exact and late construction without any socket handoff"
+    )]
+    async fn buflo_kernel_main_validation_retains_real_prepared_attribution_and_lateness() {
+        for lateness_us in [0, 1] {
+            let output =
+                trace_output_dir(&format!("kernel-main-prepared-attribution-{lateness_us}"));
+            let started = test_fixture::now();
+            let observation_clock = QcsdObservationClock::new(started);
+            let packet = Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200)
+                .expect("one actual target");
+            let mut controller = rolling_abort_controller(packet);
+            let preview = controller
+                .drain_actions()
+                .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+                .expect("controller-issued preview");
+            let mut endpoints = vec![connected_runner_endpoint(
+                &output,
+                started,
+                &observation_clock,
+            )];
+            drop(endpoints[0].client.qcsd_timestamped_observations());
+            let mut traces = TraceFiles::new(&output, started).expect("trace files");
+            apply_action_batch(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                started,
+                Duration::ZERO,
+                vec![preview],
+            )
+            .expect("apply actual preview");
+            let release = started + packet.timestamp();
+            controller
+                .reconcile_due_rolling(packet.timestamp())
+                .expect("commit actual target");
+            controller.flush_defense_observations();
+            apply_queued_actions(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                release,
+                packet.timestamp(),
+            )
+            .expect("apply committed target");
+            let defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "fixed-buflo-1200-20000us.json".into(),
+            });
+            let guard = next_buflo_exact_release_guard(&defense, &controller, &endpoints)
+                .expect("actual adapter guard")
+                .expect("one committed target");
+            assert_eq!(guard.release, release);
+            let prepared = match super::prepare_output_once_with_evidence(
+                &mut endpoints[0],
+                release + Duration::from_micros(lateness_us),
+            )
+            .await
+            .unwrap_or_else(|failure| {
+                panic!("actual packet build failed: {}", failure.into_error())
+            }) {
+                PreparedOutputDrive::Datagram(prepared) => prepared,
+                PreparedOutputDrive::Callback(_) | PreparedOutputDrive::None => {
+                    panic!("actual committed target must build one datagram")
+                }
+            };
+            assert_eq!(prepared.batch.num_datagrams(), 1);
+            assert_eq!(prepared.batch.data().len(), 1_200);
+            let attribution = &prepared.attributed_datagrams[0];
+            let satisfied = attribution.satisfied.expect("actual satisfied target");
+            assert_eq!(satisfied.slot, guard.slot);
+            assert_eq!(satisfied.observed_size, 1_200);
+            assert_eq!(attribution.composition.lateness_us, lateness_us);
+            assert!(super::qcsd_composition_exact_wire_accounting(
+                &attribution.composition,
+                1_200,
+            ));
+            let validation = super::validate_buflo_kernel_main(&guard, &prepared);
+            if lateness_us == 0 {
+                validation.expect("exact construction retains zero lateness");
+            } else {
+                let error = validation.expect_err("late construction must stay failed");
+                let message = error.to_string();
+                assert!(message.contains("built a mismatched target attribution"));
+                assert!(message.contains(&format!("expected_slot={}", guard.slot.0)));
+                assert!(message.contains(&format!("satisfied_slot={}", satisfied.slot.0)));
+                assert!(message.contains("satisfied_observed_bytes=1200"));
+                assert!(message.contains("datagram_observed_bytes=1200"));
+                assert!(message.contains("lateness_us: 1"));
+                let built_record = prepared
+                    .observations
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.observation(),
+                            QcsdObservation::ClassifiedDatagram {
+                                direction: Direction::Outgoing,
+                                composition: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                    .expect("actual packet-build production record");
+                let production = Some((
+                    built_record.sequence(),
+                    built_record.produced_monotonic_ns(),
+                ));
+                assert!(message.contains(&format!(
+                    "built_production_sequence_and_monotonic_ns={production:?}"
+                )));
+                let retained = super::PreparedOutputFailure::from_prepared(
+                    "main-validation",
+                    error,
+                    &prepared,
+                );
+                assert_eq!(retained.receipt.error, message);
+                assert_eq!(retained.receipt.batch_datagram_lengths, vec![1_200]);
+                assert_eq!(retained.receipt.satisfied_datagram_count, 1);
+            }
+            assert!(
+                controller
+                    .pending_slots()
+                    .iter()
+                    .any(|(slot, _)| *slot == guard.slot)
+            );
+            assert!(!traces.is_slot_terminal(guard.slot));
+            drop(traces);
+            let packets = fs::read_to_string(output.join("packets.csv"))
+                .expect("packet trace before socket handoff");
+            assert_eq!(packets.lines().count(), 1, "no prepared batch was sent");
+            drop(endpoints);
+            fs::remove_dir_all(output).expect("remove trace test directory");
+        }
     }
 
     #[tokio::test]
@@ -43036,6 +44259,7 @@ mod tests {
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
                 runner_wakeup_metrics: Some(RunnerWakeupMetrics::new()),
+                terminal_primary_partial_cell: None,
             },
         );
         let receipt: serde_json::Value =
@@ -44420,6 +45644,67 @@ mod tests {
     const SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS: u64 = 20_000_000;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_receipt_reservation_covers_timeout_and_rejects_overflow() {
+        for (timeout_seconds, required) in [(0, 1), (1, 51), (82, 4_101)] {
+            let (selections, jobs) = super::reserve_buflo_kernel_receipt_vectors(timeout_seconds)
+                .expect("bounded timeout reservation before arm");
+            assert!(selections.is_empty());
+            assert!(jobs.is_empty());
+            assert!(selections.capacity() >= required);
+            assert!(jobs.capacity() >= required);
+        }
+        assert!(matches!(
+            super::reserve_buflo_kernel_receipt_vectors(u64::MAX),
+            Err(Error::RunAborted(message))
+                if message == "BuFLO kernel receipt timeout capacity overflow"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_receipt_history_crosses_4096_without_protected_reallocation() {
+        let (mut selections, mut jobs) = super::reserve_buflo_kernel_receipt_vectors(82)
+            .expect("reserve the existing timeout before the first protected wait");
+        let selection_storage = selections.as_ptr();
+        let job_storage = jobs.as_ptr();
+        for tick in 0..=4_096_u64 {
+            let identity = synthetic_protected_selection_identity(tick * 2, tick == 0);
+            let mut samples =
+                VecDeque::from([identity.admission_tai_ns, identity.selection_tai_ns]);
+            let super::BufloKernelProtectedSelectionStep::Ready(entry) =
+                super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                    Ok(samples
+                        .pop_front()
+                        .expect("ordered protected clock samples"))
+                })
+            else {
+                panic!("each retained wait reaches its exact selection");
+            };
+            selections.push(entry);
+            let mut job = synthetic_buflo_kernel_raw_job(Vec::new());
+            job.job_id = tick;
+            job.tick = tick;
+            job.release_tai_ns = identity.release_tai_ns;
+            job.deadline_tai_ns = identity.release_tai_ns + 5_000_000;
+            jobs.push(job);
+            assert_eq!(selections.as_ptr(), selection_storage);
+            assert_eq!(jobs.as_ptr(), job_storage);
+        }
+        assert_eq!(selections.len(), 4_097);
+        assert_eq!(jobs.len(), 4_097);
+        assert_eq!(selections[4_096].slot, 8_192);
+        assert_eq!(jobs[4_096].tick, 4_096);
+        assert_eq!(selections[0].slot, 0);
+        assert_eq!(jobs[0].tick, 0);
+        assert_eq!(selections[4_095].slot, 8_190);
+        assert_eq!(
+            jobs[4_095].release_tai_ns + 20_000_000,
+            jobs[4_096].release_tai_ns
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn synthetic_protected_selection_identity(
         slot: u64,
         tick_zero: bool,
@@ -45719,6 +47004,7 @@ mod tests {
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
                 runner_wakeup_metrics: Some(metrics),
+                terminal_primary_partial_cell: None,
             },
         );
         let receipt: serde_json::Value =

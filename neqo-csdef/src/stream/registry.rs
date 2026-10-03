@@ -357,6 +357,27 @@ impl StreamRegistry {
             .collect()
     }
 
+    /// One explicitly bound primary can expose an owned DATA opportunity even
+    /// when its independent unowned framing reservation is exhausted. This
+    /// does not change the ordinary opportunity list or exact Capacity signal.
+    pub(crate) fn owned_data_continuation_opportunity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        due_quantum: u64,
+    ) -> Option<AllocationOpportunity> {
+        if self.owned_data_continuation_capacity(endpoint, stream, due_quantum) == 0 {
+            return None;
+        }
+        Some(AllocationOpportunity {
+            endpoint,
+            stream,
+            role: QcsdRequestRole::Application,
+            exact: 0,
+            claimable: 0,
+        })
+    }
+
     /// Deterministic exact-capacity opportunities for a held receiver
     /// continuation. Only peer-ACK-activated pristine controlled chaff streams
     /// are eligible; provisional framing claims are never exposed to this path.
@@ -678,6 +699,46 @@ impl StreamRegistry {
         }
         state.parser_blocked_at = Some(blocked_at);
         true
+    }
+
+    /// Reserve solely against a real due cell, independently of the bounded
+    /// legacy framing allowance. Only application DATA may use this route.
+    pub(crate) fn owned_data_continuation_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        due_quantum: u64,
+    ) -> u64 {
+        self.streams.get(&(endpoint, stream)).map_or(0, |state| {
+            if !state.receive_actions_available || state.role != QcsdRequestRole::Application {
+                return 0;
+            }
+            state
+                .receive
+                .owned_data_continuation_capacity(state.parser_blocked_at, due_quantum)
+        })
+    }
+
+    pub(crate) fn owned_data_continuation(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        due_quantum: u64,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available || state.role != QcsdRequestRole::Application {
+            return None;
+        }
+        let (absolute_limit, increase, scheduled) = state
+            .receive
+            .owned_data_continuation(state.parser_blocked_at, due_quantum)?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
     }
 
     pub(crate) fn scheduled_parser_lease_capacity(

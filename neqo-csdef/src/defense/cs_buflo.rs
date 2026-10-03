@@ -193,6 +193,7 @@ pub struct CsBuflo {
     rate_transitions: Vec<CsBufloRateTransitionDiagnostics>,
     event_guard_triggered: bool,
     realization_failed: bool,
+    terminal_primary_partial: Option<QcsdSlotId>,
 }
 
 impl CsBuflo {
@@ -279,6 +280,7 @@ impl CsBuflo {
             rate_transitions: Vec::new(),
             event_guard_triggered: false,
             realization_failed: false,
+            terminal_primary_partial: None,
         };
         defense.next_us[OUTGOING] = defense.randomized_delay_us(Direction::Outgoing);
         defense.next_us[INCOMING] = defense.randomized_delay_us(Direction::Incoming);
@@ -845,6 +847,47 @@ impl CsBuflo {
         self.maybe_latch_local_termination();
     }
 
+    fn record_terminal_primary_partial(
+        &mut self,
+        at_us: u64,
+        slot: QcsdSlotId,
+        packet: Packet,
+        consumed: u64,
+        retired: u64,
+    ) {
+        let pending = self.pending_incoming.get(&slot).copied();
+        if self.terminal_primary_partial.is_some()
+            || packet.timestamp_us() > at_us
+            || !pending.is_some_and(|pending| pending.packet == packet && pending.locally_realized)
+            || !super::traits::terminal_primary_partial_split_valid(
+                packet,
+                self.parameters.packet_size,
+                consumed,
+                retired,
+            )
+        {
+            self.realization_failed = true;
+            return;
+        }
+        let pending = self
+            .pending_incoming
+            .remove(&slot)
+            .expect("validated owned incoming slot");
+        self.terminal_primary_partial = Some(slot);
+        self.missed_incoming = self.missed_incoming.saturating_add(1);
+        self.terminal[INCOMING] = self.terminal[INCOMING].saturating_add(1);
+        if pending.at_minimum_interval {
+            self.minimum_interval_terminal[INCOMING] =
+                self.minimum_interval_terminal[INCOMING].saturating_add(1);
+        }
+        // These exact consumed owned bytes are the only termination progress.
+        // The retired suffix stays retired and does not make this a full cell.
+        let crossing = self.record_termination_increment(INCOMING, consumed);
+        self.realized_total[INCOMING] = self.realized_total[INCOMING].saturating_add(consumed);
+        self.maybe_latch_termination_stop(at_us, Direction::Incoming, crossing);
+        self.maybe_latch_local_termination();
+    }
+
     fn pop_direction(&mut self, elapsed_us: u64, direction: Direction) -> Option<Packet> {
         self.maybe_latch_termination_stop(elapsed_us, direction, None);
         let index = direction_index(direction);
@@ -934,6 +977,14 @@ impl Defense for CsBuflo {
                 packet,
                 outcome,
             } => self.record_incoming_outcome(at_us, slot, packet, outcome),
+            SignalKind::TerminalPrimaryPartial {
+                slot,
+                packet,
+                consumed,
+                retired,
+            } => {
+                self.record_terminal_primary_partial(at_us, slot, packet, consumed, retired);
+            }
             _ => {}
         }
         self.maybe_latch_local_termination();
@@ -1287,6 +1338,99 @@ mod tests {
         defense.record_incoming_scheduled(slot, packet);
         defense.record_incoming_advertised(at_us, slot, packet);
         packet
+    }
+
+    #[test]
+    fn terminal_primary_partial_preserves_owned_progress_and_minimum_classification() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0x12);
+        defense.current_interval_us[INCOMING] = 4_096;
+        let slot = QcsdSlotId(1);
+        let packet = advertise_incoming(&mut defense, 0, slot);
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(1),
+            kind: SignalKind::TerminalPrimaryPartial {
+                slot,
+                packet,
+                consumed: 599,
+                retired: 1,
+            },
+        });
+        assert!(defense.pending_incoming.is_empty());
+        assert_eq!(defense.terminal[INCOMING], 1);
+        assert!(defense.realized_total[INCOMING] < 600);
+        assert_eq!(defense.missed_incoming, 1);
+        assert_eq!(defense.realized_total[INCOMING], 599);
+        assert_eq!(defense.termination_accounted_bytes[INCOMING], 599);
+        assert_eq!(defense.minimum_interval_terminal[INCOMING], 1);
+        assert_eq!(defense.minimum_interval_full[INCOMING], 0);
+        assert!(defense.terminal_failure().is_none());
+        assert!(
+            !defense.is_complete(),
+            "the owned result alone is not onLoad"
+        );
+        // Actual onLoad freezes both padding targets and authorizes idleness;
+        // the already terminal partial drains without a fabricated full cell.
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert!(defense.is_complete());
+        assert_eq!(defense.realized_total[INCOMING], 599);
+    }
+
+    #[test]
+    fn terminal_primary_partial_requires_actual_advertisement_and_unique_positive_split() {
+        for invalid in 0..6 {
+            let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0x12);
+            let slot = QcsdSlotId(1);
+            let packet = if invalid == 0 {
+                defense.next_us[OUTGOING] = u64::MAX;
+                defense.next_us[INCOMING] = 0;
+                let packet = defense
+                    .pop_direction(0, Direction::Incoming)
+                    .expect("scheduled");
+                defense.record_incoming_scheduled(slot, packet);
+                packet
+            } else {
+                advertise_incoming(&mut defense, 0, slot)
+            };
+            let signal = SignalKind::TerminalPrimaryPartial {
+                slot,
+                packet,
+                consumed: if invalid == 1 { 0 } else { 599 },
+                retired: if invalid == 2 {
+                    0
+                } else if invalid == 3 {
+                    2
+                } else {
+                    1
+                },
+            };
+            if invalid == 5 {
+                defense.record_incoming_outcome(
+                    1,
+                    slot,
+                    packet,
+                    EventOutcome::Missed(MissedSlotReason::ReceiveCreditRetired),
+                );
+            } else {
+                defense.observe(DefenseSignal {
+                    at: Duration::from_micros(1),
+                    kind: signal,
+                });
+                if invalid == 4 {
+                    defense.observe(DefenseSignal {
+                        at: Duration::from_micros(2),
+                        kind: signal,
+                    });
+                }
+            }
+            assert!(defense.terminal_failure().is_some(), "invalid {invalid}");
+            assert_eq!(
+                defense.realized_total[INCOMING],
+                if invalid == 4 { 599 } else { 0 }
+            );
+        }
     }
 
     fn oracle_direction_index(direction: Direction) -> usize {

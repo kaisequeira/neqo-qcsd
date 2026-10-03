@@ -1163,6 +1163,7 @@ impl Defense for WtfPad {
             | SignalKind::ApplicationBatchCompleted
             | SignalKind::IncomingCreditScheduled { .. }
             | SignalKind::IncomingCreditAdvertised { .. }
+            | SignalKind::TerminalPrimaryPartial { .. }
             | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::TrafficMorphingEgress { .. } => {}
         }
