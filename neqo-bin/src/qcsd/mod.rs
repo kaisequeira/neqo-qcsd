@@ -571,7 +571,7 @@ impl Args {
                     application_response_policy,
                     application_workload_source
                         .as_ref()
-                        .map(|(_, _, _, policy)| *policy),
+                        .map(|(_, _, _, policy, _)| *policy),
                 )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
@@ -1343,6 +1343,7 @@ struct RunSpec {
         String,
         BTreeMap<u32, PreparedExpectedResponse>,
         ApplicationResponsePolicy,
+        QualifiedChaffOriginPolicy,
     )>,
     application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
@@ -9915,6 +9916,73 @@ struct PreparedExpectedResponse {
     body_sha256: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum QualifiedChaffOriginPolicy {
+    #[default]
+    PrimaryOrigin,
+    PreparedApprovedOrigins(BTreeSet<String>),
+}
+
+impl QualifiedChaffOriginPolicy {
+    fn from_preparation(preparation: &serde_json::Value) -> Result<Self, Error> {
+        let Some(policy) = preparation.get("qualified_chaff_origin_policy") else {
+            return Ok(Self::PrimaryOrigin);
+        };
+        if policy.as_str() != Some("prepared-approved-origins-v1") {
+            return Err(Error::Argument(
+                "present qualified_chaff_origin_policy must be prepared-approved-origins-v1".into(),
+            ));
+        }
+        let origins = preparation
+            .get("approved_origins")
+            .and_then(serde_json::Value::as_array)
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| {
+                Error::Argument(
+                    "approved-origin chaff requires a non-empty preparation.approved_origins array"
+                        .into(),
+                )
+            })?;
+        let mut approved = BTreeSet::new();
+        for value in origins {
+            let origin = value.as_str().ok_or_else(|| {
+                Error::Argument("approved chaff origins must be canonical HTTPS strings".into())
+            })?;
+            // Reuse the same canonical origin derivation as endpoint routing;
+            // equality rejects paths, credentials, case aliases and port aliases.
+            let resource = Resource {
+                id: 0,
+                url: origin.into(),
+                kind: "Other".into(),
+                content_length: None,
+                data_length: 0,
+                chaff_priority: false,
+                known_valid: false,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            };
+            if resource.origin().as_deref() != Some(origin) || !approved.insert(origin.into()) {
+                return Err(Error::Argument(
+                    "approved chaff origins must be unique canonical HTTPS origins".into(),
+                ));
+            }
+        }
+        Ok(Self::PreparedApprovedOrigins(approved))
+    }
+
+    fn permits(&self, resource: &Resource, application: &Resource) -> bool {
+        match self {
+            Self::PrimaryOrigin => resource.origin() == application.origin(),
+            Self::PreparedApprovedOrigins(approved) => {
+                resource.id != 0
+                    && resource
+                        .origin()
+                        .is_some_and(|origin| approved.contains(&origin))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct PacketDirectionStats {
     packet_count: u64,
@@ -10344,6 +10412,7 @@ fn selected_identity_chaff_resource<'a>(
     expected: &'a BTreeMap<u32, PreparedExpectedResponse>,
     application: &Resource,
     selected_chaff_resource_id: u32,
+    origin_policy: &QualifiedChaffOriginPolicy,
 ) -> Result<(&'a Resource, &'a PreparedExpectedResponse), Error> {
     let resource = workload
         .resources
@@ -10359,12 +10428,22 @@ fn selected_identity_chaff_resource<'a>(
     })?;
     if !resource.known_valid
         || resource.origin().is_none()
-        || resource.origin() != application.origin()
+        || !origin_policy.permits(resource, application)
+        || matches!(
+            origin_policy,
+            QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+        ) && !(200..300).contains(&response.status)
         || response.bytes < 1_200
     {
         return Err(Error::Argument(
-            "selected identity-chaff resource must be known-valid, same-origin, and have a prepared body of at least 1200 bytes"
-                .into(),
+            match origin_policy {
+                QualifiedChaffOriginPolicy::PrimaryOrigin => {
+                    "selected identity-chaff resource must be known-valid, same-origin, and have a prepared body of at least 1200 bytes"
+                }
+                QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_) => {
+                    "selected identity-chaff resource must be a known-valid 2xx auxiliary resource from a frozen approved origin with a prepared body of at least 1200 bytes"
+                }
+            }.into(),
         ));
     }
     projected_identity_chaff_headers(resource)?;
@@ -10547,7 +10626,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses, _) =
+    let (workload, workload_hash, expected_responses, _, origin_policy) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -10574,6 +10653,7 @@ async fn qualify_chaff_response(
             &expected_responses,
             application,
             selected_chaff_resource_id,
+            &origin_policy,
         )?,
     };
     let request_headers = match mode {
@@ -11360,7 +11440,7 @@ async fn qualify_chaff_prefix(
     output_dir: &Path,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let (application_source, application_source_sha256, prepared_expected_responses, _) =
+    let (application_source, application_source_sha256, prepared_expected_responses, _, _) =
         load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
@@ -12056,6 +12136,7 @@ fn load_application_workload_source(
         String,
         BTreeMap<u32, PreparedExpectedResponse>,
         ApplicationResponsePolicy,
+        QualifiedChaffOriginPolicy,
     ),
     Error,
 > {
@@ -12068,6 +12149,7 @@ fn load_application_workload_source(
         ));
     }
     let policy = ApplicationResponsePolicy::from_preparation(&source.preparation)?;
+    let origin_policy = QualifiedChaffOriginPolicy::from_preparation(&source.preparation)?;
     let manifest = ResourceManifest {
         resources: source.resources,
     };
@@ -12120,7 +12202,7 @@ fn load_application_workload_source(
                 .into(),
         ));
     }
-    Ok((manifest, sha256(&bytes)?, by_id, policy))
+    Ok((manifest, sha256(&bytes)?, by_id, policy, origin_policy))
 }
 
 fn load_chaff_manifest(path: &Path) -> Result<(RuntimeChaffManifest, String), Error> {
@@ -12697,13 +12779,13 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     if spec
         .application_workload_source
         .as_ref()
-        .is_some_and(|(_, _, _, policy)| *policy != spec.application_response_policy)
+        .is_some_and(|(_, _, _, policy, _)| *policy != spec.application_response_policy)
     {
         return Err(Error::Argument(
             "run application response policy differs from its frozen prepared source".into(),
         ));
     }
-    if let Some((source, _, _, _)) = &spec.application_workload_source {
+    if let Some((source, _, _, _, _)) = &spec.application_workload_source {
         spec.application_response_policy
             .validate_source_binding(&spec.workload, source)?;
     }
@@ -12905,7 +12987,8 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash, expected_responses, _)) = &spec.application_workload_source
+    let Some((source, source_hash, expected_responses, _, origin_policy)) =
+        &spec.application_workload_source
     else {
         return Err(Error::Argument(
             "qualified chaff requires an exact application workload source binding".into(),
@@ -12974,6 +13057,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
             expected_responses,
             source_application_root,
             selected_chaff_resource_id,
+            origin_policy,
         )?;
     } else {
         let (deterministic_selected, deterministic_response) =
@@ -13042,7 +13126,11 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         ));
     }
     if selected.origin().is_none()
-        || selected.origin() != application_root.origin()
+        || if chaff.is_identity_chaff_v4() {
+            !origin_policy.permits(selected, application_root)
+        } else {
+            selected.origin() != application_root.origin()
+        }
         || selected.url != qualified.url
         || selected.kind != qualified.kind
         || selected.chaff_priority != qualified.chaff_priority
@@ -22166,7 +22254,7 @@ fn render_run_json(
         "request_policy": spec.request_policy,
         "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _)| hash),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _)| hash),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -24023,6 +24111,7 @@ mod tests {
                 "e".repeat(64),
                 expected,
                 ApplicationResponsePolicy::default(),
+                super::QualifiedChaffOriginPolicy::default(),
             )),
             application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
@@ -24061,6 +24150,254 @@ mod tests {
         let mut legacy_spec = spec;
         legacy_spec.chaff_manifest = Some(schema_three.into());
         assert!(validate_qualified_chaff_binding(&legacy_spec).is_err());
+    }
+
+    fn approved_origin_chaff_spec() -> RunSpec {
+        let mut spec = terminal_http_error_spec(ApplicationResponsePolicy::default());
+        let headers = vec![
+            ("accept".into(), "text/html".into()),
+            ("accept-encoding".into(), "gzip, br".into()),
+            ("accept-language".into(), "en-AU".into()),
+        ];
+        for resource in &mut spec.workload.resources {
+            resource.known_valid = true;
+            resource.headers = headers.clone();
+        }
+        spec.workload.resources[0].url = "https://example.com/".into();
+        spec.workload.resources[1].url = "https://cdn.example.com/site.css".into();
+        spec.workload.resources[1].kind = "Stylesheet".into();
+        let expected = BTreeMap::from([
+            (
+                0,
+                PreparedExpectedResponse {
+                    resource_id: 0,
+                    status: 200,
+                    bytes: 6_165,
+                    body_sha256: "a".repeat(64),
+                },
+            ),
+            (
+                1,
+                PreparedExpectedResponse {
+                    resource_id: 1,
+                    status: 200,
+                    bytes: 1_463,
+                    body_sha256: "b".repeat(64),
+                },
+            ),
+        ]);
+        let policy = super::QualifiedChaffOriginPolicy::from_preparation(&json!({
+            "qualified_chaff_origin_policy": "prepared-approved-origins-v1",
+            "approved_origins": ["https://example.com", "https://cdn.example.com"],
+        }))
+        .expect("explicit approved-origin policy");
+        spec.application_workload_source = Some((
+            spec.workload.clone(),
+            "e".repeat(64),
+            expected,
+            ApplicationResponsePolicy::default(),
+            policy,
+        ));
+        spec.chaff_manifest = Some(
+            response_only_chaff_manifest_v4(
+                1,
+                "https://cdn.example.com/site.css",
+                1_500,
+                &"c".repeat(64),
+            )
+            .into(),
+        );
+        spec.config.defense = DefenseConfig::Front(FrontConfig::default());
+        spec.max_response_bytes = 2_000;
+        spec
+    }
+
+    #[test]
+    fn qualified_chaff_origin_policy_absence_preserves_primary_only() {
+        let policy = super::QualifiedChaffOriginPolicy::from_preparation(&json!({
+            "approved_origins": null,
+        }))
+        .expect("legacy metadata does not opt into approved origins");
+        assert_eq!(policy, super::QualifiedChaffOriginPolicy::PrimaryOrigin);
+        let mut spec = approved_origin_chaff_spec();
+        let (source, _, expected, _, _) = spec.application_workload_source.as_ref().unwrap();
+        assert!(
+            super::selected_identity_chaff_resource(
+                source,
+                expected,
+                &source.resources[0],
+                1,
+                &policy,
+            )
+            .is_err()
+        );
+        // Historical identity qualification may still select its primary
+        // document; only the new policy requires a nonzero auxiliary ID.
+        super::selected_identity_chaff_resource(source, expected, &source.resources[0], 0, &policy)
+            .expect("legacy primary document selection");
+        spec.application_workload_source.as_mut().unwrap().4 = policy;
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
+    }
+
+    #[test]
+    fn qualified_chaff_origin_policy_rejects_present_unknown_or_malformed() {
+        for policy in [
+            json!(null),
+            json!("primary-origin-v1"),
+            json!("other-policy"),
+            json!(true),
+            json!(4),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(
+                super::QualifiedChaffOriginPolicy::from_preparation(&json!({
+                    "qualified_chaff_origin_policy": policy,
+                    "approved_origins": ["https://example.com"],
+                }))
+                .is_err()
+            );
+            let mut source = terminal_http_error_source();
+            source["preparation"]["qualified_chaff_origin_policy"] = policy;
+            source["preparation"]["approved_origins"] = json!(["https://example.com"]);
+            assert_terminal_http_error_source(&source, false);
+        }
+    }
+
+    #[test]
+    fn qualified_chaff_origin_policy_rejects_invalid_approved_origin_inventory() {
+        for origins in [
+            json!(null),
+            json!([]),
+            json!("https://example.com"),
+            json!([null]),
+            json!(["http://example.com"]),
+            json!(["https://user@example.com"]),
+            json!(["https://EXAMPLE.com"]),
+            json!(["https://example.com/"]),
+            json!(["https://example.com/path"]),
+            json!(["https://example.com:443"]),
+            json!(["https://example.com", "https://example.com"]),
+        ] {
+            let mut source = terminal_http_error_source();
+            source["preparation"]["qualified_chaff_origin_policy"] =
+                json!("prepared-approved-origins-v1");
+            source["preparation"]["approved_origins"] = origins;
+            assert_terminal_http_error_source(&source, false);
+        }
+        let mut source = terminal_http_error_source();
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        assert_terminal_http_error_source(&source, false);
+    }
+
+    #[test]
+    fn qualified_chaff_origin_policy_source_retains_exact_hash_and_full_graph() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("qualified-chaff-origin-source");
+        let path = output.join("prepared.json");
+        let mut value = terminal_http_error_source();
+        value["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        value["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        let bytes = serde_json::to_vec(&value).expect("serialize opt-in source");
+        fs::write(&path, &bytes).expect("write source");
+        let (source, digest, expected, _, policy) =
+            super::load_application_workload_source(&path).expect("load bound opt-in source");
+        assert_eq!(digest, sha256(&bytes).expect("exact raw-source hash"));
+        assert_eq!(source.resources.len(), 2);
+        assert_eq!(source.resources[1].depends_on, [0]);
+        assert!(!source.resources[1].known_valid);
+        assert_eq!(expected[&1].status, 401);
+        assert_eq!(
+            policy,
+            super::QualifiedChaffOriginPolicy::PreparedApprovedOrigins(BTreeSet::from([
+                "https://example.com".into(),
+                "https://api.example.com".into()
+            ]),)
+        );
+        fs::remove_dir_all(output).expect("remove source test directory");
+    }
+
+    #[test]
+    fn qualified_chaff_origin_policy_accepts_only_approved_auxiliary_identity_resource() {
+        let mut spec = approved_origin_chaff_spec();
+        let (source, _, expected, _, policy) = spec.application_workload_source.as_mut().unwrap();
+        let (resource, response) = super::selected_identity_chaff_resource(
+            source,
+            expected,
+            &source.resources[0],
+            1,
+            policy,
+        )
+        .expect("approved CDN candidate");
+        assert_eq!(resource.url, "https://cdn.example.com/site.css");
+        assert_eq!(response.bytes, 1_463);
+        assert!(
+            super::selected_identity_chaff_resource(
+                source,
+                expected,
+                &source.resources[0],
+                0,
+                policy,
+            )
+            .is_err()
+        );
+        for mutation in 0..5 {
+            let mut invalid_source = source.clone();
+            let mut invalid_expected = expected.clone();
+            match mutation {
+                0 => invalid_source.resources[1].url = "https://unapproved.example/site.css".into(),
+                1 => invalid_source.resources[1].known_valid = false,
+                2 => invalid_expected.get_mut(&1).unwrap().bytes = 1_199,
+                3 => invalid_expected.get_mut(&1).unwrap().status = 401,
+                4 => invalid_source.resources[1].headers.clear(),
+                _ => unreachable!("bounded mutation"),
+            }
+            assert!(
+                super::selected_identity_chaff_resource(
+                    &invalid_source,
+                    &invalid_expected,
+                    &invalid_source.resources[0],
+                    1,
+                    policy,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_chaff_origin_policy_runtime_preserves_source_and_legacy_bindings() {
+        let mut spec = approved_origin_chaff_spec();
+        validate_qualified_chaff_binding(&spec).expect("qualified approved CDN runtime");
+        let original = spec.workload.resources[1].url.clone();
+        spec.workload.resources[1].url = "https://cdn.example.com/other.css".into();
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
+        spec.workload.resources[1].url = original;
+        spec.application_workload_source.as_mut().unwrap().1 = "d".repeat(64);
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
+        spec.application_workload_source.as_mut().unwrap().1 = "e".repeat(64);
+        spec.application_workload_source.as_mut().unwrap().4 =
+            super::QualifiedChaffOriginPolicy::PreparedApprovedOrigins(BTreeSet::from([
+                "https://example.com".into(),
+            ]));
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
+
+        let mut spec = approved_origin_chaff_spec();
+        let mut legacy = response_only_chaff_manifest();
+        legacy.selected_chaff_resource_id = 1;
+        legacy.resources[0].id = 1;
+        legacy.resources[0].url = "https://cdn.example.com/site.css".into();
+        spec.chaff_manifest = Some(legacy.into());
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
+        let mut full = qualified_chaff_manifest(vec![spec.workload.resources[1].clone()]);
+        full.selected_chaff_resource_id = 1;
+        full.resources[0].id = 1;
+        full.resources[0].url = "https://cdn.example.com/site.css".into();
+        spec.chaff_manifest = Some(full.into());
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
     }
 
     #[test]
@@ -32862,7 +33199,7 @@ mod tests {
         let value = terminal_http_error_source();
         let bytes = serde_json::to_vec(&value).expect("serialize source");
         fs::write(&path, &bytes).expect("write source");
-        let (manifest, digest, expected, policy) =
+        let (manifest, digest, expected, policy, _) =
             super::load_application_workload_source(&path).expect("policy source");
         assert_eq!(
             policy,
