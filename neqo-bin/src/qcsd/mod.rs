@@ -571,7 +571,7 @@ impl Args {
                     application_response_policy,
                     application_workload_source
                         .as_ref()
-                        .map(|(_, _, _, policy, _, _, _, _)| *policy),
+                        .map(|(_, _, _, policy, _, _, _, _, _)| *policy),
                 )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
@@ -1517,6 +1517,46 @@ impl TamarawCapturePolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FrontCapturePolicy {
+    #[default]
+    Legacy,
+    RapidV5BoundedCongestionOmission,
+}
+
+impl FrontCapturePolicy {
+    const RAPID_V5_NAME: &'static str =
+        "rapid-v5-front-bounded-outgoing-congestion-omission-1pct-v1";
+
+    fn from_preparation(
+        preparation: &serde_json::Value,
+        application: ApplicationResponsePolicy,
+        primary: PrimaryDocumentIdentityPolicy,
+        chaff_origin: &QualifiedChaffOriginPolicy,
+    ) -> Result<Self, Error> {
+        match preparation.get("front_capture_policy") {
+            None => Ok(Self::Legacy),
+            Some(serde_json::Value::String(policy)) if policy == Self::RAPID_V5_NAME => {
+                if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+                    || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+                    || !matches!(
+                        chaff_origin,
+                        QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+                    )
+                {
+                    return Err(Error::Argument(
+                        "FRONT bounded congestion omission policy requires bound variable-primary, terminal-HTTP, and prepared-approved-origin policies".into(),
+                    ));
+                }
+                Ok(Self::RapidV5BoundedCongestionOmission)
+            }
+            Some(_) => Err(Error::Argument(
+                "prepared FRONT capture policy is invalid".into(),
+            )),
+        }
+    }
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
@@ -1530,6 +1570,7 @@ struct RunSpec {
         PrimaryDocumentIdentityPolicy,
         BufloIncomingCreditReleasePolicy,
         TamarawCapturePolicy,
+        FrontCapturePolicy,
     )>,
     application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
@@ -1544,7 +1585,7 @@ struct RunSpec {
 }
 
 fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, source_hash, _, prepared_application, chaff_origin, primary, policy, _)) =
+    let Some((source, source_hash, _, prepared_application, chaff_origin, primary, policy, _, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -1596,7 +1637,7 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
         || !spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|(_, _, _, _, _, _, policy, _)| policy.name().is_some())
+            .is_some_and(|(_, _, _, _, _, _, policy, _, _)| policy.name().is_some())
         || validate_buflo_incoming_credit_release_policy(spec).is_err()
     {
         return None;
@@ -1614,7 +1655,7 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
 }
 
 fn validate_tamaraw_capture_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, hash, _, application, origin, primary, _, policy)) =
+    let Some((source, hash, _, application, origin, primary, _, policy, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -1675,6 +1716,73 @@ fn tamaraw_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
         "padding_modulus": 100,
         "outgoing_release_window_us": 10_000,
         "historical_outgoing_release_window_us": 5_000,
+        "paper_equivalent": false,
+        "scientific_credit": false,
+    }))
+}
+
+fn validate_front_capture_policy(spec: &RunSpec) -> Result<(), Error> {
+    let Some((source, hash, _, application, origin, primary, _, _, policy)) =
+        &spec.application_workload_source
+    else {
+        return Ok(());
+    };
+    if *policy == FrontCapturePolicy::Legacy {
+        return Ok(());
+    }
+    if !lower_hex_sha256(hash)
+        || *application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+        || spec.application_response_policy != *application
+        || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+        || !matches!(
+            origin,
+            QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+        )
+    {
+        return Err(Error::Argument(
+            "FRONT bounded congestion omission policy is not bound to the frozen prepared application policies".into(),
+        ));
+    }
+    spec.application_response_policy
+        .validate_source_binding(&spec.workload, source)?;
+    if let DefenseConfig::Front(parameters) = &spec.config.defense
+        && (parameters.packet_size != 1_200
+            || parameters.n_client_packets != 900
+            || parameters.n_server_packets != 1_200
+            || parameters.peak_minimum_seconds != 0.1
+            || parameters.peak_maximum_seconds != 2.5
+            || spec.config.control_interval_us != 5_000
+            || spec.config.max_udp_payload_size != 1_200
+            || spec.config.drop_unsatisfied_events)
+    {
+        return Err(Error::Argument(
+            "FRONT bounded congestion omission policy requires fixed research-1200 parameters and the unchanged 5000-us retrying controller".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
+    if !matches!(spec.config.defense, DefenseConfig::Front(_))
+        || !spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| source.8 == FrontCapturePolicy::RapidV5BoundedCongestionOmission)
+        || validate_front_capture_policy(spec).is_err()
+    {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "source": "bound-preparation-v1",
+        "policy": FrontCapturePolicy::RAPID_V5_NAME,
+        "outgoing_omission_reason": "CongestionLimited",
+        "outgoing_omission_ratio_numerator": 1,
+        "outgoing_omission_ratio_denominator": 100,
+        "rounding": "exact-cross-multiplication-no-minimum-one",
+        "packet_size": 1_200,
+        "n_client_packets": 900,
+        "n_server_packets": 1_200,
         "paper_equivalent": false,
         "scientific_credit": false,
     }))
@@ -11054,7 +11162,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _) =
+    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _, _) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -11868,8 +11976,17 @@ async fn qualify_chaff_prefix(
     output_dir: &Path,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let (application_source, application_source_sha256, prepared_expected_responses, _, _, _, _, _) =
-        load_application_workload_source(application_source_path)?;
+    let (
+        application_source,
+        application_source_sha256,
+        prepared_expected_responses,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
     let (prefix_spec, prefix_pack_spec_sha256) = load_prefix_pack_spec(prefix_pack_spec_path)?;
@@ -12568,6 +12685,7 @@ fn load_application_workload_source(
         PrimaryDocumentIdentityPolicy,
         BufloIncomingCreditReleasePolicy,
         TamarawCapturePolicy,
+        FrontCapturePolicy,
     ),
     Error,
 > {
@@ -12651,6 +12769,12 @@ fn load_application_workload_source(
         primary_policy,
         &origin_policy,
     )?;
+    let front_policy = FrontCapturePolicy::from_preparation(
+        &source.preparation,
+        policy,
+        primary_policy,
+        &origin_policy,
+    )?;
     Ok((
         manifest,
         sha256(&bytes)?,
@@ -12660,6 +12784,7 @@ fn load_application_workload_source(
         primary_policy,
         buflo_incoming_policy,
         tamaraw_policy,
+        front_policy,
     ))
 }
 
@@ -13237,18 +13362,19 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     if spec
         .application_workload_source
         .as_ref()
-        .is_some_and(|(_, _, _, policy, _, _, _, _)| *policy != spec.application_response_policy)
+        .is_some_and(|(_, _, _, policy, _, _, _, _, _)| *policy != spec.application_response_policy)
     {
         return Err(Error::Argument(
             "run application response policy differs from its frozen prepared source".into(),
         ));
     }
-    if let Some((source, _, _, _, _, _, _, _)) = &spec.application_workload_source {
+    if let Some((source, _, _, _, _, _, _, _, _)) = &spec.application_workload_source {
         spec.application_response_policy
             .validate_source_binding(&spec.workload, source)?;
     }
     validate_buflo_incoming_credit_release_policy(&spec)?;
     validate_tamaraw_capture_policy(&spec)?;
+    validate_front_capture_policy(&spec)?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
         validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
@@ -13447,7 +13573,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _)) =
+    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _, _)) =
         &spec.application_workload_source
     else {
         return Err(Error::Argument(
@@ -14794,7 +14920,7 @@ fn expected_application_response_length(
 fn application_response_length_hint(spec: &RunSpec, resource: &Resource) -> Option<u64> {
     let variable_primary = resource.id == 0
         && spec.application_workload_source.as_ref().is_some_and(
-            |(_, _, _, _, _, policy, _, _)| {
+            |(_, _, _, _, _, policy, _, _, _)| {
                 *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
             },
         );
@@ -15773,7 +15899,7 @@ fn finish_application_record(
         && record.resource_id == 0
         && spec.is_some_and(|spec| {
             spec.application_workload_source.as_ref().is_some_and(
-                |(_, _, _, _, _, policy, _, _)| {
+                |(_, _, _, _, _, policy, _, _, _)| {
                     *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
                 },
             )
@@ -23031,8 +23157,8 @@ fn render_run_json(
         "request_policy": spec.request_policy,
         "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _)| hash),
-        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _)| *policy).name(),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _, _)| hash),
+        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _, _)| *policy).name(),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -23058,6 +23184,9 @@ fn render_run_json(
     }
     if let Some(policy) = tamaraw_capture_policy_receipt(spec) {
         run["tamaraw_capture_policy"] = policy;
+    }
+    if let Some(policy) = front_capture_policy_receipt(spec) {
+        run["front_capture_policy"] = policy;
     }
     serde_json::to_vec_pretty(&run)
         .expect("serializing a fully materialized serde_json::Value to Vec cannot fail")
@@ -24899,6 +25028,7 @@ mod tests {
                 super::PrimaryDocumentIdentityPolicy::default(),
                 super::BufloIncomingCreditReleasePolicy::default(),
                 super::TamarawCapturePolicy::default(),
+                super::FrontCapturePolicy::default(),
             )),
             application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
@@ -24987,6 +25117,7 @@ mod tests {
             super::PrimaryDocumentIdentityPolicy::default(),
             super::BufloIncomingCreditReleasePolicy::default(),
             super::TamarawCapturePolicy::default(),
+            super::FrontCapturePolicy::default(),
         ));
         spec.chaff_manifest = Some(
             response_only_chaff_manifest_v4(
@@ -25010,7 +25141,7 @@ mod tests {
         .expect("legacy metadata does not opt into approved origins");
         assert_eq!(policy, super::QualifiedChaffOriginPolicy::PrimaryOrigin);
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, _, _, _, _) =
+        let (source, _, expected, _, _, _, _, _, _) =
             spec.application_workload_source.as_ref().unwrap();
         assert!(
             super::selected_identity_chaff_resource(
@@ -25094,7 +25225,7 @@ mod tests {
             json!(["https://example.com", "https://api.example.com"]);
         let bytes = serde_json::to_vec(&value).expect("serialize opt-in source");
         fs::write(&path, &bytes).expect("write source");
-        let (source, digest, expected, _, policy, _, _, _) =
+        let (source, digest, expected, _, policy, _, _, _, _) =
             super::load_application_workload_source(&path).expect("load bound opt-in source");
         assert_eq!(digest, sha256(&bytes).expect("exact raw-source hash"));
         assert_eq!(source.resources.len(), 2);
@@ -25114,7 +25245,7 @@ mod tests {
     #[test]
     fn qualified_chaff_origin_policy_accepts_only_approved_auxiliary_identity_resource() {
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, policy, _, _, _) =
+        let (source, _, expected, _, policy, _, _, _, _) =
             spec.application_workload_source.as_mut().unwrap();
         let (resource, response) = super::selected_identity_chaff_resource(
             source,
@@ -34448,6 +34579,199 @@ mod tests {
         spec
     }
 
+    fn front_capture_policy_source() -> serde_json::Value {
+        let mut value = variable_primary_document_source();
+        value["preparation"]["front_capture_policy"] =
+            json!(super::FrontCapturePolicy::RAPID_V5_NAME);
+        value["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        value["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        value
+    }
+
+    fn front_capture_policy_spec() -> RunSpec {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("front-bounded-congestion-policy-source");
+        let path = output.join("prepared.json");
+        let raw = serde_json::to_vec(&front_capture_policy_source()).expect("prepared policy");
+        fs::write(&path, &raw).expect("frozen source");
+        let bound = super::load_application_workload_source(&path).expect("bound policy source");
+        assert_eq!(bound.1, sha256(&raw).expect("actual frozen-source hash"));
+        assert_eq!(
+            bound.8,
+            super::FrontCapturePolicy::RapidV5BoundedCongestionOmission
+        );
+        let mut spec =
+            terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        spec.workload = bound.0.clone();
+        spec.application_workload_source = Some(bound);
+        spec.max_response_bytes = 1_048_576;
+        spec.config = QcsdConfig {
+            max_udp_payload_size: 1_200,
+            control_interval_us: 5_000,
+            drop_unsatisfied_events: false,
+            defense: DefenseConfig::Front(FrontConfig {
+                n_client_packets: 900,
+                n_server_packets: 1_200,
+                packet_size: 1_200,
+                peak_minimum_seconds: 0.1,
+                peak_maximum_seconds: 2.5,
+            }),
+            ..QcsdConfig::default()
+        };
+        fs::remove_dir_all(output).expect("source parsed before execution");
+        spec
+    }
+
+    #[test]
+    fn front_capture_policy_rejects_unknown_or_unbound_prepared_values() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("front-bounded-congestion-invalid-source");
+        let path = output.join("prepared.json");
+        for invalid in [
+            json!(null),
+            json!(false),
+            json!(1),
+            json!({}),
+            json!("unknown"),
+        ] {
+            let mut source = front_capture_policy_source();
+            source["preparation"]["front_capture_policy"] = invalid;
+            fs::write(&path, serde_json::to_vec(&source).expect("source")).expect("fixture");
+            assert!(super::load_application_workload_source(&path).is_err());
+        }
+        for field in [
+            "application_response_policy",
+            "primary_document_identity_policy",
+            "qualified_chaff_origin_policy",
+        ] {
+            let mut source = front_capture_policy_source();
+            source["preparation"]
+                .as_object_mut()
+                .expect("preparation")
+                .remove(field);
+            fs::write(&path, serde_json::to_vec(&source).expect("source")).expect("fixture");
+            assert!(
+                super::load_application_workload_source(&path).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut source = front_capture_policy_source();
+        source["preparation"]
+            .as_object_mut()
+            .expect("preparation")
+            .remove("front_capture_policy");
+        fs::write(&path, serde_json::to_vec(&source).expect("source")).expect("fixture");
+        assert_eq!(
+            super::load_application_workload_source(&path)
+                .expect("legacy source")
+                .8,
+            super::FrontCapturePolicy::Legacy
+        );
+        fs::remove_dir_all(output).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn front_capture_policy_marker_is_exact_and_other_four_modes_get_no_override() {
+        let mut spec = front_capture_policy_spec();
+        super::validate_front_capture_policy(&spec).expect("fixed FRONT source policy");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["front_capture_policy"],
+            json!({
+                "schema_version": 1, "source": "bound-preparation-v1",
+                "policy": super::FrontCapturePolicy::RAPID_V5_NAME,
+                "outgoing_omission_reason": "CongestionLimited",
+                "outgoing_omission_ratio_numerator": 1,
+                "outgoing_omission_ratio_denominator": 100,
+                "rounding": "exact-cross-multiplication-no-minimum-one",
+                "packet_size": 1_200, "n_client_packets": 900, "n_server_packets": 1_200,
+                "paper_equivalent": false, "scientific_credit": false,
+            })
+        );
+        assert!(run.get("tamaraw_capture_policy").is_none());
+        assert!(run.get("buflo_incoming_credit_release_policy").is_none());
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "unused.json".into(),
+            }),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            super::validate_front_capture_policy(&spec).expect("shared source flag is inert");
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+            assert!(
+                buflo_incoming_credit_release_policy_run(&spec)
+                    .get("front_capture_policy")
+                    .is_none()
+            );
+        }
+        let mut legacy = front_capture_policy_spec();
+        legacy
+            .application_workload_source
+            .as_mut()
+            .expect("source")
+            .8 = super::FrontCapturePolicy::Legacy;
+        super::validate_front_capture_policy(&legacy).expect("legacy remains valid");
+        assert!(super::front_capture_policy_receipt(&legacy).is_none());
+        legacy.application_workload_source = None;
+        assert!(super::front_capture_policy_receipt(&legacy).is_none());
+    }
+
+    #[test]
+    fn front_capture_policy_rejects_changed_runtime_graph_source_and_parameters() {
+        for change in 0..15 {
+            let mut spec = front_capture_policy_spec();
+            match change {
+                0 => spec.config.control_interval_us = 6_000,
+                1 => spec.config.max_udp_payload_size = 1_500,
+                2 => spec.config.drop_unsatisfied_events = true,
+                3..=7 => {
+                    let DefenseConfig::Front(parameters) = &mut spec.config.defense else {
+                        unreachable!()
+                    };
+                    match change {
+                        3 => parameters.packet_size = 1_450,
+                        4 => parameters.n_client_packets = 901,
+                        5 => parameters.n_server_packets = 1_201,
+                        6 => parameters.peak_minimum_seconds = 0.2,
+                        _ => parameters.peak_maximum_seconds = 2.6,
+                    }
+                }
+                8 => {
+                    spec.application_workload_source.as_mut().expect("source").1 = "invalid".into()
+                }
+                9 => {
+                    spec.application_workload_source.as_mut().expect("source").4 =
+                        super::QualifiedChaffOriginPolicy::default()
+                }
+                10 => {
+                    spec.application_workload_source.as_mut().expect("source").5 =
+                        super::PrimaryDocumentIdentityPolicy::default()
+                }
+                11 => spec.application_response_policy = ApplicationResponsePolicy::default(),
+                12 => spec.workload.resources[0].url = "https://unapproved.example/".into(),
+                13 => {
+                    spec.workload.resources.pop();
+                }
+                _ => {
+                    spec.application_workload_source.as_mut().expect("source").3 =
+                        ApplicationResponsePolicy::default()
+                }
+            }
+            assert!(
+                super::validate_front_capture_policy(&spec).is_err(),
+                "changed field {change}"
+            );
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+        }
+    }
+
     fn tamaraw_capture_policy_source() -> serde_json::Value {
         let mut value = variable_primary_document_source();
         value["preparation"]["tamaraw_capture_policy"] =
@@ -35368,7 +35692,7 @@ mod tests {
         let value = terminal_http_error_source();
         let bytes = serde_json::to_vec(&value).expect("serialize source");
         fs::write(&path, &bytes).expect("write source");
-        let (manifest, digest, expected, policy, _, _, _, _) =
+        let (manifest, digest, expected, policy, _, _, _, _, _) =
             super::load_application_workload_source(&path).expect("policy source");
         assert_eq!(
             policy,

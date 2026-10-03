@@ -4395,11 +4395,20 @@ impl QcsdController {
                     // pristine parser continuation, never speculative body work.
                     // Exact-window modes commit complete cells atomically;
                     // Tamaraw owned-retry retains real partial releases.
-                    let amount = self.streams.claim_stream(
-                        opportunity.endpoint,
-                        opportunity.stream,
-                        incoming.remaining.min(parser_continuation),
-                    );
+                    let requested = incoming.remaining.min(parser_continuation);
+                    let amount = if self.incoming_requires_explicit_physical_ownership() {
+                        self.streams.claim_scheduled_parser_lease(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                            requested,
+                        )
+                    } else {
+                        self.streams.claim_stream(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                            requested,
+                        )
+                    };
                     incoming.remaining = incoming.remaining.saturating_sub(amount);
                     if amount > 0 {
                         staged_claims.push(PendingClaim {
@@ -9074,7 +9083,8 @@ mod tests {
     fn tamaraw_owned_retry_parser_claims_require_current_frontier_and_retire_unused_credit() {
         for (tail, blocked, expected_lease) in [
             (0, None, 16),
-            (1, Some(1_016), 1),
+            (1, Some(1_016), 2),
+            (2, Some(1_016), 1),
             (1, None, 0),
             (1, Some(1_015), 0),
         ] {
@@ -20089,9 +20099,18 @@ mod tests {
         reason = "the retained live primary frontier must cross actual observations, allocation, and lease ownership together"
     )]
     fn exact_cell_bridges_only_peer_proven_blocked_short_primary_tail() {
-        for blocked_at in [1_015, 1_016] {
-            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 600)
-                .expect("exact CS-BuFLO cell policy");
+        for (size, tail, blocked_at) in [
+            (600, 1, 1_015),
+            (600, 1, 1_016),
+            (600, 2, 1_015),
+            (600, 2, 1_016),
+            (1_200, 1, 1_015),
+            (1_200, 1, 1_016),
+            (1_200, 2, 1_015),
+            (1_200, 2, 1_016),
+        ] {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, size)
+                .expect("exact CS-BuFLO/BuFLO cell policy");
             let (mut defense, _) = ExactIncomingOneShot::new(packet);
             defense.event = None;
             let mut controller = QcsdController::with_defense(
@@ -20182,7 +20201,7 @@ mod tests {
                     endpoint,
                     stream: primary,
                     frame_header_bytes: 2,
-                    data_bytes: 13,
+                    data_bytes: 14 - tail,
                 },
                 Duration::ZERO,
             );
@@ -20190,7 +20209,7 @@ mod tests {
                 QcsdObservation::BytesRead {
                     endpoint,
                     stream: primary,
-                    bytes: 15,
+                    bytes: 16 - tail,
                 },
                 Duration::ZERO,
             );
@@ -20205,7 +20224,7 @@ mod tests {
             );
             assert!(
                 controller.next_action().is_none(),
-                "the existing one-byte tail gives no speculative lease"
+                "the existing short tail gives no speculative lease"
             );
             controller.observe(
                 QcsdObservation::StreamDataBlocked {
@@ -20219,7 +20238,7 @@ mod tests {
                 controller.next_action().is_none(),
                 "blocked evidence alone creates no credit"
             );
-            let (slot, _, elapsed) = install_exact_parser_cell(&mut controller, 0, 600);
+            let (slot, _, elapsed) = install_exact_parser_cell(&mut controller, 0, size);
             let actions: Vec<_> = controller.drain_actions().collect();
             let primary_lease = actions.iter().find_map(|action| match action {
                 QcsdAction::LeaseParserReceive {
@@ -20246,18 +20265,19 @@ mod tests {
             if blocked_at == 1_016 {
                 let (absolute_limit, increase, owner) =
                     primary_lease.expect("actual blocked frontier advances");
-                assert_eq!((absolute_limit, increase), (1_017, 1));
+                let required = 3 - tail;
+                assert_eq!((absolute_limit, increase), (1_016 + required, required));
                 assert!(
                     owner.is_some(),
-                    "the one-byte bridge is owned by this scheduled cell"
+                    "the complete minimum DATA opportunity is owned by this scheduled cell"
                 );
-                assert_eq!(auxiliary_increase, 599);
+                assert_eq!(auxiliary_increase, u64::from(size) - required);
                 controller.observe(
                     QcsdObservation::ReceiveLimitAdvertised {
                         endpoint,
                         stream: primary,
                         absolute_limit,
-                        slot: Some(slot),
+                        slot: None,
                     },
                     elapsed,
                 );
@@ -20269,32 +20289,69 @@ mod tests {
                     },
                     elapsed,
                 );
+                controller.observe(
+                    QcsdObservation::DataFrame {
+                        endpoint,
+                        stream: primary,
+                        frame_header_bytes: 2,
+                        data_bytes: 1,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream: primary,
+                        bytes: 1,
+                    },
+                    elapsed,
+                );
                 assert_eq!(
                     controller
                         .defense_diagnostics()
                         .scheduled_incoming_consumed_bytes,
-                    1,
-                    "the pre-existing one byte is not credited to the new scheduled owner"
+                    required,
+                    "the pre-existing tail is not credited to the new scheduled owner"
                 );
             } else {
                 assert!(
                     primary_lease.is_none(),
                     "a mismatching blocked offset has no authority"
                 );
-                assert_eq!(auxiliary_increase, 600);
+                assert_eq!(auxiliary_increase, u64::from(size));
             }
-            assert_eq!(
-                controller
-                    .defense_diagnostics()
-                    .scheduled_incoming_requested_bytes,
-                600
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream: auxiliary,
+                    absolute_limit: 1_000 + auxiliary_increase,
+                    slot: Some(slot),
+                },
+                elapsed,
             );
-            assert_eq!(
-                controller
-                    .defense_diagnostics()
-                    .scheduled_incoming_retired_bytes,
-                0
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: auxiliary,
+                    bytes: 1_000 + auxiliary_increase,
+                },
+                elapsed,
             );
+            assert!(controller.drain_actions().any(|action| matches!(
+                action,
+                QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot
+            )));
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(
+                (
+                    diagnostics.scheduled_incoming_requested_bytes,
+                    diagnostics.scheduled_incoming_advertised_bytes,
+                    diagnostics.scheduled_incoming_consumed_bytes,
+                ),
+                (u64::from(size), u64::from(size), u64::from(size))
+            );
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
         }
     }
 

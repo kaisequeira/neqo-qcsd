@@ -699,6 +699,23 @@ impl StreamRegistry {
         }
     }
 
+    pub(crate) fn claim_scheduled_parser_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        amount: u64,
+    ) -> u64 {
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return 0;
+        };
+        if !state.receive_actions_available {
+            return 0;
+        }
+        state
+            .receive
+            .claim_scheduled_parser_lease_with_blocked(amount, state.parser_blocked_at)
+    }
+
     /// Lease the remaining prefix up to the stream's absolute framing ceiling
     /// after its retained blocked proof agrees with either the prepared floor
     /// or the controller's exact live scheduled prefix.
@@ -946,21 +963,31 @@ mod tests {
         consume_recorded_short_frame(&mut registry, endpoint, stream);
         assert_eq!(
             registry.scheduled_parser_lease_capacity(endpoint, stream),
-            1
+            2
         );
-        assert_eq!(registry.claim_stream(endpoint, stream, 1), 1);
-        registry.restore_claim(endpoint, stream, 1);
+        assert_eq!(
+            registry.claim_scheduled_parser_lease(endpoint, stream, 1),
+            0
+        );
+        assert_eq!(
+            registry.claim_scheduled_parser_lease(endpoint, stream, 2),
+            2
+        );
+        registry.restore_claim(endpoint, stream, 2);
         assert_eq!(
             registry.scheduled_parser_lease_capacity(endpoint, stream),
-            1
+            2
         );
-        assert_eq!(registry.claim_stream(endpoint, stream, 1), 1);
+        assert_eq!(
+            registry.claim_scheduled_parser_lease(endpoint, stream, 2),
+            2
+        );
         let lease = registry
-            .parser_lease_with_blocked(endpoint, stream, true, 1, None)
-            .expect("proven owned byte");
+            .parser_lease_with_blocked(endpoint, stream, true, 2, None)
+            .expect("complete owned DATA opportunity");
         assert_eq!(
             (lease.absolute_limit, lease.increase, lease.scheduled),
-            (1_017, 1, true)
+            (1_018, 2, true)
         );
         assert_eq!(
             registry.scheduled_parser_lease_capacity(endpoint, stream),

@@ -3970,6 +3970,265 @@ mod tests {
     }
 
     #[cfg(feature = "qcsd")]
+    fn qcsd_connect_http3_pair(
+        client: &mut Http3Client,
+        server: &mut Http3Server,
+        at: std::time::Instant,
+    ) -> Option<Datagram> {
+        // Keep the same datagram handshake as the shared fixture, using the
+        // HTTP/3 types in this crate's test compilation.
+        assert_eq!(client.state(), Http3State::Initializing);
+        let initial = client.process_output(at);
+        let initial_again = client.process_output(at);
+        drop(server.process(initial.dgram(), at));
+        let outgoing = server.process(initial_again.dgram(), at);
+        let outgoing = client.process(outgoing.dgram(), at);
+        let outgoing = server.process(outgoing.dgram(), at);
+        let outgoing = client.process(outgoing.dgram(), at);
+        drop(server.process(outgoing.dgram(), at));
+        assert!(
+            client
+                .events()
+                .any(|event| matches!(event, Http3ClientEvent::AuthenticationNeeded))
+        );
+        client.authenticated(AuthenticationStatus::Ok, at);
+        let outgoing = client.process_output(at);
+        assert_eq!(client.state(), Http3State::Connected);
+        let outgoing = server.process(outgoing.dgram(), at);
+        let outgoing = client.process(outgoing.dgram(), at);
+        let outgoing = server.process(outgoing.dgram(), at);
+        client.process(outgoing.dgram(), at).dgram()
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_pump_http3_pair(
+        client: &mut Http3Client,
+        server: &mut Http3Server,
+        at: &mut std::time::Instant,
+    ) {
+        // Advance the fixture clock for real ACK and pacing callbacks. Every
+        // delivered input remains an actual datagram from the opposite peer.
+        for _ in 0..16 {
+            *at += Duration::from_millis(1);
+            let outgoing = client.process_output(*at).dgram();
+            if let Some(incoming) = server.process(outgoing, *at).dgram() {
+                client.process_input(incoming, *at);
+            }
+        }
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one real HTTP/3 peer proves the exact receive frontier before and after DATA packetization"
+    )]
+    fn qcsd_real_http3_peer_requires_three_wire_bytes_for_one_data_octet() {
+        fixture_init();
+        let mut at = now();
+        let mut client = Http3Client::new(
+            DEFAULT_SERVER_NAME,
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            DEFAULT_ADDR,
+            DEFAULT_ADDR,
+            Http3Parameters::default().connection_parameters(
+                ConnectionParameters::default().max_stream_data(StreamType::BiDi, false, 1_016),
+            ),
+            at,
+        )
+        .expect("create the local HTTP/3 client");
+        let mut server = Http3Server::new(
+            at,
+            DEFAULT_KEYS,
+            DEFAULT_ALPN_H3,
+            anti_replay(),
+            Rc::new(RefCell::new(CountingConnectionIdGenerator::default())),
+            Http3Parameters::default()
+                .max_table_size_encoder(100)
+                .max_table_size_decoder(100)
+                .max_blocked_streams(100)
+                .max_concurrent_push_streams(10),
+            None,
+        )
+        .expect("create the local HTTP/3 server");
+        let outgoing = qcsd_connect_http3_pair(&mut client, &mut server, at);
+        drop(server.process(outgoing, at));
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        enable_qcsd_observations(&mut client);
+
+        let stream = client
+            .fetch(
+                at,
+                "GET",
+                &Uri::from_static("https://something.com/"),
+                &[],
+                Priority::default(),
+            )
+            .expect("create the real request at the current fixture clock");
+        client.stream_close_send(stream, at).unwrap();
+        let qcsd_stream = QcsdStreamId(stream.as_u64());
+        client
+            .register_qcsd_stream(stream, QcsdRequestRole::Application, Some(1))
+            .expect("register variable nonempty primary body");
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint: QcsdEndpointId(7),
+                    stream: qcsd_stream,
+                    initial_limit: 1_016,
+                },
+            )
+            .expect("keep the request's actual initial receive frontier");
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let response = server
+            .events()
+            .find_map(|event| match event {
+                crate::Http3ServerEvent::Headers {
+                    stream: request, ..
+                } if request.stream_id() == stream => Some(request),
+                _ => None,
+            })
+            .expect("real server decoded the request");
+        response
+            .send_headers(&[
+                Header::new(":status", "200"),
+                Header::new("content-type", "text/html"),
+            ])
+            .expect("encode actual response HEADERS");
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let header_observations = drain_qcsd_observations(&mut client);
+        let headers_bytes = header_observations
+            .iter()
+            .find_map(|observation| match observation {
+                QcsdObservation::ResponseHeaders {
+                    stream: observed,
+                    frame_bytes,
+                    status: Some(200),
+                    ..
+                } if *observed == qcsd_stream => Some(*frame_bytes),
+                _ => None,
+            })
+            .expect("client parsed the real response HEADERS");
+        let raw_bytes = |observations: &[QcsdObservation]| {
+            observations
+                .iter()
+                .filter_map(|observation| match observation {
+                    QcsdObservation::BytesRead {
+                        stream: observed,
+                        bytes,
+                        ..
+                    } if *observed == qcsd_stream => Some(*bytes),
+                    _ => None,
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(raw_bytes(&header_observations), headers_bytes);
+        assert!(headers_bytes < 950);
+        let first_body = vec![b'x'; usize::try_from(1_015 - headers_bytes - 3).unwrap()];
+        assert!((64..16_384).contains(&first_body.len()));
+        assert_eq!(
+            response.available().unwrap(),
+            usize::try_from(1_016 - headers_bytes).unwrap()
+        );
+        assert_eq!(
+            response.send_data(&first_body, at).unwrap(),
+            first_body.len()
+        );
+        assert_eq!(response.available().unwrap(), 1);
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let mut body = vec![0; first_body.len()];
+        assert_eq!(
+            client.read_data(at, stream, &mut body).unwrap(),
+            (first_body.len(), false)
+        );
+        assert_eq!(body, first_body);
+        let first_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(headers_bytes + raw_bytes(&first_observations), 1_015);
+        assert!(first_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::DataFrame { stream: observed, frame_header_bytes: 3, data_bytes, .. }
+                if *observed == qcsd_stream && *data_bytes == u64::try_from(first_body.len()).unwrap()
+        )));
+        assert!(first_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::HeaderProgress { stream: observed, min_remaining: 1, awaiting_data_frame: true, .. }
+                if *observed == qcsd_stream
+        )));
+
+        // The retained byte plus a one-byte grant is still too little for
+        // Neqo's atomic two-byte DATA header and one application octet.
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint: QcsdEndpointId(7),
+                    stream: qcsd_stream,
+                    absolute_limit: 1_017,
+                    packet: Packet::new(Duration::ZERO, Direction::Incoming, 1).unwrap(),
+                    slot: QcsdSlotId(1),
+                },
+            )
+            .expect("advertise one real additional wire byte");
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        assert_eq!(response.available().unwrap(), 2);
+        assert_eq!(response.send_data(b"y", at).unwrap(), 0);
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        let mut final_body = [0];
+        assert_eq!(
+            client.read_data(at, stream, &mut final_body).unwrap(),
+            (0, false)
+        );
+        let blocked_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(raw_bytes(&blocked_observations), 0);
+        assert!(!blocked_observations.iter().any(|observation| matches!(
+            observation, QcsdObservation::DataFrame { stream: observed, .. } if *observed == qcsd_stream
+        )));
+        assert!(blocked_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::ReceiveLimitAdvertised { stream: observed, absolute_limit: 1_017, .. }
+                if *observed == qcsd_stream
+        )));
+
+        client
+            .apply_qcsd_action(
+                at,
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint: QcsdEndpointId(7),
+                    stream: qcsd_stream,
+                    absolute_limit: 1_018,
+                    packet: Packet::new(Duration::ZERO, Direction::Incoming, 1).unwrap(),
+                    slot: QcsdSlotId(2),
+                },
+            )
+            .expect("complete the minimum three-byte DATA opportunity");
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        assert_eq!(response.available().unwrap(), 3);
+        assert_eq!(response.send_data(b"y", at).unwrap(), 1);
+        assert_eq!(response.available().unwrap(), 0);
+        response.stream_close_send(at).unwrap();
+        qcsd_pump_http3_pair(&mut client, &mut server, &mut at);
+        assert_eq!(
+            client.read_data(at, stream, &mut final_body).unwrap(),
+            (1, true)
+        );
+        assert_eq!(final_body, [b'y']);
+        let final_observations = drain_qcsd_observations(&mut client);
+        assert_eq!(raw_bytes(&final_observations), 3);
+        assert!(final_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::DataFrame { stream: observed, frame_header_bytes: 2, data_bytes: 1, .. }
+                if *observed == qcsd_stream
+        )));
+        assert!(final_observations.iter().any(|observation| matches!(
+            observation,
+            QcsdObservation::StreamFinished { stream: observed, finish: QcsdStreamFinish::Fin, .. }
+                if *observed == qcsd_stream
+        )));
+        assert_eq!(1_015 + raw_bytes(&final_observations), 1_018);
+    }
+
+    #[cfg(feature = "qcsd")]
     #[test]
     fn qcsd_observes_final_data_zero_data_and_fin_in_raw_causal_order() {
         let (mut client, mut server) = connect();

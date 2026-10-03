@@ -683,7 +683,8 @@ impl ReceiveState {
 
     /// Materialize an exact scheduled continuation with its live peer proof.
     /// A positive advertised suffix cannot authorize another maximum header
-    /// lease: a matching blocked report proves only one byte beyond its limit.
+    /// lease. Its matching blocked report can support only the bounded owned
+    /// prefix needed for the smallest nonempty DATA opportunity.
     pub(crate) fn parser_lease_with_blocked(
         &mut self,
         pristine_data_boundary: bool,
@@ -710,10 +711,10 @@ impl ReceiveState {
             // Reservation was already debited when the complete slot staged
             // this claim. Recheck the frontier, not the now-reduced allowance.
             let ceiling = self.scheduled_parser_lease_ceiling_with_blocked(blocked_at);
-            if ceiling == 0 {
+            if ceiling == 0 || scheduled_backing < ceiling {
                 return None;
             }
-            scheduled_backing.min(ceiling)
+            ceiling
         } else {
             scheduled_backing
         };
@@ -732,10 +733,11 @@ impl ReceiveState {
         self.scheduled_parser_lease_capacity_with_blocked(None)
     }
 
-    /// A short advertised DATA suffix may need one additional raw byte before
-    /// HTTP/3 can expose the next exact frame extent. Permit only the byte
-    /// proven necessary by a current peer blocked report; absence of that
-    /// report preserves the exhausted zero-tail rule and FIN behavior.
+    /// A short advertised DATA suffix must leave room for a two-byte frame
+    /// header and at least one payload byte: real HTTP/3 senders can withhold
+    /// DATA while only two bytes are available. A matching current blocked
+    /// report permits this bounded owned opportunity; absence of that report
+    /// preserves the exhausted zero-tail rule and FIN behavior.
     pub(crate) fn scheduled_parser_lease_capacity_with_blocked(
         &self,
         blocked_at: Option<u64>,
@@ -749,9 +751,47 @@ impl ReceiveState {
             | Self::ReceivingData {
                 reservation_available,
                 ..
-            } => (*reservation_available).min(ceiling),
+            } => {
+                if self.has_positive_parser_tail() && *reservation_available < ceiling {
+                    0
+                } else {
+                    (*reservation_available).min(ceiling)
+                }
+            }
             _ => 0,
         }
+    }
+
+    /// Claim a whole positive-tail DATA opportunity, never an undersized
+    /// prefix that cannot make the peer's minimum nonempty DATA write possible.
+    pub(crate) fn claim_scheduled_parser_lease_with_blocked(
+        &mut self,
+        amount: u64,
+        blocked_at: Option<u64>,
+    ) -> u64 {
+        let capacity = self.scheduled_parser_lease_capacity_with_blocked(blocked_at);
+        let amount = amount.min(capacity);
+        if self.has_positive_parser_tail()
+            && amount < self.scheduled_parser_lease_ceiling_with_blocked(blocked_at)
+        {
+            return 0;
+        }
+        self.claim(amount)
+    }
+
+    const fn has_positive_parser_tail(&self) -> bool {
+        matches!(
+            self,
+            Self::ReceivingHeaders {
+                requested_limit,
+                consumed,
+                ..
+            } | Self::ReceivingData {
+                requested_limit,
+                consumed,
+                ..
+            } if *requested_limit > *consumed
+        )
     }
 
     fn scheduled_parser_lease_ceiling_with_blocked(&self, blocked_at: Option<u64>) -> u64 {
@@ -790,7 +830,9 @@ impl ReceiveState {
                     && raw_tail < MAX_HTTP3_FRAME_HEADER_BYTES
                     && blocked_at == Some(*requested_limit)
                 {
-                    1
+                    MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+                        .saturating_sub(raw_tail)
+                        .max(1)
                 } else {
                     return 0;
                 }
@@ -1149,6 +1191,11 @@ impl ReceiveState {
 /// bytes.  This is enough to classify the frame without leasing its payload.
 const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
 
+/// The smallest nonempty DATA write has a one-byte type, one-byte length and
+/// one payload byte. This is a peer packetization opportunity, not a promise
+/// that an unobserved response body contains another byte.
+const MIN_HTTP3_DATA_OPPORTUNITY_BYTES: u64 = 3;
+
 #[cfg(test)]
 mod tests {
     use super::{MAX_HTTP3_FRAME_HEADER_BYTES, ReceiveState};
@@ -1178,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_blocked_short_tail_owns_only_one_proven_byte_then_discovers_exact_data() {
+    fn parser_blocked_short_tail_owns_a_complete_nonempty_data_opportunity() {
         let mut state = recorded_primary_parser_tail();
         assert_eq!(state.scheduled_parser_lease_capacity(), 0);
         for proof in [None, Some(1_015), Some(1_017)] {
@@ -1186,7 +1233,7 @@ mod tests {
         }
         assert_eq!(
             state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
-            1
+            2
         );
         if let ReceiveState::ReceivingData {
             reservation_available,
@@ -1195,29 +1242,92 @@ mod tests {
         {
             *reservation_available = 1;
         }
-        assert_eq!(state.claim(1), 1);
+        assert_eq!(
+            state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
+            0,
+            "one remaining reservation byte cannot establish a three-byte opportunity"
+        );
+        assert_eq!(
+            state.claim_scheduled_parser_lease_with_blocked(1, Some(1_016)),
+            0
+        );
+        assert_eq!(
+            state.parser_lease_with_blocked(true, 1, None, Some(1_016)),
+            None,
+            "an incomplete scheduled owner must not advertise the stalled prefix"
+        );
+        if let ReceiveState::ReceivingData {
+            reservation_available,
+            ..
+        } = &mut state
+        {
+            *reservation_available = 2;
+        }
+        assert_eq!(
+            state.claim_scheduled_parser_lease_with_blocked(1, Some(1_016)),
+            0,
+            "a cell with one byte left cannot split the minimum bridge"
+        );
+        assert_eq!(
+            state.claim_scheduled_parser_lease_with_blocked(2, Some(1_016)),
+            2
+        );
         assert_eq!(
             state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
             0
         );
         assert_eq!(
             state.parser_lease_with_blocked(true, 16, None, Some(1_016)),
-            Some((1_017, 1, true)),
-            "peer demand proves only one additional byte, never sixteen"
+            Some((1_018, 2, true)),
+            "one old byte plus two owned bytes admits DATA header and one payload byte"
         );
-        state.advertised(1_017);
+        state.advertised(1_018);
         state.bytes_read(2);
         state.data_frame(2, 1);
-        assert_eq!(state.available(), 1);
-        assert_eq!(state.release(1), Some((1_018, 1)));
-        state.advertised(1_018);
+        assert_eq!(state.available(), 0);
         state.bytes_read(1);
-        assert_eq!(state.schedule_parser_lease_bytes(1, false), 1);
+        assert_eq!(state.schedule_parser_lease_bytes(2, false), 2);
         assert_eq!(state.close(), (458, 0));
         assert_eq!(
             state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
             0
         );
+    }
+
+    #[test]
+    fn parser_blocked_two_byte_tail_needs_only_one_owned_byte() {
+        let mut state = recorded_primary_parser_tail();
+        let ReceiveState::ReceivingData {
+            consumed,
+            data_length,
+            pending_parser_boundary,
+            ..
+        } = &mut state
+        else {
+            panic!("recorded DATA state");
+        };
+        *consumed -= 1;
+        *data_length -= 1;
+        *pending_parser_boundary = Some(*consumed);
+        assert_eq!(
+            state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
+            1
+        );
+        assert_eq!(
+            state.claim_scheduled_parser_lease_with_blocked(1, Some(1_016)),
+            1
+        );
+        assert_eq!(
+            state.parser_lease_with_blocked(true, 1, None, Some(1_016)),
+            Some((1_017, 1, true))
+        );
+        state.advertised(1_017);
+        state.bytes_read(2);
+        state.data_frame(2, 1);
+        state.bytes_read(1);
+        assert_eq!(state.consumed(), 1_017);
+        assert_eq!(state.schedule_parser_lease_bytes(1, false), 1);
+        assert_eq!(state.close(), (457, 0));
     }
 
     #[test]
