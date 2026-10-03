@@ -29,11 +29,11 @@ use futures::{
 use http::Uri;
 use neqo_common::{Header, datagram, event::Provider as _};
 use neqo_csdef::{
-    ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics, DefenseKind,
-    DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
-    QcsdChaffCancellationReason, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId,
-    QcsdObservation, QcsdObservationClock, QcsdPrearmCancellationReason, QcsdProfile,
-    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    BufloParameters, ChaffManifest, ChaffQualification, DefenseConfig, DefenseDiagnostics,
+    DefenseKind, DependencyTracker, Direction, ExpectedChaffResponse, MissedSlotReason, Packet,
+    QcsdAction, QcsdChaffCancellationReason, QcsdChaffRequestId, QcsdConfig, QcsdController,
+    QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdPrearmCancellationReason,
+    QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
     QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
     QcsdSlotOutcome, QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
     ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
@@ -571,7 +571,7 @@ impl Args {
                     application_response_policy,
                     application_workload_source
                         .as_ref()
-                        .map(|(_, _, _, policy, _)| *policy),
+                        .map(|(_, _, _, policy, _, _, _)| *policy),
                 )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
@@ -924,6 +924,10 @@ struct DefenseParameterProvenance {
     reference_tcp_write_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reference_nominal_tcp_packet_size_bytes: Option<u64>,
+    /// Parsed from the same immutable bytes whose SHA256 is receipted above.
+    /// Retention avoids introducing parameter-file reads into receipt rendering.
+    #[serde(skip)]
+    buflo_parameters: Option<BufloParameters>,
 }
 
 fn defense_parameter_provenance(
@@ -986,6 +990,15 @@ fn defense_parameter_provenance(
             }
         };
     let contents = fs::read(path)?;
+    let buflo_parameters = if matches!(config.defense, DefenseConfig::Buflo(_)) {
+        Some(BufloParameters::from_json(
+            std::str::from_utf8(&contents)
+                .map_err(|_| Error::Argument("BuFLO parameters are not UTF-8".into()))?,
+            config.max_udp_payload_size,
+        )?)
+    } else {
+        None
+    };
     Ok(Some(DefenseParameterProvenance {
         kind,
         path: path.to_string(),
@@ -995,6 +1008,7 @@ fn defense_parameter_provenance(
         early_termination_semantics: early_termination,
         reference_tcp_write_size_bytes: reference_write,
         reference_nominal_tcp_packet_size_bytes: reference_packet,
+        buflo_parameters,
     }))
 }
 
@@ -1334,6 +1348,111 @@ fn resolve_application_response_policy(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PrimaryDocumentIdentityPolicy {
+    #[default]
+    ExactResponseBody,
+    VariablePrimaryDocumentBody,
+}
+
+impl PrimaryDocumentIdentityPolicy {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ExactResponseBody => "exact-response-body-v1",
+            Self::VariablePrimaryDocumentBody => "variable-primary-document-body-v1",
+        }
+    }
+
+    fn from_preparation(
+        preparation: &serde_json::Value,
+        application_policy: ApplicationResponsePolicy,
+        workload: &ResourceManifest,
+        expected: &BTreeMap<u32, PreparedExpectedResponse>,
+    ) -> Result<Self, Error> {
+        let policy = match preparation.get("primary_document_identity_policy") {
+            None => Self::default(),
+            Some(serde_json::Value::String(value)) if value == Self::ExactResponseBody.name() => {
+                Self::ExactResponseBody
+            }
+            Some(serde_json::Value::String(value))
+                if value == Self::VariablePrimaryDocumentBody.name() =>
+            {
+                Self::VariablePrimaryDocumentBody
+            }
+            Some(_) => {
+                return Err(Error::Argument(
+                    "prepared primary document identity policy is invalid".into(),
+                ));
+            }
+        };
+        if policy == Self::VariablePrimaryDocumentBody {
+            let root = workload.resources.iter().find(|resource| resource.id == 0);
+            let max_bytes = preparation
+                .get("max_response_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|limit| *limit > 0);
+            if application_policy != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+                || !root.is_some_and(|root| {
+                    root.kind == "Document"
+                        && root.known_valid
+                        && !root.chaff_priority
+                        && root.depends_on.is_empty()
+                })
+                || !expected.get(&0).is_some_and(|response| {
+                    (200..300).contains(&response.status)
+                        && response.bytes > 0
+                        && max_bytes.is_some_and(|limit| response.bytes <= limit)
+                })
+            {
+                return Err(Error::Argument(
+                    "variable primary document identity requires a bounded known-valid Document root 0 and the terminal HTTP response policy"
+                        .into(),
+                ));
+            }
+        }
+        Ok(policy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum BufloIncomingCreditReleasePolicy {
+    #[default]
+    LegacyControlInterval,
+    RapidV5HalfPeriod,
+}
+
+impl BufloIncomingCreditReleasePolicy {
+    const RAPID_V5_NAME: &'static str = "rapid-v5-half-period-10000us-v1";
+
+    fn from_preparation(
+        preparation: &serde_json::Value,
+        application_policy: ApplicationResponsePolicy,
+        primary_policy: PrimaryDocumentIdentityPolicy,
+    ) -> Result<Self, Error> {
+        let policy = match preparation.get("buflo_incoming_credit_release_policy") {
+            None => Self::default(),
+            Some(serde_json::Value::String(value)) if value == Self::RAPID_V5_NAME => {
+                Self::RapidV5HalfPeriod
+            }
+            Some(_) => {
+                return Err(Error::Argument(
+                    "prepared BuFLO incoming credit release policy is invalid".into(),
+                ));
+            }
+        };
+        if policy == Self::RapidV5HalfPeriod
+            && (application_policy != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+                || primary_policy != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody)
+        {
+            return Err(Error::Argument(
+                "BuFLO incoming half-period policy requires the bound variable primary document and terminal HTTP response policies"
+                    .into(),
+            ));
+        }
+        Ok(policy)
+    }
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
@@ -1344,6 +1463,8 @@ struct RunSpec {
         BTreeMap<u32, PreparedExpectedResponse>,
         ApplicationResponsePolicy,
         QualifiedChaffOriginPolicy,
+        PrimaryDocumentIdentityPolicy,
+        BufloIncomingCreditReleasePolicy,
     )>,
     application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
@@ -1355,6 +1476,72 @@ struct RunSpec {
     output_dir: PathBuf,
     max_response_bytes: u64,
     timeout_seconds: u64,
+}
+
+fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), Error> {
+    let Some((source, source_hash, _, prepared_application, _, primary, policy)) =
+        &spec.application_workload_source
+    else {
+        return Ok(());
+    };
+    if *policy == BufloIncomingCreditReleasePolicy::LegacyControlInterval {
+        return Ok(());
+    }
+    if !lower_hex_sha256(source_hash)
+        || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+        || *prepared_application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+        || spec.application_response_policy != *prepared_application
+    {
+        return Err(Error::Argument(
+            "BuFLO incoming half-period policy is not bound to the validated prepared application policies"
+                .into(),
+        ));
+    }
+    spec.application_response_policy
+        .validate_source_binding(&spec.workload, source)?;
+    if let DefenseConfig::Buflo(config) = &spec.config.defense {
+        let valid_parameters = spec.defense_parameters.as_ref().is_some_and(|provenance| {
+            provenance.kind == "buflo"
+                && provenance.path == config.parameters
+                && lower_hex_sha256(&provenance.sha256)
+                && provenance
+                    .buflo_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| {
+                        parameters.packet_size == 1_200 && parameters.interval_us == 20_000
+                    })
+        });
+        if !valid_parameters || spec.config.control_interval_us != 5_000 {
+            return Err(Error::Argument(
+                "BuFLO incoming half-period policy requires bound 1200-byte cells, a 20000-us period, and the unchanged 5000-us native control interval"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
+    if !matches!(spec.config.defense, DefenseConfig::Buflo(_))
+        || !spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|(_, _, _, _, _, _, policy)| {
+                *policy == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriod
+            })
+        || validate_buflo_incoming_credit_release_policy(spec).is_err()
+    {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "source": "bound-preparation-v1",
+        "policy": BufloIncomingCreditReleasePolicy::RAPID_V5_NAME,
+        "incoming_release_window_us": 10_000,
+        "period_us": 20_000,
+        "cell_bytes": 1_200,
+        "scientific_credit": false,
+    }))
 }
 
 struct RunCompletion<'a> {
@@ -10088,6 +10275,99 @@ enum TestOutputDrive {
     ErrorAt(Instant),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceivePollDisposition {
+    DrainedToWouldBlock,
+    BoundedOneBatch,
+    Error,
+}
+
+impl ReceivePollDisposition {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DrainedToWouldBlock => "drained_to_would_block",
+            Self::BoundedOneBatch => "bounded_one_batch",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceivePollReturn {
+    returned_monotonic_ns: Option<u64>,
+    returned_unix_ns: Option<u64>,
+    disposition: ReceivePollDisposition,
+}
+
+/// The latest actual input-call return, retained until the event loop ends.
+/// Completing an HTTP stream does not retire its endpoint's UDP receive loop.
+struct ReceiveLoopState {
+    origin: Instant,
+    latest_return: Option<ReceivePollReturn>,
+}
+
+impl ReceiveLoopState {
+    const fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            latest_return: None,
+        }
+    }
+
+    fn record_return(
+        &mut self,
+        returned_at: Instant,
+        returned_unix_ns: u128,
+        disposition: ReceivePollDisposition,
+    ) {
+        let returned_monotonic_ns = returned_at
+            .checked_duration_since(self.origin)
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok());
+        // Always replace the prior call, including bounded and failed calls.
+        // A stale successful drain must never become retirement evidence.
+        self.latest_return = Some(ReceivePollReturn {
+            returned_monotonic_ns,
+            returned_unix_ns: u64::try_from(returned_unix_ns)
+                .ok()
+                .filter(|time| *time > 0),
+            disposition,
+        });
+    }
+
+    fn final_drain_return(&self, successfully_complete: bool) -> Option<ReceivePollReturn> {
+        let latest = self.latest_return?;
+        (successfully_complete
+            && latest.disposition == ReceivePollDisposition::DrainedToWouldBlock
+            && latest.returned_monotonic_ns.is_some()
+            && latest.returned_unix_ns.is_some())
+        .then_some(latest)
+    }
+
+    fn receipt(&self, successfully_complete: bool) -> serde_json::Value {
+        let final_drain = self.final_drain_return(successfully_complete);
+        json!({
+            "schema_version": 1,
+            "source": "native-final-udp-receive-drain-v1",
+            "time_basis": "runner-process-start-elapsed-monotonic-v1",
+            "polling_stopped_at_elapsed_ns": final_drain.and_then(|drain| drain.returned_monotonic_ns),
+            "polling_stopped_at_unix_ns": final_drain.and_then(|drain| drain.returned_unix_ns),
+            "disposition": self.latest_return.map_or("not_polled", |latest| latest.disposition.name()),
+            "scientific_credit": false,
+        })
+    }
+}
+
+fn receive_loop_completion_authorized(
+    completion: &RunCompletion<'_>,
+    evidence_render_errors: &[String],
+) -> bool {
+    completion.status == "complete"
+        && completion.ended_unix_ns.is_some()
+        && completion.error.is_none()
+        && completion.error_class.is_none()
+        && evidence_render_errors.is_empty()
+}
+
 struct Endpoint {
     id: QcsdEndpointId,
     origin: Uri,
@@ -10095,6 +10375,7 @@ struct Endpoint {
     local_addr: SocketAddr,
     socket: Socket,
     recv_buf: RecvBuf,
+    receive_loop: ReceiveLoopState,
     client: Http3Client,
     /// Greatest Instant supplied to Neqo for this endpoint. Kernel `BuFLO` may
     /// prepare one packet at a short-lived future physical projection; clamp
@@ -10626,7 +10907,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses, _, origin_policy) =
+    let (workload, workload_hash, expected_responses, _, origin_policy, _, _) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -11440,7 +11721,7 @@ async fn qualify_chaff_prefix(
     output_dir: &Path,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let (application_source, application_source_sha256, prepared_expected_responses, _, _) =
+    let (application_source, application_source_sha256, prepared_expected_responses, _, _, _, _) =
         load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
@@ -12137,6 +12418,8 @@ fn load_application_workload_source(
         BTreeMap<u32, PreparedExpectedResponse>,
         ApplicationResponsePolicy,
         QualifiedChaffOriginPolicy,
+        PrimaryDocumentIdentityPolicy,
+        BufloIncomingCreditReleasePolicy,
     ),
     Error,
 > {
@@ -12202,7 +12485,26 @@ fn load_application_workload_source(
                 .into(),
         ));
     }
-    Ok((manifest, sha256(&bytes)?, by_id, policy, origin_policy))
+    let primary_policy = PrimaryDocumentIdentityPolicy::from_preparation(
+        &source.preparation,
+        policy,
+        &manifest,
+        &by_id,
+    )?;
+    let buflo_incoming_policy = BufloIncomingCreditReleasePolicy::from_preparation(
+        &source.preparation,
+        policy,
+        primary_policy,
+    )?;
+    Ok((
+        manifest,
+        sha256(&bytes)?,
+        by_id,
+        policy,
+        origin_policy,
+        primary_policy,
+        buflo_incoming_policy,
+    ))
 }
 
 fn load_chaff_manifest(path: &Path) -> Result<(RuntimeChaffManifest, String), Error> {
@@ -12779,16 +13081,17 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     if spec
         .application_workload_source
         .as_ref()
-        .is_some_and(|(_, _, _, policy, _)| *policy != spec.application_response_policy)
+        .is_some_and(|(_, _, _, policy, _, _, _)| *policy != spec.application_response_policy)
     {
         return Err(Error::Argument(
             "run application response policy differs from its frozen prepared source".into(),
         ));
     }
-    if let Some((source, _, _, _, _)) = &spec.application_workload_source {
+    if let Some((source, _, _, _, _, _, _)) = &spec.application_workload_source {
         spec.application_response_policy
             .validate_source_binding(&spec.workload, source)?;
     }
+    validate_buflo_incoming_credit_release_policy(&spec)?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
         validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
@@ -12987,7 +13290,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash, expected_responses, _, origin_policy)) =
+    let Some((source, source_hash, expected_responses, _, origin_policy, _, _)) =
         &spec.application_workload_source
     else {
         return Err(Error::Argument(
@@ -14282,6 +14585,28 @@ fn expected_application_response_length(
     (max_response_bytes > 0).then(|| resource.effective_length().min(max_response_bytes))
 }
 
+fn application_response_length_hint(spec: &RunSpec, resource: &Resource) -> Option<u64> {
+    let variable_primary = resource.id == 0
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|(_, _, _, _, _, policy, _)| {
+                *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+            });
+    if variable_primary {
+        // Prepared primary bodies may differ between visits under this explicit
+        // source-bound policy. A prepared length is not a lower bound on the
+        // next response. The policy requires a nonempty primary body, so its
+        // only prepared-independent body floor is one byte. Preserve the
+        // bounded, unadvertised framing reservation and parser continuations;
+        // actual HEADERS and DATA frame extents establish every further byte.
+        // Scheduled cells retain their full consumption requirement.
+        (spec.max_response_bytes > 0).then_some(1)
+    } else {
+        expected_application_response_length(resource, spec.max_response_bytes)
+    }
+}
+
 fn traffic_morphing_endpoint_seed(seed: u64, endpoint: QcsdEndpointId) -> u64 {
     derive(seed, &format!("traffic-morphing-endpoint-{}", endpoint.0)).next_u64()
 }
@@ -14358,10 +14683,7 @@ fn create_endpoints(
                 resource_id: resource.id,
                 url,
                 headers: spec.workload.application_headers(resource.id)?,
-                expected_response_length: expected_application_response_length(
-                    resource,
-                    spec.max_response_bytes,
-                ),
+                expected_response_length: application_response_length_hint(spec, resource),
             });
     }
     grouped
@@ -14416,6 +14738,7 @@ fn create_endpoints(
                 local_addr,
                 socket,
                 recv_buf: RecvBuf::default(),
+                receive_loop: ReceiveLoopState::new(start),
                 client,
                 transport_instant_floor: start,
                 pending,
@@ -15105,6 +15428,15 @@ fn finish_application_record(
     record: &mut StreamRecord,
     spec: Option<&RunSpec>,
 ) -> ResourceRunState {
+    let variable_primary = record.role == QcsdRequestRole::Application
+        && record.resource_id == 0
+        && spec.is_some_and(|spec| {
+            spec.application_workload_source
+                .as_ref()
+                .is_some_and(|(_, _, _, _, _, policy, _)| {
+                    *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+                })
+        });
     let terminal_error_completed = record.role == QcsdRequestRole::Application
         && record.outcome == "in_flight"
         && u64::try_from(record.body.len()).ok() == Some(record.bytes)
@@ -15121,6 +15453,7 @@ fn finish_application_record(
                     .permits_terminal_error(&spec.workload, record.resource_id)
         });
     let succeeded = record.complete
+        && (!variable_primary || record.bytes > 0)
         && (record
             .status
             .is_some_and(|status| (200..300).contains(&status))
@@ -22032,43 +22365,59 @@ fn process_input(
     controller: &mut QcsdController,
     traces: &mut TraceFiles,
     observation_clock: &QcsdObservationClock,
-    now: Instant,
+    input_now: Instant,
     defense_elapsed: Option<Duration>,
     drain_socket: bool,
 ) -> Result<(), Error> {
-    let transport_at = endpoint.transport_instant(now);
-    while let Some(datagrams) = endpoint
-        .socket
-        .recv(endpoint.local_addr, &mut endpoint.recv_buf)?
-    {
-        for datagram in datagrams {
-            traces.packet(&PacketTraceRow {
-                now,
-                endpoint: endpoint.id,
-                direction: "incoming",
-                observed: datagram.len(),
-                scheduled: None,
-                satisfaction: "observed",
-                slot: None,
-                qcsd: QcsdTraceColumns::default(),
-            })?;
-            if let Some((observation, at)) = datagram_observation(
-                endpoint.id,
-                Direction::Incoming,
-                u16::try_from(datagram.len()).unwrap_or(u16::MAX),
-                defense_elapsed,
-            ) {
-                let record = observation_clock.record_at(observation, now);
-                traces.observation(Some(endpoint.id), &record)?;
-                controller.observe(record.into_observation(), at);
+    let result = (|| -> Result<ReceivePollDisposition, Error> {
+        let transport_at = endpoint.transport_instant(input_now);
+        while let Some(datagrams) = endpoint
+            .socket
+            .recv(endpoint.local_addr, &mut endpoint.recv_buf)?
+        {
+            for datagram in datagrams {
+                traces.packet(&PacketTraceRow {
+                    now: input_now,
+                    endpoint: endpoint.id,
+                    direction: "incoming",
+                    observed: datagram.len(),
+                    scheduled: None,
+                    satisfaction: "observed",
+                    slot: None,
+                    qcsd: QcsdTraceColumns::default(),
+                })?;
+                if let Some((observation, at)) = datagram_observation(
+                    endpoint.id,
+                    Direction::Incoming,
+                    u16::try_from(datagram.len()).unwrap_or(u16::MAX),
+                    defense_elapsed,
+                ) {
+                    let record = observation_clock.record_at(observation, input_now);
+                    traces.observation(Some(endpoint.id), &record)?;
+                    controller.observe(record.into_observation(), at);
+                }
+                endpoint.client.process_input(datagram, transport_at);
             }
-            endpoint.client.process_input(datagram, transport_at);
+            if !drain_socket {
+                return Ok(ReceivePollDisposition::BoundedOneBatch);
+            }
         }
-        if !drain_socket {
-            break;
-        }
-    }
-    Ok(())
+        Ok(ReceivePollDisposition::DrainedToWouldBlock)
+    })();
+    // These fresh samples follow the actual receive-call return. The UNIX
+    // sample comes last and provides a conservative post-drain wall-clock
+    // bound for host PCAP evidence; neither uses the captured input-call time.
+    let returned_at = now();
+    let returned_unix_ns = unix_nanos();
+    endpoint.receive_loop.record_return(
+        returned_at,
+        returned_unix_ns,
+        result
+            .as_ref()
+            .copied()
+            .unwrap_or(ReceivePollDisposition::Error),
+    );
+    result.map(|_| ())
 }
 
 fn response_result(record: &StreamRecord) -> Result<ResponseResult, Error> {
@@ -22203,6 +22552,11 @@ fn render_run_json(
         &spec.config.defense,
         completion.defense_diagnostics.as_ref(),
     );
+    // Only the terminal successful run path can assert that these retained
+    // input returns were the final polls. Evidence finalization failures must
+    // not promote an earlier drain into a successful retirement boundary.
+    let receive_loop_successfully_complete =
+        receive_loop_completion_authorized(completion, evidence_render_errors);
     let endpoint_data: Vec<_> = endpoints
         .iter()
         .map(|endpoint| {
@@ -22218,6 +22572,7 @@ fn render_run_json(
                 },
                 "negotiated_protocol": endpoint.client.tls_info().and_then(|info| info.alpn()),
                 "transport_stats": format!("{:?}", endpoint.client.transport_stats()),
+                "receive_lifecycle": endpoint.receive_loop.receipt(receive_loop_successfully_complete),
             })
         })
         .collect();
@@ -22240,7 +22595,7 @@ fn render_run_json(
     } else {
         Some("run-artifact-evidence-finalization-v1")
     };
-    let run = json!({
+    let mut run = json!({
         "neqo_version": env!("CARGO_PKG_VERSION"),
         "neqo_base_commit": NEQO_BASE_COMMIT,
         "published_qcsd_commit": PUBLISHED_QCSD_COMMIT,
@@ -22254,7 +22609,8 @@ fn render_run_json(
         "request_policy": spec.request_policy,
         "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _)| hash),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _)| hash),
+        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _)| *policy).name(),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -22275,6 +22631,9 @@ fn render_run_json(
         "responses": responses,
         "chaff_responses": chaff_responses,
     });
+    if let Some(policy) = buflo_incoming_credit_release_receipt(spec) {
+        run["buflo_incoming_credit_release_policy"] = policy;
+    }
     serde_json::to_vec_pretty(&run)
         .expect("serializing a fully materialized serde_json::Value to Vec cannot fail")
 }
@@ -24112,6 +24471,8 @@ mod tests {
                 expected,
                 ApplicationResponsePolicy::default(),
                 super::QualifiedChaffOriginPolicy::default(),
+                super::PrimaryDocumentIdentityPolicy::default(),
+                super::BufloIncomingCreditReleasePolicy::default(),
             )),
             application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
@@ -24197,6 +24558,8 @@ mod tests {
             expected,
             ApplicationResponsePolicy::default(),
             policy,
+            super::PrimaryDocumentIdentityPolicy::default(),
+            super::BufloIncomingCreditReleasePolicy::default(),
         ));
         spec.chaff_manifest = Some(
             response_only_chaff_manifest_v4(
@@ -24220,7 +24583,7 @@ mod tests {
         .expect("legacy metadata does not opt into approved origins");
         assert_eq!(policy, super::QualifiedChaffOriginPolicy::PrimaryOrigin);
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, _) = spec.application_workload_source.as_ref().unwrap();
+        let (source, _, expected, _, _, _, _) = spec.application_workload_source.as_ref().unwrap();
         assert!(
             super::selected_identity_chaff_resource(
                 source,
@@ -24303,7 +24666,7 @@ mod tests {
             json!(["https://example.com", "https://api.example.com"]);
         let bytes = serde_json::to_vec(&value).expect("serialize opt-in source");
         fs::write(&path, &bytes).expect("write source");
-        let (source, digest, expected, _, policy) =
+        let (source, digest, expected, _, policy, _, _) =
             super::load_application_workload_source(&path).expect("load bound opt-in source");
         assert_eq!(digest, sha256(&bytes).expect("exact raw-source hash"));
         assert_eq!(source.resources.len(), 2);
@@ -24323,7 +24686,8 @@ mod tests {
     #[test]
     fn qualified_chaff_origin_policy_accepts_only_approved_auxiliary_identity_resource() {
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, policy) = spec.application_workload_source.as_mut().unwrap();
+        let (source, _, expected, _, policy, _, _) =
+            spec.application_workload_source.as_mut().unwrap();
         let (resource, response) = super::selected_identity_chaff_resource(
             source,
             expected,
@@ -24705,6 +25069,130 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn receive_lifecycle_requires_a_complete_run_and_an_actual_final_drain() {
+        let origin = now();
+        let mut receive_loop = super::ReceiveLoopState::new(origin);
+        assert!(receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"].is_null());
+        receive_loop.record_return(
+            origin + Duration::from_nanos(2_001),
+            5_001,
+            super::ReceivePollDisposition::DrainedToWouldBlock,
+        );
+        let mut completion = RunCompletion {
+            ended_unix_ns: Some(2),
+            status: "complete",
+            error: None,
+            error_class: None,
+            defense_start_monotonic_ns: None,
+            application_completion_monotonic_ns: None,
+            defense_diagnostics: None,
+            runner_wakeup_metrics: None,
+        };
+        let authorized = super::receive_loop_completion_authorized(&completion, &[]);
+        let receipt = receive_loop.receipt(authorized);
+        assert_eq!(receipt["schema_version"], 1);
+        assert_eq!(receipt["source"], "native-final-udp-receive-drain-v1");
+        assert_eq!(
+            receipt["time_basis"],
+            "runner-process-start-elapsed-monotonic-v1"
+        );
+        assert_eq!(receipt["polling_stopped_at_elapsed_ns"], 2_001);
+        assert_eq!(receipt["polling_stopped_at_unix_ns"], 5_001);
+        assert_eq!(receipt["disposition"], "drained_to_would_block");
+        assert_eq!(receipt["scientific_credit"], false);
+
+        completion.status = "running";
+        assert!(!super::receive_loop_completion_authorized(&completion, &[]));
+        completion.status = "complete";
+        completion.ended_unix_ns = None;
+        assert!(!super::receive_loop_completion_authorized(&completion, &[]));
+        completion.ended_unix_ns = Some(2);
+        completion.error = Some("terminal failure");
+        assert!(!super::receive_loop_completion_authorized(&completion, &[]));
+        completion.error = None;
+        completion.error_class = Some("runner-error-v1");
+        assert!(!super::receive_loop_completion_authorized(&completion, &[]));
+        completion.error_class = None;
+        assert!(!super::receive_loop_completion_authorized(
+            &completion,
+            &["response hashing failed".into()],
+        ));
+        assert!(receive_loop.receipt(false)["polling_stopped_at_elapsed_ns"].is_null());
+        assert!(receive_loop.receipt(false)["polling_stopped_at_unix_ns"].is_null());
+    }
+
+    #[test]
+    fn receive_lifecycle_latest_bounded_or_failed_call_supersedes_a_stale_drain() {
+        let origin = now();
+        let mut receive_loop = super::ReceiveLoopState::new(origin);
+        receive_loop.record_return(
+            origin + Duration::from_nanos(10),
+            5_010,
+            super::ReceivePollDisposition::DrainedToWouldBlock,
+        );
+        assert_eq!(
+            receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"],
+            10
+        );
+        receive_loop.record_return(
+            origin + Duration::from_nanos(20),
+            5_020,
+            super::ReceivePollDisposition::BoundedOneBatch,
+        );
+        assert_eq!(
+            receive_loop.latest_return.unwrap().returned_monotonic_ns,
+            Some(20)
+        );
+        assert_eq!(
+            receive_loop.receipt(true)["disposition"],
+            "bounded_one_batch"
+        );
+        assert!(receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"].is_null());
+        assert!(receive_loop.receipt(true)["polling_stopped_at_unix_ns"].is_null());
+        receive_loop.record_return(
+            origin + Duration::from_nanos(30),
+            5_030,
+            super::ReceivePollDisposition::DrainedToWouldBlock,
+        );
+        assert_eq!(
+            receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"],
+            30
+        );
+        receive_loop.record_return(
+            origin + Duration::from_nanos(40),
+            5_040,
+            super::ReceivePollDisposition::Error,
+        );
+        assert_eq!(
+            receive_loop.latest_return.unwrap().returned_monotonic_ns,
+            Some(40)
+        );
+        assert_eq!(receive_loop.receipt(true)["disposition"], "error");
+        assert!(receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"].is_null());
+        assert!(receive_loop.receipt(true)["polling_stopped_at_unix_ns"].is_null());
+    }
+
+    #[test]
+    fn receive_lifecycle_never_clamps_an_unproven_return_clock_into_a_boundary() {
+        let sampled_at = now();
+        let mut receive_loop = super::ReceiveLoopState::new(sampled_at + Duration::from_nanos(1));
+        receive_loop.record_return(
+            sampled_at,
+            5_000,
+            super::ReceivePollDisposition::DrainedToWouldBlock,
+        );
+        assert!(receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"].is_null());
+        assert!(receive_loop.receipt(true)["polling_stopped_at_unix_ns"].is_null());
+        receive_loop.record_return(
+            sampled_at + Duration::from_nanos(2),
+            0,
+            super::ReceivePollDisposition::DrainedToWouldBlock,
+        );
+        assert!(receive_loop.receipt(true)["polling_stopped_at_elapsed_ns"].is_null());
+        assert!(receive_loop.receipt(true)["polling_stopped_at_unix_ns"].is_null());
     }
 
     #[test]
@@ -27881,7 +28369,9 @@ mod tests {
         let mut endpoints = create_endpoints(&spec, started, &clock).expect("endpoint");
         let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("dependencies");
         dependencies.mark_failed(1).expect("parent failure");
-        endpoints[0].pending.retain(|request| request.resource_id == 2);
+        endpoints[0]
+            .pending
+            .retain(|request| request.resource_id == 2);
         endpoints[0].application_stream_limit_blocked = true;
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
         assert_eq!(
@@ -27900,7 +28390,10 @@ mod tests {
         );
         assert!(endpoints[0].application_stream_limit_blocked);
         assert!(endpoints[0].pending.is_empty());
-        assert_eq!(dependencies.state(2), Some(ResourceRunState::SkippedDependency));
+        assert_eq!(
+            dependencies.state(2),
+            Some(ResourceRunState::SkippedDependency)
+        );
         assert_eq!(endpoints[0].completed.len(), 1);
         assert_eq!(endpoints[0].completed[0].resource_id, 2);
         assert_eq!(endpoints[0].completed[0].outcome, "skipped_dependency");
@@ -33006,6 +33499,363 @@ mod tests {
         })
     }
 
+    fn variable_primary_document_source() -> serde_json::Value {
+        let mut value = terminal_http_error_source();
+        value["resources"][0]["content_length"] = json!(58_478);
+        value["resources"][0]["data_length"] = json!(58_371);
+        value["resources"][1]["content_length"] = json!(157);
+        value["resources"][1]["data_length"] = json!(157);
+        value["preparation"]["expected_responses"][0]["bytes"] = json!(58_478);
+        value["preparation"]["max_response_bytes"] = json!(1_048_576);
+        value["preparation"]["primary_document_identity_policy"] =
+            json!("variable-primary-document-body-v1");
+        value
+    }
+
+    fn variable_primary_document_spec() -> RunSpec {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("variable-primary-document-source");
+        let path = output.join("prepared.json");
+        let raw = serde_json::to_vec(&variable_primary_document_source())
+            .expect("serialize explicit variable primary source");
+        fs::write(&path, &raw).expect("write source");
+        let source = super::load_application_workload_source(&path)
+            .expect("load bound complete application graph");
+        assert_eq!(source.1, sha256(&raw).expect("exact source hash"));
+        let mut spec =
+            terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        spec.workload = source.0.clone();
+        spec.max_response_bytes = 1_048_576;
+        spec.application_workload_source = Some(source);
+        fs::remove_dir_all(output).expect("remove source fixture");
+        spec
+    }
+
+    fn buflo_incoming_credit_release_policy_spec() -> RunSpec {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("buflo-incoming-credit-release-policy-source");
+        let source_path = output.join("prepared.json");
+        let mut source = variable_primary_document_source();
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME);
+        let raw = serde_json::to_vec(&source).expect("serialize bound incoming policy");
+        fs::write(&source_path, &raw).expect("write source");
+        let bound = super::load_application_workload_source(&source_path)
+            .expect("load explicit incoming policy source");
+        assert_eq!(bound.1, sha256(&raw).expect("exact raw source hash"));
+        let parameter_path = output.join("buflo.json");
+        fs::write(
+            &parameter_path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "interval_us": 20_000,
+                "minimum_duration_us": 1_000_000,
+                "packet_size": 1_200,
+                "max_events": 1_000,
+                "implementation_scope": "client_only_quic",
+                "paper_equivalent": false,
+            }))
+            .expect("serialize fixed BuFLO parameters"),
+        )
+        .expect("write parameters");
+        let mut spec = variable_primary_document_spec();
+        spec.application_workload_source = Some(bound);
+        spec.config.defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: parameter_path
+                .to_str()
+                .expect("UTF-8 parameter path")
+                .into(),
+        });
+        spec.config.max_udp_payload_size = 1_200;
+        spec.defense_parameters =
+            defense_parameter_provenance(&spec.config).expect("retain exact hashed parameters");
+        fs::remove_dir_all(output).expect("receipt rendering does not reread parameters");
+        spec
+    }
+
+    fn buflo_incoming_credit_release_policy_run(spec: &RunSpec) -> serde_json::Value {
+        let scheduler = super::process_scheduler_evidence().expect("scheduler evidence");
+        let bytes = super::render_run_json(
+            spec,
+            &[],
+            &[],
+            &[],
+            &scheduler,
+            &[],
+            1,
+            &RunCompletion {
+                ended_unix_ns: Some(2),
+                status: "complete",
+                error: None,
+                error_class: None,
+                defense_start_monotonic_ns: None,
+                application_completion_monotonic_ns: None,
+                defense_diagnostics: None,
+                runner_wakeup_metrics: None,
+            },
+        );
+        serde_json::from_slice(&bytes).expect("run receipt")
+    }
+
+    #[test]
+    fn buflo_incoming_credit_release_policy_rejects_malformed_or_unbound_preparation() {
+        let absent = super::BufloIncomingCreditReleasePolicy::from_preparation(
+            &json!({}),
+            ApplicationResponsePolicy::Http2xxOnly,
+            super::PrimaryDocumentIdentityPolicy::ExactResponseBody,
+        )
+        .expect("missing opt-in retains legacy admission");
+        assert_eq!(
+            absent,
+            super::BufloIncomingCreditReleasePolicy::LegacyControlInterval
+        );
+        let mut valid = variable_primary_document_source();
+        valid["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME);
+        assert_terminal_http_error_source(&valid, true);
+        for invalid in [
+            json!(null),
+            json!(false),
+            json!(10_000),
+            json!([]),
+            json!({}),
+            json!("unknown-policy"),
+        ] {
+            let mut value = valid.clone();
+            value["preparation"]["buflo_incoming_credit_release_policy"] = invalid;
+            assert_terminal_http_error_source(&value, false);
+        }
+        let mut exact = valid.clone();
+        exact["preparation"]["primary_document_identity_policy"] = json!("exact-response-body-v1");
+        assert_terminal_http_error_source(&exact, false);
+        exact["preparation"]
+            .as_object_mut()
+            .expect("preparation")
+            .remove("primary_document_identity_policy");
+        assert_terminal_http_error_source(&exact, false);
+        let mut nonterminal = valid;
+        nonterminal["preparation"]["application_response_policy"] = json!("http-2xx-only-v1");
+        assert_terminal_http_error_source(&nonterminal, false);
+    }
+
+    #[test]
+    fn buflo_incoming_credit_release_policy_receipt_is_exact_and_omitted_for_legacy_or_other_modes()
+    {
+        let mut spec = buflo_incoming_credit_release_policy_spec();
+        super::validate_buflo_incoming_credit_release_policy(&spec).expect("bound fixed policy");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"],
+            json!({
+                "schema_version": 1,
+                "source": "bound-preparation-v1",
+                "policy": "rapid-v5-half-period-10000us-v1",
+                "incoming_release_window_us": 10_000,
+                "period_us": 20_000,
+                "cell_bytes": 1_200,
+                "scientific_credit": false,
+            })
+        );
+        assert_eq!(spec.config.control_interval_us, 5_000);
+        assert!(run["defense_parameters"].get("buflo_parameters").is_none());
+        spec.application_workload_source
+            .as_mut()
+            .expect("bound source")
+            .6 = super::BufloIncomingCreditReleasePolicy::LegacyControlInterval;
+        assert!(
+            buflo_incoming_credit_release_policy_run(&spec)
+                .get("buflo_incoming_credit_release_policy")
+                .is_none()
+        );
+        spec.application_workload_source
+            .as_mut()
+            .expect("bound source")
+            .6 = super::BufloIncomingCreditReleasePolicy::RapidV5HalfPeriod;
+        for defense in [
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused-cs-buflo.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            super::validate_buflo_incoming_credit_release_policy(&spec)
+                .expect("other mode carries prepared flag");
+            assert!(
+                buflo_incoming_credit_release_policy_run(&spec)
+                    .get("buflo_incoming_credit_release_policy")
+                    .is_none()
+            );
+        }
+        spec.application_workload_source = None;
+        assert!(
+            buflo_incoming_credit_release_policy_run(&spec)
+                .get("buflo_incoming_credit_release_policy")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn buflo_incoming_credit_release_policy_rejects_wrong_parameters_and_runtime_binding() {
+        for mutation in 0..11 {
+            let mut spec = buflo_incoming_credit_release_policy_spec();
+            match mutation {
+                0 => {
+                    spec.defense_parameters
+                        .as_mut()
+                        .expect("parameters")
+                        .buflo_parameters
+                        .as_mut()
+                        .expect("BuFLO")
+                        .packet_size = 600
+                }
+                1 => {
+                    spec.defense_parameters
+                        .as_mut()
+                        .expect("parameters")
+                        .buflo_parameters
+                        .as_mut()
+                        .expect("BuFLO")
+                        .interval_us = 10_000
+                }
+                2 => {
+                    spec.defense_parameters.as_mut().expect("parameters").path =
+                        "different-receipt.json".into()
+                }
+                3 => spec.defense_parameters.as_mut().expect("parameters").kind = "cs_buflo",
+                4 => {
+                    spec.defense_parameters.as_mut().expect("parameters").sha256 = "invalid".into()
+                }
+                5 => spec.defense_parameters = None,
+                6 => spec.application_response_policy = ApplicationResponsePolicy::Http2xxOnly,
+                7 => {
+                    spec.application_workload_source.as_mut().expect("source").5 =
+                        super::PrimaryDocumentIdentityPolicy::ExactResponseBody
+                }
+                8 => {
+                    spec.application_workload_source.as_mut().expect("source").1 = "invalid".into()
+                }
+                9 => spec.workload.resources[0].url = "https://different.example/".into(),
+                10 => spec.config.control_interval_us = 10_000,
+                _ => unreachable!("known mutation"),
+            }
+            assert!(
+                super::validate_buflo_incoming_credit_release_policy(&spec).is_err(),
+                "mutation {mutation}"
+            );
+            assert!(
+                buflo_incoming_credit_release_policy_run(&spec)
+                    .get("buflo_incoming_credit_release_policy")
+                    .is_none(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_primary_document_hint_changes_only_the_bound_primary_body_floor() {
+        let mut spec = variable_primary_document_spec();
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[0]),
+            Some(1)
+        );
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[1]),
+            Some(157)
+        );
+        let source = spec.application_workload_source.as_ref().expect("source");
+        assert_eq!(source.0.resources[0].effective_length(), 58_478);
+        assert_eq!(source.2[&0].bytes, 58_478);
+        spec.application_response_policy
+            .validate_source_binding(&spec.workload, &source.0)
+            .expect("unchanged full graph");
+        spec.application_workload_source.as_mut().expect("source").5 =
+            super::PrimaryDocumentIdentityPolicy::ExactResponseBody;
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[0]),
+            Some(58_478)
+        );
+        spec.application_workload_source = None;
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[0]),
+            Some(58_478)
+        );
+        spec.max_response_bytes = 128;
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[0]),
+            Some(128)
+        );
+    }
+
+    #[test]
+    fn variable_primary_document_source_rejects_malformed_policy_or_unbounded_primary() {
+        for invalid in [
+            json!(null),
+            json!(false),
+            json!({}),
+            json!("unknown-primary-policy"),
+        ] {
+            let mut value = variable_primary_document_source();
+            value["preparation"]["primary_document_identity_policy"] = invalid;
+            assert_terminal_http_error_source(&value, false);
+        }
+        for invalid in [json!(null), json!(0), json!(-1), json!(58_477)] {
+            let mut value = variable_primary_document_source();
+            value["preparation"]["max_response_bytes"] = invalid;
+            assert_terminal_http_error_source(&value, false);
+        }
+        for (field, invalid) in [("chaff_priority", json!(true)), ("type", json!("Script"))] {
+            let mut value = variable_primary_document_source();
+            value["resources"][0][field] = invalid;
+            assert_terminal_http_error_source(&value, false);
+        }
+        let mut value = variable_primary_document_source();
+        value["preparation"]["application_response_policy"] = json!("http-2xx-only-v1");
+        assert_terminal_http_error_source(&value, false);
+        let mut value = variable_primary_document_source();
+        value["preparation"]["expected_responses"][0]["bytes"] = json!(0);
+        assert_terminal_http_error_source(&value, false);
+        let mut exact = terminal_http_error_source();
+        assert_terminal_http_error_source(&exact, true);
+        exact["preparation"]["primary_document_identity_policy"] = json!("exact-response-body-v1");
+        assert_terminal_http_error_source(&exact, true);
+    }
+
+    #[test]
+    fn variable_primary_document_runtime_requires_a_complete_nonempty_2xx_body() {
+        let spec = variable_primary_document_spec();
+        for body_size in [58_379, 58_383, 58_478, 58_573] {
+            let mut record = application(Some(200), true);
+            record.resource_id = 0;
+            record.bytes = body_size;
+            record.body = vec![b'x'; usize::try_from(body_size).expect("body length")];
+            record.content_length = None;
+            assert_eq!(
+                finish_application_record(&mut record, Some(&spec)),
+                ResourceRunState::Succeeded
+            );
+        }
+        for (status, complete, body_size) in [(200, true, 0), (200, false, 1), (404, true, 1)] {
+            let mut record = application(Some(status), complete);
+            record.resource_id = 0;
+            record.bytes = body_size;
+            record.body = vec![b'x'; usize::try_from(body_size).expect("body length")];
+            record.content_length = None;
+            assert_eq!(
+                finish_application_record(&mut record, Some(&spec)),
+                ResourceRunState::Failed
+            );
+        }
+        let mut legacy = application(Some(200), true);
+        legacy.resource_id = 0;
+        legacy.bytes = 0;
+        legacy.body.clear();
+        assert_eq!(
+            finish_application_record(&mut legacy, None),
+            ResourceRunState::Succeeded
+        );
+    }
+
     fn assert_terminal_http_error_source(value: &serde_json::Value, valid: bool) {
         test_fixture::fixture_init();
         let output = trace_output_dir("application-response-policy-source");
@@ -33199,7 +34049,7 @@ mod tests {
         let value = terminal_http_error_source();
         let bytes = serde_json::to_vec(&value).expect("serialize source");
         fs::write(&path, &bytes).expect("write source");
-        let (manifest, digest, expected, policy, _) =
+        let (manifest, digest, expected, policy, _, _, _) =
             super::load_application_workload_source(&path).expect("policy source");
         assert_eq!(
             policy,

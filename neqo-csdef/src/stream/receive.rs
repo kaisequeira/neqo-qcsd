@@ -665,6 +665,51 @@ impl ReceiveState {
         }
     }
 
+    /// Bounded parser continuation that can be owned by a due scheduled cell.
+    ///
+    /// This does not advertise credit or relax the unowned lifetime allowance.
+    /// A complete allocator transaction must provide the same-cell ownership,
+    /// and the ordinary parser lease checks the boundary again before release.
+    pub(crate) fn scheduled_parser_lease_capacity(&self) -> u64 {
+        const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                reservation_available,
+                consumed,
+                parser_lease_exhausted,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            }
+            | Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                reservation_available,
+                consumed,
+                parser_lease_exhausted,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } if *parser_lease_exhausted
+                && *requested_limit == *advertised_limit
+                && *known_limit <= *requested_limit
+                && *pending_parser_boundary == Some(*consumed)
+                && *last_parser_lease_boundary != Some(*consumed) =>
+            {
+                if *reservation_available < MAX_HTTP3_FRAME_HEADER_BYTES {
+                    *reservation_available
+                } else {
+                    MAX_HTTP3_FRAME_HEADER_BYTES
+                }
+            }
+            _ => 0,
+        }
+    }
+
     /// Reclassify consumed parser-lease bytes as scheduled raw-stream work.
     ///
     /// Only bytes that the controller actually debited to a live scheduling
