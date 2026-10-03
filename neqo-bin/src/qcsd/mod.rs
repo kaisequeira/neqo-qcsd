@@ -44324,6 +44324,131 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn buflo_kernel_ack_start_controller_preserves_cadence_job_identity() {
+        let parameters = neqo_csdef::BufloParameters {
+            schema_version: 1,
+            interval_us: 20_000,
+            minimum_duration_us: 120_000_000,
+            packet_size: 1_200,
+            max_events: 10_000,
+            implementation_scope: neqo_csdef::QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        };
+        for ack_start in [false, true] {
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    defense: DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                        parameters: "fixed-buflo-1200-20000us.json".into(),
+                    }),
+                    max_udp_payload_size: 1_200,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(neqo_csdef::Buflo::from_parameters(parameters.clone())),
+            )
+            .expect("fixed controller");
+            if ack_start {
+                controller
+                    .enable_buflo_acknowledged_incoming_startup()
+                    .expect("explicit V2 source opt-in");
+            }
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint: QcsdEndpointId(0),
+                    origin: "https://example.com".into(),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(0),
+                    stream: QcsdStreamId(0),
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(24_064),
+                },
+                Duration::ZERO,
+            );
+            controller.poll(Duration::ZERO);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            let (packet_zero, slot_zero) = actions
+                .iter()
+                .find_map(|action| match action {
+                    QcsdAction::SendPacket { packet, slot, .. } => Some((*packet, *slot)),
+                    _ => None,
+                })
+                .expect("actual outgoing tick zero");
+            let (packet_one, slot_one) = actions
+                .iter()
+                .find_map(|action| match action {
+                    QcsdAction::PrearmPacket { packet, slot, .. } => Some((*packet, *slot)),
+                    _ => None,
+                })
+                .expect("actual controller rolling preview");
+            assert_eq!((packet_zero.timestamp_us(), slot_zero.0), (0, 0));
+            assert_eq!((packet_one.timestamp_us(), slot_one.0), (20_000, 2));
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .buflo_scheduled_incoming_cells,
+                u64::from(!ack_start)
+            );
+
+            let mut runtime = synthetic_buflo_kernel_runtime(
+                synthetic_buflo_clock_phase_with_offsets(300_000, 10_000, 0, 10, 10),
+                None,
+                Vec::new(),
+            );
+            let start = runtime.arm().expect("real monotonic/TAI epoch");
+            let guard = |packet: Packet, slot| BufloExactReleaseGuard {
+                endpoint_index: 0,
+                endpoint: QcsdEndpointId(0),
+                slot,
+                packet,
+                phase: BufloExactReleasePhase::Prearmed,
+                output_admission_at: start,
+                guard_at: start + packet.timestamp().saturating_sub(Duration::from_millis(5)),
+                active_wait_at: start + packet.timestamp().saturating_sub(Duration::from_millis(5)),
+                release: start + packet.timestamp(),
+                deadline: start + packet.timestamp() + Duration::from_millis(5),
+            };
+            assert_eq!(
+                runtime
+                    .begin_job(&guard(packet_zero, slot_zero))
+                    .expect("tick zero job"),
+                0
+            );
+            assert!(
+                runtime
+                    .begin_job(&guard(packet_one, QcsdSlotId(1)))
+                    .is_err(),
+                "the actual failed V2 slot1 must stay rejected by the kernel guard"
+            );
+            assert_eq!(runtime.jobs.len(), 1);
+            assert_eq!(
+                runtime
+                    .begin_job(&guard(packet_one, slot_one))
+                    .expect("canonical rolling job"),
+                1
+            );
+            assert_eq!(runtime.jobs[1].tick, 1);
+            assert_eq!(
+                runtime.jobs[1].release_tai_ns - runtime.jobs[0].release_tai_ns,
+                20_000_000
+            );
+            assert_eq!(
+                runtime.jobs[1].deadline_tai_ns - runtime.jobs[1].release_tai_ns,
+                5_000_000
+            );
+            assert!(
+                runtime.begin_job(&guard(packet_one, slot_one)).is_err(),
+                "duplicate kernel jobs remain rejected"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn buflo_kernel_late_main_cannot_reach_incoming_credit_helper() {
         let finalized = synthetic_buflo_kernel_raw_job(vec![synthetic_buflo_kernel_raw_item(
             "controller-and-trace-finalized",

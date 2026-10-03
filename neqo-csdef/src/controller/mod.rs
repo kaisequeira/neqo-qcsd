@@ -1457,6 +1457,11 @@ impl QcsdController {
                 stream,
                 blocked_at,
             } => {
+                // Retain the actual peer-blocked receive frontier for the
+                // exact-window parser continuation guard. This observation
+                // does not itself allocate or realize scheduled credit.
+                self.streams
+                    .record_parser_blocked(endpoint, stream, blocked_at);
                 if self
                     .streams
                     .record_pre_header_blocked(endpoint, stream, blocked_at)
@@ -2035,13 +2040,24 @@ impl QcsdController {
         } else {
             None
         };
-        let Some(lease) = self.streams.parser_lease(
-            endpoint,
-            stream,
-            pristine_data_boundary,
-            backing,
-            terminal_advertised_tail,
-        ) else {
+        let lease = if self.defense.incoming_slot_must_resolve_in_window() {
+            self.streams.parser_lease_with_blocked(
+                endpoint,
+                stream,
+                pristine_data_boundary,
+                backing,
+                terminal_advertised_tail,
+            )
+        } else {
+            self.streams.parser_lease(
+                endpoint,
+                stream,
+                pristine_data_boundary,
+                backing,
+                terminal_advertised_tail,
+            )
+        };
+        let Some(lease) = lease else {
             return;
         };
         let owner = lease
@@ -3421,7 +3437,7 @@ impl QcsdController {
         let Some(endpoint) = self.scheduler.next_outgoing() else {
             return;
         };
-        let slot = self.control.next_slot();
+        let slot = self.next_dynamic_slot(packet);
         self.rolling_outgoing_prearm = Some(RollingOutgoingPrearm {
             endpoint,
             packet,
@@ -3435,6 +3451,37 @@ impl QcsdController {
             deadline_after_us,
             allow_stream_data: self.defense.mode() == DefenseMode::ChaffAndShape,
         });
+    }
+
+    /// Preserve fixed BuFLO's cadence identities across ACK-start suppression.
+    ///
+    /// Its kernel receipts bind outgoing tick `k` to `2*k` and the paired
+    /// incoming opportunity to `2*k+1`. V2 withholds startup incoming
+    /// opportunities entirely. Reserve only the unused odd identity directly
+    /// before a canonical outgoing tick whose preceding incoming opportunity
+    /// was suppressed. An identity hole creates no action, pending event,
+    /// signal, terminal outcome, or realized cell.
+    fn next_dynamic_slot(&mut self, packet: crate::Packet) -> QcsdSlotId {
+        if matches!(self.config.defense, DefenseConfig::Buflo(_))
+            && packet.direction() == Direction::Outgoing
+            && let Some(startup) = self.defense.diagnostics().buflo_incoming_startup
+            && let Ok(timestamp_us) = u64::try_from(packet.timestamp().as_micros())
+            && packet.timestamp().as_nanos().is_multiple_of(20_000_000)
+            && let Some(previous_incoming_us) = timestamp_us.checked_sub(20_000)
+            && let Some(expected_outgoing_id) = (timestamp_us / 20_000).checked_mul(2)
+            && self.control.next_slot_id.checked_add(1) == Some(expected_outgoing_id)
+            && (!startup.armed
+                || startup
+                    .armed_at_us
+                    .is_some_and(|armed_at| previous_incoming_us < armed_at))
+        {
+            // Exactly one absent startup incoming identity is reserved. If
+            // another ID is missing/reused, leave the existing strict kernel
+            // identity guard to reject it rather than repairing accounting.
+            let reserved = self.control.next_slot();
+            debug_assert_eq!(reserved.0, expected_outgoing_id - 1);
+        }
+        self.control.next_slot()
     }
 
     fn cancel_closed_rolling_prearm(&mut self) {
@@ -3516,7 +3563,7 @@ impl QcsdController {
             && self.defense.terminal_failure().is_none()
             && let Some(endpoint) = self.scheduler.next_outgoing()
         {
-            let slot = self.control.next_slot();
+            let slot = self.next_dynamic_slot(abandoned.packet);
             self.rolling_outgoing_prearm = Some(RollingOutgoingPrearm {
                 endpoint,
                 packet: abandoned.packet,
@@ -3593,7 +3640,7 @@ impl QcsdController {
                 )
             });
         }
-        let slot = replacement.map_or_else(|| self.control.next_slot(), |prearm| prearm.slot);
+        let slot = replacement.map_or_else(|| self.next_dynamic_slot(packet), |prearm| prearm.slot);
         let deadline = packet
             .timestamp()
             .saturating_add(self.config.control_interval());
@@ -3842,7 +3889,8 @@ impl QcsdController {
                 .then_some(self.rolling_outgoing_prearm)
                 .flatten()
                 .filter(|prearm| prearm.packet == packet);
-            let slot = prearmed.map_or_else(|| self.control.next_slot(), |prearm| prearm.slot);
+            let slot =
+                prearmed.map_or_else(|| self.next_dynamic_slot(packet), |prearm| prearm.slot);
             self.pending_slots.insert(slot, packet);
             match packet.direction() {
                 Direction::Outgoing => {
@@ -4285,8 +4333,7 @@ impl QcsdController {
                 }
                 let parser_continuation = if exact_window {
                     self.streams
-                        .get_mut(opportunity.endpoint, opportunity.stream)
-                        .map_or(0, |state| state.receive.scheduled_parser_lease_capacity())
+                        .scheduled_parser_lease_capacity(opportunity.endpoint, opportunity.stream)
                 } else {
                     opportunity.claimable
                 };
@@ -16711,6 +16758,15 @@ mod tests {
         assert_eq!(resource_id, 14);
         assert!(actions.iter().any(|action| matches!(action,
             QcsdAction::SendPacket { packet, .. } if packet.direction() == Direction::Outgoing && packet.timestamp_us() == 0)));
+        assert!(actions.iter().any(|action| matches!(action,
+            QcsdAction::PrearmPacket { packet, slot, .. }
+                if packet.timestamp_us() == 20_000 && *slot == QcsdSlotId(2))));
+        assert!(!controller.pending_slots.contains_key(&QcsdSlotId(1)));
+        assert!(
+            !controller
+                .terminal_slot_resolution_at
+                .contains_key(&QcsdSlotId(1))
+        );
         assert!(!actions.iter().any(|action| matches!(
             action,
             QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::SlotMissed { .. }
@@ -16798,7 +16854,7 @@ mod tests {
                 bytes: 185,
                 fin: false,
             },
-            Duration::from_micros(6_000),
+            Duration::from_micros(8_165),
         );
         // Duplicate ACK after terminal coverage must not replace its time.
         controller.observe(
@@ -16810,15 +16866,15 @@ mod tests {
                 bytes: 1,
                 fin: false,
             },
-            Duration::from_micros(7_000),
+            Duration::from_micros(8_200),
         );
-        controller.poll(Duration::from_micros(8_000));
+        controller.poll(Duration::from_micros(8_280));
         let startup = controller
             .defense_diagnostics()
             .buflo_incoming_startup
             .expect("receipt");
-        assert_eq!(startup.ack_observed_at_us, Some(6_000));
-        assert_eq!(startup.ready_at_us, Some(8_000));
+        assert_eq!(startup.ack_observed_at_us, Some(8_165));
+        assert_eq!(startup.ready_at_us, Some(8_280));
         assert_eq!(startup.armed_at_us, Some(20_000));
         assert_eq!(startup.startup_suppressed_opportunities, 1);
         assert_eq!(
@@ -16848,6 +16904,7 @@ mod tests {
             (incoming.0, incoming.1.timestamp_us(), incoming.1.length()),
             (1_216, 20_000, 1_200)
         );
+        assert_eq!(incoming.2, QcsdSlotId(3));
         controller.observe(
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint,
@@ -16871,6 +16928,171 @@ mod tests {
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
         assert_eq!(diagnostics.buflo_missed_incoming_cells, 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boundary ACK and multiple suppressed cadences exercise the complete live allocation order"
+    )]
+    fn buflo_ack_start_reserves_only_suppressed_incoming_identity_holes() {
+        for (ack_us, ready_us, first_incoming_us) in
+            [(19_999, 20_000, 40_000), (48_165, 48_280, 60_000)]
+        {
+            let mut controller = startup_controller(true);
+            controller.poll(Duration::ZERO);
+            let initial: Vec<_> = controller.drain_actions().collect();
+            let request_id = initial
+                .iter()
+                .find_map(|action| match action {
+                    QcsdAction::RequestChaff { request_id, .. } => Some(*request_id),
+                    _ => None,
+                })
+                .expect("real qualified request issued");
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(4);
+            let role = QcsdRequestRole::Chaff {
+                resource_id: 14,
+                request_id: Some(request_id),
+            };
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role,
+                    expected_response_length: None,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamDataTransmitted {
+                    endpoint,
+                    stream,
+                    role,
+                    offset: 0,
+                    bytes: 185,
+                    fin: true,
+                    slot: Some(QcsdSlotId(0)),
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::SlotSatisfied {
+                    endpoint,
+                    slot: QcsdSlotId(0),
+                    observed_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+
+            let mut next_tick_us = 20_000;
+            while next_tick_us < ready_us {
+                controller.poll(Duration::from_micros(next_tick_us));
+                let actions: Vec<_> = controller.drain_actions().collect();
+                assert!(actions.iter().any(|action| matches!(action,
+                    QcsdAction::CommitPrearmedPacket { packet, slot, .. }
+                        if packet.timestamp_us() == next_tick_us
+                        && slot.0 == 2 * (next_tick_us / 20_000))));
+                assert!(!actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::SlotMissed { .. }
+                )));
+                controller.observe(
+                    QcsdObservation::SlotSatisfied {
+                        endpoint,
+                        slot: QcsdSlotId(2 * (next_tick_us / 20_000)),
+                        observed_size: 1_200,
+                    },
+                    Duration::from_micros(next_tick_us),
+                );
+                next_tick_us += 20_000;
+            }
+            controller.observe(
+                QcsdObservation::StreamDataAcknowledged {
+                    endpoint,
+                    stream,
+                    role,
+                    offset: 0,
+                    bytes: 185,
+                    fin: true,
+                },
+                Duration::from_micros(ack_us),
+            );
+            controller.poll(Duration::from_micros(ready_us));
+            let startup = controller
+                .defense_diagnostics()
+                .buflo_incoming_startup
+                .expect("armed receipt");
+            assert!(startup.armed);
+            assert_eq!(startup.armed_at_us, Some(first_incoming_us));
+            assert_eq!(
+                startup.startup_suppressed_opportunities,
+                first_incoming_us / 20_000
+            );
+            if next_tick_us == ready_us {
+                controller.observe(
+                    QcsdObservation::SlotSatisfied {
+                        endpoint,
+                        slot: QcsdSlotId(2 * (next_tick_us / 20_000)),
+                        observed_size: 1_200,
+                    },
+                    Duration::from_micros(next_tick_us),
+                );
+                next_tick_us += 20_000;
+            }
+            controller.drain_actions().for_each(drop);
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .buflo_scheduled_incoming_cells,
+                0
+            );
+            controller.poll(Duration::from_micros(next_tick_us));
+            assert_eq!(next_tick_us, first_incoming_us);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            assert!(actions.iter().any(|action| matches!(action,
+                QcsdAction::CommitPrearmedPacket { packet, slot, .. }
+                    if packet.timestamp_us() == first_incoming_us
+                    && slot.0 == 2 * (first_incoming_us / 20_000))));
+            assert!(actions.iter().any(|action| matches!(action,
+                QcsdAction::IncreaseReceiveLimit { packet, slot, .. }
+                    if packet.timestamp_us() == first_incoming_us && packet.length() == 1_200
+                    && slot.0 == 2 * (first_incoming_us / 20_000) + 1)));
+            for suppressed_tick in 0..(first_incoming_us / 20_000) {
+                let absent = QcsdSlotId(2 * suppressed_tick + 1);
+                assert!(!controller.pending_slots.contains_key(&absent));
+                assert!(!controller.incoming_credit_ledger.contains_key(&absent));
+                assert!(!controller.terminal_slot_resolution_at.contains_key(&absent));
+            }
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.buflo_scheduled_incoming_cells, 1);
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn buflo_ack_start_slot_reservation_does_not_repair_missing_real_ids() {
+        let packet = Packet::new(Duration::from_micros(40_000), Direction::Outgoing, 1_200)
+            .expect("canonical next outgoing");
+        let mut controller = startup_controller(true);
+        controller.control.next_slot_id = 1;
+        assert_eq!(
+            controller.next_dynamic_slot(packet),
+            QcsdSlotId(1),
+            "a missing even outgoing ID cannot be concealed by advancing to tick two"
+        );
+        controller.control.next_slot_id = 5;
+        assert_eq!(
+            controller.next_dynamic_slot(packet),
+            QcsdSlotId(5),
+            "allocated identities cannot be rewound or reused"
+        );
+        controller.control.next_slot_id = 3;
+        let off_grid = Packet::new(Duration::from_micros(40_001), Direction::Outgoing, 1_200)
+            .expect("off-grid packet");
+        assert_eq!(controller.next_dynamic_slot(off_grid), QcsdSlotId(3));
     }
 
     #[test]
@@ -19133,6 +19355,221 @@ mod tests {
         controller.process_incoming(u64::try_from(elapsed.as_micros()).expect("time"), elapsed);
         controller.retry_pending_parser_leases();
         (slot, packet, elapsed)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the retained live primary frontier must cross actual observations, allocation, and lease ownership together"
+    )]
+    fn exact_cell_bridges_only_peer_proven_blocked_short_primary_tail() {
+        for blocked_at in [1_015, 1_016] {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 600)
+                .expect("exact CS-BuFLO cell policy");
+            let (mut defense, _) = ExactIncomingOneShot::new(packet);
+            defense.event = None;
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: 1_000,
+                    max_stream_data_excess: 16,
+                    control_interval_us: 5_000,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(defense),
+            )
+            .expect("exact controller");
+            let endpoint = QcsdEndpointId(1);
+            let primary = QcsdStreamId(0);
+            let auxiliary = QcsdStreamId(4);
+            ready(&mut controller, endpoint.0, "https://example.com");
+            for (stream, expected_response_length) in
+                [(primary, Some(1)), (auxiliary, Some(1_000_000))]
+            {
+                controller.observe(
+                    QcsdObservation::StreamOpened {
+                        endpoint,
+                        stream,
+                        role: QcsdRequestRole::Application,
+                        expected_response_length,
+                    },
+                    Duration::ZERO,
+                );
+            }
+            controller.drain_actions().for_each(drop);
+            controller.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint,
+                    stream: primary,
+                    frame_bytes: 553,
+                    status: Some(200),
+                    content_length: None,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::DataFrame {
+                    endpoint,
+                    stream: primary,
+                    frame_header_bytes: 3,
+                    data_bytes: 444,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: primary,
+                    bytes: 1_000,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream: primary,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+            assert!(matches!(
+                controller.next_action(),
+                Some(QcsdAction::LeaseParserReceive {
+                    absolute_limit: 1_016,
+                    increase: 16,
+                    owner: None,
+                    ..
+                })
+            ));
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream: primary,
+                    absolute_limit: 1_016,
+                    slot: None,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::DataFrame {
+                    endpoint,
+                    stream: primary,
+                    frame_header_bytes: 2,
+                    data_bytes: 13,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: primary,
+                    bytes: 15,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream: primary,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+            assert!(
+                controller.next_action().is_none(),
+                "the existing one-byte tail gives no speculative lease"
+            );
+            controller.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint,
+                    stream: primary,
+                    blocked_at,
+                },
+                Duration::from_micros(1),
+            );
+            assert!(
+                controller.next_action().is_none(),
+                "blocked evidence alone creates no credit"
+            );
+            let (slot, _, elapsed) = install_exact_parser_cell(&mut controller, 0, 600);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            let primary_lease = actions.iter().find_map(|action| match action {
+                QcsdAction::LeaseParserReceive {
+                    stream,
+                    absolute_limit,
+                    increase,
+                    owner,
+                    ..
+                } if *stream == primary => Some((*absolute_limit, *increase, *owner)),
+                _ => None,
+            });
+            let auxiliary_increase = actions
+                .iter()
+                .find_map(|action| match action {
+                    QcsdAction::IncreaseReceiveLimit {
+                        stream,
+                        absolute_limit,
+                        slot: observed,
+                        ..
+                    } if *stream == auxiliary && *observed == slot => Some(*absolute_limit - 1_000),
+                    _ => None,
+                })
+                .expect("the rest of the real cell uses known auxiliary capacity");
+            if blocked_at == 1_016 {
+                let (absolute_limit, increase, owner) =
+                    primary_lease.expect("actual blocked frontier advances");
+                assert_eq!((absolute_limit, increase), (1_017, 1));
+                assert!(
+                    owner.is_some(),
+                    "the one-byte bridge is owned by this scheduled cell"
+                );
+                assert_eq!(auxiliary_increase, 599);
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint,
+                        stream: primary,
+                        absolute_limit,
+                        slot: Some(slot),
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream: primary,
+                        bytes: 2,
+                    },
+                    elapsed,
+                );
+                assert_eq!(
+                    controller
+                        .defense_diagnostics()
+                        .scheduled_incoming_consumed_bytes,
+                    1,
+                    "the pre-existing one byte is not credited to the new scheduled owner"
+                );
+            } else {
+                assert!(
+                    primary_lease.is_none(),
+                    "a mismatching blocked offset has no authority"
+                );
+                assert_eq!(auxiliary_increase, 600);
+            }
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_requested_bytes,
+                600
+            );
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_retired_bytes,
+                0
+            );
+        }
     }
 
     #[test]

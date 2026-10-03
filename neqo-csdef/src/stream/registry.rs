@@ -23,6 +23,9 @@ pub struct StreamState {
     /// progress or an exact prepared/scheduled prefix can activate the one
     /// bootstrap lease.
     pre_header_blocked_at: Option<u64>,
+    /// Actual post-header peer demand at one exact advertised frontier. The
+    /// receive state rechecks this frontier at allocation and lease grant.
+    parser_blocked_at: Option<u64>,
     request_acknowledged_ranges: Vec<(u64, u64)>,
     request_acknowledged_final_size: Option<u64>,
     request_acknowledgment_invalid: bool,
@@ -149,6 +152,7 @@ impl StreamRegistry {
                 status: None,
                 receive_actions_available: true,
                 pre_header_blocked_at: None,
+                parser_blocked_at: None,
                 request_acknowledged_ranges: Vec::new(),
                 request_acknowledged_final_size: None,
                 request_acknowledgment_invalid: false,
@@ -191,6 +195,7 @@ impl StreamRegistry {
         };
         state.receive_actions_available = false;
         state.pre_header_blocked_at = None;
+        state.parser_blocked_at = None;
         state.receive.clear_parser_boundary();
         true
     }
@@ -602,6 +607,7 @@ impl StreamRegistry {
         for key in &streams {
             let state = self.streams.get_mut(key).ok_or(*key)?;
             state.pre_header_blocked_at = None;
+            state.parser_blocked_at = None;
             if !state.receive.handoff_to_automatic() {
                 return Err(*key);
             }
@@ -655,6 +661,44 @@ impl StreamRegistry {
         true
     }
 
+    /// Retain a real `STREAM_DATA_BLOCKED` observation for a live DATA stream.
+    /// Bytes below the same limit may subsequently be parsed; the report still
+    /// proves peer demand beyond that limit. A changed limit cannot reuse it.
+    pub(crate) fn record_parser_blocked(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        blocked_at: u64,
+    ) -> bool {
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return false;
+        };
+        if !state.receive_actions_available || !state.receive.accepts_parser_blocked(blocked_at) {
+            return false;
+        }
+        state.parser_blocked_at = Some(blocked_at);
+        true
+    }
+
+    pub(crate) fn scheduled_parser_lease_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> u64 {
+        let Some(state) = self.streams.get(&(endpoint, stream)) else {
+            return 0;
+        };
+        if !state.receive_actions_available {
+            return 0;
+        }
+        match state.parser_blocked_at {
+            Some(blocked_at) => state
+                .receive
+                .scheduled_parser_lease_capacity_with_blocked(Some(blocked_at)),
+            None => state.receive.scheduled_parser_lease_capacity(),
+        }
+    }
+
     /// Lease the remaining prefix up to the stream's absolute framing ceiling
     /// after its retained blocked proof agrees with either the prepared floor
     /// or the controller's exact live scheduled prefix.
@@ -698,6 +742,35 @@ impl StreamRegistry {
             pristine_data_boundary,
             scheduled_backing,
             terminal_advertised_tail,
+        )?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
+    }
+
+    /// Exact-window materialization rechecks the same actual blocked frontier
+    /// that allowed a positive short-tail claim in the complete slot allocation.
+    pub(crate) fn parser_lease_with_blocked(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        pristine_data_boundary: bool,
+        scheduled_backing: u64,
+        terminal_advertised_tail: Option<u64>,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available {
+            return None;
+        }
+        let (absolute_limit, increase, scheduled) = state.receive.parser_lease_with_blocked(
+            pristine_data_boundary,
+            scheduled_backing,
+            terminal_advertised_tail,
+            state.parser_blocked_at,
         )?;
         Some(ParserLease {
             endpoint,
@@ -783,6 +856,7 @@ impl StreamRegistry {
         )]
         for state in self.streams.values_mut() {
             state.pre_header_blocked_at = None;
+            state.parser_blocked_at = None;
             state.receive.clear_parser_boundary();
         }
     }
@@ -810,8 +884,162 @@ fn merge_ranges(ranges: &mut Vec<(u64, u64)>) {
 
 #[cfg(test)]
 mod tests {
-    use super::StreamRegistry;
+    use super::{ReceiveState, StreamRegistry};
     use crate::{DefenseMode, QcsdEndpointId, QcsdRequestRole, QcsdStreamId};
+
+    fn recorded_primary_before_short_frame() -> (StreamRegistry, QcsdEndpointId, QcsdStreamId) {
+        let endpoint = QcsdEndpointId(3);
+        let stream = QcsdStreamId(0);
+        let mut registry = StreamRegistry::default();
+        registry.open(
+            endpoint,
+            stream,
+            QcsdRequestRole::Application,
+            true,
+            16,
+            1_000,
+            1,
+        );
+        assert!(registry.record_pre_header_blocked(endpoint, stream, 16));
+        let bootstrap = registry
+            .pre_header_bootstrap_lease(endpoint, stream, None)
+            .expect("bootstrap");
+        {
+            let receive = &mut registry.get_mut(endpoint, stream).expect("primary").receive;
+            receive.advertised(bootstrap.absolute_limit);
+            receive.bytes_read(553);
+            receive.response_headers(553, None);
+            receive.bytes_read(3);
+            receive.data_frame(3, 444);
+            receive.bytes_read(444);
+        }
+        registry.header_progress(endpoint, stream, 1, true);
+        let prefix = registry
+            .parser_lease(endpoint, stream, true, 0, None)
+            .expect("last unowned prefix");
+        registry
+            .get_mut(endpoint, stream)
+            .expect("primary")
+            .receive
+            .advertised(prefix.absolute_limit);
+        assert_eq!(prefix.absolute_limit, 1_016);
+        (registry, endpoint, stream)
+    }
+
+    fn consume_recorded_short_frame(
+        registry: &mut StreamRegistry,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) {
+        let receive = &mut registry.get_mut(endpoint, stream).expect("primary").receive;
+        receive.bytes_read(2);
+        receive.data_frame(2, 13);
+        receive.bytes_read(13);
+        registry.header_progress(endpoint, stream, 1, true);
+    }
+
+    #[test]
+    fn parser_blocked_registry_retains_actual_frontier_before_data_and_rechecks_grant() {
+        let (mut registry, endpoint, stream) = recorded_primary_before_short_frame();
+        assert!(!registry.record_parser_blocked(endpoint, stream, 1_015));
+        assert!(registry.record_parser_blocked(endpoint, stream, 1_016));
+        consume_recorded_short_frame(&mut registry, endpoint, stream);
+        assert_eq!(
+            registry.scheduled_parser_lease_capacity(endpoint, stream),
+            1
+        );
+        assert_eq!(registry.claim_stream(endpoint, stream, 1), 1);
+        registry.restore_claim(endpoint, stream, 1);
+        assert_eq!(
+            registry.scheduled_parser_lease_capacity(endpoint, stream),
+            1
+        );
+        assert_eq!(registry.claim_stream(endpoint, stream, 1), 1);
+        let lease = registry
+            .parser_lease_with_blocked(endpoint, stream, true, 1, None)
+            .expect("proven owned byte");
+        assert_eq!(
+            (lease.absolute_limit, lease.increase, lease.scheduled),
+            (1_017, 1, true)
+        );
+        assert_eq!(
+            registry.scheduled_parser_lease_capacity(endpoint, stream),
+            0
+        );
+        assert_eq!(
+            registry.parser_lease_with_blocked(endpoint, stream, true, 1, None),
+            None
+        );
+    }
+
+    #[test]
+    fn parser_blocked_registry_rejects_missing_stale_closed_and_unavailable_proof() {
+        let (mut missing, endpoint, stream) = recorded_primary_before_short_frame();
+        consume_recorded_short_frame(&mut missing, endpoint, stream);
+        assert_eq!(missing.scheduled_parser_lease_capacity(endpoint, stream), 0);
+        assert_eq!(
+            missing.parser_lease_with_blocked(endpoint, stream, true, 1, None),
+            None
+        );
+
+        let (mut stale, endpoint, stream) = recorded_primary_before_short_frame();
+        assert!(stale.record_parser_blocked(endpoint, stream, 1_016));
+        consume_recorded_short_frame(&mut stale, endpoint, stream);
+        if let ReceiveState::ReceivingData {
+            requested_limit,
+            advertised_limit,
+            ..
+        } = &mut stale.get_mut(endpoint, stream).expect("primary").receive
+        {
+            *requested_limit = 1_017;
+            *advertised_limit = 1_017;
+        }
+        assert_eq!(stale.scheduled_parser_lease_capacity(endpoint, stream), 0);
+        assert_eq!(
+            stale.parser_lease_with_blocked(endpoint, stream, true, 1, None),
+            None
+        );
+
+        let (mut unavailable, endpoint, stream) = recorded_primary_before_short_frame();
+        assert!(unavailable.record_parser_blocked(endpoint, stream, 1_016));
+        consume_recorded_short_frame(&mut unavailable, endpoint, stream);
+        assert!(unavailable.mark_receive_unavailable(endpoint, stream));
+        assert_eq!(
+            unavailable.scheduled_parser_lease_capacity(endpoint, stream),
+            0
+        );
+        assert!(!unavailable.record_parser_blocked(endpoint, stream, 1_016));
+        assert_eq!(
+            unavailable.parser_lease_with_blocked(endpoint, stream, true, 1, None),
+            None
+        );
+
+        let (mut automatic, endpoint, stream) = recorded_primary_before_short_frame();
+        assert!(automatic.record_parser_blocked(endpoint, stream, 1_016));
+        consume_recorded_short_frame(&mut automatic, endpoint, stream);
+        assert_eq!(
+            automatic.handoff_application_receive_to_automatic(),
+            Ok(vec![(endpoint, stream)])
+        );
+        assert_eq!(
+            automatic
+                .get_mut(endpoint, stream)
+                .expect("automatic")
+                .parser_blocked_at,
+            None
+        );
+        assert_eq!(
+            automatic.scheduled_parser_lease_capacity(endpoint, stream),
+            0
+        );
+        assert!(!automatic.record_parser_blocked(endpoint, stream, 1_016));
+
+        let (mut closed, endpoint, stream) = recorded_primary_before_short_frame();
+        assert!(closed.record_parser_blocked(endpoint, stream, 1_016));
+        assert!(closed.close(endpoint, stream).is_some());
+        assert_eq!(closed.scheduled_parser_lease_capacity(endpoint, stream), 0);
+        assert!(!closed.record_parser_blocked(endpoint, stream, 1_016));
+    }
 
     #[test]
     fn application_handoff_is_atomic_preserves_counters_and_accepts_a_parser_boundary() {
