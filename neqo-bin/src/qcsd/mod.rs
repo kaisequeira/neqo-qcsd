@@ -1419,20 +1419,34 @@ enum BufloIncomingCreditReleasePolicy {
     #[default]
     LegacyControlInterval,
     RapidV5HalfPeriod,
+    RapidV5HalfPeriodAckStart,
 }
 
 impl BufloIncomingCreditReleasePolicy {
     const RAPID_V5_NAME: &'static str = "rapid-v5-half-period-10000us-v1";
+    const RAPID_V5_ACK_START_NAME: &'static str = "rapid-v5-half-period-10000us-ack-start-v2";
+
+    const fn name(self) -> Option<&'static str> {
+        match self {
+            Self::LegacyControlInterval => None,
+            Self::RapidV5HalfPeriod => Some(Self::RAPID_V5_NAME),
+            Self::RapidV5HalfPeriodAckStart => Some(Self::RAPID_V5_ACK_START_NAME),
+        }
+    }
 
     fn from_preparation(
         preparation: &serde_json::Value,
         application_policy: ApplicationResponsePolicy,
         primary_policy: PrimaryDocumentIdentityPolicy,
+        chaff_origin_policy: &QualifiedChaffOriginPolicy,
     ) -> Result<Self, Error> {
         let policy = match preparation.get("buflo_incoming_credit_release_policy") {
             None => Self::default(),
             Some(serde_json::Value::String(value)) if value == Self::RAPID_V5_NAME => {
                 Self::RapidV5HalfPeriod
+            }
+            Some(serde_json::Value::String(value)) if value == Self::RAPID_V5_ACK_START_NAME => {
+                Self::RapidV5HalfPeriodAckStart
             }
             Some(_) => {
                 return Err(Error::Argument(
@@ -1440,12 +1454,23 @@ impl BufloIncomingCreditReleasePolicy {
                 ));
             }
         };
-        if policy == Self::RapidV5HalfPeriod
+        if policy != Self::LegacyControlInterval
             && (application_policy != ApplicationResponsePolicy::CompletedTerminalHttpErrors
                 || primary_policy != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody)
         {
             return Err(Error::Argument(
                 "BuFLO incoming half-period policy requires the bound variable primary document and terminal HTTP response policies"
+                    .into(),
+            ));
+        }
+        if policy == Self::RapidV5HalfPeriodAckStart
+            && !matches!(
+                chaff_origin_policy,
+                QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+            )
+        {
+            return Err(Error::Argument(
+                "BuFLO acknowledged incoming startup requires the bound prepared-approved-origins-v1 chaff selector"
                     .into(),
             ));
         }
@@ -1479,7 +1504,7 @@ struct RunSpec {
 }
 
 fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, source_hash, _, prepared_application, _, primary, policy)) =
+    let Some((source, source_hash, _, prepared_application, chaff_origin, primary, policy)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -1491,6 +1516,11 @@ fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), E
         || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
         || *prepared_application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
         || spec.application_response_policy != *prepared_application
+        || (*policy == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
+            && !matches!(
+                chaff_origin,
+                QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+            ))
     {
         return Err(Error::Argument(
             "BuFLO incoming half-period policy is not bound to the validated prepared application policies"
@@ -1526,17 +1556,16 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
         || !spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|(_, _, _, _, _, _, policy)| {
-                *policy == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriod
-            })
+            .is_some_and(|(_, _, _, _, _, _, policy)| policy.name().is_some())
         || validate_buflo_incoming_credit_release_policy(spec).is_err()
     {
         return None;
     }
+    let policy = spec.application_workload_source.as_ref()?.6.name()?;
     Some(json!({
         "schema_version": 1,
         "source": "bound-preparation-v1",
-        "policy": BufloIncomingCreditReleasePolicy::RAPID_V5_NAME,
+        "policy": policy,
         "incoming_release_window_us": 10_000,
         "period_us": 20_000,
         "cell_bytes": 1_200,
@@ -10377,6 +10406,17 @@ struct Endpoint {
     recv_buf: RecvBuf,
     receive_loop: ReceiveLoopState,
     client: Http3Client,
+    /// Sockets and exact capture tuples exist for the complete workload, but a
+    /// dependent origin must not start its peer idle clock before real work is
+    /// eligible. Historical endpoint construction remains eagerly active.
+    network_active: bool,
+    /// A newly activated dependent origin must complete its real HTTP/3
+    /// handshake before request dispatch; temporary unreadiness is not a
+    /// failed application request.
+    defer_application_until_connected: bool,
+    /// Only the source-bound prospective policy publishes the controller's
+    /// separate defense-clock reduction time for real chaff ACK observations.
+    buflo_ack_start_enabled: bool,
     /// Greatest Instant supplied to Neqo for this endpoint. Kernel `BuFLO` may
     /// prepare one packet at a short-lived future physical projection; clamp
     /// later contemporaneous samples so transport time never regresses when
@@ -12495,6 +12535,7 @@ fn load_application_workload_source(
         &source.preparation,
         policy,
         primary_policy,
+        &origin_policy,
     )?;
     Ok((
         manifest,
@@ -13563,7 +13604,7 @@ async fn execute_run_inner(
 ) -> Result<Vec<ResponseResult>, Error> {
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
     let observation_clock = QcsdObservationClock::new(process_start);
-    let mut endpoints = create_endpoints(spec, process_start, &observation_clock)?;
+    let mut endpoints = create_run_endpoints(spec, process_start, &observation_clock)?;
     // Complete all fallible controller/workload construction before creating
     // the privileged-setup kernel runtime. Once that runtime exists, every
     // later error must pass through `finish` and retain its total receipt.
@@ -13574,6 +13615,16 @@ async fn execute_run_inner(
             .as_ref()
             .map(RuntimeChaffManifest::resource_manifest),
     )?;
+    if matches!(spec.config.defense, DefenseConfig::Buflo(_))
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| {
+                source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
+            })
+    {
+        controller.enable_buflo_acknowledged_incoming_startup()?;
+    }
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let scheduler_initial = process_scheduler.clone();
     let etf_scheduler_requested = scheduler_initial
@@ -13605,6 +13656,14 @@ async fn execute_run_inner(
         ApplicationBatchLifecycle::new(&spec.config.defense, spec.request_policy);
     let mut runner_wakeup_metrics = RunnerWakeupMetrics::new();
     let mut cs_exact_incoming_retry_attempted = BTreeSet::new();
+    let mut buflo_incoming_startup_recorded =
+        !(matches!(spec.config.defense, DefenseConfig::Buflo(_))
+            && spec
+                .application_workload_source
+                .as_ref()
+                .is_some_and(|source| {
+                    source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
+                }));
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
     let bound_ordinary_work = matches!(&spec.config.defense, DefenseConfig::Buflo(_));
 
@@ -13735,8 +13794,13 @@ async fn execute_run_inner(
                     spec.timeout_seconds,
                 ));
             }
-
             yield_to_exact_boundaries!('runner);
+            record_buflo_incoming_startup_ready(
+                &controller,
+                &mut traces,
+                loop_now,
+                &mut buflo_incoming_startup_recorded,
+            )?;
 
             let elapsed_before_http = defense_elapsed_at!(loop_now);
             for endpoint_index in 0..endpoints.len() {
@@ -13789,7 +13853,16 @@ async fn execute_run_inner(
             }
             yield_to_exact_boundaries!('runner);
 
-            if defense_start.is_none() && endpoints.iter().all(|endpoint| endpoint.connected) {
+            activate_needed_endpoints(
+                &mut endpoints,
+                spec,
+                &dependencies,
+                defense_start.is_none() || controller.can_start_application_batch(),
+                loop_now,
+                &mut traces,
+                &observation_clock,
+            )?;
+            if defense_start.is_none() && startup_endpoints_connected(&endpoints) {
                 // Handshake datagrams predate the defense clock even though
                 // their transport classifications can still be queued when
                 // the final endpoint becomes ready.  Retain the endpoint and
@@ -14124,6 +14197,12 @@ async fn execute_run_inner(
                 yield_to_exact_boundaries!('runner);
             }
 
+            record_buflo_incoming_startup_ready(
+                &controller,
+                &mut traces,
+                now(),
+                &mut buflo_incoming_startup_recorded,
+            )?;
             if application_complete_observed
                 && controller.is_complete()
                 && endpoints.iter_mut().all(|endpoint| {
@@ -14220,7 +14299,10 @@ async fn execute_run_inner(
                 controller_deadline_selected = false;
             }
             let wake = wait_for_activity_until(
-                endpoints.iter().map(|endpoint| &endpoint.socket),
+                endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.network_active)
+                    .map(|endpoint| &endpoint.socket),
                 next_wakeup,
             )
             .await?;
@@ -14652,14 +14734,44 @@ fn activate_traffic_morphing(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "endpoint construction validates and binds one fail-closed multi-origin QCSD unit"
-)]
+#[cfg(test)]
 fn create_endpoints(
     spec: &RunSpec,
     start: Instant,
     observation_clock: &QcsdObservationClock,
+) -> Result<Vec<Endpoint>, Error> {
+    create_endpoint_inventory(spec, start, observation_clock, false)
+}
+
+fn create_run_endpoints(
+    spec: &RunSpec,
+    start: Instant,
+    observation_clock: &QcsdObservationClock,
+) -> Result<Vec<Endpoint>, Error> {
+    create_endpoint_inventory(
+        spec,
+        start,
+        observation_clock,
+        matches!(
+            spec.config.defense,
+            DefenseConfig::None
+                | DefenseConfig::Front(_)
+                | DefenseConfig::Tamaraw(_)
+                | DefenseConfig::Buflo(_)
+                | DefenseConfig::CsBuflo(_)
+        ),
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "endpoint construction validates and binds one fail-closed multi-origin QCSD unit"
+)]
+fn create_endpoint_inventory(
+    spec: &RunSpec,
+    start: Instant,
+    observation_clock: &QcsdObservationClock,
+    defer_activation: bool,
 ) -> Result<Vec<Endpoint>, Error> {
     let mut grouped = BTreeMap::<(String, u16), VecDeque<ApplicationRequest>>::new();
     for resource in &spec.workload.resources {
@@ -14701,7 +14813,7 @@ fn create_endpoints(
             let socket = Socket::bind_for_direct_capture(bind_addr)?;
             let local_addr = socket.local_addr()?;
             let params = qcsd_connection_parameters(&spec.config, remote_addr.ip());
-            let transport = Connection::new_client(
+            let mut transport = Connection::new_client(
                 &host,
                 &["h3"],
                 Rc::new(RefCell::new(RandomConnectionIdGenerator::new(8))),
@@ -14710,6 +14822,9 @@ fn create_endpoints(
                 params,
                 start,
             )?;
+            // Handshakes retain the same configured ceiling even while the
+            // HTTP/3 adapter waits for genuine connection readiness.
+            transport.qcsd_set_udp_payload_ceiling(spec.config.max_udp_payload_size)?;
             let mut client = Http3Client::new_with_conn(
                 transport,
                 Http3Parameters::default().max_concurrent_push_streams(0),
@@ -14722,15 +14837,16 @@ fn create_endpoints(
             }
             .parse()
             .map_err(|_| Error::Argument("invalid origin".into()))?;
-            let shape_stream_sends = shapes_stream_sends(&spec.config.defense);
-            client.enable_qcsd_with_observation_clock(
-                endpoint_id,
-                &origin,
-                spec.config.max_udp_payload_size,
-                shape_stream_sends,
-                Duration::from_micros(spec.config.keep_alive_lead_time_us),
-                observation_clock.clone(),
-            )?;
+            if !defer_activation {
+                client.enable_qcsd_with_observation_clock(
+                    endpoint_id,
+                    &origin,
+                    spec.config.max_udp_payload_size,
+                    shapes_stream_sends(&spec.config.defense),
+                    Duration::from_micros(spec.config.keep_alive_lead_time_us),
+                    observation_clock.clone(),
+                )?;
+            }
             Ok(Endpoint {
                 id: endpoint_id,
                 origin,
@@ -14740,6 +14856,15 @@ fn create_endpoints(
                 recv_buf: RecvBuf::default(),
                 receive_loop: ReceiveLoopState::new(start),
                 client,
+                network_active: !defer_activation,
+                defer_application_until_connected: defer_activation,
+                buflo_ack_start_enabled: matches!(spec.config.defense, DefenseConfig::Buflo(_))
+                    && spec
+                        .application_workload_source
+                        .as_ref()
+                        .is_some_and(|source| {
+                            source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
+                        }),
                 transport_instant_floor: start,
                 pending,
                 application_stream_limit_blocked: false,
@@ -14776,6 +14901,92 @@ fn create_endpoints(
             })
         })
         .collect()
+}
+
+fn startup_endpoints_connected(endpoints: &[Endpoint]) -> bool {
+    endpoints.iter().any(|endpoint| endpoint.network_active)
+        && endpoints
+            .iter()
+            .filter(|endpoint| endpoint.network_active)
+            .all(|endpoint| endpoint.connected)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dependency activation binds real readiness, adapter clock, and the unchanged endpoint trace"
+)]
+fn activate_needed_endpoints(
+    endpoints: &mut [Endpoint],
+    spec: &RunSpec,
+    dependencies: &DependencyTracker,
+    defense_batch_ready: bool,
+    activated_at: Instant,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+) -> Result<(), Error> {
+    let application_in_flight = has_in_flight_application_stream(
+        endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.streams.values()),
+    );
+    let ready = ready_request_batch(
+        &spec.config.defense,
+        spec.request_policy,
+        application_in_flight,
+        defense_batch_ready,
+        dependencies,
+    );
+    let chaff_origin = if matches!(spec.config.defense, DefenseConfig::None) {
+        None
+    } else {
+        spec.chaff_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.selected_resource().origin())
+            .map(|origin| {
+                origin
+                    .parse::<Uri>()
+                    .map_err(|_| Error::Argument("invalid selected qualified chaff origin".into()))
+            })
+            .transpose()?
+    };
+    for endpoint in endpoints {
+        if endpoint.network_active {
+            continue;
+        }
+        let application_ready = endpoint
+            .pending
+            .iter()
+            .any(|request| ready.contains(&request.resource_id));
+        let chaff_ready = chaff_origin
+            .as_ref()
+            .is_some_and(|origin| origin == &endpoint.origin);
+        if application_ready || chaff_ready {
+            // Enable before the first protocol microstep so every handshake
+            // datagram retains the ordinary packet-build composition proof.
+            endpoint.client.enable_qcsd_with_observation_clock(
+                endpoint.id,
+                &endpoint.origin,
+                spec.config.max_udp_payload_size,
+                shapes_stream_sends(&spec.config.defense),
+                Duration::from_micros(spec.config.keep_alive_lead_time_us),
+                observation_clock.clone(),
+            )?;
+            endpoint.network_active = true;
+            _ = endpoint.transport_instant(activated_at);
+            traces.event(
+                activated_at,
+                Some(endpoint.id),
+                "endpoint_activation",
+                "started",
+                &json!({
+                    "origin": endpoint.origin.to_string(),
+                    "application_ready": application_ready,
+                    "qualified_chaff_ready": chaff_ready,
+                }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn qcsd_connection_parameters(config: &QcsdConfig, remote_ip: IpAddr) -> ConnectionParameters {
@@ -14866,7 +15077,11 @@ fn dispatch_ready_requests(
                 )?;
                 continue;
             }
-            if endpoint.application_stream_limit_blocked || !ready.contains(&request.resource_id) {
+            if !endpoint.network_active
+                || (endpoint.defer_application_until_connected && !endpoint.connected)
+                || endpoint.application_stream_limit_blocked
+                || !ready.contains(&request.resource_id)
+            {
                 endpoint.pending.push_back(request);
                 continue;
             }
@@ -15116,6 +15331,9 @@ fn handle_http_events(
     traces: &mut TraceFiles,
     max_events: Option<usize>,
 ) -> Result<(), Error> {
+    if !endpoint.network_active {
+        return Ok(());
+    }
     let transport_at = endpoint.transport_instant(now);
     let mut handled_events = 0_usize;
     loop {
@@ -15524,6 +15742,7 @@ fn handle_qcsd_observations(
             &observation,
             terminal_us,
             None,
+            Some(defense_elapsed),
         )?;
         if let Some(slot) = terminal {
             require_controller_terminal_resolution(controller, slot, defense_elapsed)?;
@@ -15549,6 +15768,7 @@ fn handle_all_qcsd_observations(
             &observation,
             terminal_us,
             None,
+            Some(defense_elapsed),
         )?;
         if let Some(slot) = terminal {
             require_controller_terminal_resolution(controller, slot, defense_elapsed)?;
@@ -15613,6 +15833,7 @@ fn handle_defense_activation_observations(
             &observation,
             None,
             None,
+            Some(Duration::ZERO),
         )?;
     }
     Ok(())
@@ -15779,6 +16000,7 @@ fn record_qcsd_observation(
     record: &TimestampedQcsdObservation,
     terminal_defense_elapsed_us: Option<u64>,
     receive_credit_handoff_at: Option<Instant>,
+    controller_defense_elapsed: Option<Duration>,
 ) -> Result<(), Error> {
     let observation = record.observation();
     if terminal_observation_slot(observation).is_some() != terminal_defense_elapsed_us.is_some() {
@@ -15921,6 +16143,70 @@ fn record_qcsd_observation(
         controller,
         receive_credit_handoff_at,
     )?;
+    if endpoint.buflo_ack_start_enabled
+        && matches!(
+            observation,
+            QcsdObservation::StreamDataAcknowledged {
+                role: QcsdRequestRole::Chaff { .. },
+                ..
+            }
+        )
+    {
+        let reduced_at = controller_defense_elapsed.ok_or_else(|| {
+            Error::SlotInvariant(
+                "source-bound BuFLO chaff ACK lacks its actual controller reduction clock".into(),
+            )
+        })?;
+        let produced_at = endpoint
+            .receive_loop
+            .origin
+            .checked_add(Duration::from_nanos(record.produced_monotonic_ns()))
+            .ok_or_else(|| {
+                Error::SlotInvariant("BuFLO chaff ACK production timestamp overflow".into())
+            })?;
+        traces.event(
+            produced_at,
+            Some(endpoint.id),
+            "buflo_incoming_startup_ack",
+            "controller_reduced",
+            &json!({
+                "schema_version": 1,
+                "source": "native-controller-defense-elapsed-us-v1",
+                "production_sequence": record.sequence(),
+                "production_monotonic_ns": record.produced_monotonic_ns(),
+                "controller_defense_elapsed_us": duration_as_trace_micros(reduced_at),
+                "observation": observation,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn record_buflo_incoming_startup_ready(
+    controller: &QcsdController,
+    traces: &mut TraceFiles,
+    recorded_at: Instant,
+    recorded: &mut bool,
+) -> Result<(), Error> {
+    if *recorded {
+        return Ok(());
+    }
+    let diagnostics = controller.defense_diagnostics();
+    let Some(startup) = diagnostics
+        .buflo_incoming_startup
+        .as_ref()
+        .filter(|startup| startup.armed)
+    else {
+        return Ok(());
+    };
+    traces.event(
+        recorded_at,
+        startup.ready_endpoint.map(QcsdEndpointId),
+        "buflo_incoming_startup_ready",
+        "armed",
+        startup,
+    )?;
+    *recorded = true;
     Ok(())
 }
 
@@ -19183,6 +19469,7 @@ fn expire_buflo_exact_incoming_credit(
             &record,
             Some(duration_as_trace_micros(elapsed)),
             None,
+            Some(elapsed),
         )?;
         require_controller_terminal_resolution(controller, slot, elapsed)?;
     }
@@ -20541,6 +20828,7 @@ async fn dispatch_buflo_exact_release(
                 &record,
                 Some(duration_as_trace_micros(dispatch_elapsed)),
                 None,
+                Some(dispatch_elapsed),
             )?;
             require_controller_terminal_resolution(controller, guard.slot, dispatch_elapsed)?;
             controller.flush_defense_observations();
@@ -21909,6 +22197,9 @@ async fn prepare_output_once_with_evidence(
     endpoint: &mut Endpoint,
     drive_now: Instant,
 ) -> Result<PreparedOutputDrive, PreparedOutputFailure> {
+    if !endpoint.network_active {
+        return Ok(PreparedOutputDrive::None);
+    }
     #[cfg(test)]
     if let Some(output) = endpoint.test_output_drives.pop_front() {
         match output {
@@ -22167,6 +22458,7 @@ fn finalize_prepared_output_with_elapsed(
             observation,
             terminal_us,
             Some(receive_credit_handoff_at),
+            wire_elapsed,
         )?;
         if let (Some(slot), Some(at)) = (terminal, wire_elapsed) {
             require_controller_terminal_resolution(controller, slot, at)?;
@@ -22369,6 +22661,9 @@ fn process_input(
     defense_elapsed: Option<Duration>,
     drain_socket: bool,
 ) -> Result<(), Error> {
+    if !endpoint.network_active {
+        return Ok(());
+    }
     let result = (|| -> Result<ReceivePollDisposition, Error> {
         let transport_at = endpoint.transport_instant(input_now);
         while let Some(datagrams) = endpoint
@@ -22483,7 +22778,7 @@ fn buflo_run_summary(
         return None;
     };
     diagnostics.map(|diagnostics| {
-        json!({
+        let mut summary = json!({
             "schema_version": 4,
             "kind": "buflo",
             "implementation_scope": "client_only_quic",
@@ -22497,7 +22792,11 @@ fn buflo_run_summary(
                 "scheduled_server_datagram_size",
             ],
             "diagnostics": diagnostics,
-        })
+        });
+        if let Some(startup) = diagnostics.buflo_incoming_startup.as_ref() {
+            summary["incoming_startup"] = json!(startup);
+        }
+        summary
     })
 }
 
@@ -28186,6 +28485,495 @@ mod tests {
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
+        reason = "the real HTTP/3 regression follows dependency completion and delayed origin activation without fake connection readiness"
+    )]
+    async fn dependent_endpoint_waits_for_real_resource_then_completes_original_graph() {
+        let output = trace_output_dir("dependent-endpoint-activation");
+        let activated_at = test_fixture::now();
+        let started = activated_at - Duration::from_secs(40);
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![
+                request(1, "https://127.0.0.1:4433", Vec::new()),
+                request(2, "https://127.0.0.1:4434", vec![1]),
+            ],
+        );
+        let mut endpoints = super::create_run_endpoints(&spec, started, &clock)
+            .expect("allocate the complete original endpoint inventory");
+        let tuples = endpoints
+            .iter()
+            .map(|endpoint| (endpoint.id, endpoint.local_addr, endpoint.remote_addr))
+            .collect::<Vec<_>>();
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.iter().all(|endpoint| !endpoint.network_active));
+        assert!(super::take_all_qcsd_observations(&mut endpoints).is_empty());
+        let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("graph");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        super::activate_needed_endpoints(
+            &mut endpoints,
+            &spec,
+            &dependencies,
+            true,
+            started,
+            &mut traces,
+            &clock,
+        )
+        .expect("activate only the dispatchable primary origin");
+        assert!(endpoints[0].network_active);
+        assert!(!endpoints[1].network_active);
+        let initial = super::take_all_qcsd_observations(&mut endpoints);
+        assert_eq!(initial.len(), 1);
+        assert!(matches!(
+            initial[0].1.observation(),
+            QcsdObservation::EndpointReady { endpoint, .. } if *endpoint == endpoints[0].id
+        ));
+        assert!(matches!(
+            super::prepare_output_once_with_evidence(&mut endpoints[1], activated_at)
+                .await
+                .unwrap_or_else(|_| panic!(
+                    "inactive endpoint remains untouched after forty seconds"
+                )),
+            PreparedOutputDrive::None
+        ));
+        assert!(matches!(
+            endpoints[1].client.state(),
+            neqo_http3::Http3State::Initializing
+        ));
+        assert!(endpoints[1].receive_loop.latest_return.is_none());
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                activated_at,
+                &mut traces,
+                true,
+                None,
+                None,
+            )
+            .expect("wait for a genuine handshake instead of failing the ready request"),
+            0
+        );
+        assert_eq!(dependencies.state(1), Some(ResourceRunState::Pending));
+
+        for endpoint_index in 0..2 {
+            if endpoint_index == 1 {
+                super::activate_needed_endpoints(
+                    &mut endpoints,
+                    &spec,
+                    &dependencies,
+                    true,
+                    activated_at,
+                    &mut traces,
+                    &clock,
+                )
+                .expect("completed primary dependency activates the original auth origin");
+                assert!(endpoints[1].network_active);
+                assert!(!endpoints[1].connected);
+                assert_eq!(
+                    dispatch_ready_requests(
+                        &mut endpoints,
+                        &spec,
+                        &mut dependencies,
+                        activated_at,
+                        &mut traces,
+                        true,
+                        None,
+                        None,
+                    )
+                    .expect("late handshake preserves pending dependency state"),
+                    0
+                );
+                assert_eq!(dependencies.state(2), Some(ResourceRunState::Pending));
+                assert!(!super::startup_endpoints_connected(&endpoints));
+            }
+            let mut server = test_fixture::default_http3_server();
+            let trailing =
+                test_fixture::connect_peers(&mut endpoints[endpoint_index].client, &mut server);
+            let server_output = server.process(trailing, activated_at).dgram();
+            test_fixture::exchange_packets(
+                &mut endpoints[endpoint_index].client,
+                &mut server,
+                false,
+                server_output,
+            );
+            handle_http_events(
+                &mut endpoints[endpoint_index],
+                &spec,
+                activated_at,
+                &mut traces,
+                None,
+            )
+            .expect("consume actual connected state");
+            assert!(super::startup_endpoints_connected(&endpoints));
+            assert_eq!(
+                dispatch_ready_requests(
+                    &mut endpoints,
+                    &spec,
+                    &mut dependencies,
+                    activated_at,
+                    &mut traces,
+                    true,
+                    None,
+                    None,
+                )
+                .expect("dispatch the original resource after actual handshake"),
+                1
+            );
+            test_fixture::exchange_packets(
+                &mut endpoints[endpoint_index].client,
+                &mut server,
+                false,
+                None,
+            );
+            let stream = server
+                .events()
+                .find_map(|event| match event {
+                    neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                        assert!(fin);
+                        Some(stream)
+                    }
+                    _ => None,
+                })
+                .expect("peer receives the real application request");
+            stream
+                .send_headers(&[
+                    neqo_common::Header::new(":status", "200"),
+                    neqo_common::Header::new("content-length", "1"),
+                ])
+                .expect("response headers");
+            assert_eq!(stream.send_data(b"x", activated_at).expect("body"), 1);
+            stream
+                .stream_close_send(activated_at)
+                .expect("response FIN");
+            test_fixture::exchange_packets(
+                &mut endpoints[endpoint_index].client,
+                &mut server,
+                false,
+                None,
+            );
+            handle_http_events(
+                &mut endpoints[endpoint_index],
+                &spec,
+                activated_at,
+                &mut traces,
+                None,
+            )
+            .expect("retire the actual completed response");
+            let resource_id = u32::try_from(endpoint_index + 1).expect("resource ID");
+            assert_eq!(
+                endpoints[endpoint_index].retired_applications,
+                [(resource_id, ResourceRunState::Succeeded)]
+            );
+            for (completed_id, _) in endpoints[endpoint_index].retired_applications.drain(..) {
+                dependencies
+                    .mark_succeeded(completed_id)
+                    .expect("actual dependency completion");
+            }
+        }
+        assert!(dependencies.is_successful());
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| endpoint.connected && endpoint.pending.is_empty())
+        );
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| endpoint.completed.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(
+            endpoints
+                .iter()
+                .map(|endpoint| (endpoint.id, endpoint.local_addr, endpoint.remote_addr))
+                .collect::<Vec<_>>(),
+            tuples,
+            "late activation preserves the frozen complete endpoint tuple inventory"
+        );
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert_eq!(events.matches(",endpoint_activation,started,").count(), 2);
+        assert_eq!(events.matches(",application_request,started,").count(), 2);
+        assert!(!events.contains(",application_request,failed,"));
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_qualified_chaff_origin_activates_before_its_application_dependencies() {
+        let output = trace_output_dir("selected-chaff-endpoint-activation");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let mut spec = application_stream_limit_spec(
+            output.clone(),
+            vec![
+                request(1, "https://127.0.0.1:4433", Vec::new()),
+                request(2, "https://127.0.0.1:4434", vec![1]),
+                request(3, "https://127.0.0.1:4435", vec![1]),
+            ],
+        );
+        spec.chaff_manifest = Some(
+            response_only_chaff_manifest_v4(
+                9,
+                "https://127.0.0.1:4434/chaff",
+                24_064,
+                &"a".repeat(64),
+            )
+            .into(),
+        );
+        let dependencies = DependencyTracker::new(spec.workload.clone()).expect("graph");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let mut baseline =
+            super::create_run_endpoints(&spec, started, &clock).expect("baseline endpoints");
+        super::activate_needed_endpoints(
+            &mut baseline,
+            &spec,
+            &dependencies,
+            true,
+            started,
+            &mut traces,
+            &clock,
+        )
+        .expect("an undefended manifest does not register actual padding work");
+        assert!(baseline[0].network_active);
+        assert!(!baseline[1].network_active);
+        assert!(!baseline[2].network_active);
+        assert_eq!(super::take_all_qcsd_observations(&mut baseline).len(), 1);
+        drop(baseline);
+        spec.config.defense = DefenseConfig::Front(FrontConfig::default());
+        let mut endpoints =
+            super::create_run_endpoints(&spec, started, &clock).expect("defended endpoints");
+        super::activate_needed_endpoints(
+            &mut endpoints,
+            &spec,
+            &dependencies,
+            true,
+            started,
+            &mut traces,
+            &clock,
+        )
+        .expect("activate registered qualified chaff and primary origins only");
+        assert!(endpoints[0].network_active);
+        assert!(endpoints[1].network_active);
+        assert!(!endpoints[2].network_active);
+        assert_eq!(dependencies.state(2), Some(ResourceRunState::Pending));
+        assert_eq!(dependencies.state(3), Some(ResourceRunState::Pending));
+        assert_eq!(super::take_all_qcsd_observations(&mut endpoints).len(), 2);
+        drop(endpoints);
+        spec.workload.resources[1].url = "https://127.0.0.1:443/2".into();
+        spec.chaff_manifest = Some(
+            response_only_chaff_manifest_v4(
+                9,
+                "https://127.0.0.1:443/chaff",
+                24_064,
+                &"a".repeat(64),
+            )
+            .into(),
+        );
+        let dependencies =
+            DependencyTracker::new(spec.workload.clone()).expect("default-port graph");
+        let mut endpoints =
+            super::create_run_endpoints(&spec, started, &clock).expect("default-port endpoints");
+        super::activate_needed_endpoints(
+            &mut endpoints,
+            &spec,
+            &dependencies,
+            true,
+            started,
+            &mut traces,
+            &clock,
+        )
+        .expect("activate the exact selected default-port origin");
+        assert!(
+            endpoints
+                .iter()
+                .find(|endpoint| endpoint.remote_addr.port() == 443)
+                .expect("selected default-port endpoint")
+                .network_active
+        );
+        assert!(
+            !endpoints
+                .iter()
+                .find(|endpoint| endpoint.remote_addr.port() == 4435)
+                .expect("unselected dependent endpoint")
+                .network_active
+        );
+        assert_eq!(super::take_all_qcsd_observations(&mut endpoints).len(), 2);
+        drop(endpoints);
+        drop(traces);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_endpoint_construction_keeps_eager_adapter_readiness() {
+        let output = trace_output_dir("legacy-endpoint-activation");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![
+                request(1, "https://127.0.0.1:4433", Vec::new()),
+                request(2, "https://127.0.0.1:4434", vec![1]),
+            ],
+        );
+        let mut endpoints = create_endpoints(&spec, started, &clock).expect("legacy construction");
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| endpoint.network_active
+                    && !endpoint.defer_application_until_connected)
+        );
+        assert_eq!(super::take_all_qcsd_observations(&mut endpoints).len(), 2);
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buflo_startup_ack_binding_uses_actual_reduction_clock_and_preserves_legacy_rows() {
+        let output = trace_output_dir("buflo-startup-ack-reduction-clock");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoint = create_endpoints(&spec, started, &clock)
+            .expect("endpoint")
+            .remove(0);
+        let mut controller = QcsdController::new(spec.config.clone(), 7, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let endpoint_id = endpoint.id;
+        let acknowledgment = |role| QcsdObservation::StreamDataAcknowledged {
+            endpoint: endpoint_id,
+            stream: QcsdStreamId(0),
+            role,
+            offset: 0,
+            bytes: 185,
+            fin: true,
+        };
+        let chaff_role = QcsdRequestRole::Chaff {
+            resource_id: 9,
+            request_id: Some(QcsdChaffRequestId(7)),
+        };
+        let legacy = clock.record_at(
+            acknowledgment(chaff_role),
+            started + Duration::from_micros(10),
+        );
+        controller.observe(legacy.observation().clone(), Duration::from_micros(90_000));
+        super::record_qcsd_observation(
+            &mut endpoint,
+            &controller,
+            &mut traces,
+            &legacy,
+            None,
+            None,
+            None,
+        )
+        .expect("legacy ACK does not require the prospective reduction-clock field");
+
+        endpoint.buflo_ack_start_enabled = true;
+        let application = clock.record_at(
+            acknowledgment(QcsdRequestRole::Application),
+            started + Duration::from_micros(20),
+        );
+        controller.observe(
+            application.observation().clone(),
+            Duration::from_micros(91_000),
+        );
+        super::record_qcsd_observation(
+            &mut endpoint,
+            &controller,
+            &mut traces,
+            &application,
+            None,
+            None,
+            None,
+        )
+        .expect("non-chaff ACK retains its ordinary shape without a startup binding");
+        let missing = clock.record_at(
+            acknowledgment(chaff_role),
+            started + Duration::from_micros(30),
+        );
+        controller.observe(missing.observation().clone(), Duration::from_micros(91_500));
+        assert!(
+            super::record_qcsd_observation(
+                &mut endpoint,
+                &controller,
+                &mut traces,
+                &missing,
+                None,
+                None,
+                None,
+            )
+            .expect_err("V2 chaff ACK cannot infer its controller time from production time")
+            .to_string()
+            .contains("actual controller reduction clock")
+        );
+
+        let bound = clock.record_at(
+            acknowledgment(chaff_role),
+            started + Duration::from_micros(40),
+        );
+        let reduced_at = Duration::from_micros(92_000);
+        controller.observe(bound.observation().clone(), reduced_at);
+        super::record_qcsd_observation(
+            &mut endpoint,
+            &controller,
+            &mut traces,
+            &bound,
+            None,
+            None,
+            Some(reduced_at),
+        )
+        .expect("preserve the same controller reduction argument alongside its raw ACK");
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        let binding_rows = events
+            .lines()
+            .filter(|line| line.contains(",buflo_incoming_startup_ack,controller_reduced,"))
+            .collect::<Vec<_>>();
+        assert_eq!(binding_rows.len(), 1);
+        let raw = binding_rows[0]
+            .splitn(5, ',')
+            .nth(4)
+            .expect("binding details column");
+        let last_quote = raw.rfind('"').expect("quoted JSON closing delimiter");
+        let details: serde_json::Value =
+            serde_json::from_str(&raw[1..last_quote].replace("\"\"", "\""))
+                .expect("reopen exact binding JSON");
+        assert_eq!(
+            details,
+            json!({
+                "schema_version": 1,
+                "source": "native-controller-defense-elapsed-us-v1",
+                "production_sequence": bound.sequence(),
+                "production_monotonic_ns": bound.produced_monotonic_ns(),
+                "controller_defense_elapsed_us": 92_000,
+                "observation": bound.observation(),
+            })
+        );
+        assert_eq!(bound.produced_monotonic_ns(), 40_000);
+        let ordinary = events
+            .lines()
+            .filter(|line| line.contains(",observation,recorded,"))
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.len(), 4);
+        assert!(
+            ordinary
+                .iter()
+                .all(|line| !line.contains("controller_defense_elapsed_us"))
+        );
+        assert_eq!(events.matches("buflo_incoming_startup_ready").count(), 0);
+        drop(endpoint);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
         reason = "the real peer regression checks queue, dependency, stream-credit and response lifecycle together"
     )]
     async fn application_stream_limit_preserves_pending_and_resumes_on_peer_credit() {
@@ -33532,12 +34320,23 @@ mod tests {
     }
 
     fn buflo_incoming_credit_release_policy_spec() -> RunSpec {
+        buflo_incoming_credit_release_policy_spec_for(
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME,
+        )
+    }
+
+    fn buflo_incoming_credit_release_policy_spec_for(policy: &str) -> RunSpec {
         test_fixture::fixture_init();
         let output = trace_output_dir("buflo-incoming-credit-release-policy-source");
         let source_path = output.join("prepared.json");
         let mut source = variable_primary_document_source();
-        source["preparation"]["buflo_incoming_credit_release_policy"] =
-            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME);
+        source["preparation"]["buflo_incoming_credit_release_policy"] = json!(policy);
+        if policy == super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME {
+            source["preparation"]["qualified_chaff_origin_policy"] =
+                json!("prepared-approved-origins-v1");
+            source["preparation"]["approved_origins"] =
+                json!(["https://example.com", "https://api.example.com"]);
+        }
         let raw = serde_json::to_vec(&source).expect("serialize bound incoming policy");
         fs::write(&source_path, &raw).expect("write source");
         let bound = super::load_application_workload_source(&source_path)
@@ -33603,6 +34402,7 @@ mod tests {
             &json!({}),
             ApplicationResponsePolicy::Http2xxOnly,
             super::PrimaryDocumentIdentityPolicy::ExactResponseBody,
+            &super::QualifiedChaffOriginPolicy::PrimaryOrigin,
         )
         .expect("missing opt-in retains legacy admission");
         assert_eq!(
@@ -33693,6 +34493,74 @@ mod tests {
                 .get("buflo_incoming_credit_release_policy")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn buflo_acknowledged_incoming_startup_requires_exact_prepared_origin_selector() {
+        let mut source = variable_primary_document_source();
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME);
+        assert_terminal_http_error_source(&source, false);
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        source["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        assert_terminal_http_error_source(&source, true);
+        for field in ["qualified_chaff_origin_policy", "approved_origins"] {
+            let mut absent = source.clone();
+            absent["preparation"]
+                .as_object_mut()
+                .expect("preparation")
+                .remove(field);
+            assert_terminal_http_error_source(&absent, false);
+        }
+        let mut exact_primary = source.clone();
+        exact_primary["preparation"]["primary_document_identity_policy"] =
+            json!("exact-response-body-v1");
+        assert_terminal_http_error_source(&exact_primary, false);
+        let mut legacy = source;
+        legacy["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME);
+        legacy["preparation"]
+            .as_object_mut()
+            .expect("preparation")
+            .remove("qualified_chaff_origin_policy");
+        legacy["preparation"]
+            .as_object_mut()
+            .expect("preparation")
+            .remove("approved_origins");
+        assert_terminal_http_error_source(&legacy, true);
+    }
+
+    #[test]
+    fn buflo_acknowledged_incoming_policy_marker_is_source_bound_without_fabricating_startup() {
+        let mut spec = buflo_incoming_credit_release_policy_spec_for(
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME,
+        );
+        super::validate_buflo_incoming_credit_release_policy(&spec)
+            .expect("bound prospective policy");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"],
+            json!({
+                "schema_version": 1,
+                "source": "bound-preparation-v1",
+                "policy": "rapid-v5-half-period-10000us-ack-start-v2",
+                "incoming_release_window_us": 10_000,
+                "period_us": 20_000,
+                "cell_bytes": 1_200,
+                "scientific_credit": false,
+            })
+        );
+        assert!(
+            run["buflo_summary"].is_null(),
+            "the static opt-in never invents an actual ACK/startup receipt"
+        );
+        assert_eq!(spec.config.control_interval_us, 5_000);
+        spec.application_workload_source.as_mut().expect("source").4 =
+            super::QualifiedChaffOriginPolicy::PrimaryOrigin;
+        assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
+        assert!(super::buflo_incoming_credit_release_receipt(&spec).is_none());
     }
 
     #[test]

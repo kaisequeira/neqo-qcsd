@@ -32,9 +32,9 @@ pub use static_schedule::StaticSchedule;
 pub use tamaraw::Tamaraw;
 pub use traffic_morphing::{TrafficMorphing, TrafficMorphingEgress};
 pub use traits::{
-    CapacityAdjustment, CsBufloRateTransitionDiagnostics, Defense, DefenseDiagnostics, DefenseMode,
-    DefenseSignal, EventOutcome, ReceiverContinuationDisposition, SignalKind,
-    WalkieTalkieBurstDiagnostics,
+    BufloIncomingStartupDiagnostics, CapacityAdjustment, CsBufloRateTransitionDiagnostics, Defense,
+    DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, ReceiverContinuationDisposition,
+    SignalKind, WalkieTalkieBurstDiagnostics,
 };
 pub use walkie_talkie::{
     BurstPair, HistoricalWalkieTalkieSchemaFiveDiagnostic, WalkieTalkie,

@@ -670,6 +670,9 @@ impl ReceiveState {
     /// This does not advertise credit or relax the unowned lifetime allowance.
     /// A complete allocator transaction must provide the same-cell ownership,
     /// and the ordinary parser lease checks the boundary again before release.
+    /// Already advertised bytes ahead of the parser must be read first. A
+    /// pristine boundary does not prove that this tail contains another frame,
+    /// nor that appending sixteen more bytes can be consumed before FIN.
     pub(crate) fn scheduled_parser_lease_capacity(&self) -> u64 {
         const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
         match self {
@@ -696,6 +699,7 @@ impl ReceiveState {
                 ..
             } if *parser_lease_exhausted
                 && *requested_limit == *advertised_limit
+                && *requested_limit == *consumed
                 && *known_limit <= *requested_limit
                 && *pending_parser_boundary == Some(*consumed)
                 && *last_parser_lease_boundary != Some(*consumed) =>
@@ -1063,6 +1067,44 @@ const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
 #[cfg(test)]
 mod tests {
     use super::{MAX_HTTP3_FRAME_HEADER_BYTES, ReceiveState};
+
+    #[test]
+    fn scheduled_parser_capacity_waits_for_existing_advertised_tail() {
+        for tail in [1, 2, 15, 16, 24, 604] {
+            let mut state = ReceiveState::controlled(1, 16, 1);
+            let ReceiveState::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_used,
+                parser_lease_exhausted,
+                ..
+            } = &mut state
+            else {
+                panic!("controlled parser state");
+            };
+            *consumed = 24_032;
+            *advertised_limit = *consumed + tail;
+            *requested_limit = *advertised_limit;
+            *known_limit = *advertised_limit;
+            *parser_lease_used = 16;
+            *parser_lease_exhausted = true;
+            state.header_progress(1, true);
+            assert_eq!(state.scheduled_parser_lease_capacity(), 0);
+
+            // Receiving existing bytes, rather than granting them again,
+            // exposes the next genuinely blocked pristine boundary.
+            state.bytes_read(tail);
+            state.header_progress(1, true);
+            assert_eq!(state.scheduled_parser_lease_capacity(), 16);
+
+            // A partially decoded header supplies an exact remaining extent.
+            state.header_progress(8, false);
+            assert_eq!(state.scheduled_parser_lease_capacity(), 0);
+            assert_eq!(state.available(), 8);
+        }
+    }
 
     #[test]
     fn created_stream_transitions_to_the_selected_receive_policy() {

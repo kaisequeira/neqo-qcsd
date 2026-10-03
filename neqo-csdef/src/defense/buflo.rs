@@ -5,7 +5,10 @@
 
 use std::time::Duration;
 
-use super::{Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, SignalKind};
+use super::{
+    BufloIncomingStartupDiagnostics, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal,
+    EventOutcome, SignalKind,
+};
 use crate::{BufloConfig, BufloParameters, Direction, Packet, QcsdChaffCancellationReason, Result};
 
 /// Clean-room, client-only `BuFLO` schedule adaptation.
@@ -22,6 +25,7 @@ pub struct Buflo {
     parameters: BufloParameters,
     next_incoming_us: u64,
     next_outgoing_us: u64,
+    incoming_startup: Option<BufloIncomingStartupDiagnostics>,
     scheduled_incoming: u64,
     scheduled_outgoing: u64,
     full_outgoing: u64,
@@ -69,6 +73,7 @@ impl Buflo {
             parameters,
             next_incoming_us: 0,
             next_outgoing_us: 0,
+            incoming_startup: None,
             scheduled_incoming: 0,
             scheduled_outgoing: 0,
             full_outgoing: 0,
@@ -99,8 +104,13 @@ impl Buflo {
     }
 
     const fn minimum_schedule_emitted(&self) -> bool {
-        self.next_incoming_us > self.parameters.minimum_duration_us
+        !self.incoming_waiting_for_ack()
+            && self.next_incoming_us > self.parameters.minimum_duration_us
             && self.next_outgoing_us > self.parameters.minimum_duration_us
+    }
+
+    const fn incoming_waiting_for_ack(&self) -> bool {
+        matches!(self.incoming_startup, Some(startup) if !startup.armed)
     }
 
     const fn terminal_conditions_met(&self) -> bool {
@@ -194,6 +204,9 @@ impl Buflo {
             return self.catch_up_failure_triggered;
         }
         for direction in [Direction::Outgoing, Direction::Incoming] {
+            if direction == Direction::Incoming && self.incoming_waiting_for_ack() {
+                continue;
+            }
             let next_us = match direction {
                 Direction::Outgoing => self.next_outgoing_us,
                 Direction::Incoming => self.next_incoming_us,
@@ -215,6 +228,9 @@ impl Buflo {
 
     fn pop_direction(&mut self, elapsed_us: u64, direction: Direction) -> Option<Packet> {
         if self.schedule_closed() || self.event_guard_triggered {
+            return None;
+        }
+        if direction == Direction::Incoming && self.incoming_waiting_for_ack() {
             return None;
         }
         let (next_us, count) = match direction {
@@ -244,6 +260,78 @@ impl Buflo {
 }
 
 impl Defense for Buflo {
+    fn enable_buflo_acknowledged_incoming_startup(&mut self) -> bool {
+        if self.parameters.packet_size != 1_200
+            || self.parameters.interval_us != 20_000
+            || self.scheduled_outgoing != 0
+            || self.scheduled_incoming != 0
+            || self.incoming_startup.is_some()
+        {
+            return false;
+        }
+        self.incoming_startup = Some(BufloIncomingStartupDiagnostics {
+            schema_version: 1,
+            policy: "qualified-chaff-terminal-ack-cadence-start-v1",
+            time_basis: "native-controller-defense-elapsed-us-v1",
+            period_us: 20_000,
+            packet_size_bytes: 1_200,
+            armed: false,
+            armed_at_us: None,
+            ready_at_us: None,
+            startup_suppressed_opportunities: 0,
+            ready_endpoint: None,
+            ready_stream: None,
+            ready_resource_id: None,
+            ready_request_id: None,
+            request_stream_final_size: None,
+            ack_observed_at_us: None,
+            eligible_exact_capacity_bytes: None,
+        });
+        true
+    }
+
+    fn arm_buflo_incoming_after_ack(&mut self, mut ready: BufloIncomingStartupDiagnostics) -> bool {
+        if !self.incoming_waiting_for_ack()
+            || ready.schema_version != 1
+            || ready.policy != "qualified-chaff-terminal-ack-cadence-start-v1"
+            || ready.time_basis != "native-controller-defense-elapsed-us-v1"
+            || ready.period_us != 20_000
+            || ready.packet_size_bytes != 1_200
+            || ready.armed
+            || ready.armed_at_us.is_some()
+            || self.scheduled_outgoing == 0
+            || ready.startup_suppressed_opportunities != self.scheduled_outgoing
+            || ready.ready_at_us.is_none()
+            || ready.ack_observed_at_us.is_none()
+            || ready.ack_observed_at_us > ready.ready_at_us
+            || ready
+                .eligible_exact_capacity_bytes
+                .is_none_or(|bytes| bytes < 1_200)
+            || ready
+                .request_stream_final_size
+                .is_none_or(|bytes| bytes == 0)
+            || ready.ready_endpoint.is_none()
+            || ready.ready_stream.is_none()
+            || ready.ready_resource_id.is_none()
+            || ready.ready_request_id.is_none()
+        {
+            return false;
+        }
+        let Some(first_us) = ready
+            .ready_at_us
+            .and_then(|at| (at / 20_000).checked_add(1))
+            .and_then(|tick| tick.checked_mul(20_000))
+        else {
+            return false;
+        };
+        ready.armed = true;
+        ready.armed_at_us = Some(first_us);
+        ready.startup_suppressed_opportunities = first_us / 20_000;
+        self.next_incoming_us = first_us;
+        self.incoming_startup = Some(ready);
+        true
+    }
+
     fn observe(&mut self, signal: DefenseSignal) {
         self.latest_elapsed_us = self
             .latest_elapsed_us
@@ -286,11 +374,12 @@ impl Defense for Buflo {
         if self.reject_overdue_cells(elapsed_us) {
             return None;
         }
-        let first = if self.next_outgoing_us <= self.next_incoming_us {
-            Direction::Outgoing
-        } else {
-            Direction::Incoming
-        };
+        let first =
+            if self.incoming_waiting_for_ack() || self.next_outgoing_us <= self.next_incoming_us {
+                Direction::Outgoing
+            } else {
+                Direction::Incoming
+            };
         self.pop_direction(elapsed_us, first).or_else(|| {
             self.pop_direction(
                 elapsed_us,
@@ -323,8 +412,13 @@ impl Defense for Buflo {
         if self.is_complete() || self.realization_failed {
             return None;
         }
-        (!self.schedule_closed())
-            .then(|| Duration::from_micros(self.next_incoming_us.min(self.next_outgoing_us)))
+        (!self.schedule_closed()).then(|| {
+            Duration::from_micros(if self.incoming_waiting_for_ack() {
+                self.next_outgoing_us
+            } else {
+                self.next_incoming_us.min(self.next_outgoing_us)
+            })
+        })
     }
 
     fn is_complete(&self) -> bool {
@@ -391,7 +485,14 @@ impl Defense for Buflo {
     }
 
     fn diagnostics(&self) -> DefenseDiagnostics {
+        let mut incoming_startup = self.incoming_startup;
+        if let Some(startup) = &mut incoming_startup
+            && !startup.armed
+        {
+            startup.startup_suppressed_opportunities = self.scheduled_outgoing;
+        }
         DefenseDiagnostics {
+            buflo_incoming_startup: incoming_startup,
             buflo_paper_equivalent: false,
             buflo_client_only: true,
             buflo_scheduled_outgoing_cells: self.scheduled_outgoing,
@@ -446,6 +547,159 @@ mod tests {
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
         }
+    }
+
+    fn acknowledged_startup_defense() -> Buflo {
+        let mut params = parameters();
+        params.interval_us = 20_000;
+        let mut defense = Buflo::from_parameters(params);
+        assert!(defense.enable_buflo_acknowledged_incoming_startup());
+        defense
+    }
+
+    fn ready_startup(defense: &Buflo, at: u64) -> crate::BufloIncomingStartupDiagnostics {
+        let mut ready = defense
+            .diagnostics()
+            .buflo_incoming_startup
+            .expect("enabled");
+        ready.ready_at_us = Some(at);
+        ready.ready_endpoint = Some(1);
+        ready.ready_stream = Some(0);
+        ready.ready_resource_id = Some(14);
+        ready.ready_request_id = Some(0);
+        ready.request_stream_final_size = Some(185);
+        ready.ack_observed_at_us = Some(at);
+        ready.eligible_exact_capacity_bytes = Some(24_048);
+        ready
+    }
+
+    #[test]
+    fn acknowledged_startup_keeps_outgoing_zero_and_arms_incoming_on_next_grid() {
+        for ack_at in [1, 19_999, 20_000, 20_001] {
+            let mut defense = acknowledged_startup_defense();
+            let first = defense.next_event(Duration::ZERO).expect("shaped tickzero");
+            assert_eq!(
+                (first.direction(), first.timestamp_us(), first.length()),
+                (Direction::Outgoing, 0, 1_200)
+            );
+            assert!(defense.next_event(Duration::ZERO).is_none());
+            assert_eq!(defense.next_event_at(), Some(Duration::from_micros(20_000)));
+            if ack_at >= 20_000 {
+                assert_eq!(
+                    defense
+                        .next_event(Duration::from_micros(20_000))
+                        .expect("outgoing tickone")
+                        .direction(),
+                    Direction::Outgoing
+                );
+            }
+            assert!(defense.arm_buflo_incoming_after_ack(ready_startup(&defense, ack_at)));
+            let first_incoming = (ack_at / 20_000 + 1) * 20_000;
+            let startup = defense
+                .diagnostics()
+                .buflo_incoming_startup
+                .expect("receipt");
+            assert_eq!(startup.armed_at_us, Some(first_incoming));
+            assert_eq!(
+                startup.startup_suppressed_opportunities,
+                first_incoming / 20_000
+            );
+            assert!(
+                defense
+                    .next_event(Duration::from_micros(first_incoming - 1))
+                    .is_none()
+            );
+            let outgoing = defense
+                .next_event(Duration::from_micros(first_incoming))
+                .expect("same-grid outgoing first");
+            assert_eq!(
+                (outgoing.direction(), outgoing.timestamp_us()),
+                (Direction::Outgoing, first_incoming)
+            );
+            let incoming = defense
+                .next_event(Duration::from_micros(first_incoming))
+                .expect("first incoming");
+            assert_eq!(
+                (
+                    incoming.direction(),
+                    incoming.timestamp_us(),
+                    incoming.length()
+                ),
+                (Direction::Incoming, first_incoming, 1_200)
+            );
+            assert!(
+                defense
+                    .next_event(Duration::from_micros(first_incoming))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn acknowledged_startup_rejects_inconsistent_public_ready_proofs() {
+        let mut base = acknowledged_startup_defense();
+        base.next_event(Duration::ZERO).expect("outgoing");
+        let valid = ready_startup(&base, 1);
+        for variant in 0..13 {
+            let mut ready = valid;
+            match variant {
+                0 => ready.schema_version = 2,
+                1 => ready.policy = "unknown",
+                2 => ready.time_basis = "unknown",
+                3 => ready.period_us = 10_000,
+                4 => ready.packet_size_bytes = 600,
+                5 => ready.armed = true,
+                6 => ready.armed_at_us = Some(0),
+                7 => ready.startup_suppressed_opportunities += 1,
+                8 => ready.ack_observed_at_us = Some(2),
+                9 => ready.eligible_exact_capacity_bytes = Some(1_199),
+                10 => ready.request_stream_final_size = Some(0),
+                11 => ready.ready_request_id = None,
+                _ => ready.ready_at_us = Some(u64::MAX),
+            }
+            assert!(
+                !base.arm_buflo_incoming_after_ack(ready),
+                "variant{variant}"
+            );
+            assert!(
+                !base
+                    .diagnostics()
+                    .buflo_incoming_startup
+                    .expect("receipt")
+                    .armed
+            );
+        }
+        assert!(base.arm_buflo_incoming_after_ack(valid));
+        assert!(
+            !base.arm_buflo_incoming_after_ack(valid),
+            "cannot move a sealed incoming epoch"
+        );
+    }
+
+    #[test]
+    fn acknowledged_startup_without_ack_retains_zero_incoming_and_honest_guard() {
+        let mut params = parameters();
+        params.interval_us = 20_000;
+        params.max_events = 3;
+        let mut defense = Buflo::from_parameters(params);
+        assert!(defense.enable_buflo_acknowledged_incoming_startup());
+        for tick in 0..3 {
+            let at = Duration::from_micros(tick * 20_000);
+            assert_eq!(
+                defense.next_event(at).expect("outgoing").direction(),
+                Direction::Outgoing
+            );
+            assert!(defense.next_event(at).is_none());
+        }
+        assert!(defense.next_event(Duration::from_micros(60_000)).is_none());
+        assert_eq!(
+            defense.terminal_failure(),
+            Some("BuFLO event guard exhausted before normal completion")
+        );
+        let diagnostics = defense.diagnostics();
+        assert_eq!(diagnostics.buflo_scheduled_incoming_cells, 0);
+        assert_eq!(diagnostics.buflo_missed_incoming_cells, 0);
+        assert!(!diagnostics.buflo_incoming_startup.expect("receipt").armed);
     }
 
     #[test]

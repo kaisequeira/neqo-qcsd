@@ -83,6 +83,13 @@ impl StreamState {
                         .is_some_and(|(start, end)| *start == 0 && *end == final_size)
             })
     }
+
+    /// Positive final request size after the same contiguous ACK/FIN check.
+    pub fn activated_chaff_request_final_size(&self) -> Option<u64> {
+        self.chaff_request_activated()
+            .then_some(self.request_acknowledged_final_size)
+            .flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

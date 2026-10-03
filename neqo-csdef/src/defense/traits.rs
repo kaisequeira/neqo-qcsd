@@ -233,6 +233,27 @@ pub struct CsBufloRateTransitionDiagnostics {
     pub retained_current_interval: bool,
 }
 
+/// Prospective outgoing-first `BuFLO` startup, with actual request-ACK evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BufloIncomingStartupDiagnostics {
+    pub schema_version: u32,
+    pub policy: &'static str,
+    pub time_basis: &'static str,
+    pub period_us: u64,
+    pub packet_size_bytes: u16,
+    pub armed: bool,
+    pub armed_at_us: Option<u64>,
+    pub ready_at_us: Option<u64>,
+    pub startup_suppressed_opportunities: u64,
+    pub ready_endpoint: Option<u64>,
+    pub ready_stream: Option<u64>,
+    pub ready_resource_id: Option<u32>,
+    pub ready_request_id: Option<u64>,
+    pub request_stream_final_size: Option<u64>,
+    pub ack_observed_at_us: Option<u64>,
+    pub eligible_exact_capacity_bytes: Option<u64>,
+}
+
 /// Defense-specific counters recorded with the terminal run artifact.
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
 #[expect(
@@ -240,6 +261,9 @@ pub struct CsBufloRateTransitionDiagnostics {
     reason = "the terminal artifact intentionally flattens independent fidelity predicates"
 )]
 pub struct DefenseDiagnostics {
+    /// Explicit new-policy startup; absent for every historical/default mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buflo_incoming_startup: Option<BufloIncomingStartupDiagnostics>,
     /// Incoming schedule bytes handed to the shared receive-credit adapter.
     pub scheduled_incoming_requested_bytes: u64,
     /// Scheduled receive-credit bytes currently or terminally attributed to
@@ -676,6 +700,15 @@ pub struct DefenseDiagnostics {
 /// decisions may be cancelled before their deadline; emitted events cannot be
 /// retracted. Returned events must be non-decreasing in timestamp.
 pub trait Defense: Debug {
+    /// Opt into the source-bound fixed `BuFLO` acknowledged incoming startup.
+    /// Unsupported defenses and already started instances reject the request.
+    fn enable_buflo_acknowledged_incoming_startup(&mut self) -> bool {
+        false
+    }
+    /// Arm incoming cells only from the controller's actual qualified ACK proof.
+    fn arm_buflo_incoming_after_ack(&mut self, _ready: BufloIncomingStartupDiagnostics) -> bool {
+        false
+    }
     /// Consume one observation.
     #[expect(
         clippy::large_types_passed_by_value,

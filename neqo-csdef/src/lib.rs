@@ -30,9 +30,9 @@ pub use config::{
 };
 pub use controller::{QcsdController, QcsdReceiveCancellation, QcsdReceiveCancellationPlan};
 pub use defense::{
-    Buflo, BurstPair, Capacity, CapacityAdjustment, CsBuflo, CsBufloRateTransitionDiagnostics,
-    Defense, DefenseDiagnostics, DefenseMode, DefenseSignal, EventOutcome, Front,
-    HistoricalWalkieTalkieSchemaFiveDiagnostic, MIN_SHAPED_PAYLOAD,
+    Buflo, BufloIncomingStartupDiagnostics, BurstPair, Capacity, CapacityAdjustment, CsBuflo,
+    CsBufloRateTransitionDiagnostics, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal,
+    EventOutcome, Front, HistoricalWalkieTalkieSchemaFiveDiagnostic, MIN_SHAPED_PAYLOAD,
     ReceiverContinuationDisposition, RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw,
     TrafficMorphing, TrafficMorphingEgress, WalkieTalkie, WalkieTalkieBurstDiagnostics,
     WalkieTalkieQualificationBinding, WtfPad, clamp_packet_size,
