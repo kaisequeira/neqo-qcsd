@@ -387,6 +387,9 @@ pub struct QcsdController {
     endpoint_origins: HashMap<QcsdEndpointId, String>,
     buflo_chaff_ack_observed_at: HashMap<(QcsdEndpointId, QcsdStreamId), Duration>,
     buflo_startup_requested_chaff: HashMap<(QcsdEndpointId, u64), u32>,
+    /// Only an independently validated prepared BuFLO policy may widen the
+    /// incoming advertisement window; outgoing deadlines stay unchanged.
+    buflo_incoming_half_period_window: bool,
     /// Prospective source-bound Tamaraw receive ownership and outgoing window.
     /// Incoming releases can still complete across real transport callbacks;
     /// slotless parser bootstrap never becomes scheduled ownership afterward.
@@ -624,6 +627,7 @@ impl QcsdController {
             endpoint_origins: HashMap::new(),
             buflo_chaff_ack_observed_at: HashMap::new(),
             buflo_startup_requested_chaff: HashMap::new(),
+            buflo_incoming_half_period_window: false,
             tamaraw_rapid_capture_policy: false,
             terminal_primary_partial_cell_policy: false,
             terminal_primary_stream: None,
@@ -798,6 +802,50 @@ impl QcsdController {
             ));
         }
         Ok(())
+    }
+
+    /// Honor the explicit prepared 10 ms incoming advertisement policy.
+    ///
+    /// The caller must validate the bound fixed 1200-byte/20 ms preparation.
+    /// This does not change control polling or the outgoing 5 ms window.
+    ///
+    /// # Errors
+    /// Rejects another mode, changed control parameters, repeated opt-in, or
+    /// a controller that has already scheduled work.
+    pub fn enable_buflo_half_period_incoming_window(&mut self) -> Result<()> {
+        if !matches!(self.config.defense, DefenseConfig::Buflo(_))
+            || self.config.control_interval_us != 5_000
+            || self.config.max_udp_payload_size != 1_200
+            || self.config.drop_unsatisfied_events
+            || self.defense.mode() != DefenseMode::ChaffAndShape
+            || !self.defense.incoming_slot_must_resolve_in_window()
+            || self.fixed_schedule.is_some()
+            || self.buflo_incoming_half_period_window
+            || self.control.next_slot_id != 0
+            || !self.pending_slots.is_empty()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "BuFLO half-period incoming window requires an unstarted bound fixed1200-byte/20000-us defense with unchanged5000-us control".into(),
+            ));
+        }
+        self.buflo_incoming_half_period_window = true;
+        Ok(())
+    }
+
+    fn exact_incoming_release_window(&self) -> Duration {
+        if self.buflo_incoming_half_period_window {
+            Duration::from_micros(10_000)
+        } else {
+            self.config.control_interval()
+        }
+    }
+
+    /// The source-validated BuFLO-only incoming override. Absence preserves
+    /// the original adapter deadline, including its microsecond rounding.
+    #[must_use]
+    pub fn buflo_incoming_release_window(&self) -> Option<Duration> {
+        self.buflo_incoming_half_period_window
+            .then_some(Duration::from_micros(10_000))
     }
 
     fn arm_buflo_incoming_if_ready(&mut self, elapsed: Duration) {
@@ -3370,7 +3418,7 @@ impl QcsdController {
                 let deadline = ledger
                     .packet
                     .timestamp()
-                    .saturating_add(self.config.control_interval());
+                    .saturating_add(self.exact_incoming_release_window());
                 (!ledger.local_realization_emitted && at >= deadline).then_some(*slot)
             })
             .collect();
@@ -4331,7 +4379,7 @@ impl QcsdController {
                     >= incoming
                         .packet
                         .timestamp()
-                        .saturating_add(self.config.control_interval())
+                        .saturating_add(self.exact_incoming_release_window())
             {
                 self.fail_incoming_slot(
                     incoming.slot,
@@ -5515,7 +5563,7 @@ impl QcsdController {
                     ledger
                         .packet
                         .timestamp()
-                        .saturating_add(self.config.control_interval())
+                        .saturating_add(self.exact_incoming_release_window())
                 })
                 .min()
         {
@@ -21885,6 +21933,198 @@ mod tests {
         assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 100);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn buflo_half_period_incoming_window_preserves_physical_half_open_boundaries() {
+        for opted_in in [false, true] {
+            for advertised_at_us in [4_999_u64, 5_000, 6_090, 9_999, 10_000] {
+                let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200)
+                    .expect("fixed incoming cell");
+                let (defense, outcomes) = ExactIncomingOneShot::new(packet);
+                let mut controller = QcsdController::with_defense(
+                    QcsdConfig {
+                        defense: DefenseConfig::Buflo(crate::BufloConfig {
+                            parameters: "bound-fixed-buflo.json".into(),
+                        }),
+                        max_udp_payload_size: 1_200,
+                        control_interval_us: 5_000,
+                        ..QcsdConfig::default()
+                    },
+                    None,
+                    Box::new(defense),
+                )
+                .expect("isolated strict incoming controller");
+                if opted_in {
+                    controller
+                        .enable_buflo_half_period_incoming_window()
+                        .expect("independently bound incoming policy");
+                }
+                ready(&mut controller, 0, "https://example.com");
+                controller.observe(
+                    QcsdObservation::StreamOpened {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        role: QcsdRequestRole::Application,
+                        expected_response_length: Some(10_000),
+                    },
+                    Duration::ZERO,
+                );
+                controller.drain_actions().for_each(drop);
+                controller.poll(Duration::ZERO);
+                let QcsdAction::IncreaseReceiveLimit {
+                    absolute_limit,
+                    slot,
+                    ..
+                } = controller
+                    .next_action()
+                    .expect("actual whole credit action")
+                else {
+                    panic!("expected receive action");
+                };
+                controller.drain_actions().for_each(drop);
+                controller.flush_defense_observations();
+                let window_us = if opted_in { 10_000 } else { 5_000 };
+                assert_eq!(
+                    controller.next_deadline(),
+                    Some(Duration::from_micros(window_us))
+                );
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        absolute_limit,
+                        slot: Some(slot),
+                    },
+                    Duration::from_micros(advertised_at_us),
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        bytes: absolute_limit,
+                    },
+                    Duration::from_millis(50),
+                );
+                controller.poll(Duration::from_millis(50));
+                let timely = advertised_at_us < window_us;
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    [if timely {
+                        EventOutcome::Satisfied { observed: 1_200 }
+                    } else {
+                        EventOutcome::Missed(MissedSlotReason::DeadlineExpired)
+                    }]
+                );
+                let metrics = controller.defense_diagnostics();
+                assert_eq!(metrics.scheduled_incoming_requested_bytes, 1_200);
+                assert_eq!(metrics.scheduled_incoming_advertised_bytes, 1_200);
+                assert_eq!(
+                    metrics.scheduled_incoming_consumed_bytes,
+                    if timely { 1_200 } else { 0 }
+                );
+                assert_eq!(
+                    metrics.scheduled_incoming_retired_bytes,
+                    if timely { 0 } else { 1_200 }
+                );
+                assert_eq!(metrics.scheduled_incoming_unresolved_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn buflo_half_period_incoming_window_guards_opt_in_and_late_allocation() {
+        for opted_in in [false, true] {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("cell");
+            let (defense, _) = ExactIncomingOneShot::new(packet);
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    defense: DefenseConfig::Buflo(crate::BufloConfig {
+                        parameters: "bound-fixed-buflo.json".into(),
+                    }),
+                    max_udp_payload_size: 1_200,
+                    control_interval_us: 5_000,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(defense),
+            )
+            .expect("controller");
+            if opted_in {
+                controller
+                    .enable_buflo_half_period_incoming_window()
+                    .expect("source opt-in");
+                assert!(
+                    controller
+                        .enable_buflo_half_period_incoming_window()
+                        .is_err()
+                );
+            }
+            ready(&mut controller, 0, "https://example.com");
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(0),
+                    stream: QcsdStreamId(0),
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(10_000),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::from_micros(6_090));
+            let actions: Vec<_> = controller.drain_actions().collect();
+            assert_eq!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. })),
+                opted_in
+            );
+            assert_eq!(
+                actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::SlotMissed {
+                        reason: MissedSlotReason::DeadlineExpired,
+                        ..
+                    }
+                )),
+                !opted_in
+            );
+            assert!(
+                controller
+                    .enable_buflo_half_period_incoming_window()
+                    .is_err(),
+                "a started controller cannot acquire a new policy"
+            );
+        }
+        for variant in 0..4 {
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("cell");
+            let (defense, _) = ExactIncomingOneShot::new(packet);
+            let mut config = QcsdConfig {
+                defense: DefenseConfig::Buflo(crate::BufloConfig {
+                    parameters: "bound-fixed-buflo.json".into(),
+                }),
+                max_udp_payload_size: 1_200,
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            };
+            match variant {
+                0 => config.defense = DefenseConfig::None,
+                1 => config.control_interval_us = 10_000,
+                2 => config.max_udp_payload_size = 1_300,
+                _ => config.drop_unsatisfied_events = true,
+            }
+            let controller = QcsdController::with_defense(config, None, Box::new(defense));
+            if variant == 2 {
+                assert!(matches!(controller, Err(crate::Error::InvalidConfig(_))));
+                continue;
+            }
+            let mut controller = controller.expect("valid alternate controller");
+            assert!(
+                controller
+                    .enable_buflo_half_period_incoming_window()
+                    .is_err()
+            );
+        }
     }
 
     #[test]
