@@ -10860,6 +10860,10 @@ struct Endpoint {
     /// A peer stream limit is temporary admission backpressure. Keep pending
     /// resources untouched until HTTP/3 reports fresh request-stream credit.
     application_stream_limit_blocked: bool,
+    /// Chaff and application requests share the peer's request-stream quota.
+    /// Retain controller-reserved chaff identities until real peer credit.
+    pending_chaff_requests: VecDeque<QcsdAction>,
+    chaff_stream_limit_blocked: bool,
     streams: HashMap<StreamId, StreamRecord>,
     /// Every application request send half opened on this endpoint. Entries
     /// remain after response retirement so candidate-defense completion can
@@ -15374,6 +15378,8 @@ fn create_endpoint_inventory(
                 transport_instant_floor: start,
                 pending,
                 application_stream_limit_blocked: false,
+                pending_chaff_requests: VecDeque::new(),
+                chaff_stream_limit_blocked: false,
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
                 chaff_send_streams: BTreeSet::new(),
@@ -15762,10 +15768,11 @@ fn candidate_aggregate_snapshot_should_emit(
 }
 
 fn endpoint_send_terminal(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
-    !candidate_defense
-        || (!endpoint_egress_backlog_pending(endpoint, true)
-            && application_send_halves_peer_confirmed(endpoint)
-            && chaff_send_halves_peer_confirmed(endpoint))
+    endpoint.pending_chaff_requests.is_empty()
+        && (!candidate_defense
+            || (!endpoint_egress_backlog_pending(endpoint, true)
+                && application_send_halves_peer_confirmed(endpoint)
+                && chaff_send_halves_peer_confirmed(endpoint)))
 }
 
 fn tracked_application_send_halves_peer_confirmed(
@@ -15863,6 +15870,16 @@ fn handle_http_events(
             }
             Http3ClientEvent::StateChange(Http3State::Connected) => endpoint.connected = true,
             Http3ClientEvent::RequestsCreatable => {
+                if endpoint.chaff_stream_limit_blocked {
+                    endpoint.chaff_stream_limit_blocked = false;
+                    traces.event(
+                        now,
+                        Some(endpoint.id),
+                        "chaff_request",
+                        "stream_limit_released",
+                        &"peer request-stream credit available",
+                    )?;
+                }
                 if endpoint.application_stream_limit_blocked {
                     endpoint.application_stream_limit_blocked = false;
                     traces.event(
@@ -17926,6 +17943,14 @@ fn apply_queued_actions(
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
     loop {
+        retry_pending_chaff_requests(
+            endpoints,
+            controller,
+            chaff_manifest,
+            traces,
+            now,
+            defense_elapsed,
+        )?;
         // FRONT's frozen schedule is reconciled before every action batch so
         // RequestChaff-created streams can immediately receive any due credit
         // before a prearmed outgoing target is eligible to flush.
@@ -17946,6 +17971,57 @@ fn apply_queued_actions(
             actions,
         )?;
     }
+}
+
+fn retry_pending_chaff_requests(
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    now: Instant,
+    defense_elapsed: Duration,
+) -> Result<(), Error> {
+    for index in 0..endpoints.len() {
+        if endpoints[index].pending_chaff_requests.is_empty() {
+            continue;
+        }
+        let diagnostics = controller.defense_diagnostics();
+        if controller.is_complete()
+            || diagnostics.buflo_terminal_subcell_latched
+            || diagnostics.cs_buflo_local_termination_latched
+        {
+            // A reserved request that never opened is still unresolved. It
+            // cannot be revived across local termination or silently counted
+            // as completed by the runner's terminal transport predicate.
+            return Err(Error::RunAborted(
+                "pending chaff request reached a terminal defense boundary".into(),
+            ));
+        }
+        if endpoints[index].chaff_stream_limit_blocked {
+            continue;
+        }
+        let mut pending = std::mem::take(&mut endpoints[index].pending_chaff_requests);
+        while let Some(action) = pending.pop_front() {
+            apply_action(
+                endpoints,
+                controller,
+                chaff_manifest,
+                traces,
+                now,
+                defense_elapsed,
+                action,
+                false,
+                None,
+            )?;
+            if endpoints[index].chaff_stream_limit_blocked {
+                // apply_action retained the attempted identity first. Keep
+                // every later identity behind it without another dispatch.
+                endpoints[index].pending_chaff_requests.extend(pending);
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_chaff_cancellation_target(
@@ -18313,6 +18389,17 @@ fn apply_action(
             }
         }
     }
+    if matches!(&action, QcsdAction::RequestChaff { .. }) && endpoint.chaff_stream_limit_blocked {
+        traces.event(
+            now,
+            endpoint_id,
+            "chaff_request",
+            "stream_limit_queued",
+            &trace_action,
+        )?;
+        endpoint.pending_chaff_requests.push_back(action);
+        return Ok(());
+    }
     match endpoint.client.apply_qcsd_action(transport_at, action) {
         Ok(chaff_stream) => {
             if let QcsdAction::PrearmPacket {
@@ -18459,6 +18546,22 @@ fn apply_action(
                 finish_stream(endpoint, stream_id, None)?;
             }
             traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
+        }
+        Err(neqo_http3::Error::StreamLimit)
+            if matches!(&trace_action, QcsdAction::RequestChaff { .. }) =>
+        {
+            // The adapter created no stream and emitted no failure. Preserve
+            // the existing controller reservation and exact sanitized action;
+            // only RequestsCreatable permits another attempt.
+            traces.event(
+                now,
+                endpoint_id,
+                "chaff_request",
+                "stream_limit_blocked",
+                &trace_action,
+            )?;
+            endpoint.pending_chaff_requests.push_back(trace_action);
+            endpoint.chaff_stream_limit_blocked = true;
         }
         Err(error) => {
             handle_qcsd_observations(endpoint, controller, traces, defense_elapsed)?;
@@ -30628,6 +30731,360 @@ mod tests {
         assert_eq!(endpoints[0].completed[0].resource_id, 2);
         assert_eq!(endpoints[0].completed[0].outcome, "skipped_dependency");
         drop(traces);
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    fn measured_nonblocking_chaff_request_bytes(resource: &Resource, origin: &str) -> u64 {
+        let mut client = test_fixture::default_http3_client();
+        let mut server = test_fixture::default_http3_server();
+        let trailing = test_fixture::connect_peers(&mut client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut client, &mut server, false, server_output);
+        client
+            .enable_qcsd(
+                QcsdEndpointId(0),
+                &origin.parse().expect("qualification origin"),
+                1_200,
+                false,
+                Duration::from_millis(100),
+            )
+            .expect("enable independent qualification adapter");
+        let headers: Vec<_> = sanitize_chaff_headers(resource.headers.clone())
+            .into_iter()
+            .map(|(name, value)| neqo_common::Header::new(name, value))
+            .collect();
+        let stream = client
+            .qcsd_fetch_nonblocking(
+                test_fixture::now(),
+                &resource.url.parse().expect("qualified chaff URL"),
+                &headers,
+            )
+            .expect("measure actual nonblocking request encoder");
+        client
+            .qcsd_request_stream_bytes(stream)
+            .expect("encoded bytes")
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the real shared-credit oracle preserves the graph, controller reservation and exact chaff response identity"
+    )]
+    async fn chaff_stream_limit_preserves_reserved_identity_and_resumes_on_peer_credit() {
+        let output = trace_output_dir("chaff-stream-limit-peer-credit");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let origin = "https://127.0.0.1:4433";
+        let resource = request(9, origin, Vec::new());
+        let mut manifest = qualified_chaff_manifest(vec![resource.clone()]);
+        manifest.resources[0]
+            .chaff_qualification
+            .request_stream_bytes = measured_nonblocking_chaff_request_bytes(&resource, origin);
+        manifest.resources[0]
+            .chaff_qualification
+            .expected_response
+            .body_sha256 = super::sha256(b"x").expect("qualified body hash");
+        let runtime: RuntimeChaffManifest = manifest.clone().into();
+        let mut spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, origin, Vec::new()), request(2, origin, vec![1])],
+        );
+        spec.config.max_chaff_streams = 2;
+        spec.config.initial_max_stream_data = 1_048_576;
+        spec.chaff_manifest = Some(manifest.into());
+        let mut endpoints = create_endpoints(&spec, started, &clock).expect("endpoint");
+        let mut server = test_fixture::http3_server_with_params(
+            neqo_http3::Http3Parameters::default().connection_parameters(
+                super::ConnectionParameters::default().max_streams(StreamType::BiDi, 1),
+            ),
+        );
+        let trailing = test_fixture::connect_peers(&mut endpoints[0].client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, server_output);
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+            .expect("consume initial connection and credit events");
+        let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("graph");
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                None,
+                None,
+            )
+            .expect("occupy the peer's only request stream"),
+            1
+        );
+        let target = Packet::new(Duration::from_secs(10), Direction::Incoming, 1_200)
+            .expect("unchanged future target");
+        let mut controller = QcsdController::with_defense(
+            spec.config.clone(),
+            Some(runtime.resource_manifest()),
+            Box::new(StaticSchedule::new(Trace::new([target]), true)),
+        )
+        .expect("controller");
+        super::handle_qcsd_observations(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            Duration::ZERO,
+        )
+        .expect("retain actual endpoint and application observations");
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller
+            .drain_actions()
+            .filter(|action| matches!(action, QcsdAction::RequestChaff { .. }))
+            .collect();
+        assert_eq!(actions.len(), 2);
+        let original = serde_json::to_value(&actions).expect("original exact actions");
+        let request_ids: Vec<_> = actions
+            .iter()
+            .map(|action| match action {
+                QcsdAction::RequestChaff { request_id, .. } => *request_id,
+                _ => unreachable!(),
+            })
+            .collect();
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            Some(&runtime),
+            &mut traces,
+            started,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("temporary stream quota is retained, not a failed request");
+        assert!(endpoints[0].chaff_stream_limit_blocked);
+        assert_eq!(endpoints[0].pending_chaff_requests.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&endpoints[0].pending_chaff_requests)
+                .expect("retained exact FIFO"),
+            original
+        );
+        assert_eq!(endpoints[0].streams.len(), 1);
+        assert_eq!(dependencies.state(2), Some(ResourceRunState::Pending));
+        assert!(!endpoint_send_terminal(&mut endpoints[0], false));
+        controller.poll(Duration::ZERO);
+        assert!(
+            !controller
+                .drain_actions()
+                .any(|action| { matches!(action, QcsdAction::RequestChaff { .. }) }),
+            "the blocked identity retains its existing chaff budget reservation"
+        );
+        for _ in 0..2 {
+            apply_queued_actions(
+                &mut endpoints,
+                &mut controller,
+                Some(&runtime),
+                &mut traces,
+                started,
+                Duration::ZERO,
+            )
+            .expect("no polling resubmission without RequestsCreatable");
+        }
+        let mut terminal = QcsdController::new(spec.config.clone(), spec.seed, None)
+            .expect("terminal boundary fixture");
+        terminal.observe(QcsdObservation::ApplicationComplete, Duration::ZERO);
+        terminal.poll(Duration::ZERO);
+        assert!(terminal.is_complete());
+        assert!(matches!(super::retry_pending_chaff_requests(
+            &mut endpoints, &mut terminal, Some(&runtime), &mut traces,
+            started, Duration::ZERO,
+        ), Err(Error::RunAborted(message))
+            if message.contains("pending chaff request reached a terminal defense boundary")));
+        assert_eq!(
+            serde_json::to_value(&endpoints[0].pending_chaff_requests)
+                .expect("terminal boundary cannot drop unresolved identities"),
+            original
+        );
+
+        for stage in 0..4 {
+            test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+            let stream = server
+                .events()
+                .find_map(|event| match event {
+                    neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                        assert!(fin);
+                        Some(stream)
+                    }
+                    _ => None,
+                })
+                .expect("peer receives exactly one admitted request");
+            stream
+                .send_headers(&[
+                    neqo_common::Header::new(":status", "200"),
+                    neqo_common::Header::new("content-length", "1"),
+                ])
+                .expect("response headers");
+            assert_eq!(stream.send_data(b"x", started).expect("response body"), 1);
+            stream.stream_close_send(started).expect("response FIN");
+            for _ in 0..10 {
+                test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+                handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+                    .expect("consume real FIN and fresh request-stream credit");
+                if !endpoints[0].chaff_stream_limit_blocked && endpoints[0].streams.is_empty() {
+                    break;
+                }
+            }
+            for (id, state) in endpoints[0].retired_applications.drain(..) {
+                assert_eq!(state, ResourceRunState::Succeeded);
+                dependencies
+                    .mark_succeeded(id)
+                    .expect("preserve graph retirement");
+            }
+            if stage < 2 {
+                assert!(!endpoints[0].chaff_stream_limit_blocked);
+                apply_queued_actions(
+                    &mut endpoints,
+                    &mut controller,
+                    Some(&runtime),
+                    &mut traces,
+                    started,
+                    Duration::ZERO,
+                )
+                .expect("retry original chaff identity after actual peer credit");
+                assert_eq!(endpoints[0].pending_chaff_requests.len(), 1 - stage);
+                assert_eq!(endpoints[0].streams.len(), 1);
+                assert!(endpoints[0].streams.values().all(|record| {
+                    record.role
+                        == super::QcsdRequestRole::Chaff {
+                            resource_id: resource.id,
+                            request_id: Some(request_ids[stage]),
+                        }
+                }));
+            } else if stage == 2 {
+                let mut dispatched = dispatch_ready_requests(
+                    &mut endpoints,
+                    &spec,
+                    &mut dependencies,
+                    started,
+                    &mut traces,
+                    true,
+                    None,
+                    None,
+                )
+                .expect("resume the untouched dependent application resource");
+                for _ in 0..10 {
+                    if dispatched == 1 {
+                        break;
+                    }
+                    assert_eq!(dependencies.state(2), Some(ResourceRunState::Pending));
+                    test_fixture::exchange_packets(
+                        &mut endpoints[0].client,
+                        &mut server,
+                        false,
+                        None,
+                    );
+                    handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+                        .expect("consume request credit after the last chaff FIN");
+                    dispatched = dispatch_ready_requests(
+                        &mut endpoints,
+                        &spec,
+                        &mut dependencies,
+                        started,
+                        &mut traces,
+                        true,
+                        None,
+                        None,
+                    )
+                    .expect("resume only after real peer credit");
+                }
+                assert_eq!(dispatched, 1);
+            }
+        }
+        assert!(dependencies.is_successful());
+        assert!(endpoints[0].pending.is_empty());
+        assert!(endpoints[0].pending_chaff_requests.is_empty());
+        let records: Vec<_> = endpoints[0]
+            .completed
+            .iter()
+            .filter(|record| matches!(record.role, super::QcsdRequestRole::Chaff { .. }))
+            .collect();
+        assert_eq!(records.len(), 2);
+        for request_id in request_ids {
+            let record = records
+                .iter()
+                .find(|record| {
+                    record.role
+                        == super::QcsdRequestRole::Chaff {
+                            resource_id: resource.id,
+                            request_id: Some(request_id),
+                        }
+                })
+                .expect("each original reserved identity completes exactly once");
+            assert_eq!(record.body, b"x");
+            assert_eq!(record.outcome, "succeeded");
+            assert!(record.complete);
+        }
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert_eq!(
+            events
+                .matches(",chaff_request,stream_limit_blocked,")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .matches(",chaff_request,stream_limit_released,")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .matches(",chaff_request,stream_limit_queued,")
+                .count(),
+            1
+        );
+        assert!(!events.contains("chaff_request_failed"));
+        assert!(!events.contains(",action_error,"));
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn chaff_stream_limit_keeps_other_adapter_errors_fatal() {
+        let output = trace_output_dir("chaff-stream-limit-invalid-origin");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoints = create_endpoints(&spec, started, &clock).expect("endpoint");
+        let mut controller =
+            QcsdController::new(spec.config.clone(), spec.seed, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        let action = QcsdAction::RequestChaff {
+            endpoint: endpoints[0].id,
+            resource: request(9, "https://different.example", Vec::new()),
+            request_id: QcsdChaffRequestId(71),
+        };
+        assert!(matches!(
+            apply_action_batch(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                started,
+                Duration::ZERO,
+                vec![action],
+            ),
+            Err(Error::Http3(neqo_http3::Error::InvalidInput))
+        ));
+        assert!(endpoints[0].pending_chaff_requests.is_empty());
+        assert!(!endpoints[0].chaff_stream_limit_blocked);
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert!(events.contains("chaff_request_failed"));
+        assert!(events.contains(",action_error,"));
+        assert!(!events.contains(",chaff_request,stream_limit_blocked,"));
         drop(endpoints);
         fs::remove_dir_all(output).expect("remove test directory");
     }

@@ -794,6 +794,10 @@ impl Http3Client {
             now,
         ) {
             Ok(stream_id) => stream_id,
+            // No stream or request bytes were created. The runner retains the
+            // exact action and its controller reservation until peer credit;
+            // a failure observation would instead retire that request ID.
+            Err(Error::StreamLimit) => return Err(Error::StreamLimit),
             Err(error) => {
                 self.events
                     .qcsd_observe(|_| QcsdObservation::ChaffRequestFailed {
