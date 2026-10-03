@@ -10819,6 +10819,12 @@ fn receive_loop_completion_authorized(
         && evidence_render_errors.is_empty()
 }
 
+struct DeferredEndpointReady {
+    observation: QcsdObservation,
+    production_sequence: u64,
+    production_monotonic_ns: u64,
+}
+
 struct Endpoint {
     id: QcsdEndpointId,
     origin: Uri,
@@ -10836,6 +10842,10 @@ struct Endpoint {
     /// handshake before request dispatch; temporary unreadiness is not a
     /// failed application request.
     defer_application_until_connected: bool,
+    /// Adapter activation must precede handshake packet construction, but its
+    /// binding is not permission to schedule 1-RTT defense targets yet.
+    deferred_endpoint_ready: Option<DeferredEndpointReady>,
+    connected_readiness_reduced: bool,
     /// Only the source-bound prospective policy publishes the controller's
     /// separate defense-clock reduction time for real chaff ACK observations.
     buflo_ack_start_enabled: bool,
@@ -15347,6 +15357,8 @@ fn create_endpoint_inventory(
                 client,
                 network_active: !defer_activation,
                 defer_application_until_connected: defer_activation,
+                deferred_endpoint_ready: None,
+                connected_readiness_reduced: false,
                 buflo_ack_start_enabled: matches!(spec.config.defense, DefenseConfig::Buflo(_))
                     && spec
                         .application_workload_source
@@ -16224,11 +16236,18 @@ fn handle_qcsd_observations(
     traces: &mut TraceFiles,
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
+    reduce_connected_endpoint_readiness(endpoint, controller, traces, Some(defense_elapsed))?;
     let observations = endpoint.client.qcsd_timestamped_observations();
     for observation in observations {
         let terminal = terminal_observation_slot(observation.observation());
         let terminal_us = terminal.map(|_| duration_as_trace_micros(defense_elapsed));
-        controller.observe(observation.observation().clone(), defense_elapsed);
+        forward_endpoint_qcsd_observation(
+            endpoint,
+            controller,
+            traces,
+            &observation,
+            Some(defense_elapsed),
+        )?;
         record_qcsd_observation(
             endpoint,
             controller,
@@ -16251,10 +16270,19 @@ fn handle_all_qcsd_observations(
     traces: &mut TraceFiles,
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
+    for endpoint in endpoints.iter_mut() {
+        reduce_connected_endpoint_readiness(endpoint, controller, traces, Some(defense_elapsed))?;
+    }
     for (endpoint_index, observation) in take_all_qcsd_observations(endpoints) {
         let terminal = terminal_observation_slot(observation.observation());
         let terminal_us = terminal.map(|_| duration_as_trace_micros(defense_elapsed));
-        controller.observe(observation.observation().clone(), defense_elapsed);
+        forward_endpoint_qcsd_observation(
+            &mut endpoints[endpoint_index],
+            controller,
+            traces,
+            &observation,
+            Some(defense_elapsed),
+        )?;
         record_qcsd_observation(
             &mut endpoints[endpoint_index],
             controller,
@@ -16313,13 +16341,99 @@ fn forward_qcsd_observation(
     }
 }
 
+fn reduce_connected_endpoint_readiness(
+    endpoint: &mut Endpoint,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    defense_elapsed: Option<Duration>,
+) -> Result<(), Error> {
+    if !endpoint.defer_application_until_connected
+        || !endpoint.connected
+        || !matches!(endpoint.client.state(), Http3State::Connected)
+    {
+        return Ok(());
+    }
+    let Some(record) = endpoint.deferred_endpoint_ready.take() else {
+        return Ok(());
+    };
+    let reduced_at = defense_elapsed.unwrap_or(Duration::ZERO);
+    let reduced_process_at = now();
+    controller.observe(record.observation.clone(), reduced_at);
+    endpoint.connected_readiness_reduced = true;
+    traces.event(
+        reduced_process_at,
+        Some(endpoint.id),
+        "endpoint_scheduler_readiness",
+        "controller_reduced",
+        &json!({
+            "schema_version": 1,
+            "source": "native-connected-endpoint-controller-readiness-v1",
+            "production_sequence": record.production_sequence,
+            "production_monotonic_ns": record.production_monotonic_ns,
+            "reduction_monotonic_ns": duration_as_u64_nanos(
+                reduced_process_at.saturating_duration_since(endpoint.receive_loop.origin)
+            ),
+            "controller_defense_elapsed_us": duration_as_trace_micros(reduced_at),
+            "http3_state": "connected",
+            "observation": record.observation,
+        }),
+    )?;
+    Ok(())
+}
+
+fn forward_endpoint_qcsd_observation(
+    endpoint: &mut Endpoint,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    record: &TimestampedQcsdObservation,
+    defense_elapsed: Option<Duration>,
+) -> Result<(), Error> {
+    reduce_connected_endpoint_readiness(endpoint, controller, traces, defense_elapsed)?;
+    if endpoint.defer_application_until_connected
+        && let QcsdObservation::EndpointReady {
+            endpoint: ready, ..
+        } = record.observation()
+    {
+        if *ready != endpoint.id
+            || endpoint.deferred_endpoint_ready.is_some()
+            || endpoint.connected_readiness_reduced
+        {
+            return Err(Error::SlotInvariant(
+                "deferred endpoint readiness has an invalid or duplicate binding".into(),
+            ));
+        }
+        endpoint.deferred_endpoint_ready = Some(DeferredEndpointReady {
+            observation: record.observation().clone(),
+            production_sequence: record.sequence(),
+            production_monotonic_ns: record.produced_monotonic_ns(),
+        });
+        return reduce_connected_endpoint_readiness(endpoint, controller, traces, defense_elapsed);
+    }
+    if matches!(record.observation(), QcsdObservation::EndpointClosed { .. }) {
+        // An origin that never connected never entered the scheduled pool.
+        // Its original adapter binding remains in the raw observation trace.
+        endpoint.deferred_endpoint_ready = None;
+    }
+    forward_qcsd_observation(controller, record, defense_elapsed);
+    Ok(())
+}
+
 fn handle_defense_activation_observations(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
     traces: &mut TraceFiles,
 ) -> Result<(), Error> {
+    for endpoint in endpoints.iter_mut() {
+        reduce_connected_endpoint_readiness(endpoint, controller, traces, None)?;
+    }
     for (endpoint_index, observation) in take_all_qcsd_observations(endpoints) {
-        forward_qcsd_observation(controller, &observation, None);
+        forward_endpoint_qcsd_observation(
+            &mut endpoints[endpoint_index],
+            controller,
+            traces,
+            &observation,
+            None,
+        )?;
         record_qcsd_observation(
             &mut endpoints[endpoint_index],
             controller,
@@ -23047,7 +23161,7 @@ fn finalize_prepared_output_with_elapsed(
             }
             (None, _) => None,
         };
-        forward_qcsd_observation(controller, observation, wire_elapsed);
+        forward_endpoint_qcsd_observation(endpoint, controller, traces, observation, wire_elapsed)?;
         record_qcsd_observation(
             endpoint,
             controller,
@@ -29100,6 +29214,291 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the real delayed-handshake regression covers both scheduled send and rolling-prearm adapter boundaries"
+    )]
+    async fn delayed_connected_endpoint_is_not_scheduled_until_real_http3_readiness() {
+        for rolling in [false, true] {
+            let output = trace_output_dir(if rolling {
+                "late-connected-rolling-readiness"
+            } else {
+                "late-connected-send-readiness"
+            });
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let spec = application_stream_limit_spec(
+                output.clone(),
+                vec![
+                    request(1, "https://127.0.0.1:4433", Vec::new()),
+                    request(2, "https://127.0.0.1:4434", vec![1]),
+                ],
+            );
+            let mut endpoints = super::create_run_endpoints(&spec, started, &clock)
+                .expect("allocate both original origins");
+            let tuples = endpoints
+                .iter()
+                .map(|endpoint| (endpoint.id, endpoint.local_addr, endpoint.remote_addr))
+                .collect::<Vec<_>>();
+            let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("graph");
+            let mut traces = TraceFiles::new(&output, started).expect("traces");
+            let packets = [20, 40, 60, 80].map(|milliseconds| {
+                Packet::new(
+                    Duration::from_millis(milliseconds),
+                    Direction::Outgoing,
+                    1_200,
+                )
+                .expect("unchanged fixed-size target")
+            });
+            let defense: Box<dyn Defense> = if rolling {
+                Box::new(RollingOutgoingSequence {
+                    events: VecDeque::from(packets),
+                    exact_incoming_window: false,
+                })
+            } else {
+                Box::new(StaticSchedule::new(Trace::new(packets), false))
+            };
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    max_udp_payload_size: 1_200,
+                    ..QcsdConfig::default()
+                },
+                None,
+                defense,
+            )
+            .expect("scheduler probe");
+            super::activate_needed_endpoints(
+                &mut endpoints,
+                &spec,
+                &dependencies,
+                true,
+                started,
+                &mut traces,
+                &clock,
+            )
+            .expect("activate the initial origin before its handshake");
+            handle_all_qcsd_observations(
+                &mut endpoints,
+                &mut controller,
+                &mut traces,
+                Duration::ZERO,
+            )
+            .expect("retain the actual early adapter binding");
+            assert!(endpoints[0].deferred_endpoint_ready.is_some());
+            assert!(!endpoints[0].connected_readiness_reduced);
+            assert!(controller.drain_actions().next().is_none());
+
+            let mut first_server = test_fixture::default_http3_server();
+            let trailing = test_fixture::connect_peers(&mut endpoints[0].client, &mut first_server);
+            let server_output = first_server.process(trailing, test_fixture::now()).dgram();
+            test_fixture::exchange_packets(
+                &mut endpoints[0].client,
+                &mut first_server,
+                false,
+                server_output,
+            );
+            handle_http_events(&mut endpoints[0], &spec, started, &mut traces, None)
+                .expect("consume the actual first HTTP/3 Connected event");
+            handle_all_qcsd_observations(
+                &mut endpoints,
+                &mut controller,
+                &mut traces,
+                Duration::ZERO,
+            )
+            .expect("admit only the connected origin");
+            assert!(endpoints[0].connected_readiness_reduced);
+
+            // This graph fixture starts at the observed production failure
+            // boundary: the first resource has retired and makes origin two
+            // dispatchable. The separate full-graph peer regression verifies
+            // the request/body/FIN path that reaches this boundary.
+            dependencies.mark_in_flight(1).expect("initial request");
+            dependencies
+                .mark_succeeded(1)
+                .expect("initial dependency retired");
+            super::activate_needed_endpoints(
+                &mut endpoints,
+                &spec,
+                &dependencies,
+                true,
+                started,
+                &mut traces,
+                &clock,
+            )
+            .expect("activate the late origin with early packet composition enabled");
+            handle_all_qcsd_observations(
+                &mut endpoints,
+                &mut controller,
+                &mut traces,
+                Duration::from_millis(1),
+            )
+            .expect("retain, but do not schedule, the late adapter binding");
+            assert!(endpoints[1].network_active);
+            assert!(!endpoints[1].connected);
+            assert!(endpoints[1].deferred_endpoint_ready.is_some());
+            assert!(!endpoints[1].connected_readiness_reduced);
+
+            let mut selected = Vec::new();
+            for milliseconds in if rolling { [0, 20] } else { [20, 40] } {
+                controller.poll(Duration::from_millis(milliseconds));
+                for action in controller.drain_actions() {
+                    if let QcsdAction::SendPacket { endpoint, .. }
+                    | QcsdAction::PrearmPacket { endpoint, .. } = &action
+                    {
+                        assert_eq!(*endpoint, endpoints[0].id);
+                        selected.push(*endpoint);
+                    }
+                    if matches!(
+                        action,
+                        QcsdAction::SendPacket { .. }
+                            | QcsdAction::PrearmPacket { .. }
+                            | QcsdAction::CommitPrearmedPacket { .. }
+                    ) {
+                        let index =
+                            usize::try_from(super::action_endpoint(&action).expect("target").0)
+                                .expect("endpoint index");
+                        endpoints[index]
+                            .client
+                            .apply_qcsd_action(
+                                started + Duration::from_millis(milliseconds),
+                                action,
+                            )
+                            .expect("the real connected adapter accepts the scheduled target");
+                    }
+                }
+            }
+            assert_eq!(selected, [endpoints[0].id, endpoints[0].id]);
+
+            let mut second_server = test_fixture::default_http3_server();
+            let trailing =
+                test_fixture::connect_peers(&mut endpoints[1].client, &mut second_server);
+            let server_output = second_server.process(trailing, test_fixture::now()).dgram();
+            test_fixture::exchange_packets(
+                &mut endpoints[1].client,
+                &mut second_server,
+                false,
+                server_output,
+            );
+            handle_http_events(&mut endpoints[1], &spec, started, &mut traces, None)
+                .expect("consume the late origin's real HTTP/3 Connected event");
+            handle_all_qcsd_observations(
+                &mut endpoints,
+                &mut controller,
+                &mut traces,
+                Duration::from_millis(if rolling { 25 } else { 45 }),
+            )
+            .expect("reduce the retained binding after actual connection readiness");
+            assert!(endpoints[1].connected_readiness_reduced);
+            assert!(endpoints[1].deferred_endpoint_ready.is_none());
+            for milliseconds in if rolling { [40, 60] } else { [60, 80] } {
+                controller.poll(Duration::from_millis(milliseconds));
+                for action in controller.drain_actions() {
+                    if let QcsdAction::SendPacket { endpoint, .. }
+                    | QcsdAction::PrearmPacket { endpoint, .. } = action
+                    {
+                        selected.push(endpoint);
+                    }
+                }
+            }
+            assert_eq!(
+                selected,
+                [
+                    endpoints[0].id,
+                    endpoints[0].id,
+                    endpoints[0].id,
+                    endpoints[1].id
+                ]
+            );
+            assert_eq!(
+                endpoints
+                    .iter()
+                    .map(|endpoint| { (endpoint.id, endpoint.local_addr, endpoint.remote_addr) })
+                    .collect::<Vec<_>>(),
+                tuples
+            );
+            drop(traces);
+            let events = fs::read_to_string(output.join("events.csv")).expect("raw events");
+            assert_eq!(events.matches(",endpoint_activation,started,").count(), 2);
+            assert_eq!(
+                events
+                    .matches(",endpoint_scheduler_readiness,controller_reduced,")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                events
+                    .matches("\"\"type\"\":\"\"endpoint_ready\"\"")
+                    .count(),
+                4,
+                "two original adapter records plus two explicit reduction bindings"
+            );
+            drop(endpoints);
+            fs::remove_dir_all(output).expect("remove test directory");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_endpoint_readiness_rejects_duplicate_and_never_admits_closed_handshake() {
+        let output = trace_output_dir("deferred-readiness-closed-handshake");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoints = super::create_run_endpoints(&spec, started, &clock).expect("endpoint");
+        let dependencies = DependencyTracker::new(spec.workload.clone()).expect("graph");
+        let mut controller = QcsdController::new(spec.config.clone(), 7, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        super::activate_needed_endpoints(
+            &mut endpoints,
+            &spec,
+            &dependencies,
+            true,
+            started,
+            &mut traces,
+            &clock,
+        )
+        .expect("activate adapter before handshake");
+        handle_all_qcsd_observations(&mut endpoints, &mut controller, &mut traces, Duration::ZERO)
+            .expect("hold the original binding");
+        let endpoint = &mut endpoints[0];
+        let duplicate = clock.record_at(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoint.id,
+                origin: endpoint.origin.to_string(),
+                max_udp_payload_size: 1_200,
+            },
+            started,
+        );
+        assert!(matches!(super::forward_endpoint_qcsd_observation(
+            endpoint, &mut controller, &mut traces, &duplicate, Some(Duration::ZERO),
+        ), Err(Error::SlotInvariant(message)) if message.contains("duplicate binding")));
+        let closed = clock.record_at(
+            QcsdObservation::EndpointClosed {
+                endpoint: endpoint.id,
+            },
+            started,
+        );
+        super::forward_endpoint_qcsd_observation(
+            endpoint,
+            &mut controller,
+            &mut traces,
+            &closed,
+            Some(Duration::ZERO),
+        )
+        .expect("closed, never-connected endpoint retains zero scheduled eligibility");
+        assert!(endpoint.deferred_endpoint_ready.is_none());
+        assert!(!endpoint.connected_readiness_reduced);
+        assert!(controller.drain_actions().next().is_none());
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert!(!events.contains("endpoint_scheduler_readiness"));
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove test directory");
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -29444,7 +29843,34 @@ mod tests {
                 .all(|endpoint| endpoint.network_active
                     && !endpoint.defer_application_until_connected)
         );
-        assert_eq!(super::take_all_qcsd_observations(&mut endpoints).len(), 2);
+        let target = Packet::new(Duration::ZERO, Direction::Outgoing, 1_200).expect("target");
+        let mut controller = QcsdController::with_defense(
+            spec.config.clone(),
+            None,
+            Box::new(StaticSchedule::new(Trace::new([target]), false)),
+        )
+        .expect("legacy scheduler");
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        handle_all_qcsd_observations(&mut endpoints, &mut controller, &mut traces, Duration::ZERO)
+            .expect("legacy binding reduction remains eager");
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| endpoint.deferred_endpoint_ready.is_none())
+        );
+        controller.poll(Duration::ZERO);
+        assert!(controller.drain_actions().any(|action| matches!(action,
+            QcsdAction::SendPacket { endpoint, .. } if endpoint == endpoints[0].id
+        )));
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert_eq!(
+            events
+                .matches("\"\"type\"\":\"\"endpoint_ready\"\"")
+                .count(),
+            2
+        );
+        assert!(!events.contains("endpoint_scheduler_readiness"));
         drop(endpoints);
         fs::remove_dir_all(output).expect("remove test directory");
     }
