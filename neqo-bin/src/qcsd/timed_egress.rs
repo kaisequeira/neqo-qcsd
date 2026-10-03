@@ -4459,6 +4459,26 @@ mod tests {
     }
 
     #[test]
+    fn bounded_main_enqueue_uses_the_existing_strict_physical_deadline() {
+        // Replay the relative cutoff crossed by the retained serial attempt.
+        // The ETF diagnostic horizon and the physical deadline stay distinct.
+        let release = 1_791_060_133_670_308_078_u64;
+        let deadline = release + 5_000_000;
+        let txtime = release + 10_000_000;
+        let observed = 1_791_060_133_673_340_613;
+        assert!(validate_enqueue_deadline(txtime, release, observed).is_err());
+        assert!(validate_enqueue_deadline(txtime, deadline, observed).is_ok());
+        assert!(validate_enqueue_deadline(txtime, deadline, deadline - 1).is_ok());
+        for observed in [deadline, deadline + 1] {
+            assert!(matches!(
+                validate_enqueue_deadline(txtime, deadline, observed),
+                Err(TimedEgressError::EnqueueDeadline { latest, observed: actual })
+                    if latest == deadline && actual == observed
+            ));
+        }
+    }
+
+    #[test]
     fn expired_main_cutoff_refuses_sendmsg_and_restores_ipv4_socket_state() {
         let mut socket = pending_socket();
         socket.pending = None;
