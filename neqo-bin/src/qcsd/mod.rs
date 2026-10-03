@@ -23606,9 +23606,12 @@ fn process_input(
             .socket
             .recv(endpoint.local_addr, &mut endpoint.recv_buf)?
         {
+            // Stamp the returned batch after the actual socket receive, while
+            // retaining the caller's transport and controller input clocks.
+            let received_at = now();
             for datagram in datagrams {
                 traces.packet(&PacketTraceRow {
-                    now: input_now,
+                    now: received_at,
                     endpoint: endpoint.id,
                     direction: "incoming",
                     observed: datagram.len(),
@@ -23623,7 +23626,7 @@ fn process_input(
                     u16::try_from(datagram.len()).unwrap_or(u16::MAX),
                     defense_elapsed,
                 ) {
-                    let record = observation_clock.record_at(observation, input_now);
+                    let record = observation_clock.record_at(observation, received_at);
                     traces.observation(Some(endpoint.id), &record)?;
                     controller.observe(record.into_observation(), at);
                 }
@@ -39004,6 +39007,154 @@ mod tests {
                 timestamp_us: 12_345,
             }
         );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the real socket regression reopens packet, observation, and schedule clock boundaries"
+    )]
+    async fn assert_actual_receive_observation_clocks(
+        drain_socket: bool,
+        defense_elapsed: Option<Duration>,
+    ) {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("actual-post-recv-observation");
+        let started = now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoint = create_endpoints(&spec, started, &clock)
+            .expect("real socket endpoint")
+            .remove(0);
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let input_now = now();
+
+        // Reproduce a caller timestamp older than a packet actually delivered
+        // to the socket. Neither the emitted clock nor the receive is mocked.
+        tokio::time::sleep(Duration::from_millis(12)).await;
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("loopback sender");
+        let payload = [0_u8; 37];
+        assert_eq!(
+            sender
+                .send_to(&payload, endpoint.local_addr)
+                .expect("actual UDP delivery"),
+            payload.len()
+        );
+        tokio::time::timeout(Duration::from_secs(1), endpoint.socket.readable())
+            .await
+            .expect("bounded receive readiness")
+            .expect("socket readable");
+        let before_recv = now();
+        super::process_input(
+            &mut endpoint,
+            &mut controller,
+            &mut traces,
+            &clock,
+            input_now,
+            defense_elapsed,
+            drain_socket,
+        )
+        .expect("actual receive path");
+        let after_recv = now();
+        assert_eq!(endpoint.transport_instant_floor, input_now);
+        assert_eq!(
+            endpoint
+                .receive_loop
+                .latest_return
+                .expect("receive return")
+                .disposition,
+            if drain_socket {
+                super::ReceivePollDisposition::DrainedToWouldBlock
+            } else {
+                super::ReceivePollDisposition::BoundedOneBatch
+            }
+        );
+        assert!(controller.next_action().is_none());
+        traces.flush_events().expect("flush actual observations");
+        drop(traces);
+
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        let packet_rows: Vec<_> = packets.lines().skip(1).collect();
+        assert_eq!(packet_rows.len(), 1);
+        let packet: Vec<_> = packet_rows[0].split(',').collect();
+        assert_eq!(packet[0], "incoming");
+        assert_eq!(packet[2], "0");
+        assert_eq!(packet[3], "37");
+        assert_eq!(packet[4], "");
+        assert_eq!(packet[5], "observed");
+        assert_eq!(packet[6], "");
+        let received_us: u64 = packet[1].parse().expect("packet time");
+        assert!(received_us >= super::elapsed_ns(started, before_recv) / 1_000);
+        assert!(received_us <= super::elapsed_ns(started, after_recv) / 1_000);
+        assert!(received_us >= super::elapsed_ns(started, input_now) / 1_000 + 10_000);
+
+        let events = fs::read_to_string(output.join("events.csv")).expect("event trace");
+        let event_rows: Vec<_> = events.lines().skip(1).collect();
+        if let Some(defense_elapsed) = defense_elapsed {
+            assert_eq!(event_rows.len(), 1);
+            let event: Vec<_> = event_rows[0].splitn(5, ',').collect();
+            assert_eq!(event[0].parse::<u64>().expect("event time"), received_us);
+            assert_eq!(&event[1..4], ["0", "observation", "recorded"]);
+            let (details, _) = event[4].rsplit_once("\",").expect("CSV details terminator");
+            let details = details
+                .strip_prefix('"')
+                .expect("CSV details opening quote");
+            let details: serde_json::Value =
+                serde_json::from_str(&details.replace("\"\"", "\"")).expect("raw observation");
+            assert_eq!(details["type"], "datagram");
+            assert_eq!(details["length"], 37);
+            assert_eq!(
+                details["timestamp_us"],
+                duration_as_trace_micros(defense_elapsed)
+            );
+            let produced_ns = details["production_monotonic_ns"]
+                .as_u64()
+                .expect("production ns");
+            assert!(produced_ns >= super::elapsed_ns(started, before_recv));
+            assert!(produced_ns <= super::elapsed_ns(started, after_recv));
+            assert_eq!(produced_ns / 1_000, received_us);
+            assert!(
+                details["production_sequence"]
+                    .as_u64()
+                    .expect("production sequence")
+                    > 0
+            );
+        } else {
+            assert!(
+                event_rows.is_empty(),
+                "pre-defense input has no defense observation"
+            );
+        }
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule trace");
+        assert_eq!(
+            schedule.lines().count(),
+            1,
+            "an observed packet grants no scheduled cell"
+        );
+        drop(endpoint);
+        fs::remove_dir_all(output).expect("remove actual receive fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_packet_observations_use_actual_post_recv_clock() {
+        for drain_socket in [false, true] {
+            assert_actual_receive_observation_clocks(
+                drain_socket,
+                Some(Duration::from_micros(12_345)),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_packet_observations_preserve_predefense_and_bounded_drains() {
+        for drain_socket in [false, true] {
+            assert_actual_receive_observation_clocks(drain_socket, None).await;
+        }
     }
 
     #[test]
