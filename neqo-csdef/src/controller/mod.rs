@@ -364,6 +364,10 @@ pub struct QcsdController {
     endpoint_origins: HashMap<QcsdEndpointId, String>,
     buflo_chaff_ack_observed_at: HashMap<(QcsdEndpointId, QcsdStreamId), Duration>,
     buflo_startup_requested_chaff: HashMap<(QcsdEndpointId, u64), u32>,
+    /// Prospective source-bound Tamaraw receive ownership and outgoing window.
+    /// Incoming releases can still complete across real transport callbacks;
+    /// slotless parser bootstrap never becomes scheduled ownership afterward.
+    tamaraw_rapid_capture_policy: bool,
     streams: StreamRegistry,
     chaff: Option<ChaffManager>,
     control: ControlLoop,
@@ -594,6 +598,7 @@ impl QcsdController {
             endpoint_origins: HashMap::new(),
             buflo_chaff_ack_observed_at: HashMap::new(),
             buflo_startup_requested_chaff: HashMap::new(),
+            tamaraw_rapid_capture_policy: false,
             streams: StreamRegistry::default(),
             chaff,
             control,
@@ -652,6 +657,48 @@ impl QcsdController {
     #[must_use]
     pub const fn config(&self) -> &QcsdConfig {
         &self.config
+    }
+
+    /// Enable the prospectively bound fixed Tamaraw collection policy.
+    ///
+    /// Incoming work retains ordinary physical partial releases and retries.
+    /// Only exact capacity and currently proven parser continuations may own
+    /// it; the outgoing half-open realization window becomes 10 milliseconds.
+    /// The caller must independently validate the frozen prepared source.
+    ///
+    /// # Errors
+    ///
+    /// Rejects another defense, changed fixed parameters, repeated opt-in, or
+    /// a controller that has already scheduled work.
+    pub fn enable_tamaraw_rapid_capture_policy(&mut self) -> Result<()> {
+        if !matches!(
+            self.config.defense,
+            DefenseConfig::Tamaraw(crate::TamarawConfig {
+                incoming_interval_us: 5_000,
+                outgoing_interval_us: 20_000,
+                packet_size: 1_200,
+                modulo: 100,
+            })
+        ) || self.config.control_interval_us != 5_000
+            || self.config.max_udp_payload_size != 1_200
+            || self.config.drop_unsatisfied_events
+            || self.defense.mode() != DefenseMode::ChaffAndShape
+            || self.defense.incoming_slot_must_resolve_in_window()
+            || self.fixed_schedule.is_some()
+            || self.tamaraw_rapid_capture_policy
+            || self.control.next_slot_id != 0
+            || !self.pending_slots.is_empty()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "Tamaraw owned-retry collection requires an unstarted 1200-byte/5000-us incoming/20000-us outgoing/modulo100 retrying defense".into(),
+            ));
+        }
+        self.tamaraw_rapid_capture_policy = true;
+        Ok(())
+    }
+
+    fn incoming_requires_explicit_physical_ownership(&self) -> bool {
+        self.tamaraw_rapid_capture_policy || self.defense.incoming_slot_must_resolve_in_window()
     }
 
     /// Enable only the explicit prepared-policy fixed `BuFLO` startup.
@@ -2040,7 +2087,7 @@ impl QcsdController {
         } else {
             None
         };
-        let lease = if self.defense.incoming_slot_must_resolve_in_window() {
+        let lease = if self.incoming_requires_explicit_physical_ownership() {
             self.streams.parser_lease_with_blocked(
                 endpoint,
                 stream,
@@ -2262,11 +2309,12 @@ impl QcsdController {
         // incoming opportunities cannot inherit an earlier slotless physical
         // advertisement: they must stage slot-owned credit and advertise it
         // inside their own half-open window. Debit the oldest same-stream
-        // claims only for non-exact defenses and recycle exactly that overlap;
+        // claims only for legacy non-exact defenses and recycle exactly that overlap;
+        // prospective Tamaraw owned-retry keeps these bootstrap bytes outside cells.
         // any remainder stays permanently charged to the lifetime unowned cap.
         let mut reclassified = 0_u64;
         let mut reclassified_by_slot = BTreeMap::new();
-        if unowned_overlap > 0 && !self.defense.incoming_slot_must_resolve_in_window() {
+        if unowned_overlap > 0 && !self.incoming_requires_explicit_physical_ownership() {
             let mut indices: Vec<_> = self
                 .control
                 .claims
@@ -2609,8 +2657,8 @@ impl QcsdController {
             if remaining == 0 || !self.incoming_credit_ledger.contains_key(&owner.slot) {
                 continue;
             }
-            if self.defense.incoming_slot_must_resolve_in_window() {
-                // A physical exact-window parser advertisement cannot be
+            if self.incoming_requires_explicit_physical_ownership() {
+                // A physical explicitly owned parser advertisement cannot be
                 // withdrawn at FIN or endpoint retirement and assigned again.
                 // Its unused bytes are real failed realization, just like an
                 // unused ordinary scheduled receive range.
@@ -3957,10 +4005,15 @@ impl QcsdController {
         let pending = std::mem::take(&mut self.control.outgoing);
         for outgoing in pending {
             let send_policy = self.defense.outgoing_send_policy();
+            let realization_window = if self.tamaraw_rapid_capture_policy {
+                Duration::from_micros(10_000)
+            } else {
+                self.config.control_interval()
+            };
             let deadline = outgoing
                 .packet
                 .timestamp()
-                .saturating_add(self.config.control_interval());
+                .saturating_add(realization_window);
             if send_policy != crate::QcsdSendPolicy::CongestionSensitive && elapsed >= deadline {
                 self.actions.push_back(QcsdAction::SlotMissed {
                     endpoint: None,
@@ -4331,17 +4384,17 @@ impl QcsdController {
                         increase: release.increase,
                     });
                 }
-                let parser_continuation = if exact_window {
+                let parser_continuation = if self.incoming_requires_explicit_physical_ownership() {
                     self.streams
                         .scheduled_parser_lease_capacity(opportunity.endpoint, opportunity.stream)
                 } else {
                     opportunity.claimable
                 };
                 if incoming.remaining > 0 && parser_continuation > 0 {
-                    // Exact-window modes may own only a retained pristine
-                    // parser continuation, never speculative future body work.
-                    // It is committed with the complete same-cell allocation;
-                    // insufficient capacity rolls back every staged component.
+                    // Explicit physical-ownership modes use only a retained
+                    // pristine parser continuation, never speculative body work.
+                    // Exact-window modes commit complete cells atomically;
+                    // Tamaraw owned-retry retains real partial releases.
                     let amount = self.streams.claim_stream(
                         opportunity.endpoint,
                         opportunity.stream,
@@ -8558,6 +8611,679 @@ mod tests {
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
+    }
+
+    fn rapid_tamaraw_controller(enabled: bool, chaff: bool) -> QcsdController {
+        let manifest = chaff.then(|| ResourceManifest {
+            resources: vec![Resource {
+                id: 7,
+                url: "https://example.com/qualified-chaff".into(),
+                kind: "Image".into(),
+                content_length: Some(24_064),
+                data_length: 24_064,
+                chaff_priority: true,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            }],
+        });
+        let mut controller = QcsdController::new(
+            QcsdConfig {
+                max_udp_payload_size: 1_200,
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                max_chaff_streams: 5,
+                drop_unsatisfied_events: false,
+                defense: DefenseConfig::Tamaraw(TamarawConfig {
+                    incoming_interval_us: 5_000,
+                    outgoing_interval_us: 20_000,
+                    packet_size: 1_200,
+                    modulo: 100,
+                }),
+                ..QcsdConfig::default()
+            },
+            42,
+            manifest,
+        )
+        .expect("fixed Tamaraw controller");
+        if enabled {
+            controller
+                .enable_tamaraw_rapid_capture_policy()
+                .expect("prospective opt-in");
+        }
+        ready(&mut controller, 1, "https://example.com");
+        controller
+    }
+
+    fn open_rapid_tamaraw_stream(controller: &mut QcsdController, stream: u64, chaff: bool) {
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(stream),
+                role: if chaff {
+                    QcsdRequestRole::Chaff {
+                        resource_id: 7,
+                        request_id: None,
+                    }
+                } else {
+                    QcsdRequestRole::Application
+                },
+                expected_response_length: (!chaff).then_some(1),
+            },
+            Duration::ZERO,
+        );
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_opt_in_rejects_changed_or_started_controllers() {
+        let valid = rapid_tamaraw_controller(false, false).config.clone();
+        for change in 0..9 {
+            let mut config = valid.clone();
+            match change {
+                0 => config.defense = DefenseConfig::None,
+                1 => {
+                    config.defense = DefenseConfig::Front(FrontConfig::default());
+                    config.max_udp_payload_size = 1_500;
+                }
+                2 => config.control_interval_us = 4_000,
+                3 => config.max_udp_payload_size = 1_500,
+                4 => config.drop_unsatisfied_events = true,
+                _ => {
+                    let DefenseConfig::Tamaraw(parameters) = &mut config.defense else {
+                        unreachable!()
+                    };
+                    match change {
+                        5 => parameters.incoming_interval_us = 6_000,
+                        6 => parameters.outgoing_interval_us = 25_000,
+                        7 => parameters.modulo = 99,
+                        _ => {
+                            parameters.packet_size = 1_300;
+                            config.max_udp_payload_size = 1_300;
+                        }
+                    }
+                }
+            }
+            let mut controller =
+                QcsdController::new(config, 42, None).expect("valid changed controller");
+            assert!(controller.enable_tamaraw_rapid_capture_policy().is_err());
+        }
+        let mut enabled = rapid_tamaraw_controller(true, false);
+        assert!(enabled.enable_tamaraw_rapid_capture_policy().is_err());
+        let mut started = rapid_tamaraw_controller(false, false);
+        started.poll(Duration::ZERO);
+        assert!(started.enable_tamaraw_rapid_capture_policy().is_err());
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_outgoing_window_preserves_half_open_legacy_boundary() {
+        for enabled in [false, true] {
+            for elapsed_us in [4_999, 5_000, 6_517, 9_999, 10_000] {
+                let mut controller = rapid_tamaraw_controller(enabled, false);
+                controller.collect_due_events(Duration::ZERO);
+                controller.process_outgoing(Duration::from_micros(elapsed_us));
+                let actions: Vec<_> = controller.drain_actions().collect();
+                let window = if enabled { 10_000 } else { 5_000 };
+                let send = actions.iter().find_map(|action| match action {
+                    QcsdAction::SendPacket {
+                        packet,
+                        deadline_after_us,
+                        ..
+                    } => Some((*packet, *deadline_after_us)),
+                    _ => None,
+                });
+                if elapsed_us < window {
+                    let (packet, remaining) = send.expect("still inside physical allowance");
+                    assert_eq!(
+                        (packet.timestamp_us(), packet.length(), remaining),
+                        (0, 1_200, window - elapsed_us)
+                    );
+                } else {
+                    assert!(send.is_none());
+                    assert!(actions.iter().any(|action| matches!(
+                        action,
+                        QcsdAction::SlotMissed {
+                            reason: MissedSlotReason::DeadlineExpired,
+                            ..
+                        }
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_unknown_primary_uses_actual_whole_chaff_credit() {
+        let mut controller = rapid_tamaraw_controller(true, true);
+        open_rapid_tamaraw_stream(&mut controller, 0, false);
+        open_rapid_tamaraw_stream(&mut controller, 4, true);
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let releases: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((*stream, *absolute_limit, *slot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(releases, [(QcsdStreamId(4), 1_216, QcsdSlotId(1))]);
+        assert!(
+            controller.control.claims.is_empty(),
+            "the primary's speculative1000 bytes cannot displace physical chaff"
+        );
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(4),
+                absolute_limit: 1_216,
+                slot: Some(QcsdSlotId(1)),
+            },
+            Duration::from_millis(50),
+        );
+        assert!(
+            controller.incoming_slot_is_locally_realized(QcsdSlotId(1)),
+            "late actual advertisement is retained honestly"
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(4),
+                bytes: 1_216,
+            },
+            Duration::from_millis(80),
+        );
+        assert!(controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SlotSatisfied {
+                slot: QcsdSlotId(1),
+                ..
+            }
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_bootstrap_stays_unowned_and_decoded_headers_make_progress() {
+        let mut controller = rapid_tamaraw_controller(true, true);
+        open_rapid_tamaraw_stream(&mut controller, 0, false);
+        open_rapid_tamaraw_stream(&mut controller, 4, true);
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                blocked_at: 16,
+            },
+            Duration::ZERO,
+        );
+        assert!(controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::LeaseParserReceive {
+                absolute_limit: 1_000,
+                increase: 984,
+                owner: None,
+                ..
+            }
+        )));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                absolute_limit: 1_000,
+                slot: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                bytes: 1_000,
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            0
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            0
+        );
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                min_remaining: 53,
+                awaiting_data_frame: false,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let releases: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            releases,
+            [
+                (QcsdStreamId(0), 1_053, QcsdSlotId(1)),
+                (QcsdStreamId(4), 1_163, QcsdSlotId(1))
+            ]
+        );
+        for (stream, absolute_limit, slot) in releases {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(1),
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    bytes: if stream.0 == 0 { 53 } else { 1_163 },
+                },
+                Duration::from_micros(2),
+            );
+        }
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert!(controller.control.claims.is_empty());
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_five_partial_chaff_tails_allow_same_cell_replenishment() {
+        let mut controller = rapid_tamaraw_controller(true, true);
+        for stream in [0, 4, 8, 12, 16] {
+            open_rapid_tamaraw_stream(&mut controller, stream, true);
+            let state = controller
+                .streams
+                .get_mut(QcsdEndpointId(1), QcsdStreamId(stream))
+                .expect("actual open chaff");
+            state.status = Some(200);
+            // Five real unfinished qualified responses each retain100 raw bytes.
+            // Rolling back this subcell total would prevent every FIN/replenishment.
+            state.receive = crate::stream::ReceiveState::ReceivingData {
+                advertised_limit: 23_980,
+                requested_limit: 23_980,
+                known_limit: 24_080,
+                reservation_capacity: 1_000,
+                reservation_available: 1_000,
+                consumed: 23_980,
+                payload_floor: 24_064,
+                framing_bytes: 16,
+                parser_lease_capacity: 1_000,
+                parser_lease_used: 0,
+                parser_lease_exhausted: false,
+                last_parser_lease_boundary: None,
+                pending_parser_boundary: None,
+                data_length: 23_964,
+            };
+        }
+        controller.poll(Duration::ZERO);
+        let releases: Vec<_> = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(releases.len(), 5);
+        assert!(
+            releases
+                .iter()
+                .all(|(_, limit, slot)| *limit == 24_080 && *slot == QcsdSlotId(1))
+        );
+        assert_eq!(controller.control.incoming[0].remaining, 700);
+        for (stream, absolute_limit, slot) in releases {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_micros(100),
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    bytes: 100,
+                },
+                Duration::from_micros(101),
+            );
+            controller.observe(
+                QcsdObservation::StreamFinished {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    finish: QcsdStreamFinish::Fin,
+                },
+                Duration::from_micros(102),
+            );
+        }
+        assert_eq!(controller.streams.open_chaff_count(), 0);
+        controller.request_chaff_if_needed(true);
+        let request = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::RequestChaff {
+                    resource,
+                    request_id,
+                    ..
+                } => Some((resource.id, request_id)),
+                _ => None,
+            })
+            .expect("closed streams permit an actual successor request");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(20),
+                role: QcsdRequestRole::Chaff {
+                    resource_id: request.0,
+                    request_id: Some(request.1),
+                },
+                expected_response_length: None,
+            },
+            Duration::from_micros(103),
+        );
+        controller.process_incoming(0, Duration::from_micros(10_000));
+        let release = controller
+            .drain_actions()
+            .find_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => Some((stream, absolute_limit, slot)),
+                _ => None,
+            })
+            .expect("old cell resumes with genuine new physical capacity");
+        assert_eq!(release, (QcsdStreamId(20), 716, QcsdSlotId(1)));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: QcsdEndpointId(1),
+                stream: release.0,
+                absolute_limit: release.1,
+                slot: Some(release.2),
+            },
+            Duration::from_micros(10_001),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint: QcsdEndpointId(1),
+                stream: release.0,
+                bytes: 716,
+            },
+            Duration::from_micros(10_002),
+        );
+        assert!(controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SlotSatisfied {
+                slot: QcsdSlotId(1),
+                ..
+            }
+        )));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            (
+                diagnostics.scheduled_incoming_requested_bytes,
+                diagnostics.scheduled_incoming_advertised_bytes,
+                diagnostics.scheduled_incoming_consumed_bytes
+            ),
+            (1_200, 1_200, 1_200)
+        );
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_parser_claims_require_current_frontier_and_retire_unused_credit() {
+        for (tail, blocked, expected_lease) in [
+            (0, None, 16),
+            (1, Some(1_016), 1),
+            (1, None, 0),
+            (1, Some(1_015), 0),
+        ] {
+            let mut controller = rapid_tamaraw_controller(true, true);
+            open_rapid_tamaraw_stream(&mut controller, 0, false);
+            open_rapid_tamaraw_stream(&mut controller, 4, true);
+            // Retained parser state after the natural1000-byte lifetime budget
+            // was actually spent. A short positive raw tail needs matching
+            // peer blocked evidence; it cannot promise sixteen unknown bytes.
+            controller
+                .streams
+                .get_mut(QcsdEndpointId(1), QcsdStreamId(0))
+                .expect("primary")
+                .receive = crate::stream::ReceiveState::ReceivingData {
+                advertised_limit: 1_016,
+                requested_limit: 1_016,
+                known_limit: 1_016,
+                reservation_capacity: 1_000,
+                reservation_available: 1_000,
+                consumed: 1_016 - tail,
+                payload_floor: 1,
+                framing_bytes: 1_015,
+                parser_lease_capacity: 1_000,
+                parser_lease_used: 1_000,
+                parser_lease_exhausted: true,
+                last_parser_lease_boundary: Some(1_000),
+                pending_parser_boundary: None,
+                data_length: 1,
+            };
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(0),
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+            if let Some(blocked_at) = blocked {
+                controller.observe(
+                    QcsdObservation::StreamDataBlocked {
+                        endpoint: QcsdEndpointId(1),
+                        stream: QcsdStreamId(0),
+                        blocked_at,
+                    },
+                    Duration::ZERO,
+                );
+            }
+            controller.poll(Duration::ZERO);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            let lease = actions.iter().find_map(|action| match action {
+                QcsdAction::LeaseParserReceive {
+                    absolute_limit,
+                    increase,
+                    owner: Some(owner),
+                    ..
+                } => Some((*absolute_limit, *increase, *owner)),
+                _ => None,
+            });
+            assert_eq!(
+                lease.map(|(_, increase, _)| increase).unwrap_or(0),
+                expected_lease
+            );
+            assert!(controller.control.claims.is_empty());
+            for action in actions {
+                match action {
+                    QcsdAction::IncreaseReceiveLimit {
+                        stream,
+                        absolute_limit,
+                        slot,
+                        ..
+                    } => {
+                        assert_eq!(stream, QcsdStreamId(4));
+                        assert_eq!(absolute_limit, 16 + 1_200 - expected_lease);
+                        controller.observe(
+                            QcsdObservation::ReceiveLimitAdvertised {
+                                endpoint: QcsdEndpointId(1),
+                                stream,
+                                absolute_limit,
+                                slot: Some(slot),
+                            },
+                            Duration::from_micros(5_001),
+                        );
+                        controller.observe(
+                            QcsdObservation::BytesRead {
+                                endpoint: QcsdEndpointId(1),
+                                stream,
+                                bytes: absolute_limit,
+                            },
+                            Duration::from_micros(5_002),
+                        );
+                    }
+                    QcsdAction::LeaseParserReceive {
+                        absolute_limit,
+                        owner: Some(_),
+                        ..
+                    } => {
+                        controller.observe(
+                            QcsdObservation::ReceiveLimitAdvertised {
+                                endpoint: QcsdEndpointId(1),
+                                stream: QcsdStreamId(0),
+                                absolute_limit,
+                                slot: None,
+                            },
+                            Duration::from_micros(5_003),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            controller.expire_unadvertised_exact_incoming(Duration::from_millis(100));
+            assert!(
+                controller
+                    .drain_actions()
+                    .all(|action| !matches!(action, QcsdAction::SlotMissed { .. })),
+                "TAM never acquires the strict incoming5ms deadline"
+            );
+            controller.observe(
+                QcsdObservation::StreamFinished {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(0),
+                    finish: QcsdStreamFinish::Fin,
+                },
+                Duration::from_millis(101),
+            );
+            let actions: Vec<_> = controller.drain_actions().collect();
+            if expected_lease > 0 {
+                assert!(actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::SlotMissed {
+                        slot: QcsdSlotId(1),
+                        reason: MissedSlotReason::ReceiveCreditRetired,
+                        ..
+                    }
+                )));
+                assert!(!actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::SlotSatisfied {
+                        slot: QcsdSlotId(1),
+                        ..
+                    }
+                )));
+            }
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 1_200);
+            assert_eq!(
+                diagnostics.scheduled_incoming_consumed_bytes,
+                1_200 - expected_lease
+            );
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, expected_lease);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_never_reclassifies_consumed_unowned_lease_into_live_claim() {
+        for enabled in [false, true] {
+            let mut controller = rapid_tamaraw_controller(enabled, false);
+            open_rapid_tamaraw_stream(&mut controller, 0, false);
+            controller.drain_actions().for_each(drop);
+            controller.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(0),
+                    blocked_at: 16,
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(0),
+                    absolute_limit: 1_000,
+                    slot: None,
+                },
+                Duration::ZERO,
+            );
+            // Inject the old still-live speculative claim to reproduce the
+            // historical consumption-time promotion at this exact seam.
+            let packet =
+                Packet::new(Duration::ZERO, Direction::Incoming, 16).expect("cell fragment");
+            let slot = QcsdSlotId(1);
+            controller
+                .incoming_credit_ledger
+                .insert(slot, IncomingCreditLedger::new(packet));
+            controller.pending_slots.insert(slot, packet);
+            controller.scheduled_incoming_requested_bytes = 16;
+            controller.control.claims.push(PendingClaim {
+                slot,
+                packet,
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                remaining: 16,
+            });
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(0),
+                    bytes: 32,
+                },
+                Duration::from_micros(1),
+            );
+            let diagnostics = controller.defense_diagnostics();
+            let expected = if enabled { 0 } else { 16 };
+            assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, expected);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, expected);
+            assert_eq!(controller.control.claims.is_empty(), !enabled);
+        }
     }
 
     fn tamaraw_controller() -> QcsdController {

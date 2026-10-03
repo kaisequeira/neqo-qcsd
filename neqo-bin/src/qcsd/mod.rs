@@ -571,7 +571,7 @@ impl Args {
                     application_response_policy,
                     application_workload_source
                         .as_ref()
-                        .map(|(_, _, _, policy, _, _, _)| *policy),
+                        .map(|(_, _, _, policy, _, _, _, _)| *policy),
                 )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
@@ -1478,6 +1478,45 @@ impl BufloIncomingCreditReleasePolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TamarawCapturePolicy {
+    #[default]
+    Legacy,
+    RapidV5OwnedRetry,
+}
+
+impl TamarawCapturePolicy {
+    const RAPID_V5_NAME: &'static str = "rapid-v5-tamaraw-owned-retry-outgoing-10000us-v1";
+
+    fn from_preparation(
+        preparation: &serde_json::Value,
+        application: ApplicationResponsePolicy,
+        primary: PrimaryDocumentIdentityPolicy,
+        chaff_origin: &QualifiedChaffOriginPolicy,
+    ) -> Result<Self, Error> {
+        match preparation.get("tamaraw_capture_policy") {
+            None => Ok(Self::Legacy),
+            Some(serde_json::Value::String(policy)) if policy == Self::RAPID_V5_NAME => {
+                if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+                    || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+                    || !matches!(
+                        chaff_origin,
+                        QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+                    )
+                {
+                    return Err(Error::Argument(
+                        "Tamaraw owned-retry policy requires bound variable-primary, terminal-HTTP, and prepared-approved-origin policies".into(),
+                    ));
+                }
+                Ok(Self::RapidV5OwnedRetry)
+            }
+            Some(_) => Err(Error::Argument(
+                "prepared Tamaraw capture policy is invalid".into(),
+            )),
+        }
+    }
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
@@ -1490,6 +1529,7 @@ struct RunSpec {
         QualifiedChaffOriginPolicy,
         PrimaryDocumentIdentityPolicy,
         BufloIncomingCreditReleasePolicy,
+        TamarawCapturePolicy,
     )>,
     application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
@@ -1504,7 +1544,7 @@ struct RunSpec {
 }
 
 fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, source_hash, _, prepared_application, chaff_origin, primary, policy)) =
+    let Some((source, source_hash, _, prepared_application, chaff_origin, primary, policy, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -1556,7 +1596,7 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
         || !spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|(_, _, _, _, _, _, policy)| policy.name().is_some())
+            .is_some_and(|(_, _, _, _, _, _, policy, _)| policy.name().is_some())
         || validate_buflo_incoming_credit_release_policy(spec).is_err()
     {
         return None;
@@ -1569,6 +1609,73 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
         "incoming_release_window_us": 10_000,
         "period_us": 20_000,
         "cell_bytes": 1_200,
+        "scientific_credit": false,
+    }))
+}
+
+fn validate_tamaraw_capture_policy(spec: &RunSpec) -> Result<(), Error> {
+    let Some((source, hash, _, application, origin, primary, _, policy)) =
+        &spec.application_workload_source
+    else {
+        return Ok(());
+    };
+    if *policy == TamarawCapturePolicy::Legacy {
+        return Ok(());
+    }
+    if !lower_hex_sha256(hash)
+        || *application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+        || spec.application_response_policy != *application
+        || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+        || !matches!(
+            origin,
+            QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+        )
+    {
+        return Err(Error::Argument(
+            "Tamaraw owned-retry policy is not bound to the frozen prepared application policies"
+                .into(),
+        ));
+    }
+    spec.application_response_policy
+        .validate_source_binding(&spec.workload, source)?;
+    if let DefenseConfig::Tamaraw(parameters) = &spec.config.defense
+        && (parameters.incoming_interval_us != 5_000
+            || parameters.outgoing_interval_us != 20_000
+            || parameters.packet_size != 1_200
+            || parameters.modulo != 100
+            || spec.config.control_interval_us != 5_000
+            || spec.config.max_udp_payload_size != 1_200
+            || spec.config.drop_unsatisfied_events)
+    {
+        return Err(Error::Argument(
+            "Tamaraw owned-retry policy requires fixed 1200-byte cells, 5000-us incoming, 20000-us outgoing, modulo 100, and the unchanged 5000-us retrying controller".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn tamaraw_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
+    if !matches!(spec.config.defense, DefenseConfig::Tamaraw(_))
+        || !spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| source.7 == TamarawCapturePolicy::RapidV5OwnedRetry)
+        || validate_tamaraw_capture_policy(spec).is_err()
+    {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "source": "bound-preparation-v1",
+        "policy": TamarawCapturePolicy::RAPID_V5_NAME,
+        "incoming_credit_semantics": "explicit-physical-ownership-with-pending-retry-v1",
+        "incoming_period_us": 5_000,
+        "outgoing_period_us": 20_000,
+        "cell_bytes": 1_200,
+        "padding_modulus": 100,
+        "outgoing_release_window_us": 10_000,
+        "historical_outgoing_release_window_us": 5_000,
+        "paper_equivalent": false,
         "scientific_credit": false,
     }))
 }
@@ -10947,7 +11054,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses, _, origin_policy, _, _) =
+    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -11761,7 +11868,7 @@ async fn qualify_chaff_prefix(
     output_dir: &Path,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let (application_source, application_source_sha256, prepared_expected_responses, _, _, _, _) =
+    let (application_source, application_source_sha256, prepared_expected_responses, _, _, _, _, _) =
         load_application_workload_source(application_source_path)?;
     let (runtime_workload, runtime_workload_sha256) = load_manifest(runtime_workload_path)?;
     let (chaff_core, chaff_core_sha256) = load_chaff_core(chaff_core_path)?;
@@ -12460,6 +12567,7 @@ fn load_application_workload_source(
         QualifiedChaffOriginPolicy,
         PrimaryDocumentIdentityPolicy,
         BufloIncomingCreditReleasePolicy,
+        TamarawCapturePolicy,
     ),
     Error,
 > {
@@ -12537,6 +12645,12 @@ fn load_application_workload_source(
         primary_policy,
         &origin_policy,
     )?;
+    let tamaraw_policy = TamarawCapturePolicy::from_preparation(
+        &source.preparation,
+        policy,
+        primary_policy,
+        &origin_policy,
+    )?;
     Ok((
         manifest,
         sha256(&bytes)?,
@@ -12545,6 +12659,7 @@ fn load_application_workload_source(
         origin_policy,
         primary_policy,
         buflo_incoming_policy,
+        tamaraw_policy,
     ))
 }
 
@@ -13122,17 +13237,18 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     if spec
         .application_workload_source
         .as_ref()
-        .is_some_and(|(_, _, _, policy, _, _, _)| *policy != spec.application_response_policy)
+        .is_some_and(|(_, _, _, policy, _, _, _, _)| *policy != spec.application_response_policy)
     {
         return Err(Error::Argument(
             "run application response policy differs from its frozen prepared source".into(),
         ));
     }
-    if let Some((source, _, _, _, _, _, _)) = &spec.application_workload_source {
+    if let Some((source, _, _, _, _, _, _, _)) = &spec.application_workload_source {
         spec.application_response_policy
             .validate_source_binding(&spec.workload, source)?;
     }
     validate_buflo_incoming_credit_release_policy(&spec)?;
+    validate_tamaraw_capture_policy(&spec)?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
         validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
@@ -13331,7 +13447,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
         return Ok(());
     };
-    let Some((source, source_hash, expected_responses, _, origin_policy, _, _)) =
+    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _)) =
         &spec.application_workload_source
     else {
         return Err(Error::Argument(
@@ -13624,6 +13740,14 @@ async fn execute_run_inner(
             })
     {
         controller.enable_buflo_acknowledged_incoming_startup()?;
+    }
+    if matches!(spec.config.defense, DefenseConfig::Tamaraw(_))
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| source.7 == TamarawCapturePolicy::RapidV5OwnedRetry)
+    {
+        controller.enable_tamaraw_rapid_capture_policy()?;
     }
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let scheduler_initial = process_scheduler.clone();
@@ -14669,12 +14793,11 @@ fn expected_application_response_length(
 
 fn application_response_length_hint(spec: &RunSpec, resource: &Resource) -> Option<u64> {
     let variable_primary = resource.id == 0
-        && spec
-            .application_workload_source
-            .as_ref()
-            .is_some_and(|(_, _, _, _, _, policy, _)| {
+        && spec.application_workload_source.as_ref().is_some_and(
+            |(_, _, _, _, _, policy, _, _)| {
                 *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
-            });
+            },
+        );
     if variable_primary {
         // Prepared primary bodies may differ between visits under this explicit
         // source-bound policy. A prepared length is not a lower bound on the
@@ -15649,11 +15772,11 @@ fn finish_application_record(
     let variable_primary = record.role == QcsdRequestRole::Application
         && record.resource_id == 0
         && spec.is_some_and(|spec| {
-            spec.application_workload_source
-                .as_ref()
-                .is_some_and(|(_, _, _, _, _, policy, _)| {
+            spec.application_workload_source.as_ref().is_some_and(
+                |(_, _, _, _, _, policy, _, _)| {
                     *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
-                })
+                },
+            )
         });
     let terminal_error_completed = record.role == QcsdRequestRole::Application
         && record.outcome == "in_flight"
@@ -22908,8 +23031,8 @@ fn render_run_json(
         "request_policy": spec.request_policy,
         "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _)| hash),
-        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _)| *policy).name(),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _)| hash),
+        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _)| *policy).name(),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
@@ -22932,6 +23055,9 @@ fn render_run_json(
     });
     if let Some(policy) = buflo_incoming_credit_release_receipt(spec) {
         run["buflo_incoming_credit_release_policy"] = policy;
+    }
+    if let Some(policy) = tamaraw_capture_policy_receipt(spec) {
+        run["tamaraw_capture_policy"] = policy;
     }
     serde_json::to_vec_pretty(&run)
         .expect("serializing a fully materialized serde_json::Value to Vec cannot fail")
@@ -24772,6 +24898,7 @@ mod tests {
                 super::QualifiedChaffOriginPolicy::default(),
                 super::PrimaryDocumentIdentityPolicy::default(),
                 super::BufloIncomingCreditReleasePolicy::default(),
+                super::TamarawCapturePolicy::default(),
             )),
             application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
@@ -24859,6 +24986,7 @@ mod tests {
             policy,
             super::PrimaryDocumentIdentityPolicy::default(),
             super::BufloIncomingCreditReleasePolicy::default(),
+            super::TamarawCapturePolicy::default(),
         ));
         spec.chaff_manifest = Some(
             response_only_chaff_manifest_v4(
@@ -24882,7 +25010,8 @@ mod tests {
         .expect("legacy metadata does not opt into approved origins");
         assert_eq!(policy, super::QualifiedChaffOriginPolicy::PrimaryOrigin);
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, _, _, _) = spec.application_workload_source.as_ref().unwrap();
+        let (source, _, expected, _, _, _, _, _) =
+            spec.application_workload_source.as_ref().unwrap();
         assert!(
             super::selected_identity_chaff_resource(
                 source,
@@ -24965,7 +25094,7 @@ mod tests {
             json!(["https://example.com", "https://api.example.com"]);
         let bytes = serde_json::to_vec(&value).expect("serialize opt-in source");
         fs::write(&path, &bytes).expect("write source");
-        let (source, digest, expected, _, policy, _, _) =
+        let (source, digest, expected, _, policy, _, _, _) =
             super::load_application_workload_source(&path).expect("load bound opt-in source");
         assert_eq!(digest, sha256(&bytes).expect("exact raw-source hash"));
         assert_eq!(source.resources.len(), 2);
@@ -24985,7 +25114,7 @@ mod tests {
     #[test]
     fn qualified_chaff_origin_policy_accepts_only_approved_auxiliary_identity_resource() {
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, policy, _, _) =
+        let (source, _, expected, _, policy, _, _, _) =
             spec.application_workload_source.as_mut().unwrap();
         let (resource, response) = super::selected_identity_chaff_resource(
             source,
@@ -34319,6 +34448,328 @@ mod tests {
         spec
     }
 
+    fn tamaraw_capture_policy_source() -> serde_json::Value {
+        let mut value = variable_primary_document_source();
+        value["preparation"]["tamaraw_capture_policy"] =
+            json!(super::TamarawCapturePolicy::RAPID_V5_NAME);
+        value["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        value["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        value
+    }
+
+    fn tamaraw_capture_policy_spec() -> RunSpec {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("tamaraw-owned-retry-policy-source");
+        let path = output.join("prepared.json");
+        let raw = serde_json::to_vec(&tamaraw_capture_policy_source()).expect("prepared policy");
+        fs::write(&path, &raw).expect("frozen source");
+        let bound = super::load_application_workload_source(&path).expect("bound policy source");
+        assert_eq!(bound.1, sha256(&raw).expect("actual frozen-source hash"));
+        assert_eq!(bound.7, super::TamarawCapturePolicy::RapidV5OwnedRetry);
+        let mut spec =
+            terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
+        spec.workload = bound.0.clone();
+        spec.application_workload_source = Some(bound);
+        spec.max_response_bytes = 1_048_576;
+        spec.config = QcsdConfig {
+            max_udp_payload_size: 1_200,
+            control_interval_us: 5_000,
+            drop_unsatisfied_events: false,
+            defense: DefenseConfig::Tamaraw(TamarawConfig {
+                incoming_interval_us: 5_000,
+                outgoing_interval_us: 20_000,
+                packet_size: 1_200,
+                modulo: 100,
+            }),
+            ..QcsdConfig::default()
+        };
+        fs::remove_dir_all(output).expect("source parsed once before execution");
+        spec
+    }
+
+    #[test]
+    fn tamaraw_capture_policy_rejects_unknown_or_unbound_prepared_values() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("tamaraw-owned-retry-invalid-source");
+        let path = output.join("prepared.json");
+        for invalid in [
+            json!(false),
+            json!(null),
+            json!(10_000),
+            json!({}),
+            json!("unknown"),
+        ] {
+            let mut source = tamaraw_capture_policy_source();
+            source["preparation"]["tamaraw_capture_policy"] = invalid;
+            fs::write(&path, serde_json::to_vec(&source).expect("source")).expect("source fixture");
+            assert!(super::load_application_workload_source(&path).is_err());
+        }
+        for field in [
+            "application_response_policy",
+            "primary_document_identity_policy",
+            "qualified_chaff_origin_policy",
+        ] {
+            let mut source = tamaraw_capture_policy_source();
+            source["preparation"]
+                .as_object_mut()
+                .expect("preparation")
+                .remove(field);
+            fs::write(&path, serde_json::to_vec(&source).expect("source")).expect("source fixture");
+            assert!(
+                super::load_application_workload_source(&path).is_err(),
+                "missing source-policy field {field}"
+            );
+        }
+        let mut legacy = tamaraw_capture_policy_source();
+        legacy["preparation"]
+            .as_object_mut()
+            .expect("preparation")
+            .remove("tamaraw_capture_policy");
+        fs::write(&path, serde_json::to_vec(&legacy).expect("source")).expect("source fixture");
+        assert_eq!(
+            super::load_application_workload_source(&path)
+                .expect("historical source")
+                .7,
+            super::TamarawCapturePolicy::Legacy
+        );
+        fs::remove_dir_all(output).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn tamaraw_capture_policy_marker_is_exact_and_other_four_modes_get_no_override() {
+        let mut spec = tamaraw_capture_policy_spec();
+        super::validate_tamaraw_capture_policy(&spec).expect("actual fixed policy");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["tamaraw_capture_policy"],
+            json!({
+                "schema_version": 1, "source": "bound-preparation-v1",
+                "policy": super::TamarawCapturePolicy::RAPID_V5_NAME,
+                "incoming_credit_semantics": "explicit-physical-ownership-with-pending-retry-v1",
+                "incoming_period_us": 5_000, "outgoing_period_us": 20_000,
+                "cell_bytes": 1_200, "padding_modulus": 100,
+                "outgoing_release_window_us": 10_000,
+                "historical_outgoing_release_window_us": 5_000,
+                "paper_equivalent": false, "scientific_credit": false,
+            })
+        );
+        assert!(run.get("buflo_incoming_credit_release_policy").is_none());
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "unused-buflo.json".into(),
+            }),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused-cs-buflo.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            super::validate_tamaraw_capture_policy(&spec)
+                .expect("shared source flag is inert for another mode");
+            assert!(super::tamaraw_capture_policy_receipt(&spec).is_none());
+        }
+        let mut legacy = tamaraw_capture_policy_spec();
+        legacy
+            .application_workload_source
+            .as_mut()
+            .expect("source")
+            .7 = super::TamarawCapturePolicy::Legacy;
+        assert!(super::tamaraw_capture_policy_receipt(&legacy).is_none());
+        legacy.application_workload_source = None;
+        assert!(super::tamaraw_capture_policy_receipt(&legacy).is_none());
+    }
+
+    #[test]
+    fn tamaraw_capture_policy_rejects_changed_runtime_graph_source_and_parameters() {
+        for change in 0..13 {
+            let mut spec = tamaraw_capture_policy_spec();
+            match change {
+                0 => spec.config.control_interval_us = 6_000,
+                1 => spec.config.max_udp_payload_size = 1_500,
+                2 => spec.config.drop_unsatisfied_events = true,
+                3..=6 => {
+                    let DefenseConfig::Tamaraw(parameters) = &mut spec.config.defense else {
+                        unreachable!()
+                    };
+                    match change {
+                        3 => parameters.incoming_interval_us = 6_000,
+                        4 => parameters.outgoing_interval_us = 25_000,
+                        5 => parameters.packet_size = 1_000,
+                        _ => parameters.modulo = 99,
+                    }
+                }
+                7 => {
+                    spec.application_workload_source.as_mut().expect("source").1 = "invalid".into()
+                }
+                8 => {
+                    spec.application_workload_source.as_mut().expect("source").4 =
+                        super::QualifiedChaffOriginPolicy::default()
+                }
+                9 => {
+                    spec.application_workload_source.as_mut().expect("source").5 =
+                        super::PrimaryDocumentIdentityPolicy::default()
+                }
+                10 => spec.application_response_policy = ApplicationResponsePolicy::default(),
+                11 => spec.workload.resources[0].url = "https://unapproved.example/".into(),
+                _ => {
+                    spec.workload.resources.pop();
+                }
+            }
+            assert!(
+                super::validate_tamaraw_capture_policy(&spec).is_err(),
+                "changed bound field {change}"
+            );
+            assert!(super::tamaraw_capture_policy_receipt(&spec).is_none());
+        }
+    }
+
+    #[test]
+    fn tamaraw_owned_retry_trace_requires_final_physical_fanout_handoff() {
+        let output = trace_output_dir("tamaraw-owned-retry-physical-fanout");
+        let start = now();
+        let clock = QcsdObservationClock::new(start);
+        let mut traces = TraceFiles::new(&output, start).expect("trace files");
+        let mut controller = QcsdController::new(
+            QcsdConfig {
+                max_udp_payload_size: 1_200,
+                defense: DefenseConfig::Tamaraw(TamarawConfig {
+                    incoming_interval_us: 5_000,
+                    outgoing_interval_us: 20_000,
+                    packet_size: 1_200,
+                    modulo: 100,
+                }),
+                ..QcsdConfig::default()
+            },
+            42,
+            None,
+        )
+        .expect("actual fixed controller");
+        controller
+            .enable_tamaraw_rapid_capture_policy()
+            .expect("prospective policy");
+        for (endpoint, length) in [(1, 316), (2, 916)] {
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint: QcsdEndpointId(endpoint),
+                    origin: format!("https://endpoint{endpoint}.example"),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(endpoint),
+                    stream: QcsdStreamId(0),
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(length),
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.poll(Duration::ZERO);
+        let incoming: Vec<_> = controller
+            .drain_actions()
+            .filter(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+            .collect();
+        assert_eq!(incoming.len(), 2);
+        register_action_batch(&mut traces, start + Duration::from_micros(10), &incoming)
+            .expect("actual incoming fanout");
+        for (index, action) in incoming.into_iter().enumerate() {
+            let QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot,
+                ..
+            } = action
+            else {
+                unreachable!()
+            };
+            let produced_at = start + Duration::from_micros(20 + index as u64);
+            let physical_us = if index == 0 { 50 } else { 90 };
+            let record = clock.record_at(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                produced_at,
+            );
+            controller.observe(
+                record.observation().clone(),
+                Duration::from_micros(physical_us),
+            );
+            assert!(
+                traces
+                    .observation_after_controller(Some(endpoint), &record, &controller, None)
+                    .is_err(),
+                "production time cannot replace successful physical handoff"
+            );
+            traces
+                .observation_after_controller(
+                    Some(endpoint),
+                    &record,
+                    &controller,
+                    Some(start + Duration::from_micros(physical_us)),
+                )
+                .expect("physical advertisement");
+            assert_eq!(
+                controller.incoming_slot_is_locally_realized(slot),
+                index == 1
+            );
+        }
+        for (endpoint, bytes) in [(1, 316), (2, 916)] {
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(endpoint),
+                    stream: QcsdStreamId(0),
+                    bytes,
+                },
+                Duration::from_micros(100),
+            );
+        }
+        let terminal = controller
+            .drain_actions()
+            .find(|action| {
+                matches!(
+                    action,
+                    QcsdAction::SlotSatisfied {
+                        slot: QcsdSlotId(1),
+                        ..
+                    }
+                )
+            })
+            .expect("actual1200-byte consumption");
+        record_terminal_action(
+            &mut traces,
+            start + Duration::from_micros(100),
+            100,
+            Some(100),
+            "recorded",
+            TerminalActionSemantics::OpportunityResolution,
+            &terminal,
+        )
+        .expect("terminal row");
+        traces
+            .ensure_no_pending_slots()
+            .expect("no unsealed trace slots");
+        drop(traces);
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        let rows: Vec<_> = schedule.lines().skip(1).collect();
+        assert_eq!(rows.len(), 1);
+        let fields: Vec<_> = rows[0].split(',').collect();
+        assert_eq!(
+            fields[21], "90",
+            "last physical child handoff completes the cell"
+        );
+        assert_eq!(fields[23], "100");
+        fs::remove_dir_all(output).expect("fixture cleanup");
+    }
+
     fn buflo_incoming_credit_release_policy_spec() -> RunSpec {
         buflo_incoming_credit_release_policy_spec_for(
             super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME,
@@ -34917,7 +35368,7 @@ mod tests {
         let value = terminal_http_error_source();
         let bytes = serde_json::to_vec(&value).expect("serialize source");
         fs::write(&path, &bytes).expect("write source");
-        let (manifest, digest, expected, policy, _, _, _) =
+        let (manifest, digest, expected, policy, _, _, _, _) =
             super::load_application_workload_source(&path).expect("policy source");
         assert_eq!(
             policy,
