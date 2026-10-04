@@ -2288,17 +2288,17 @@ const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 10;
+const BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION: u32 = 11;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION: u32 = 6;
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION: u32 = 6;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v10; schema10_retains_schema9_layout_with_role_deadlines=true;incoming_credit_window_ns=bound_preparation_10000000_or_legacy_5000000;incoming_deadline_is_separate_from_unchanged_outgoing_5000000ns=true;main_enqueue_cutoff=release_plus_5ms;main_enqueue_TAI_upper_must_precede_strict_deadline=true;exact_main_TX_lower_must_not_precede_its_enqueue_TAI_lower=true;late_enqueue_does_not_extend_physical_window=true;main_coalesced_credit_without_residual_reconciled_at_proven_physical_time_before_current_tai_expiry=true;any_residual_pending_credit_defers_initial_global_reduction_until_first_residual_owner_turn=true;completed_credit_inventory_precedes_current_tai_expiry=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms; protected_selection_wait_applies_to_tick_zero_and_rolling_slots=true; protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; selection_window_is_half_open_release_minus_5ms_through_release=true; late_or_failed_selection_remains_fatal=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
+const BUFLO_KERNEL_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v11; schema11_retains_schema10_layout_with_before_release_late_selection_entry=true;incoming_credit_window_ns=bound_preparation_10000000_or_legacy_5000000;incoming_deadline_is_separate_from_unchanged_outgoing_5000000ns=true;main_enqueue_cutoff=release_plus_5ms;main_enqueue_TAI_upper_must_precede_strict_deadline=true;exact_main_TX_lower_must_not_precede_its_enqueue_TAI_lower=true;late_enqueue_does_not_extend_physical_window=true;main_coalesced_credit_without_residual_reconciled_at_proven_physical_time_before_current_tai_expiry=true;any_residual_pending_credit_defers_initial_global_reduction_until_first_residual_owner_turn=true;completed_credit_inventory_precedes_current_tai_expiry=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true; clock=CLOCK_TAI_bracketed_against_CLOCK_MONOTONIC_and_CLOCK_REALTIME; exact_outgoing=SO_TXTIME_SCM_TXTIME_ETF; tick_zero_is_kernel_timed_after_future_defense_start_arm=true; residual_incoming_credit=ordered_after_exact_transmit; same_endpoint_credit_may_be_coalesced_in_exact_outgoing=true; packet_priority=per_datagram_SCM_PRIORITY_after_IP_controls_or_single_threaded_serialized_SO_PRIORITY; serialized_ipv4_traffic_class=socket_IP_TOS_before_SO_PRIORITY_and_restore_IP_TOS_before_SO_PRIORITY; serialized_ipv6_traffic_class=per_message_IPV6_TCLASS; serialized_socket_state_requires_verified_traffic_class_and_priority_readback_and_restoration; sender_exclusivity_is_current_thread_control_flow_not_OS_socket_ownership; protected_selection_wait=CLOCK_TAI_active_poll_before_selection_or_immediate_late_entry_before_release; protected_selection_wait_applies_to_tick_zero_and_rolling_slots=true; protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; selection_window_is_half_open_release_minus_5ms_through_release=true; late_selection_entry_before_release_is_diagnostic=true;release_expiry_or_failed_selection_remains_fatal=true; tx_sched_and_tx_software_are_linux_error_queue_timestamps; txtime_drop_scm_timestamping_is_requested_tai_context_not_transmit_evidence=true; enqueue_clock_evidence=TAI_before_sendmsg_then_MONOTONIC_after_sendmsg_then_TAI_after; post_tx_phase_same_clock_order_is_hard=true; post_tx_monotonic_offset_overlap_is_diagnostic=true; global_monotonic_drift_is_diagnostic=true; kernel_selection_and_incoming_retry_deadlines=CLOCK_TAI; neqo_transport_instants=nondecreasing_CLOCK_MONOTONIC; general_controller_elapsed=current_CLOCK_TAI_minus_defense_start_TAI; physical_handoff_defense_elapsed=conservative_TX_TAI_upper_minus_defense_start_TAI; semantic_deadline_wakeups_are_monotonic_hints_rechecked_against_CLOCK_TAI=true; strict_realization_window_is_half_open; no_catch_up=true; client_only_preselection_adaptation=true; paper_equivalent=false; raw_runner_receipt_does_not_claim_post_veth_observation=true";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS: &str = "CLOCK_TAI_protected_wait_enters_during_release_minus_10ms_to_release_minus_5ms; application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_one_strict_window_early; runner_freezes_until_kernel_tx_software_receipt; late_wait_entry_and_release_expiry_fail_closed; client_only_adaptation; paper_equivalent=false";
+const BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS: &str = "CLOCK_TAI_selection_readiness_enters_during_release_minus_10ms_to_release; application_and_transport_state_selected_at_nominal_release_while_wall_clock_is_before_release; nominal_selection_boundary=release_minus_5ms; early_entry_polls_until_selection; late_entry_before_release_has_zero_wait_and_no_full_dwell_claim; runner_freezes_until_kernel_tx_software_receipt; release_expiry_and_clock_failure_fail_closed; client_only_adaptation; paper_equivalent=false";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; selection=release_minus_5ms; release=defense_start_plus_tick_times_20ms; entry_requires_admission<=entered_tai<selection; active_poll_runs_until_selection; pre_admission_calls_create_no_entry; first_entry_at_or_after_selection_is_selection_entry_late; selection_success_requires_selection<=completed_tai<release; completed_tai_is_immutable_selection_completion=true; confirmation_attempts=count_each_confirm_call_exactly_once; confirmation_phase_order=tick_zero_completed<=staging<=dispatch<release_or_rolling_completed<=dispatch<release; failed_confirmation_retains_prior_phase_evidence=true; exact_release_is_expired; every_recorded_wait_clock_read_attempt_is_counted; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; completed_job_release_tai_must_equal_entry_release_tai=true; consecutive_successful_samples_must_not_regress; failures_are_typed_and_fail_closed; no_early_packet_construction; no_window_extension; no_catch_up";
+const BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; selection=release_minus_5ms; release=defense_start_plus_tick_times_20ms; entry_requires_admission<=entered_tai<release; active_poll_runs_until_selection_if_entry_precedes_selection; pre_admission_calls_create_no_entry; first_entry_at_or_after_selection_before_release_is_ready_with_zero_wait; late_entry_completed_tai_equals_entered_tai_and_initial_clock_reads_equal_one; protected_dwell_is_measured_not_required; selection_success_requires_selection<=completed_tai<release; completed_tai_is_immutable_selection_completion=true; confirmation_attempts=count_each_confirm_call_exactly_once; confirmation_phase_order=tick_zero_completed<=staging<=dispatch<release_or_rolling_completed<=dispatch<release; failed_confirmation_retains_prior_phase_evidence=true; exact_release_is_expired; every_recorded_wait_clock_read_attempt_is_counted; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1; completed_job_release_tai_must_equal_entry_release_tai=true; consecutive_successful_samples_must_not_regress; failures_are_typed_and_fail_closed; no_early_packet_construction; no_window_extension; no_catch_up";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS: &str = "std_Instant_bracketed_around_CLOCK_MONOTONIC; upper_bracket_edge_selected; translated_Instant_is_a_conservative_latest_bound; full_bracket_width_is_alignment_uncertainty";
 #[cfg(target_os = "linux")]
@@ -4054,27 +4054,9 @@ fn buflo_kernel_protected_selection_wait_with_clock(
             error: Error::DefenseExecution(detail),
         };
     }
-    if entered_tai_ns >= identity.selection_tai_ns {
-        let detail = format!(
-            "BuFLO kernel slot {} entered its protected CLOCK_TAI wait at or after the selection boundary",
-            identity.slot
-        );
-        return BufloKernelProtectedSelectionStep::Failed {
-            entry: buflo_kernel_failed_selection_entry(
-                identity,
-                Some(entered_tai_ns),
-                Some(entered_tai_ns),
-                Some(entered_tai_ns),
-                clock_read_attempts,
-                0,
-                0,
-                "selection-entry-late",
-                detail.clone(),
-            ),
-            error: Error::DefenseExecution(detail),
-        };
-    }
-
+    // Selection is a preparation boundary. An entry after that boundary can
+    // still prepare the exact future release; retain its actual zero wait.
+    // The release check above and fresh dispatch confirmation stay strict.
     let mut current_tai_ns = entered_tai_ns;
     let mut max_sample_gap_ns = 0;
     while current_tai_ns < identity.selection_tai_ns {
@@ -4355,15 +4337,26 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
                 && completed < entry.release_tai_ns
                 && entry.entered_tai_ns.is_some_and(|entered| {
                     entered >= entry.admission_tai_ns
-                        && entered < entry.selection_tai_ns
+                        && entered < entry.release_tai_ns
                         && completed.saturating_sub(entered) == entry.wait_duration_ns
+                        && (entered < entry.selection_tai_ns || completed == entered)
                 })
         });
         let clock_read_attempts_valid = if entry.completed_tai_ns.is_some() {
-            entry
-                .confirmation_attempts
-                .checked_add(2)
-                .is_some_and(|minimum| entry.clock_read_attempts >= minimum)
+            if entry
+                .entered_tai_ns
+                .is_some_and(|entered| entered >= entry.selection_tai_ns)
+            {
+                entry
+                    .confirmation_attempts
+                    .checked_add(1)
+                    .is_some_and(|exact| entry.clock_read_attempts == exact)
+            } else {
+                entry
+                    .confirmation_attempts
+                    .checked_add(2)
+                    .is_some_and(|minimum| entry.clock_read_attempts >= minimum)
+            }
         } else {
             entry.clock_read_attempts > 0
         };
@@ -4405,10 +4398,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
                 && failure.tick_zero == entry.tick_zero
                 && matches!(
                     failure.kind,
-                    "selection-entry-late"
-                        | "selection-expired"
-                        | "clock-regression"
-                        | "clock-read-error"
+                    "selection-expired" | "clock-regression" | "clock-read-error"
                 )
                 && !failure.detail.is_empty()
                 && failure.admission_tai_ns == entry.admission_tai_ns
@@ -4421,13 +4411,6 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
             entry.confirmation_attempts == 0
                 && entry.completed_tai_ns.is_none()
                 && match failure.kind {
-                    "selection-entry-late" => entry.entered_tai_ns.is_some_and(|entered| {
-                        entered >= entry.selection_tai_ns
-                            && entered < entry.release_tai_ns
-                            && failure.previous_tai_ns == Some(entered)
-                            && failure.observed_tai_ns == Some(entered)
-                            && entry.wait_duration_ns == 0
-                    }),
                     "selection-expired" => entry.entered_tai_ns.is_some_and(|entered| {
                         failure.observed_tai_ns.is_some_and(|observed| {
                             observed >= entry.release_tai_ns
@@ -4471,7 +4454,6 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
             };
             entry.confirmation_attempts > 0
                 && completed_selection_valid
-                && failure.kind != "selection-entry-late"
                 && failure.previous_tai_ns == expected_previous
                 && match failure.kind {
                     "selection-expired" => failure.observed_tai_ns.is_some_and(|observed| {
@@ -4557,7 +4539,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
         .and_then(|entry| entry.failure.clone());
     valid &= (failed_count == 1) == last_failure.is_some();
     let receipt = BufloKernelProtectedSelectionWaitReceipt {
-        schema_version: 1,
+        schema_version: 2,
         semantics: BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS,
         entry_count: entries.len(),
         completed_count,
@@ -7228,9 +7210,9 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
 const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 10;
 const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=5000; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guard_coincides_with_output_admission=false; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_exact_release_schema10_passive_wait_unreachable=true; buflo_exact_release_guard_wait_equals_active_wait=true; buflo_exact_release_max_passive_wake_lateness_equals_max_guard_entry_lateness=true; buflo_exact_release_aggregate_entry_lateness_reachable=max_retained_failure_entry_or_5000000_plus_max_dispatch_lateness; buflo_exact_release_aggregate_active_wait_reachable=retained_success_plus_retained_failure_plus_bounded_unretained_successes_with_hidden_entry_max_subtraction_saturating; buflo_exact_release_active_derived_maxima_reachable=retained_per_metric_or_unretained_success_5000000_plus_dispatch; buflo_exact_release_deadline_count_reachable=outside_zero_or_max_dispatch_lateness_at_least_4999000; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_one_actual_adapter_window_before_release=true; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_wait_iterations=counter_read_attempts_including_ordered_and_unavailable_or_fallback_authoritative_polls; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard_entry; buflo_exact_release_dispatch_lateness_histogram_counts_one_dispatch_ready_guard; buflo_exact_release_guard_entries=dispatch_ready_guards+failed_guards; buflo_exact_release_failed_guards=sum_typed_failure_guards; buflo_exact_release_failed_guards_max=1; buflo_exact_release_last_failure_present_iff_failed_guards=1; buflo_exact_release_failure_dispatch_at_is_null=true; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=actual_adapter_window_ns; buflo_exact_release_configured_output_admission_lead_us=10000; buflo_exact_release_configured_guard_and_active_wait_lead_us=5000; buflo_exact_release_active_wait_poll=linux_aarch64_cntvct_el0_predictive_authoritative_watchdog_else_instant_authoritative_fallback; buflo_exact_release_counter_target_rounding=ceil; buflo_exact_release_counter_calibration=counter_instant_counter; buflo_exact_release_counter_is_predictive_with_periodic_authoritative_watchdog=true; buflo_exact_release_authoritative_watchdog_interval_successful_relaxed_reads=64; buflo_exact_release_authoritative_watchdog_dispatch_preserves_strict_half_open_transport_check=true; buflo_exact_release_authoritative_watchdog_cadence_validated_guards=count_dispatch_ready_production_guards_passing_exact_per_guard_cadence; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_reads=active_wait_iterations-2*counter_calibrations; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_bound=counter_calibrations=guards+early_confirmation_retries_and_64*checks<=remainder<64*(checks+guards)_and_remainder>=early_confirmation_retries; buflo_exact_release_zero_failure_empty_partition=zero_iterations_calibrations_checks_retries_dispatches; buflo_exact_release_remaining_success_guard_projection=subtract_worst_and_exact_retained_failure_then_same_remainder_bounds; buflo_exact_release_zero_failure_watchdog_dispatch_residue=dispatches<=checks_and_remainder-64*checks<=63*(guards-dispatches); buflo_exact_release_max_authoritative_sample_gap=consecutive_calibration_watchdog_or_final_authoritative_samples; buflo_exact_release_authoritative_counter_lag=max_authoritative_elapsed_minus_counter_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_authoritative_lead=max_counter_elapsed_minus_authoritative_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_frequency_hz_range_inclusive=1000000..4294967295; buflo_exact_release_counter_target_error=defensive_unreachable_for_valid_live_guard_and_frequency; buflo_exact_release_first_calibration_target_error=exactly_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_zero_calibration_counter_unavailable=one_or_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_counter_unavailable=scripted_trait_failure_not_architectural_trap_receipt; buflo_exact_release_production_counter_access=target_gated_live_smoke_test; buflo_exact_release_counter_frequency_change=hard_failure_before_transport_dispatch_and_before_success_metrics_mutation; buflo_exact_release_cross_guard_frequency_precedence=typed_wait_failure_preserved_dispatch_ready_retyped; buflo_exact_release_dispatch_confirmation=authoritative_instant; buflo_exact_release_transport_and_socket_clock=authoritative_instant; buflo_exact_release_counter_regression=hard_failure; buflo_exact_release_guard_metrics_recorded_before_result_propagation=true; buflo_exact_release_transport_dispatch_result_precedes_guard_metrics=true; buflo_exact_release_failure_authoritative_watchdog_cadence=successful_relaxed_reads_R_checks_floor_R_div_64; buflo_exact_release_failure_terminal_counter_reads=target_or_frequency_change_0_unavailable_or_nonmonotonic_1_or_2_C_eq_confirmations_plus_1_requires_1; buflo_exact_release_failure_retry_requires_successful_relaxed_read=true; buflo_exact_release_early_confirmation_retry_requires_positive_counter_nanoseconds=true; buflo_exact_release_failure_counter_comparison_absence=zero_watchdog_and_zero_confirmation_implies_zero_lag_and_lead; buflo_exact_release_sole_success_failure_projection=exact_saturating_sums_chronology_and_maxima; buflo_exact_release_retained_failure_exact_fields=iterations_active_duration_interruptions_interruption_nanoseconds_and_max_gap; buflo_exact_release_nullable_chronology_duration=adapter_window_exists_in_4999000_or_5000000_nanoseconds; buflo_exact_release_structural_count_partitions=checked_u64_exact_no_saturation; buflo_exact_release_histogram_integrity=max_bucket_and_coupled_G_plus_A_minus_H_times_50001; buflo_exact_release_remaining_histograms=subtract_exact_worst_and_failure; buflo_exact_release_remaining_success_duration=dispatch_bucket_floor_with_4999000ns_window; buflo_exact_incoming_retry_zero_drives_implies_zero_max_lateness=true; buflo_exact_release_predictive_interruptions=count_le_iterations_minus_anchor_and_nonmonotonic_or_calibrated_unavailable_failed_read_and_nanoseconds_le_counter";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 19;
+const BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 20;
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS: &str = "runner_schema19_retains_schema18_schema17_schema16_schema15_and_schema10_layout_for_non_kernel_metrics=true";
+const BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS: &str = "runner_schema20_retains_schema19_schema18_schema17_schema16_schema15_and_schema10_layout_for_non_kernel_metrics=true";
 
 const BUFLO_EXACT_RELEASE_PREDICTIVE_POLL_SOURCE: &str =
     "linux-aarch64-cntvct-el0-predictive-authoritative-watchdog-v2";
@@ -14852,6 +14834,21 @@ async fn execute_run_inner(
                     !bound_ordinary_work || defense_start.is_none(),
                 )?;
                 yield_to_exact_boundaries!('runner);
+                if let Some(wakeup) = drive_front_v3_post_input_output(
+                    endpoint_index,
+                    &mut endpoints,
+                    &mut controller,
+                    spec.chaff_manifest.as_ref(),
+                    &mut traces,
+                    &observation_clock,
+                    defense_start,
+                )
+                .await?
+                    && wakeup < next_wakeup
+                {
+                    next_wakeup = wakeup;
+                    controller_deadline_selected = false;
+                }
             }
 
             record_buflo_incoming_startup_ready(
@@ -23193,6 +23190,84 @@ fn due_rolling_output_target<'a>(
         })
         .min_by_key(|(_, scheduled)| (scheduled.packet.timestamp(), scheduled.slot))
         .map(|(index, scheduled)| (index, scheduled.not_before))
+}
+
+fn front_v3_post_input_output_due(
+    endpoint: &Endpoint,
+    controller: &QcsdController,
+    defense_start: Option<Instant>,
+    observed_at: Instant,
+) -> bool {
+    if endpoint.socket_handoff_policy != SocketHandoffPolicy::FrontV3ScheduledPadding
+        || !endpoint.network_active
+        || !controller.has_fixed_schedule_staging()
+    {
+        return false;
+    }
+    let Some(started) = defense_start else {
+        return false;
+    };
+    let elapsed = observed_at.saturating_duration_since(started);
+    endpoint
+        .scheduled_outgoing
+        .iter()
+        .any(|scheduled| !scheduled.rolling_prearmed && scheduled.packet.timestamp() <= elapsed)
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "the current-thread runner owns one source-bound FRONT padding retry after actual input"
+)]
+async fn drive_front_v3_post_input_output(
+    endpoint_index: usize,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Option<Instant>,
+) -> Result<Option<Instant>, Error> {
+    let Some(started) = defense_start else {
+        return Ok(None);
+    };
+    let observed_at = now();
+    if !front_v3_post_input_output_due(
+        &endpoints[endpoint_index],
+        controller,
+        defense_start,
+        observed_at,
+    ) {
+        return Ok(None);
+    }
+    // An ACK can make the owner writable near the end of its fixed window.
+    // Reduce the actual input evidence before fixed reconciliation, then give
+    // that owner one output microstep before other origins or ordinary request
+    // work. Transport still enforces eligibility, congestion and the original
+    // deadline; the successful socket timestamp remains strictly checked.
+    handle_all_qcsd_observations(
+        endpoints,
+        controller,
+        traces,
+        observed_at.saturating_duration_since(started),
+    )?;
+    controller.flush_defense_observations();
+    ensure_defense_realizable(controller)?;
+    drive_endpoint_output_until(
+        endpoint_index,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        Some(started),
+        None,
+        None,
+        None,
+        RunnerDefenseClock::Monotonic,
+        OutputDriveCardinality::OneDatagram,
+    )
+    .await
 }
 
 #[expect(
@@ -36144,6 +36219,277 @@ mod tests {
         assert!(!rolling_output_lifecycle_active(&controller, &[]));
     }
 
+    fn front_v3_post_input_fixture(
+        output: &Path,
+        started: Instant,
+        clock: &QcsdObservationClock,
+    ) -> (
+        Vec<super::Endpoint>,
+        neqo_http3::Http3Server,
+        QcsdController,
+        TraceFiles,
+        Instant,
+        Packet,
+    ) {
+        // StaticSchedule preserves ordinary due-time generation by default.
+        // This deterministic FRONT fixture opts into the same exact snapshot
+        // protocol as Front, while retaining both original test targets.
+        #[derive(Debug)]
+        struct FixedFrontSchedule(StaticSchedule);
+
+        impl Defense for FixedFrontSchedule {
+            fn observe(&mut self, signal: DefenseSignal) {
+                self.0.observe(signal);
+            }
+
+            fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
+                self.0.next_event(elapsed)
+            }
+
+            fn fixed_schedule_snapshot(&self) -> Option<Vec<Packet>> {
+                Some(self.0.snapshot())
+            }
+
+            fn next_event_at(&self) -> Option<Duration> {
+                self.0.next_event_at()
+            }
+
+            fn is_complete(&self) -> bool {
+                self.0.is_complete()
+            }
+
+            fn is_incoming_complete(&self) -> bool {
+                self.0.is_incoming_complete()
+            }
+
+            fn is_outgoing_complete(&self) -> bool {
+                self.0.is_outgoing_complete()
+            }
+
+            fn mode(&self) -> DefenseMode {
+                self.0.mode()
+            }
+        }
+
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            output,
+            started,
+            clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        drop(endpoint.client.qcsd_timestamped_observations());
+        endpoint.socket_handoff_policy = SocketHandoffPolicy::FrontV3ScheduledPadding;
+        let packet = Packet::new(Duration::from_secs(1), Direction::Outgoing, 1_200)
+            .expect("fixed padding packet");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: DefenseConfig::Front(FrontConfig {
+                    packet_size: 1_200,
+                    ..FrontConfig::default()
+                }),
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(FixedFrontSchedule(StaticSchedule::with_mode(
+                Trace::new([packet, packet]),
+                DefenseMode::ChaffOnly,
+            ))),
+        )
+        .expect("fixed FRONT runner fixture");
+        assert!(controller.has_fixed_schedule_staging());
+        controller
+            .enable_front_padding_outgoing_window()
+            .expect("original V3 ten-millisecond window");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoint.id,
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller.reconcile_due_fixed(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(actions.len(), 2);
+        // The connected peer fixture starts on its future-shifted test clock.
+        // Bind the defense epoch to the same nondecreasing transport instant
+        // that actual action dispatch uses, rather than an earlier wall sample.
+        let action_at = endpoint.transport_instant(now());
+        let mut endpoints = vec![endpoint];
+        let mut traces = TraceFiles::new(output, started).expect("trace files");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            action_at,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("stage the actual padding targets");
+        (endpoints, server, controller, traces, action_at, packet)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v3_post_input_output_keeps_one_real_padding_datagram() {
+        let output = trace_output_dir("front-post-input-one-datagram");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, mut traces, action_at, packet) =
+            front_v3_post_input_fixture(&output, started, &clock);
+        let receiver = tokio::net::UdpSocket::bind(endpoints[0].remote_addr)
+            .await
+            .expect("actual peer UDP receiver");
+        tokio::time::timeout(Duration::from_secs(1), endpoints[0].socket.writable())
+            .await
+            .expect("bounded socket readiness")
+            .expect("sender socket writable");
+        let released_at = action_at + packet.timestamp();
+        let _logical_now = TestMonotonicNowOverride::fixed(released_at);
+        assert_eq!(endpoints[0].scheduled_outgoing.len(), 2);
+        assert_eq!(
+            endpoints[0].scheduled_outgoing[0].deadline,
+            released_at + Duration::from_millis(10)
+        );
+        super::drive_front_v3_post_input_output(
+            0,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &clock,
+            Some(action_at),
+        )
+        .await
+        .expect("one immediate owner output microstep");
+        let mut buffer = [0_u8; 1_500];
+        let (length, peer) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+                .await
+                .expect("bounded actual UDP receipt")
+                .expect("receive the real padding datagram");
+        assert_eq!(length, 1_200);
+        assert_eq!(peer, endpoints[0].local_addr);
+        assert_eq!(endpoints[0].scheduled_outgoing.len(), 1);
+        assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 1);
+        assert_eq!(controller.pending_slots().len(), 1);
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        let rows: Vec<_> = packets.lines().skip(1).collect();
+        assert_eq!(rows.len(), 1, "the retry never drains ordinary output");
+        let row: Vec<_> = rows[0].split(',').collect();
+        assert_eq!(row[0], "outgoing");
+        assert_eq!(row[3], "1200");
+        assert_eq!(row[5], "satisfied");
+        assert_eq!(row[11], "0", "no application STREAM bytes");
+        assert_eq!(row[12], "0", "no retransmitted STREAM bytes");
+        assert_eq!(row[13], "0", "no chaff STREAM bytes");
+        drop(endpoints);
+        drop(server);
+        drop(receiver);
+        fs::remove_dir_all(output).expect("remove trace fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v3_post_input_output_preserves_callback_and_target() {
+        let output = trace_output_dir("front-post-input-callback");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, mut traces, action_at, packet) =
+            front_v3_post_input_fixture(&output, started, &clock);
+        let released_at = action_at + packet.timestamp();
+        let callback = released_at + Duration::from_millis(1);
+        let _logical_now = TestMonotonicNowOverride::fixed(released_at);
+        endpoints[0]
+            .test_output_drives
+            .push_back(TestOutputDrive::CallbackAt(callback));
+        assert_eq!(
+            super::drive_front_v3_post_input_output(
+                0,
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                &clock,
+                Some(action_at),
+            )
+            .await
+            .expect("propagate the transport pacing callback"),
+            Some(callback)
+        );
+        assert_eq!(endpoints[0].scheduled_outgoing.len(), 2);
+        assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 2);
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(
+            packets.lines().count(),
+            1,
+            "a callback is not a sent packet"
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v3_post_input_output_requires_due_fixed_v3_owner() {
+        let output = trace_output_dir("front-post-input-boundaries");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, controller, traces, action_at, packet) =
+            front_v3_post_input_fixture(&output, started, &clock);
+        let released_at = action_at + packet.timestamp();
+        let before_release = released_at - Duration::from_nanos(1);
+        let due = |endpoint: &super::Endpoint, at| {
+            super::front_v3_post_input_output_due(endpoint, &controller, Some(action_at), at)
+        };
+        assert!(!due(&endpoints[0], before_release));
+        assert!(due(&endpoints[0], released_at));
+        assert!(!super::front_v3_post_input_output_due(
+            &endpoints[0],
+            &controller,
+            None,
+            released_at
+        ));
+        let ordinary = QcsdController::new(QcsdConfig::default(), 0, None)
+            .expect("unchanged ordinary controller");
+        assert!(!super::front_v3_post_input_output_due(
+            &endpoints[0],
+            &ordinary,
+            Some(action_at),
+            released_at
+        ));
+        for policy in [
+            SocketHandoffPolicy::HistoricalBestEffort,
+            SocketHandoffPolicy::CandidateFidelityStrict,
+        ] {
+            endpoints[0].socket_handoff_policy = policy;
+            assert!(
+                !due(&endpoints[0], released_at),
+                "legacy/candidate unchanged"
+            );
+        }
+        endpoints[0].socket_handoff_policy = SocketHandoffPolicy::FrontV3ScheduledPadding;
+        endpoints[0].network_active = false;
+        assert!(!due(&endpoints[0], released_at));
+        endpoints[0].network_active = true;
+        for target in &mut endpoints[0].scheduled_outgoing {
+            target.rolling_prearmed = true;
+        }
+        assert!(
+            !due(&endpoints[0], released_at),
+            "rolling targets keep their own seam"
+        );
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace fixture");
+    }
+
     #[test]
     fn run_abort_receipts_prearmed_future_fixed_slots() {
         let output = trace_output_dir("future-fixed-abort");
@@ -47326,9 +47672,8 @@ mod tests {
     fn buflo_kernel_protected_selection_boundary_entries_fail_closed() {
         let identity = synthetic_protected_selection_identity(2, false);
         let cases = [
-            (identity.selection_tai_ns, "selection-entry-late"),
-            (identity.release_tai_ns - 1, "selection-entry-late"),
             (identity.release_tai_ns, "selection-expired"),
+            (identity.release_tai_ns + 1, "selection-expired"),
         ];
         for (sample, expected_kind) in cases {
             let step =
@@ -47350,6 +47695,162 @@ mod tests {
                 .pop_front()
                 .expect("scripted CLOCK_TAI sample")),),
             super::BufloKernelProtectedSelectionStep::Ready(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_late_selection_entry_records_zero_wait_before_release() {
+        for (slot, tick_zero) in [(0, true), (2, false)] {
+            let identity = synthetic_protected_selection_identity(slot, tick_zero);
+            for entered in [
+                identity.selection_tai_ns,
+                identity.selection_tai_ns + 3_699_780,
+                identity.release_tai_ns - 1,
+            ] {
+                let mut reads = 0;
+                let step =
+                    super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                        reads += 1;
+                        Ok(entered)
+                    });
+                let super::BufloKernelProtectedSelectionStep::Ready(entry) = step else {
+                    panic!("future release was rejected after selection");
+                };
+                assert_eq!(reads, 1);
+                assert_eq!(entry.schema_version, 1);
+                assert_eq!(entry.entered_tai_ns, Some(entered));
+                assert_eq!(entry.completed_tai_ns, Some(entered));
+                assert_eq!(entry.clock_read_attempts, 1);
+                assert_eq!(entry.confirmation_attempts, 0);
+                assert_eq!(entry.wait_duration_ns, 0);
+                assert_eq!(entry.max_sample_gap_ns, 0);
+                assert_eq!(entry.entry_lateness_ns, entered - identity.admission_tai_ns);
+                assert!(entry.failure.is_none());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_kernel_late_selection_confirmation_preserves_strict_clock_guards() {
+        let identity = synthetic_protected_selection_identity(0, true);
+        let entered = identity.release_tai_ns - 1_300_220;
+        for (sample, expected_kind) in [
+            (Some(identity.release_tai_ns), "selection-expired"),
+            (Some(entered - 1), "clock-regression"),
+            (None, "clock-read-error"),
+        ] {
+            let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+                super::buflo_kernel_protected_selection_wait_with_clock(&identity, || Ok(entered))
+            else {
+                panic!("late entry before release must become ready");
+            };
+            super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                sample.ok_or_else(|| Error::DefenseExecution("scripted CLOCK_TAI failure".into()))
+            })
+            .expect_err("late readiness must not waive the fresh confirmation");
+            assert_eq!(entry.completed_tai_ns, Some(entered));
+            assert_eq!(entry.wait_duration_ns, 0);
+            assert_eq!(entry.clock_read_attempts, 2);
+            assert_eq!(entry.confirmation_attempts, 1);
+            assert!(entry.staging_confirmed_tai_ns.is_none());
+            assert!(entry.dispatch_confirmed_tai_ns.is_none());
+            assert_eq!(
+                entry.failure.as_ref().map(|failure| failure.kind),
+                Some(expected_kind)
+            );
+            let (receipt, valid) = super::build_buflo_kernel_protected_selection_wait_receipt(
+                vec![entry],
+                Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+            );
+            assert!(
+                valid,
+                "typed failed confirmation must retain an honest receipt"
+            );
+            assert_eq!(receipt.schema_version, 2);
+            assert_eq!(receipt.failed_count, 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one mutation matrix keeps late-entry clock and exact job bindings together"
+    )]
+    fn buflo_kernel_late_selection_receipt_requires_measured_wait_and_exact_jobs() {
+        let mut entries = Vec::new();
+        let mut jobs = Vec::new();
+        for (slot, tick_zero) in [(0, true), (2, false)] {
+            let identity = synthetic_protected_selection_identity(slot, tick_zero);
+            let entered = identity.selection_tai_ns + 3_699_780;
+            let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+                super::buflo_kernel_protected_selection_wait_with_clock(&identity, || Ok(entered))
+            else {
+                panic!("retained late-entry mechanism must remain before release");
+            };
+            for offset in 1..=if tick_zero { 2 } else { 1 } {
+                super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                    Ok(entered + offset)
+                })
+                .expect("fresh confirmation strictly before actual release");
+            }
+            assert_eq!(entry.clock_read_attempts, 1 + entry.confirmation_attempts);
+            entries.push(entry);
+            jobs.push(synthetic_protected_selection_job(
+                identity.tick,
+                identity.release_tai_ns,
+            ));
+        }
+        let (receipt, valid) = super::build_buflo_kernel_protected_selection_wait_receipt(
+            entries.clone(),
+            Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+        );
+        assert!(valid);
+        assert_eq!(receipt.schema_version, 2);
+        assert_eq!(receipt.total_wait_duration_ns, 0);
+        assert_eq!(receipt.clock_read_attempts, 5);
+        assert_eq!(receipt.confirmation_attempts, 3);
+        assert!(super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt, &jobs, true, false,
+        ));
+        for variant in 0..6 {
+            let mut changed = entries.clone();
+            match variant {
+                0 => changed[1].wait_duration_ns = 5_000_000,
+                1 => changed[1].max_sample_gap_ns = 1,
+                2 => changed[1].clock_read_attempts += 1,
+                3 => changed[1].completed_tai_ns = changed[1].entered_tai_ns.map(|at| at + 1),
+                4 => changed[1].dispatch_confirmed_tai_ns = Some(changed[1].release_tai_ns),
+                5 => changed[1].schema_version = 2,
+                _ => unreachable!(),
+            }
+            assert!(
+                !super::build_buflo_kernel_protected_selection_wait_receipt(
+                    changed,
+                    Some(SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS),
+                )
+                .1,
+                "late-entry receipt accepted mutation {variant}",
+            );
+        }
+        let mut changed_jobs = jobs.clone();
+        changed_jobs[1].deadline_tai_ns += 5_000_000;
+        assert!(!super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt,
+            &changed_jobs,
+            true,
+            false,
+        ));
+        assert!(!super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt,
+            &jobs[..1],
+            true,
+            false,
+        ));
+        assert!(!super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt, &jobs, false, false,
         ));
     }
 
@@ -47574,10 +48075,10 @@ mod tests {
         let second_identity = synthetic_protected_selection_identity(2, false);
         let super::BufloKernelProtectedSelectionStep::Failed { entry: second, .. } =
             super::buflo_kernel_protected_selection_wait_with_clock(&second_identity, || {
-                Ok(second_identity.selection_tai_ns)
+                Ok(second_identity.release_tai_ns)
             })
         else {
-            panic!("late second entry was accepted");
+            panic!("expired second entry was accepted");
         };
         let (receipt, valid) = super::build_buflo_kernel_protected_selection_wait_receipt(
             vec![first.clone(), second.clone()],
@@ -47589,7 +48090,7 @@ mod tests {
         assert_eq!(receipt.failed_count, 1);
         assert_eq!(
             receipt.last_failure.as_ref().map(|failure| failure.kind),
-            Some("selection-entry-late")
+            Some("selection-expired")
         );
 
         assert!(
@@ -47877,8 +48378,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn buflo_kernel_schema_ten_binds_bounded_outgoing_and_separate_incoming() {
-        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 10);
+    fn buflo_kernel_schema_eleven_binds_bounded_outgoing_and_separate_incoming() {
+        assert_eq!(super::BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION, 11);
         assert_eq!(super::BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION, 6);
         assert_eq!(super::BUFLO_KERNEL_CLOCK_MAPPING_SCHEMA_VERSION, 6);
 
@@ -47891,13 +48392,13 @@ mod tests {
         assert!(duration_as_u64_nanos(super::BUFLO_KERNEL_TX_REPORT_ALLOWANCE) > delta_ns);
         assert!(
             super::BUFLO_KERNEL_TX_SEMANTICS
-                .starts_with("client_only_buflo_kernel_timed_egress_v10;")
+                .starts_with("client_only_buflo_kernel_timed_egress_v11;")
         );
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
-            "schema10_retains_schema9_layout_with_role_deadlines=true;incoming_credit_window_ns=bound_preparation_10000000_or_legacy_5000000;incoming_deadline_is_separate_from_unchanged_outgoing_5000000ns=true;main_enqueue_cutoff=release_plus_5ms;main_enqueue_TAI_upper_must_precede_strict_deadline=true;exact_main_TX_lower_must_not_precede_its_enqueue_TAI_lower=true;late_enqueue_does_not_extend_physical_window=true;main_coalesced_credit_without_residual_reconciled_at_proven_physical_time_before_current_tai_expiry=true;any_residual_pending_credit_defers_initial_global_reduction_until_first_residual_owner_turn=true;completed_credit_inventory_precedes_current_tai_expiry=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true;"
+            "schema11_retains_schema10_layout_with_before_release_late_selection_entry=true;incoming_credit_window_ns=bound_preparation_10000000_or_legacy_5000000;incoming_deadline_is_separate_from_unchanged_outgoing_5000000ns=true;main_enqueue_cutoff=release_plus_5ms;main_enqueue_TAI_upper_must_precede_strict_deadline=true;exact_main_TX_lower_must_not_precede_its_enqueue_TAI_lower=true;late_enqueue_does_not_extend_physical_window=true;main_coalesced_credit_without_residual_reconciled_at_proven_physical_time_before_current_tai_expiry=true;any_residual_pending_credit_defers_initial_global_reduction_until_first_residual_owner_turn=true;completed_credit_inventory_precedes_current_tai_expiry=true;selection_cutoff=release_minus_5ms;etf_delta=10ms;scm_txtime=release_plus_10ms;etf_dequeue_target=release_via_txtime_minus_delta;etf_expiry_is_diagnostic_horizon_at_release_plus_10ms;strict_realization_deadline_remains_release_plus_5ms;physical_tx_at_or_after_strict_deadline_is_fatal_before_incoming_credit=true;"
         ));
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
-            "protected_selection_wait=CLOCK_TAI_active_poll_from_release_minus_10ms_to_release_minus_5ms;"
+            "protected_selection_wait=CLOCK_TAI_active_poll_before_selection_or_immediate_late_entry_before_release;"
         ));
         assert!(super::BUFLO_KERNEL_TX_SEMANTICS.contains(
             "protected_selection_epoch_binding=release_tai_defense_start_plus_tick_times_20ms; protected_selection_job_binding=completed_entry_release_tai_equals_job_release_tai_and_job_deadline_equals_release_plus_5ms; epoch_absence_requires_no_protected_selection_entries_or_jobs=true; confirmation_attempts=count_each_phase_confirmation_call_exactly_once; confirmation_phase_timestamps=selection_completion_retained_then_nullable_staging_and_dispatch; successful_job_confirmation_attempts=tick_zero:2,rolling:1; terminal_no_job_confirmation_attempts=phase_bounded_tick_zero_0_to_2_rolling_0_to_1;"
@@ -48745,7 +49246,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_render_error_is_embedded_without_erasing_schema_seventeen_kernel_evidence() {
-        assert_eq!(super::BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 19);
+        assert_eq!(super::BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION, 20);
         let mut metrics = RunnerWakeupMetrics::new();
         // Exercise schema-17 normalisation even on hosts whose production
         // schema-10 default already uses the neutral fallback source.

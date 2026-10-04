@@ -292,6 +292,14 @@ struct EventTraceRow {
     qcsd: QcsdTraceColumns,
 }
 
+#[derive(Clone, Copy)]
+struct PhysicalReceiveAdvertisement {
+    absolute_limit: u64,
+    handoff_ns: u64,
+    production_ns: u64,
+    production_sequence: u64,
+}
+
 pub(super) struct TraceFiles {
     packets: BufWriter<File>,
     events: BufWriter<File>,
@@ -302,6 +310,11 @@ pub(super) struct TraceFiles {
     events_flushed: bool,
     pending_slots: HashMap<QcsdSlotId, PendingSlot>,
     incoming_target_limits: HashMap<QcsdSlotId, HashMap<(QcsdEndpointId, QcsdStreamId), u64>>,
+    /// First successful physical coverage of each advancing receive frontier.
+    /// Retain closed streams: legacy parser bytes can change scheduling owner
+    /// later, but their original handoff cannot move to that later reduction.
+    physical_receive_advertisements:
+        HashMap<(QcsdEndpointId, QcsdStreamId), Vec<PhysicalReceiveAdvertisement>>,
     terminal_slots: HashMap<QcsdSlotId, Packet>,
 }
 
@@ -344,6 +357,7 @@ impl TraceFiles {
             events_flushed: false,
             pending_slots: HashMap::new(),
             incoming_target_limits: HashMap::new(),
+            physical_receive_advertisements: HashMap::new(),
             terminal_slots: HashMap::new(),
         })
     }
@@ -620,6 +634,25 @@ impl TraceFiles {
                 // observations always use the fail-closed branch above.
                 (None, _) => record.produced_monotonic_ns() / 1_000,
             };
+            if controller.is_some() {
+                let handoff_ns = self
+                    .elapsed_ns(receive_credit_handoff_at.expect("runtime handoff checked above"));
+                let advertisements = self
+                    .physical_receive_advertisements
+                    .entry((*endpoint, *stream))
+                    .or_default();
+                if advertisements
+                    .last()
+                    .is_none_or(|previous| previous.absolute_limit < *absolute_limit)
+                {
+                    advertisements.push(PhysicalReceiveAdvertisement {
+                        absolute_limit: *absolute_limit,
+                        handoff_ns,
+                        production_ns: record.produced_monotonic_ns(),
+                        production_sequence: record.sequence(),
+                    });
+                }
+            }
             let slots = self.advertised_credit_slots(*endpoint, *stream, *absolute_limit, *slot);
             for slot in &slots {
                 let pending = self.pending_slots.get_mut(slot).ok_or_else(|| {
@@ -699,7 +732,137 @@ impl TraceFiles {
             outcome: "recorded".into(),
             details,
             qcsd,
-        })
+        })?;
+        if let Some(controller) = controller
+            && matches!(record.observation(), QcsdObservation::BytesRead { .. })
+        {
+            self.reconcile_consumed_incoming_realizations(controller, record)?;
+        }
+        Ok(())
+    }
+
+    /// A legacy parser claim can become fully advertised only when its raw
+    /// bytes acquire scheduling ownership during consumption. The controller
+    /// snapshots that terminal ledger before removing it. Join every consumed
+    /// interval to actual successful transport coverage; no candidate or
+    /// terminal/reduction timestamp can substitute for a missing handoff.
+    fn reconcile_consumed_incoming_realizations(
+        &mut self,
+        controller: &QcsdController,
+        record: &TimestampedQcsdObservation,
+    ) -> Result<(), Error> {
+        let slots: Vec<_> = controller
+            .incoming_credit_realization_slots()
+            .filter(|slot| {
+                self.pending_slots
+                    .get(slot)
+                    .is_some_and(|pending| pending.credit_advertised_at_us.is_none())
+                    && controller
+                        .incoming_credit_realization_witness(*slot)
+                        .is_some_and(|witness| witness.retired == 0)
+            })
+            .collect();
+        for slot in slots {
+            let witness = controller
+                .incoming_credit_realization_witness(slot)
+                .expect("selected immutable witness");
+            let pending = &self.pending_slots[&slot];
+            let mut ranges = witness.ranges.clone();
+            ranges.sort_unstable_by_key(|range| {
+                (range.endpoint, range.stream, range.start, range.end)
+            });
+            let covered_bytes = ranges.iter().try_fold(0_u64, |total, range| {
+                total.checked_add(range.end.checked_sub(range.start)?)
+            });
+            let overlapping = ranges.windows(2).any(|pair| {
+                pair[0].endpoint == pair[1].endpoint
+                    && pair[0].stream == pair[1].stream
+                    && pair[0].end > pair[1].start
+            });
+            if witness.packet != pending.packet
+                || witness.requested != u64::from(pending.packet.length())
+                || witness.advertised != witness.requested
+                || witness.consumed != witness.requested
+                || witness.retired != 0
+                || !witness.locally_realized
+                || covered_bytes != Some(witness.requested)
+                || overlapping
+                || ranges.iter().any(|range| range.start >= range.end)
+                || !ranges.iter().any(|range| range.reclassified_parser)
+            {
+                return Err(Error::SlotInvariant(format!(
+                    "incoming slot {} has an incomplete consumed-realization witness",
+                    slot.0
+                )));
+            }
+            let mut advertised_ns = 0;
+            let mut physical_ranges = Vec::new();
+            for range in ranges {
+                let advertisement = self
+                    .physical_receive_advertisements
+                    .get(&(range.endpoint, range.stream))
+                    .and_then(|advertisements| {
+                        advertisements.iter().find(|advertisement| {
+                            advertisement.absolute_limit >= range.end
+                                && advertisement.production_ns <= advertisement.handoff_ns
+                                && advertisement.handoff_ns <= record.produced_monotonic_ns()
+                        })
+                    })
+                    .ok_or_else(|| {
+                        Error::SlotInvariant(format!(
+                            "incoming slot {} consumed range {}:{}:{}..{} lacks original physical handoff coverage",
+                            slot.0, range.endpoint.0, range.stream.0, range.start, range.end
+                        ))
+                    })?;
+                advertised_ns = advertised_ns.max(advertisement.handoff_ns);
+                physical_ranges.push(serde_json::json!({
+                    "endpoint": range.endpoint.0,
+                    "stream": range.stream.0,
+                    "start": range.start,
+                    "end": range.end,
+                    "reclassified_parser": range.reclassified_parser,
+                    "absolute_limit": advertisement.absolute_limit,
+                    "production_sequence": advertisement.production_sequence,
+                    "production_monotonic_ns": advertisement.production_ns,
+                    "physical_handoff_monotonic_ns": advertisement.handoff_ns,
+                }));
+            }
+            let advertised_at_us = advertised_ns / 1_000;
+            if advertised_at_us < pending.action_time_us {
+                return Err(Error::SlotInvariant(format!(
+                    "incoming slot {} physical realization precedes its scheduled action",
+                    slot.0
+                )));
+            }
+            let endpoint = pending.endpoint;
+            let reduced_at = Instant::now();
+            self.event(
+                reduced_at,
+                Some(endpoint),
+                "incoming_credit_realization",
+                "reconciled",
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "source": "native-controller-consumed-physical-receive-ranges-v1",
+                    "slot": slot.0,
+                    "requested_bytes": witness.requested,
+                    "advertised_bytes": witness.advertised,
+                    "consumed_bytes": witness.consumed,
+                    "retired_bytes": witness.retired,
+                    "reconciliation_observation_production_sequence": record.sequence(),
+                    "reconciliation_observation_production_monotonic_ns": record.produced_monotonic_ns(),
+                    "controller_terminal_defense_elapsed_us": u64::try_from(witness.terminal_at.as_micros()).unwrap_or(u64::MAX),
+                    "reduction_monotonic_ns": self.elapsed_ns(reduced_at),
+                    "credit_advertised_at_us": advertised_at_us,
+                    "ranges": physical_ranges,
+                }),
+            )?;
+            self.pending_slots
+                .get_mut(&slot)
+                .expect("pending realization retained")
+                .credit_advertised_at_us = Some(advertised_at_us);
+        }
+        Ok(())
     }
 
     /// Resolve every logical incoming slot whose registered physical target
@@ -904,5 +1067,379 @@ impl TraceFiles {
 impl Drop for TraceFiles {
     fn drop(&mut self) {
         drop(self.flush_events());
+    }
+}
+
+#[cfg(test)]
+mod incoming_realization_tests {
+    use std::{
+        fs,
+        io::Write as _,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+
+    use neqo_csdef::{
+        QcsdAction, QcsdConfig, QcsdObservationClock, QcsdRequestRole, StaticSchedule, Trace,
+    };
+
+    use super::*;
+
+    struct Fixture {
+        controller: QcsdController,
+        traces: TraceFiles,
+        clock: QcsdObservationClock,
+        start: Instant,
+        output: PathBuf,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        slot: QcsdSlotId,
+        packet: Packet,
+        time_us: u64,
+        last_handoff_us: u64,
+    }
+
+    impl Fixture {
+        fn new(explicit_bytes: u64) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let output = std::env::temp_dir().join(format!(
+                "qcsd-incoming-realization-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&output).expect("fresh trace directory");
+            let start = Instant::now();
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(4);
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("cell");
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: 1,
+                    max_stream_data_excess: 1_000,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+            )
+            .expect("controller");
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: "https://example.com".into(),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(explicit_bytes + 1),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::ZERO);
+            let action = controller
+                .drain_actions()
+                .find(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+                .expect("actual partial scheduled release");
+            let QcsdAction::IncreaseReceiveLimit {
+                absolute_limit,
+                slot,
+                ..
+            } = action
+            else {
+                unreachable!();
+            };
+            assert_eq!(absolute_limit, explicit_bytes + 1);
+            let mut traces = TraceFiles::new(&output, start).expect("traces");
+            traces
+                .register_incoming_action(
+                    start + Duration::from_micros(1),
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    packet,
+                    slot,
+                )
+                .expect("register actual scheduled action");
+            let mut fixture = Self {
+                controller,
+                traces,
+                clock: QcsdObservationClock::new(start),
+                start,
+                output,
+                endpoint,
+                stream,
+                slot,
+                packet,
+                time_us: 1,
+                last_handoff_us: 0,
+            };
+            fixture
+                .advertise(absolute_limit, Some(slot), true)
+                .expect("partial advertisement");
+            fixture
+                .read(explicit_bytes + 1)
+                .expect("consume original exact offsets");
+            assert!(!fixture.controller.incoming_slot_is_locally_realized(slot));
+            fixture
+        }
+
+        fn record(&mut self, observation: QcsdObservation) -> TimestampedQcsdObservation {
+            self.time_us += 1;
+            self.clock.record_at(
+                observation,
+                self.start + Duration::from_micros(self.time_us),
+            )
+        }
+
+        fn advertise(
+            &mut self,
+            absolute_limit: u64,
+            slot: Option<QcsdSlotId>,
+            retain_physical: bool,
+        ) -> Result<(), Error> {
+            let record = self.record(QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: self.endpoint,
+                stream: self.stream,
+                absolute_limit,
+                slot,
+            });
+            self.time_us += 1;
+            self.last_handoff_us = self.time_us;
+            self.controller.observe(
+                record.observation().clone(),
+                Duration::from_micros(self.time_us),
+            );
+            if retain_physical {
+                self.traces.observation_after_controller(
+                    Some(self.endpoint),
+                    &record,
+                    &self.controller,
+                    Some(self.start + Duration::from_micros(self.time_us)),
+                )?;
+            }
+            Ok(())
+        }
+
+        fn lease(&mut self, retain_physical: bool) -> (u64, u64) {
+            let record = self.record(QcsdObservation::HeaderProgress {
+                endpoint: self.endpoint,
+                stream: self.stream,
+                min_remaining: 0,
+                awaiting_data_frame: true,
+            });
+            self.controller.observe(
+                record.observation().clone(),
+                Duration::from_micros(self.time_us),
+            );
+            self.traces
+                .observation_after_controller(Some(self.endpoint), &record, &self.controller, None)
+                .expect("typed boundary observation");
+            let (absolute_limit, increase) = self
+                .controller
+                .drain_actions()
+                .find_map(|action| {
+                    if let QcsdAction::LeaseParserReceive {
+                        absolute_limit,
+                        increase,
+                        owner,
+                        ..
+                    } = action
+                    {
+                        assert!(owner.is_none(), "legacy unowned parser lease");
+                        Some((absolute_limit, increase))
+                    } else {
+                        None
+                    }
+                })
+                .expect("actual parser lease");
+            self.advertise(absolute_limit, None, retain_physical)
+                .expect("actual parser advertisement");
+            (absolute_limit, increase)
+        }
+
+        fn read(&mut self, bytes: u64) -> Result<(), Error> {
+            let record = self.record(QcsdObservation::BytesRead {
+                endpoint: self.endpoint,
+                stream: self.stream,
+                bytes,
+            });
+            self.controller.observe(
+                record.observation().clone(),
+                Duration::from_micros(self.time_us),
+            );
+            self.traces.observation_after_controller(
+                Some(self.endpoint),
+                &record,
+                &self.controller,
+                None,
+            )
+        }
+
+        fn consume_parser_remainder(
+            &mut self,
+            mut remaining: u64,
+            retain_last: bool,
+        ) -> Result<(), Error> {
+            while remaining > 0 {
+                let (_, increase) = self.lease(remaining > 16 || retain_last);
+                let bytes = remaining.min(increase);
+                self.read(bytes)?;
+                remaining -= bytes;
+            }
+            Ok(())
+        }
+
+        fn terminal(&mut self) -> Result<(), Error> {
+            let terminal = self.controller.drain_actions().find(|action| {
+                matches!(action, QcsdAction::SlotSatisfied { slot, .. } if *slot == self.slot)
+            }).expect("controller-issued full terminal action");
+            assert!(matches!(terminal, QcsdAction::SlotSatisfied { .. }));
+            self.write_terminal()
+        }
+
+        fn write_terminal(&mut self) -> Result<(), Error> {
+            self.traces.schedule(&ScheduleTraceRow {
+                action_time_us: self.time_us + 7,
+                endpoint: Some(self.endpoint),
+                packet: self.packet,
+                satisfaction: "satisfied",
+                observed: Some(1_200),
+                miss_reason: "",
+                slot: self.slot,
+                qcsd: QcsdTraceColumns::exact(1_200, Some(1_200)),
+                terminal_defense_elapsed_us: self.time_us,
+            })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.output);
+        }
+    }
+
+    #[test]
+    fn incoming_realization_trace_reclassifies_491_and_534_byte_splits_after_last_advertisement() {
+        for explicit in [993, 1_179] {
+            let mut fixture = Fixture::new(explicit);
+            fixture
+                .consume_parser_remainder(1_200 - explicit, true)
+                .expect("full raw consumption");
+            assert!(
+                !fixture
+                    .controller
+                    .incoming_slot_is_locally_realized(fixture.slot),
+                "the completed live ledger has been removed"
+            );
+            let witness = fixture
+                .controller
+                .incoming_credit_realization_witness(fixture.slot)
+                .expect("immutable terminal ownership witness");
+            assert_eq!(
+                (
+                    witness.requested,
+                    witness.advertised,
+                    witness.consumed,
+                    witness.retired
+                ),
+                (1_200, 1_200, 1_200, 0)
+            );
+            assert_eq!(
+                witness
+                    .ranges
+                    .iter()
+                    .filter(|range| range.reclassified_parser)
+                    .map(|range| range.end - range.start)
+                    .sum::<u64>(),
+                1_200 - explicit
+            );
+            assert_eq!(
+                fixture.traces.pending_slots[&fixture.slot].credit_advertised_at_us,
+                Some(fixture.last_handoff_us)
+            );
+            assert!(fixture.last_handoff_us < fixture.time_us);
+            fixture.terminal().expect("full terminal schedule");
+            assert!(
+                fixture.write_terminal().is_err(),
+                "one terminal action cannot be reused"
+            );
+            fixture
+                .traces
+                .schedule
+                .flush()
+                .expect("flush schedule bytes");
+            fixture
+                .traces
+                .flush_events()
+                .expect("flush raw event bytes");
+            let schedule =
+                fs::read_to_string(fixture.output.join("schedule.csv")).expect("schedule");
+            let fields: Vec<_> = schedule
+                .lines()
+                .nth(1)
+                .expect("one terminal row")
+                .split(',')
+                .collect();
+            assert_eq!(schedule.lines().count(), 2);
+            assert_eq!(fields[21], fixture.last_handoff_us.to_string());
+            assert_eq!(fields[22], (fixture.last_handoff_us - 1).to_string());
+            assert_eq!(fields[23], (fixture.time_us + 7).to_string());
+            assert_eq!(fields[25], fixture.time_us.to_string());
+            let events = fs::read_to_string(fixture.output.join("events.csv")).expect("events");
+            assert_eq!(
+                events
+                    .lines()
+                    .filter(|line| line.contains("incoming_credit_realization"))
+                    .count(),
+                1
+            );
+            assert!(events.contains("native-controller-consumed-physical-receive-ranges-v1"));
+            assert!(events.contains("physical_handoff_monotonic_ns"));
+        }
+    }
+
+    #[test]
+    fn incoming_realization_trace_rejects_missing_original_parser_handoff_coverage() {
+        let mut fixture = Fixture::new(1_179);
+        assert!(matches!(fixture.consume_parser_remainder(21, false),
+            Err(Error::SlotInvariant(message)) if message.contains("lacks original physical handoff coverage")));
+        assert_eq!(
+            fixture.traces.pending_slots[&fixture.slot].credit_advertised_at_us,
+            None
+        );
+    }
+
+    #[test]
+    fn incoming_realization_trace_rejects_no_handoff_and_future_coverage() {
+        for future in [false, true] {
+            let mut fixture = Fixture::new(1_184);
+            let (limit, _) = fixture.lease(false);
+            let record = fixture.record(QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: fixture.endpoint,
+                stream: fixture.stream,
+                absolute_limit: limit,
+                slot: None,
+            });
+            let handoff =
+                future.then_some(fixture.start + Duration::from_micros(fixture.time_us + 100));
+            let result = fixture.traces.observation_after_controller(
+                Some(fixture.endpoint),
+                &record,
+                &fixture.controller,
+                handoff,
+            );
+            assert_eq!(result.is_ok(), future);
+            assert!(fixture.read(16).is_err());
+            assert_eq!(
+                fixture.traces.pending_slots[&fixture.slot].credit_advertised_at_us,
+                None
+            );
+        }
     }
 }

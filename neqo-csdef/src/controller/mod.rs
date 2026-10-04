@@ -306,6 +306,46 @@ struct IncomingCreditLedger {
     retired: u64,
 }
 
+/// One raw receive interval actually debited against an incoming cell.
+///
+/// This is ownership provenance, not a transport advertisement timestamp.
+/// The runner must join the interval to its original successful handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncomingCreditConsumedRange {
+    /// Original receive endpoint.
+    pub endpoint: QcsdEndpointId,
+    /// Original request stream, retained after stream closure.
+    pub stream: QcsdStreamId,
+    /// Inclusive raw consumed offset.
+    pub start: u64,
+    /// Exclusive raw consumed offset.
+    pub end: u64,
+    /// Ownership was assigned to an already advertised parser interval.
+    pub reclassified_parser: bool,
+}
+
+/// Immutable terminal ledger retained when legacy parser consumption supplies
+/// scheduled ownership after the original physical advertisement callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingCreditRealizationWitness {
+    /// Original scheduled incoming packet.
+    pub packet: crate::Packet,
+    /// Original scheduled cell bytes.
+    pub requested: u64,
+    /// Ledger bytes backed by advertised receive capacity.
+    pub advertised: u64,
+    /// Ledger bytes actually read from the peer.
+    pub consumed: u64,
+    /// Ledger bytes retired without consumption.
+    pub retired: u64,
+    /// The original whole-cell local realization transition occurred.
+    pub locally_realized: bool,
+    /// Exact controller terminal reduction on the defense clock.
+    pub terminal_at: Duration,
+    /// Disjoint raw intervals attributed by the actual consumption reducer.
+    pub ranges: Vec<IncomingCreditConsumedRange>,
+}
+
 impl IncomingCreditLedger {
     const fn new(packet: crate::Packet) -> Self {
         Self {
@@ -414,6 +454,10 @@ pub struct QcsdController {
     /// a lease never satisfies scheduled work.
     parser_lease_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<ParserLeaseRange>>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
+    /// Metadata only: actual consumed offsets survive a later legacy parser
+    /// ownership transfer and terminal ledger removal.
+    incoming_consumed_ranges: HashMap<QcsdSlotId, Vec<IncomingCreditConsumedRange>>,
+    incoming_realization_witnesses: HashMap<QcsdSlotId, IncomingCreditRealizationWitness>,
     /// Scheduled receive releases that crossed their exclusive realization
     /// deadline after the adapter accepted them but before transport encoded
     /// them.  They are terminal scheduling tombstones, not live ownership:
@@ -644,6 +688,8 @@ impl QcsdController {
             advertised_incoming_credit: HashMap::new(),
             parser_lease_ranges: HashMap::new(),
             incoming_credit_ledger: HashMap::new(),
+            incoming_consumed_ranges: HashMap::new(),
+            incoming_realization_witnesses: HashMap::new(),
             terminal_unadvertised_incoming_credit: Vec::new(),
             scheduled_incoming_requested_bytes: 0,
             scheduled_incoming_advertised_bytes: 0,
@@ -1358,6 +1404,23 @@ impl QcsdController {
         self.incoming_credit_ledger
             .get(&slot)
             .is_some_and(|ledger| ledger.local_realization_emitted)
+    }
+
+    /// Terminal consumed-range provenance for a cell that acquired legacy
+    /// parser ownership during consumption. It cannot authorize credit or
+    /// change a terminal outcome; the runner still needs physical coverage.
+    #[must_use]
+    pub fn incoming_credit_realization_witness(
+        &self,
+        slot: QcsdSlotId,
+    ) -> Option<&IncomingCreditRealizationWitness> {
+        self.incoming_realization_witnesses.get(&slot)
+    }
+
+    /// Terminal cells with retained parser ownership provenance. The trace
+    /// need not scan every still-pending incoming cell on each byte read.
+    pub fn incoming_credit_realization_slots(&self) -> impl Iterator<Item = QcsdSlotId> + '_ {
+        self.incoming_realization_witnesses.keys().copied()
     }
 
     /// Exact defense-clock resolution instant for one terminal scheduled slot.
@@ -2520,6 +2583,7 @@ impl QcsdController {
     ) {
         let key = (endpoint, stream);
         let mut consumed_by_slot = BTreeMap::new();
+        let mut consumed_ranges = Vec::new();
         let remove_stream = self
             .advertised_incoming_credit
             .get_mut(&key)
@@ -2531,6 +2595,7 @@ impl QcsdController {
                     if consumed > 0 {
                         let total = consumed_by_slot.entry(range.slot).or_insert(0_u64);
                         *total = total.saturating_add(consumed);
+                        consumed_ranges.push((range.slot, overlap_start, overlap_end));
                     }
                     if range.start < end {
                         range.start = end.min(range.end);
@@ -2541,6 +2606,9 @@ impl QcsdController {
             });
         if remove_stream {
             self.advertised_incoming_credit.remove(&key);
+        }
+        for (slot, start, end) in consumed_ranges {
+            self.retain_consumed_credit_range(slot, endpoint, stream, start, end, false);
         }
         for (slot, bytes) in consumed_by_slot {
             self.record_consumed_credit(slot, bytes, at);
@@ -2562,7 +2630,9 @@ impl QcsdController {
     ) {
         let key = (endpoint, stream);
         let mut unowned_overlap = 0_u64;
+        let mut unowned_ranges = VecDeque::new();
         let mut owned_by_slot = BTreeMap::new();
+        let mut consumed_ranges = Vec::new();
         let mut reservation_consumed = 0_u64;
         let remove_stream = self
             .parser_lease_ranges
@@ -2576,11 +2646,13 @@ impl QcsdController {
                         if let Some(owner) = range.owner {
                             let total = owned_by_slot.entry(owner.slot).or_insert(0_u64);
                             *total = total.saturating_add(overlap);
+                            consumed_ranges.push((owner.slot, overlap_start, overlap_end, false));
                             if range.reservation_debited {
                                 reservation_consumed = reservation_consumed.saturating_add(overlap);
                             }
                         } else if range.unowned {
                             unowned_overlap = unowned_overlap.saturating_add(overlap);
+                            unowned_ranges.push_back((overlap_start, overlap_end));
                         }
                     }
                     if range.start < end {
@@ -2641,6 +2713,18 @@ impl QcsdController {
                     *total = total.saturating_add(consumed);
                     let advertised = reclassified_by_slot.entry(claim.slot).or_insert(0_u64);
                     *advertised = advertised.saturating_add(consumed);
+                    let mut remaining = consumed;
+                    while remaining > 0 {
+                        let (start, end) =
+                            unowned_ranges.front_mut().expect("counted parser overlap");
+                        let amount = remaining.min(end.saturating_sub(*start));
+                        consumed_ranges.push((claim.slot, *start, *start + amount, true));
+                        *start += amount;
+                        remaining -= amount;
+                        if *start == *end {
+                            unowned_ranges.pop_front();
+                        }
+                    }
                 }
             }
         }
@@ -2660,6 +2744,9 @@ impl QcsdController {
         // short by the parser bytes displaced at stream hand-off.
         for (slot, advertised) in reclassified_by_slot {
             self.record_advertised_credit(slot, advertised, at);
+        }
+        for (slot, start, end, reclassified) in consumed_ranges {
+            self.retain_consumed_credit_range(slot, endpoint, stream, start, end, reclassified);
         }
         for (slot, consumed) in owned_by_slot {
             self.record_consumed_credit(slot, consumed, at);
@@ -2690,6 +2777,28 @@ impl QcsdController {
             .saturating_add(consumed);
         self.push_signal(at, SignalKind::ReceiveCreditConsumed { bytes: consumed });
         self.finish_incoming_slot_if_resolved(slot, at);
+    }
+
+    fn retain_consumed_credit_range(
+        &mut self,
+        slot: QcsdSlotId,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        start: u64,
+        end: u64,
+        reclassified_parser: bool,
+    ) {
+        if start < end && self.incoming_credit_ledger.contains_key(&slot) {
+            self.incoming_consumed_ranges.entry(slot).or_default().push(
+                IncomingCreditConsumedRange {
+                    endpoint,
+                    stream,
+                    start,
+                    end,
+                    reclassified_parser,
+                },
+            );
+        }
     }
 
     fn retire_stream_advertised_credit(
@@ -2747,9 +2856,31 @@ impl QcsdController {
         {
             return;
         }
-        let Some(ledger) = self.incoming_credit_ledger.remove(&slot) else {
+        let Some(ledger) = self.incoming_credit_ledger.get(&slot).copied() else {
             return;
         };
+        let ranges = self
+            .incoming_consumed_ranges
+            .remove(&slot)
+            .unwrap_or_default();
+        if ranges.iter().any(|range| range.reclassified_parser) {
+            let witness = IncomingCreditRealizationWitness {
+                packet: ledger.packet,
+                requested: ledger.requested(),
+                advertised: ledger.advertised,
+                consumed: ledger.consumed,
+                retired: ledger.retired,
+                locally_realized: ledger.local_realization_emitted,
+                terminal_at: at,
+                ranges,
+            };
+            assert!(
+                self.incoming_realization_witnesses
+                    .insert(slot, witness)
+                    .is_none()
+            );
+        }
+        self.incoming_credit_ledger.remove(&slot);
         if !self.control.terminal_incoming.insert(slot) {
             return;
         }
@@ -3431,6 +3562,7 @@ impl QcsdController {
         let mut slots: Vec<_> = affected.iter().copied().collect();
         slots.sort_unstable();
         for slot in slots {
+            self.incoming_consumed_ranges.remove(&slot);
             let Some(mut ledger) = self.incoming_credit_ledger.remove(&slot) else {
                 continue;
             };
@@ -13422,6 +13554,31 @@ mod tests {
             Duration::from_micros(7),
         );
         controller.drain_observations();
+
+        let witness = controller
+            .incoming_credit_realization_witness(slot)
+            .expect("terminal ownership survives the live ledger");
+        assert_eq!(
+            (
+                witness.requested,
+                witness.advertised,
+                witness.consumed,
+                witness.retired
+            ),
+            (4, 4, 4, 0)
+        );
+        assert!(witness.locally_realized);
+        assert_eq!(
+            witness.ranges,
+            vec![super::IncomingCreditConsumedRange {
+                endpoint,
+                stream,
+                start: 1,
+                end: 5,
+                reclassified_parser: true,
+            }]
+        );
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
 
         let calls = calls.borrow();
         let advertised: Vec<_> = calls
@@ -23632,6 +23789,249 @@ mod tests {
                 class: QcsdDatagramClass::DefenseCover,
             },
         })));
+    }
+
+    #[test]
+    fn incoming_realization_witness_splits_disjoint_parser_ranges_between_actual_claims() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let (defense, _) = RecordingDefense::new([], DefenseMode::ChaffAndShape);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .bytes_read(1);
+        assert_eq!(controller.streams.claim_stream(endpoint, stream, 5), 5);
+        for (id, bytes) in [(491, 3), (534, 2)] {
+            let slot = QcsdSlotId(id);
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, bytes).expect("cell");
+            controller.pending_slots.insert(slot, packet);
+            controller
+                .incoming_credit_ledger
+                .insert(slot, IncomingCreditLedger::new(packet));
+            controller.control.claims.push(PendingClaim {
+                reservation_debited: true,
+                slot,
+                packet,
+                endpoint,
+                stream,
+                remaining: u64::from(bytes),
+            });
+        }
+        controller.scheduled_incoming_requested_bytes = 5;
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![
+                ParserLeaseRange {
+                    reservation_debited: true,
+                    start: 1,
+                    end: 3,
+                    owner: None,
+                    unowned: true,
+                    advertised: true,
+                },
+                ParserLeaseRange {
+                    reservation_debited: true,
+                    start: 5,
+                    end: 8,
+                    owner: None,
+                    unowned: true,
+                    advertised: true,
+                },
+            ],
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 7,
+            },
+            Duration::from_micros(7),
+        );
+        let first = controller
+            .incoming_credit_realization_witness(QcsdSlotId(491))
+            .expect("first full ledger")
+            .clone();
+        let second = controller
+            .incoming_credit_realization_witness(QcsdSlotId(534))
+            .expect("second full ledger")
+            .clone();
+        assert_eq!(
+            first
+                .ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(1, 3), (5, 6)]
+        );
+        assert_eq!(
+            second
+                .ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(6, 8)]
+        );
+        assert!(
+            first
+                .ranges
+                .iter()
+                .chain(&second.ranges)
+                .all(|range| range.endpoint == endpoint
+                    && range.stream == stream
+                    && range.reclassified_parser)
+        );
+        assert_eq!(
+            (
+                first.requested,
+                first.advertised,
+                first.consumed,
+                first.retired
+            ),
+            (3, 3, 3, 0)
+        );
+        assert_eq!(
+            (
+                second.requested,
+                second.advertised,
+                second.consumed,
+                second.retired
+            ),
+            (2, 2, 2, 0)
+        );
+        assert!(controller.incoming_credit_ledger.is_empty());
+        assert!(controller.incoming_consumed_ranges.is_empty());
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 1,
+            },
+            Duration::from_micros(8),
+        );
+        assert_eq!(
+            controller.incoming_credit_realization_witness(QcsdSlotId(491)),
+            Some(&first)
+        );
+        assert_eq!(
+            controller.incoming_credit_realization_witness(QcsdSlotId(534)),
+            Some(&second)
+        );
+    }
+
+    #[test]
+    fn incoming_realization_witness_retirement_preserves_partial_counts_and_missed_outcome() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        let slot = QcsdSlotId(491);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 5).expect("cell");
+        let (defense, _) = RecordingDefense::new([], DefenseMode::ChaffAndShape);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1,
+                max_stream_data_excess: 16,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("controller");
+        ready(&mut controller, 1, "https://example.com");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .bytes_read(1);
+        assert_eq!(controller.streams.claim_stream(endpoint, stream, 5), 5);
+        controller.pending_slots.insert(slot, packet);
+        controller
+            .incoming_credit_ledger
+            .insert(slot, IncomingCreditLedger::new(packet));
+        controller.scheduled_incoming_requested_bytes = 5;
+        controller.control.claims.push(PendingClaim {
+            reservation_debited: true,
+            slot,
+            packet,
+            endpoint,
+            stream,
+            remaining: 5,
+        });
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                reservation_debited: true,
+                start: 1,
+                end: 6,
+                owner: None,
+                unowned: true,
+                advertised: true,
+            }],
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 2,
+            },
+            Duration::from_micros(2),
+        );
+        assert!(
+            controller
+                .incoming_credit_realization_witness(slot)
+                .is_none()
+        );
+        controller.record_retired_credit(slot, 3, Duration::from_micros(3));
+        let witness = controller
+            .incoming_credit_realization_witness(slot)
+            .expect("partial ledger");
+        assert_eq!(
+            (
+                witness.requested,
+                witness.advertised,
+                witness.consumed,
+                witness.retired
+            ),
+            (5, 2, 2, 3)
+        );
+        assert!(!witness.locally_realized);
+        assert!(
+            matches!(controller.next_action(), Some(QcsdAction::SlotMissed {
+            reason: MissedSlotReason::ReceiveCreditRetired, slot: observed, ..
+        }) if observed == slot)
+        );
     }
 
     #[test]
