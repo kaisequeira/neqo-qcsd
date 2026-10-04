@@ -24,9 +24,10 @@ mod stream;
 mod trace;
 
 pub use config::{
-    BufloConfig, BufloParameters, CsBufloConfig, CsBufloEarlyTermination, CsBufloPaddingMode,
-    CsBufloParameters, DefenseConfig, FrontConfig, QcsdConfig, QcsdImplementationScope,
-    TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
+    BufloConfig, BufloDurationBudgetPolicy, BufloParameters, CsBufloConfig,
+    CsBufloEarlyTermination, CsBufloPaddingMode, CsBufloParameters, DefenseConfig, FrontConfig,
+    QcsdConfig, QcsdImplementationScope, TamarawConfig, TrafficMorphingConfig, WalkieTalkieConfig,
+    WtfPadConfig,
 };
 pub use controller::{
     QcsdController, QcsdReceiveCancellation, QcsdReceiveCancellationPlan,

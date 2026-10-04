@@ -319,6 +319,32 @@ pub struct CsBufloConfig {
     pub parameters: String,
 }
 
+/// Explicit prospective duration allowance for one fixed `BuFLO` study.
+///
+/// Absence retains the historical 120-second guard. This policy changes only
+/// the event budget, never packet size, cadence, physical windows, or omissions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum BufloDurationBudgetPolicy {
+    /// Fixed 1200-byte/20-ms/minimum-10-second/10000-cell, 200-second budget.
+    #[serde(rename = "rapid-v6-fixed-200s-duration-budget-v1")]
+    RapidV6Fixed200Seconds,
+}
+
+impl<'de> Deserialize<'de> for BufloDurationBudgetPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let policy = String::deserialize(deserializer)?;
+        match policy.as_str() {
+            "rapid-v6-fixed-200s-duration-budget-v1" => Ok(Self::RapidV6Fixed200Seconds),
+            _ => Err(serde::de::Error::unknown_variant(
+                &policy,
+                &["rapid-v6-fixed-200s-duration-budget-v1"],
+            )),
+        }
+    }
+}
+
 /// Exact numeric inputs for the client-side `BuFLO` adaptation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -337,6 +363,9 @@ pub struct BufloParameters {
     pub implementation_scope: QcsdImplementationScope,
     /// Must remain false for the client-only QUIC adaptation.
     pub paper_equivalent: bool,
+    /// Optional explicit fixed 200-second budget; omitted for historical receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_budget_policy: Option<BufloDurationBudgetPolicy>,
 }
 
 impl BufloParameters {
@@ -383,7 +412,23 @@ impl BufloParameters {
             .ok_or_else(|| {
                 Error::InvalidConfig("BuFLO interval_us * max_events overflows u64".into())
             })?;
-        if guard_duration_us > 120_000_000 || self.minimum_duration_us >= guard_duration_us {
+        let guard_limit_us = match self.duration_budget_policy {
+            None => 120_000_000,
+            Some(BufloDurationBudgetPolicy::RapidV6Fixed200Seconds) => {
+                if self.interval_us != 20_000
+                    || self.minimum_duration_us != 10_000_000
+                    || self.packet_size != 1_200
+                    || self.max_events != 10_000
+                {
+                    return Err(Error::InvalidConfig(
+                        "BuFLO fixed 200-second duration policy requires interval_us=20000, minimum_duration_us=10000000, packet_size=1200, and max_events=10000"
+                            .into(),
+                    ));
+                }
+                200_000_000
+            }
+        };
+        if guard_duration_us > guard_limit_us || self.minimum_duration_us >= guard_duration_us {
             return Err(Error::InvalidConfig(
                 "BuFLO per-direction event guard must be at most 120 seconds and cover the inclusive minimum-duration tick"
                     .into(),
@@ -734,8 +779,9 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        BufloParameters, CsBufloPaddingMode, CsBufloParameters, DefenseConfig, FrontConfig,
-        QcsdConfig, TrafficMorphingConfig, WalkieTalkieConfig, WtfPadConfig,
+        BufloDurationBudgetPolicy, BufloParameters, CsBufloPaddingMode, CsBufloParameters,
+        DefenseConfig, FrontConfig, QcsdConfig, TrafficMorphingConfig, WalkieTalkieConfig,
+        WtfPadConfig,
     };
 
     #[test]
@@ -1023,6 +1069,106 @@ mod tests {
             .is_err(),
             "the two-direction schedule may never exceed 20,000 cells"
         );
+    }
+
+    const BUFLO_DURATION200_RECEIPT: &str = r#"{"schema_version":1,"interval_us":20000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v6-fixed-200s-duration-budget-v1"}"#;
+
+    #[test]
+    fn buflo_duration200_keeps_legacy_serialized_keys_and_120_second_boundary() {
+        let original = r#"{"schema_version":1,"interval_us":20000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":6000,"implementation_scope":"client_only_quic","paper_equivalent":false}"#;
+        let parameters = BufloParameters::from_json(original, 1_200).expect("legacy receipt");
+        assert_eq!(parameters.duration_budget_policy, None);
+        assert_eq!(
+            serde_json::to_string(&parameters).expect("legacy bytes"),
+            original
+        );
+        let mut beyond: serde_json::Value = serde_json::from_str(original).expect("legacy JSON");
+        beyond["max_events"] = serde_json::json!(6_001);
+        assert!(BufloParameters::from_json(&beyond.to_string(), 1_200).is_err());
+        beyond["max_events"] = serde_json::json!(10_000);
+        assert!(BufloParameters::from_json(&beyond.to_string(), 1_200).is_err());
+        beyond["duration_budget_policy"] = serde_json::Value::Null;
+        assert!(BufloParameters::from_json(&beyond.to_string(), 1_200).is_err());
+    }
+
+    #[test]
+    fn buflo_duration200_requires_explicit_policy_and_retains_it_in_resolved_parameters() {
+        let parameters = BufloParameters::from_json(BUFLO_DURATION200_RECEIPT, 1_200)
+            .expect("explicit fixed 200-second parameters");
+        assert_eq!(
+            parameters.duration_budget_policy,
+            Some(BufloDurationBudgetPolicy::RapidV6Fixed200Seconds)
+        );
+        assert_eq!(
+            parameters.interval_us.checked_mul(parameters.max_events),
+            Some(200_000_000)
+        );
+        assert_eq!(
+            serde_json::to_string(&parameters).expect("resolved bytes"),
+            BUFLO_DURATION200_RECEIPT
+        );
+        assert!(BufloParameters::from_json(BUFLO_DURATION200_RECEIPT, 1_199).is_err());
+    }
+
+    #[test]
+    fn buflo_duration200_rejects_other_fixed_settings_and_unknown_policy_types() {
+        let original: serde_json::Value =
+            serde_json::from_str(BUFLO_DURATION200_RECEIPT).expect("prospective JSON");
+        for (key, value) in [
+            ("schema_version", serde_json::json!(2)),
+            ("interval_us", serde_json::json!(10_000)),
+            ("interval_us", serde_json::json!(20_001)),
+            ("minimum_duration_us", serde_json::json!(9_999_999)),
+            ("packet_size", serde_json::json!(600)),
+            ("max_events", serde_json::json!(6_000)),
+            ("max_events", serde_json::json!(9_999)),
+            ("max_events", serde_json::json!(10_001)),
+            ("paper_equivalent", serde_json::json!(true)),
+            (
+                "duration_budget_policy",
+                serde_json::json!("arbitrary-200s"),
+            ),
+            ("duration_budget_policy", serde_json::json!(200_000_000)),
+            ("duration_budget_policy", serde_json::json!(true)),
+            (
+                "duration_budget_policy",
+                serde_json::json!({"duration_us": 200_000_000}),
+            ),
+            (
+                "duration_budget_policy",
+                serde_json::json!({"rapid-v6-fixed-200s-duration-budget-v1": null}),
+            ),
+        ] {
+            let mut changed = original.clone();
+            changed[key] = value;
+            assert!(
+                BufloParameters::from_json(&changed.to_string(), 1_200).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn buflo_duration200_preserves_checked_duration_arithmetic() {
+        let mut input: serde_json::Value =
+            serde_json::from_str(BUFLO_DURATION200_RECEIPT).expect("prospective JSON");
+        input["interval_us"] = serde_json::json!(u64::MAX);
+        for retain_policy in [false, true] {
+            let mut candidate = input.clone();
+            if !retain_policy {
+                candidate
+                    .as_object_mut()
+                    .expect("parameter object")
+                    .remove("duration_budget_policy");
+            }
+            let error = BufloParameters::from_json(&candidate.to_string(), 1_200)
+                .expect_err("duration multiplication must not wrap");
+            assert!(
+                error
+                    .to_string()
+                    .contains("interval_us * max_events overflows u64")
+            );
+        }
     }
 
     #[test]

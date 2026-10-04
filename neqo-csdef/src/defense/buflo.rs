@@ -574,6 +574,7 @@ mod tests {
             max_events: 100,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         }
     }
 
@@ -1124,6 +1125,41 @@ mod tests {
     }
 
     #[test]
+    fn buflo_duration200_crosses_old_capacity_without_changing_cells_or_the_final_guard() {
+        let parameters = BufloParameters::from_json(
+            r#"{"schema_version":1,"interval_us":20000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v6-fixed-200s-duration-budget-v1"}"#,
+            1_200,
+        )
+        .expect("prospective fixed budget");
+        let mut defense = Buflo::from_parameters(parameters);
+        for tick in 0..10_000 {
+            let elapsed = Duration::from_micros(tick * 20_000);
+            for direction in [Direction::Outgoing, Direction::Incoming] {
+                let packet = defense.next_event(elapsed).expect("one scheduled cell");
+                assert_eq!(packet.timestamp(), elapsed);
+                assert_eq!(packet.direction(), direction);
+                assert_eq!(packet.length(), 1_200);
+            }
+            assert!(defense.terminal_failure().is_none());
+            if tick == 6_000 {
+                let diagnostics = defense.diagnostics();
+                assert_eq!(diagnostics.buflo_scheduled_incoming_cells, 6_001);
+                assert_eq!(diagnostics.buflo_scheduled_outgoing_cells, 6_001);
+                assert!(!diagnostics.buflo_event_guard_triggered);
+            }
+        }
+        let diagnostics = defense.diagnostics();
+        assert_eq!(diagnostics.buflo_scheduled_incoming_cells, 10_000);
+        assert_eq!(diagnostics.buflo_scheduled_outgoing_cells, 10_000);
+        assert_eq!(defense.next_event(Duration::from_micros(200_000_000)), None);
+        assert_eq!(
+            defense.terminal_failure(),
+            Some("BuFLO event guard exhausted before normal completion")
+        );
+        assert!(defense.diagnostics().buflo_event_guard_triggered);
+    }
+
+    #[test]
     fn overdue_poll_fails_without_emitting_a_catch_up_burst() {
         let mut defense = Buflo::from_parameters(parameters());
         assert_eq!(defense.next_event(Duration::from_micros(25)), None);
@@ -1168,6 +1204,7 @@ mod tests {
                 max_events: 1_000,
                 implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
                 paper_equivalent: false,
+                duration_budget_policy: None,
             };
             let mut defense = Buflo::from_parameters(parameters.clone());
             let mut actual = Vec::new();

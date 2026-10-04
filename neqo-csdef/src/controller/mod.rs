@@ -12697,6 +12697,7 @@ mod tests {
             max_events: 100,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         });
         let (controller, outgoing, incoming) = exercise_candidate_across_two_endpoints(
             Box::new(defense),
@@ -17236,6 +17237,7 @@ mod tests {
             max_events: 100,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         });
         defense.observe(DefenseSignal {
             at: Duration::from_micros(5),
@@ -17298,6 +17300,7 @@ mod tests {
             max_events: 100,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         });
         if application_complete {
             defense.observe(DefenseSignal {
@@ -17605,6 +17608,7 @@ mod tests {
             max_events: 1,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         };
         let mut defense = Buflo::from_parameters(parameters);
         while defense.next_event(Duration::ZERO).is_some() {}
@@ -18146,6 +18150,7 @@ mod tests {
             max_events: 10_000,
             implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         };
         let mut controller = QcsdController::with_defense(
             QcsdConfig {

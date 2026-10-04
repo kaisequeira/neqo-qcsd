@@ -4248,6 +4248,7 @@ mod tests {
                     max_events: 100,
                     implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
                     paper_equivalent: false,
+                    duration_budget_policy: None,
                 })),
             )
         } else {

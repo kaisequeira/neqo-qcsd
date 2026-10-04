@@ -29,17 +29,18 @@ use futures::{
 use http::Uri;
 use neqo_common::{Header, datagram, event::Provider as _};
 use neqo_csdef::{
-    BufloParameters, ChaffManifest, ChaffQualification, CsBufloParameters, DefenseConfig,
-    DefenseDiagnostics, DefenseKind, DependencyTracker, Direction, ExpectedChaffResponse,
-    MissedSlotReason, Packet, QcsdAction, QcsdChaffCancellationReason, QcsdChaffRequestId,
-    QcsdConfig, QcsdController, QcsdEndpointId, QcsdObservation, QcsdObservationClock,
-    QcsdPrearmCancellationReason, QcsdProfile, QcsdReceiveActionIdentity, QcsdReceiveLimitError,
-    QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy,
-    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamTransmission, Resource,
-    ResourceManifest, ResourceRunState, ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4,
-    ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4, StaticMode,
-    TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
-    WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
+    BufloDurationBudgetPolicy, BufloParameters, ChaffManifest, ChaffQualification,
+    CsBufloParameters, DefenseConfig, DefenseDiagnostics, DefenseKind, DependencyTracker,
+    Direction, ExpectedChaffResponse, MissedSlotReason, Packet, QcsdAction,
+    QcsdChaffCancellationReason, QcsdChaffRequestId, QcsdConfig, QcsdController, QcsdEndpointId,
+    QcsdObservation, QcsdObservationClock, QcsdPrearmCancellationReason, QcsdProfile,
+    QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
+    QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
+    QcsdSlotOutcome, QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
+    ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
+    ResponseOnlyChaffQualificationV4, StaticMode, TimestampedQcsdObservation,
+    TrafficMorphingEgress, WalkieTalkie, WalkieTalkieQualificationBinding, derive,
+    normalize_content_encoding, sanitize_chaff_headers,
 };
 use neqo_http3::{Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Priority};
 use neqo_transport::{
@@ -247,6 +248,9 @@ enum SocketHandoffPolicy {
     /// Only source-bound FRONT V3 scheduled padding uses immediate successful
     /// socket timestamps. Unshaped application output retains legacy behavior.
     FrontV3ScheduledPadding,
+    /// FRONT V4 reserves the final millisecond for construction and handoff.
+    /// Its physical deadline and unshaped application behavior remain strict.
+    FrontV4PreparationReserve,
 }
 
 impl SocketHandoffPolicy {
@@ -266,7 +270,9 @@ impl SocketHandoffPolicy {
     }
 
     fn for_run(spec: &RunSpec) -> Self {
-        if front_v3_padding_window_enabled(spec) {
+        if front_v4_preparation_reserve_enabled(spec) {
+            Self::FrontV4PreparationReserve
+        } else if front_v3_padding_window_enabled(spec) {
             Self::FrontV3ScheduledPadding
         } else {
             Self::for_defense(&spec.config.defense)
@@ -275,17 +281,21 @@ impl SocketHandoffPolicy {
 
     const fn for_scheduled_targets(self, target_bearing: bool) -> Self {
         match self {
-            Self::FrontV3ScheduledPadding if target_bearing => Self::CandidateFidelityStrict,
-            Self::FrontV3ScheduledPadding => Self::HistoricalBestEffort,
+            Self::FrontV3ScheduledPadding | Self::FrontV4PreparationReserve if target_bearing => {
+                Self::CandidateFidelityStrict
+            }
+            Self::FrontV3ScheduledPadding | Self::FrontV4PreparationReserve => {
+                Self::HistoricalBestEffort
+            }
             policy => policy,
         }
     }
 
     fn send(self, socket: &Socket, batch: &datagram::Batch) -> io::Result<Option<Instant>> {
         match self {
-            Self::HistoricalBestEffort | Self::FrontV3ScheduledPadding => {
-                socket.send(batch).map(|()| None)
-            }
+            Self::HistoricalBestEffort
+            | Self::FrontV3ScheduledPadding
+            | Self::FrontV4PreparationReserve => socket.send(batch).map(|()| None),
             Self::CandidateFidelityStrict => socket.send_qcsd_timestamped(batch, now).map(Some),
         }
     }
@@ -930,6 +940,55 @@ fn reject_foreign_defense_options(
     Ok(())
 }
 
+/// Resolved from the same validated parameter bytes as their retained SHA256.
+/// This optional record leaves every historical provenance key unchanged.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct BufloDurationBudgetEvidence {
+    schema_version: u32,
+    policy: BufloDurationBudgetPolicy,
+    interval_us: u64,
+    minimum_duration_us: u64,
+    packet_size: u16,
+    max_events: u64,
+    duration_budget_us: u64,
+}
+
+fn buflo_duration_budget_evidence(
+    parameters: &BufloParameters,
+) -> Result<Option<BufloDurationBudgetEvidence>, Error> {
+    let Some(policy) = parameters.duration_budget_policy else {
+        return Ok(None);
+    };
+    let duration_budget_us = parameters
+        .interval_us
+        .checked_mul(parameters.max_events)
+        .ok_or_else(|| Error::Argument("BuFLO duration budget provenance overflow".into()))?;
+    if policy != BufloDurationBudgetPolicy::RapidV6Fixed200Seconds
+        || parameters.schema_version != 1
+        || parameters.interval_us != 20_000
+        || parameters.minimum_duration_us != 10_000_000
+        || parameters.packet_size != 1_200
+        || parameters.max_events != 10_000
+        || duration_budget_us != 200_000_000
+        || parameters.implementation_scope != neqo_csdef::QcsdImplementationScope::ClientOnlyQuic
+        || parameters.paper_equivalent
+    {
+        return Err(Error::Argument(
+            "BuFLO duration budget provenance requires the exact explicit fixed 200-second parameters"
+                .into(),
+        ));
+    }
+    Ok(Some(BufloDurationBudgetEvidence {
+        schema_version: 1,
+        policy,
+        interval_us: parameters.interval_us,
+        minimum_duration_us: parameters.minimum_duration_us,
+        packet_size: parameters.packet_size,
+        max_events: parameters.max_events,
+        duration_budget_us,
+    }))
+}
+
 #[derive(Debug, Serialize)]
 struct DefenseParameterProvenance {
     kind: &'static str,
@@ -945,6 +1004,8 @@ struct DefenseParameterProvenance {
     reference_tcp_write_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reference_nominal_tcp_packet_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buflo_duration_budget: Option<BufloDurationBudgetEvidence>,
     /// Parsed from the same immutable bytes whose SHA256 is receipted above.
     /// Retention avoids introducing parameter-file reads into receipt rendering.
     #[serde(skip)]
@@ -1022,6 +1083,11 @@ fn defense_parameter_provenance(
     } else {
         None
     };
+    let buflo_duration_budget = buflo_parameters
+        .as_ref()
+        .map(buflo_duration_budget_evidence)
+        .transpose()?
+        .flatten();
     let cs_buflo_parameters = if matches!(config.defense, DefenseConfig::CsBuflo(_)) {
         // Raw provenance remains available for legacy receipts. The new
         // source-bound policy separately requires successfully parsed values;
@@ -1041,6 +1107,7 @@ fn defense_parameter_provenance(
         early_termination_semantics: early_termination,
         reference_tcp_write_size_bytes: reference_write,
         reference_nominal_tcp_packet_size_bytes: reference_packet,
+        buflo_duration_budget,
         buflo_parameters,
         cs_buflo_parameters,
     }))
@@ -1454,26 +1521,44 @@ enum BufloIncomingCreditReleasePolicy {
     LegacyControlInterval,
     RapidV5HalfPeriod,
     RapidV5HalfPeriodAckStart,
+    // The incoming contract remains ACK-start V2. This independently declared
+    // preparation opt-in is carried with its already authenticated Source.
+    RapidV5HalfPeriodAckStartPreparationReserve,
 }
 
 impl BufloIncomingCreditReleasePolicy {
     const RAPID_V5_NAME: &'static str = "rapid-v5-half-period-10000us-v1";
     const RAPID_V5_ACK_START_NAME: &'static str = "rapid-v5-half-period-10000us-ack-start-v2";
+    const PREPARATION_RESERVE_NAME: &'static str =
+        "rapid-v6-buflo-kernel-preparation-cutoff-release-plus-4000us-reserve-1000us-v1";
+
+    const fn acknowledged_start(self) -> bool {
+        matches!(
+            self,
+            Self::RapidV5HalfPeriodAckStart | Self::RapidV5HalfPeriodAckStartPreparationReserve
+        )
+    }
+
+    const fn preparation_reserve(self) -> bool {
+        matches!(self, Self::RapidV5HalfPeriodAckStartPreparationReserve)
+    }
 
     const fn name(self) -> Option<&'static str> {
         match self {
             Self::LegacyControlInterval => None,
             Self::RapidV5HalfPeriod => Some(Self::RAPID_V5_NAME),
-            Self::RapidV5HalfPeriodAckStart => Some(Self::RAPID_V5_ACK_START_NAME),
+            Self::RapidV5HalfPeriodAckStart | Self::RapidV5HalfPeriodAckStartPreparationReserve => {
+                Some(Self::RAPID_V5_ACK_START_NAME)
+            }
         }
     }
 
     const fn incoming_window(self) -> Duration {
         match self {
             Self::LegacyControlInterval => Duration::from_micros(5_000),
-            Self::RapidV5HalfPeriod | Self::RapidV5HalfPeriodAckStart => {
-                Duration::from_micros(10_000)
-            }
+            Self::RapidV5HalfPeriod
+            | Self::RapidV5HalfPeriodAckStart
+            | Self::RapidV5HalfPeriodAckStartPreparationReserve => Duration::from_micros(10_000),
         }
     }
 
@@ -1483,7 +1568,7 @@ impl BufloIncomingCreditReleasePolicy {
         primary_policy: PrimaryDocumentIdentityPolicy,
         chaff_origin_policy: &QualifiedChaffOriginPolicy,
     ) -> Result<Self, Error> {
-        let policy = match preparation.get("buflo_incoming_credit_release_policy") {
+        let mut policy = match preparation.get("buflo_incoming_credit_release_policy") {
             None => Self::default(),
             Some(serde_json::Value::String(value)) if value == Self::RAPID_V5_NAME => {
                 Self::RapidV5HalfPeriod
@@ -1497,6 +1582,20 @@ impl BufloIncomingCreditReleasePolicy {
                 ));
             }
         };
+        match preparation.get("buflo_kernel_preparation_policy") {
+            None => (),
+            Some(serde_json::Value::String(value))
+                if value == Self::PREPARATION_RESERVE_NAME
+                    && policy == Self::RapidV5HalfPeriodAckStart =>
+            {
+                policy = Self::RapidV5HalfPeriodAckStartPreparationReserve;
+            }
+            Some(_) => {
+                return Err(Error::Argument(
+                    "BuFLO kernel preparation reserve requires its explicit policy and unchanged ACK-start incoming contract".into(),
+                ));
+            }
+        }
         if policy != Self::LegacyControlInterval
             && (application_policy != ApplicationResponsePolicy::CompletedTerminalHttpErrors
                 || primary_policy != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody)
@@ -1506,7 +1605,7 @@ impl BufloIncomingCreditReleasePolicy {
                     .into(),
             ));
         }
-        if policy == Self::RapidV5HalfPeriodAckStart
+        if policy.acknowledged_start()
             && !matches!(
                 chaff_origin_policy,
                 QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
@@ -1519,6 +1618,24 @@ impl BufloIncomingCreditReleasePolicy {
         }
         Ok(policy)
     }
+}
+
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_RESERVE_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v12; historical_schema11_default_unchanged=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=20000000; packet_bytes=1200; incoming_window=unchanged_bound_preparation; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; nominal_selection=release_minus_5ms; rolling_preparation_deadline=release_plus_4ms; tick_zero_preparation_deadline=release; completed_and_confirmed_before_recorded_preparation_deadline=true; preparation_reserve_ns=1000000; physical_deadline_unchanged_release_plus_5ms=true; exact_read_counts_and_failure_evidence=true; no_omissions_or_catch_up=true";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_RESERVE_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema21_retains_schema20_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema12=true";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS: &str = "CLOCK_TAI_selection_readiness_enters_during_release_minus_10ms_to_recorded_preparation_deadline; application_and_transport_state_selected_for_nominal_release; nominal_selection_boundary=release_minus_5ms; rolling_selection_and_fresh_dispatch_confirmation_before_release_plus_4ms; tick_zero_selection_staging_and_dispatch_before_release; late_entry_records_actual_zero_wait; preparation_reserve_ns=1000000_before_unchanged_release_plus_5ms_physical_deadline; truthful_construction_lateness_retained; runner_freezes_until_kernel_tx_software_receipt; preparation_expiry_and_clock_failure_fail_closed; client_only_adaptation; paper_equivalent=false";
+
+fn buflo_kernel_preparation_policy_marker() -> serde_json::Value {
+    json!({"schema_version": 1, "source": "bound-preparation-v1",
+        "policy": BufloIncomingCreditReleasePolicy::PREPARATION_RESERVE_NAME,
+        "period_us": 20000, "cell_bytes": 1200, "nominal_selection_lead_us": 5000,
+        "rolling_preparation_after_release_us": 4000, "outgoing_physical_window_us": 5000,
+        "preparation_reserve_us": 1000, "tick_zero_before_release": true,
+        "allow_omissions": false, "paper_equivalent": false, "scientific_credit": false})
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1567,6 +1684,7 @@ enum FrontCapturePolicy {
     RapidV5BoundedCongestionOmission,
     RapidV5BoundedPaddingOmission,
     RapidV5BoundedPaddingWindow,
+    RapidV5PaddingPreparationReserve,
 }
 
 impl FrontCapturePolicy {
@@ -1576,6 +1694,9 @@ impl FrontCapturePolicy {
         "rapid-v5-front-bounded-outgoing-padding-omission-1pct-v2";
     const RAPID_V5_PADDING_WINDOW_NAME: &'static str =
         "rapid-v5-front-bounded-outgoing-padding-omission-10pct-window-10000us-v3";
+    const RAPID_V5_PREPARATION_RESERVE_NAME: &'static str =
+        "rapid-v5-front-bounded-outgoing-padding-omission-10pct-window-10000us-reserve-1000us-v4";
+    const PREPARATION_RESERVE_US: u64 = 1_000;
 
     fn from_preparation(
         preparation: &serde_json::Value,
@@ -1588,7 +1709,8 @@ impl FrontCapturePolicy {
             Some(serde_json::Value::String(policy))
                 if policy == Self::RAPID_V5_NAME
                     || policy == Self::RAPID_V5_PADDING_NAME
-                    || policy == Self::RAPID_V5_PADDING_WINDOW_NAME =>
+                    || policy == Self::RAPID_V5_PADDING_WINDOW_NAME
+                    || policy == Self::RAPID_V5_PREPARATION_RESERVE_NAME =>
             {
                 if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
                     || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
@@ -1605,8 +1727,10 @@ impl FrontCapturePolicy {
                     Self::RapidV5BoundedCongestionOmission
                 } else if policy == Self::RAPID_V5_PADDING_NAME {
                     Self::RapidV5BoundedPaddingOmission
-                } else {
+                } else if policy == Self::RAPID_V5_PADDING_WINDOW_NAME {
                     Self::RapidV5BoundedPaddingWindow
+                } else {
+                    Self::RapidV5PaddingPreparationReserve
                 })
             }
             Some(_) => Err(Error::Argument(
@@ -1685,6 +1809,33 @@ struct RunSpec {
 }
 
 fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), Error> {
+    // A prospective budget is independently bound even when no incoming policy
+    // is selected. The historical absent-budget path keeps its existing gates.
+    if let DefenseConfig::Buflo(config) = &spec.config.defense {
+        if let Some(provenance) = spec.defense_parameters.as_ref() {
+            if provenance.buflo_duration_budget.is_some()
+                || provenance
+                    .buflo_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| parameters.duration_budget_policy.is_some())
+            {
+                let parameters = provenance.buflo_parameters.as_ref().ok_or_else(|| {
+                    Error::Argument("BuFLO duration budget has no bound parsed parameters".into())
+                })?;
+                if provenance.kind != "buflo"
+                    || provenance.path != config.parameters
+                    || !lower_hex_sha256(&provenance.sha256)
+                    || provenance.buflo_duration_budget
+                        != buflo_duration_budget_evidence(parameters)?
+                {
+                    return Err(Error::Argument(
+                        "BuFLO duration budget differs from its bound parsed parameter receipt"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
     let Some((
         source,
         source_hash,
@@ -1703,11 +1854,14 @@ fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), E
     if *policy == BufloIncomingCreditReleasePolicy::LegacyControlInterval {
         return Ok(());
     }
+    // load_application_workload_source validates the exact preparation opt-in
+    // and retains it in the typed policy. ResourceManifest retains only the
+    // resource graph; it does not retain the preparation JSON.
     if !lower_hex_sha256(source_hash)
         || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
         || *prepared_application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
         || spec.application_response_policy != *prepared_application
-        || (*policy == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
+        || (policy.acknowledged_start()
             && !matches!(
                 chaff_origin,
                 QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
@@ -1776,6 +1930,20 @@ fn bound_buflo_incoming_credit_release_policy(
     } else {
         BufloIncomingCreditReleasePolicy::LegacyControlInterval
     })
+}
+
+fn buflo_kernel_preparation_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
+    if matches!(spec.config.defense, DefenseConfig::Buflo(_))
+        && validate_buflo_incoming_credit_release_policy(spec).is_ok()
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| source.6.preparation_reserve())
+    {
+        Some(buflo_kernel_preparation_policy_marker())
+    } else {
+        None
+    }
 }
 
 fn validate_tamaraw_capture_policy(spec: &RunSpec) -> Result<(), Error> {
@@ -1915,6 +2083,7 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
         policy,
         FrontCapturePolicy::RapidV5BoundedPaddingOmission
             | FrontCapturePolicy::RapidV5BoundedPaddingWindow
+            | FrontCapturePolicy::RapidV5PaddingPreparationReserve
     ) {
         let fields = marker.as_object_mut()?;
         fields.insert("schema_version".into(), json!(2));
@@ -1928,7 +2097,11 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
             json!(["CongestionLimited", "DeadlineExpired"]),
         );
         fields.insert("require_pure_padding".into(), json!(true));
-        if policy == FrontCapturePolicy::RapidV5BoundedPaddingWindow {
+        if matches!(
+            policy,
+            FrontCapturePolicy::RapidV5BoundedPaddingWindow
+                | FrontCapturePolicy::RapidV5PaddingPreparationReserve
+        ) {
             fields.insert("schema_version".into(), json!(3));
             fields.insert(
                 "policy".into(),
@@ -1937,6 +2110,22 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
             fields.insert("outgoing_omission_ratio_denominator".into(), json!(10));
             fields.insert("outgoing_release_window_us".into(), json!(10_000));
             fields.insert("historical_outgoing_release_window_us".into(), json!(5_000));
+            if policy == FrontCapturePolicy::RapidV5PaddingPreparationReserve {
+                fields.insert("schema_version".into(), json!(4));
+                fields.insert(
+                    "policy".into(),
+                    json!(FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME),
+                );
+                fields.insert("outgoing_construction_window_us".into(), json!(9_000));
+                fields.insert(
+                    "outgoing_preparation_reserve_us".into(),
+                    json!(FrontCapturePolicy::PREPARATION_RESERVE_US),
+                );
+                fields.insert(
+                    "expired_construction_target".into(),
+                    json!("not-built-not-sent"),
+                );
+            }
         }
     }
     Some(marker)
@@ -1948,6 +2137,14 @@ fn front_v3_padding_window_enabled(spec: &RunSpec) -> bool {
             .application_workload_source
             .as_ref()
             .is_some_and(|source| source.8 == FrontCapturePolicy::RapidV5BoundedPaddingWindow)
+}
+
+fn front_v4_preparation_reserve_enabled(spec: &RunSpec) -> bool {
+    matches!(spec.config.defense, DefenseConfig::Front(_))
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| source.8 == FrontCapturePolicy::RapidV5PaddingPreparationReserve)
 }
 
 fn terminal_primary_partial_cell_size(spec: &RunSpec) -> Option<u16> {
@@ -2683,6 +2880,8 @@ struct BufloKernelProtectedSelectionFailureReceipt {
     admission_tai_ns: u64,
     selection_tai_ns: u64,
     release_tai_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preparation_deadline_tai_ns: Option<u64>,
     entered_tai_ns: Option<u64>,
     previous_tai_ns: Option<u64>,
     observed_tai_ns: Option<u64>,
@@ -2699,6 +2898,8 @@ struct BufloKernelProtectedSelectionWaitEntry {
     admission_tai_ns: u64,
     selection_tai_ns: u64,
     release_tai_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preparation_deadline_tai_ns: Option<u64>,
     entered_tai_ns: Option<u64>,
     completed_tai_ns: Option<u64>,
     staging_confirmed_tai_ns: Option<u64>,
@@ -2735,6 +2936,8 @@ struct BufloKernelProtectedSelectionWaitReceipt {
 struct BufloKernelTxReceipt {
     schema_version: u32,
     semantics: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preparation_policy: Option<serde_json::Value>,
     incoming_credit_release_window_ns: u64,
     terminal_outcome: String,
     primary_error: Option<String>,
@@ -2794,6 +2997,17 @@ struct BufloKernelProtectedSelectionIdentity {
     admission_tai_ns: u64,
     selection_tai_ns: u64,
     release_tai_ns: u64,
+    preparation_deadline_tai_ns: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloKernelProtectedSelectionIdentity {
+    const fn preparation_deadline(&self) -> u64 {
+        match self.preparation_deadline_tai_ns {
+            Some(deadline) => deadline,
+            None => self.release_tai_ns,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3014,6 +3228,7 @@ struct BufloKernelTxRuntime {
     jobs: Vec<BufloKernelRawJob>,
     next_item_id: u64,
     incoming_credit_release_window: Duration,
+    preparation_reserve: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -3397,6 +3612,27 @@ fn buflo_kernel_helper_evidence_complete(
     last_job_id: Option<u64>,
     immediate_datagram_count: usize,
 ) -> bool {
+    buflo_kernel_helper_evidence_complete_with_policy(
+        runtime,
+        qdisc,
+        endpoint_tuples,
+        job_count,
+        last_job_id,
+        immediate_datagram_count,
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_helper_evidence_complete_with_policy(
+    runtime: &BufloKernelRuntimeContract,
+    qdisc: &BufloKernelQdiscContract,
+    endpoint_tuples: &[(SocketAddr, SocketAddr)],
+    job_count: usize,
+    last_job_id: Option<u64>,
+    immediate_datagram_count: usize,
+    preparation_reserve: bool,
+) -> bool {
     let endpoint_count = endpoint_tuples.len();
     let thread = &runtime.helper_thread;
     let Some(lifecycle) = runtime.helper_lifecycle.as_ref() else {
@@ -3435,7 +3671,12 @@ fn buflo_kernel_helper_evidence_complete(
         && endpoint_count > 0
         && runtime.prebuild_selection_cutoff_lead_ns
             == duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
-        && runtime.prebuild_selection_semantics == BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS
+        && runtime.prebuild_selection_semantics
+            == (if preparation_reserve {
+                BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS
+            } else {
+                BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS
+            })
         && runtime.post_main_inventory_semantics
             == "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram"
         && runtime.max_post_main_datagrams == endpoint_count
@@ -3936,7 +4177,11 @@ const fn buflo_kernel_protected_selection_failure(
     clock_read_attempts: u64,
 ) -> BufloKernelProtectedSelectionFailureReceipt {
     BufloKernelProtectedSelectionFailureReceipt {
-        schema_version: 1,
+        schema_version: if identity.preparation_deadline_tai_ns.is_some() {
+            2
+        } else {
+            1
+        },
         slot: identity.slot,
         tick: identity.tick,
         tick_zero: identity.tick_zero,
@@ -3945,6 +4190,7 @@ const fn buflo_kernel_protected_selection_failure(
         admission_tai_ns: identity.admission_tai_ns,
         selection_tai_ns: identity.selection_tai_ns,
         release_tai_ns: identity.release_tai_ns,
+        preparation_deadline_tai_ns: identity.preparation_deadline_tai_ns,
         entered_tai_ns,
         previous_tai_ns,
         observed_tai_ns,
@@ -3978,13 +4224,18 @@ fn buflo_kernel_failed_selection_entry(
         clock_read_attempts,
     );
     BufloKernelProtectedSelectionWaitEntry {
-        schema_version: 1,
+        schema_version: if identity.preparation_deadline_tai_ns.is_some() {
+            2
+        } else {
+            1
+        },
         slot: identity.slot,
         tick: identity.tick,
         tick_zero: identity.tick_zero,
         admission_tai_ns: identity.admission_tai_ns,
         selection_tai_ns: identity.selection_tai_ns,
         release_tai_ns: identity.release_tai_ns,
+        preparation_deadline_tai_ns: identity.preparation_deadline_tai_ns,
         entered_tai_ns,
         completed_tai_ns: None,
         staging_confirmed_tai_ns: None,
@@ -4037,7 +4288,7 @@ fn buflo_kernel_protected_selection_wait_with_clock(
             };
         }
     };
-    if entered_tai_ns >= identity.release_tai_ns {
+    if entered_tai_ns >= identity.preparation_deadline() {
         let detail = buflo_kernel_selection_expired_detail(identity);
         return BufloKernelProtectedSelectionStep::Failed {
             entry: buflo_kernel_failed_selection_entry(
@@ -4056,7 +4307,9 @@ fn buflo_kernel_protected_selection_wait_with_clock(
     }
     // Selection is a preparation boundary. An entry after that boundary can
     // still prepare the exact future release; retain its actual zero wait.
-    // The release check above and fresh dispatch confirmation stay strict.
+    // Historical entries remain before release. An explicitly opted-in V12
+    // rolling entry may instead use its recorded release-plus-4ms cutoff;
+    // tick zero and the independent physical deadline remain unchanged.
     let mut current_tai_ns = entered_tai_ns;
     let mut max_sample_gap_ns = 0;
     while current_tai_ns < identity.selection_tai_ns {
@@ -4108,7 +4361,7 @@ fn buflo_kernel_protected_selection_wait_with_clock(
         let previous_tai_ns = current_tai_ns;
         max_sample_gap_ns = max_sample_gap_ns.max(next_tai_ns - current_tai_ns);
         current_tai_ns = next_tai_ns;
-        if current_tai_ns >= identity.release_tai_ns {
+        if current_tai_ns >= identity.preparation_deadline() {
             let detail = buflo_kernel_selection_expired_detail(identity);
             return BufloKernelProtectedSelectionStep::Failed {
                 entry: buflo_kernel_failed_selection_entry(
@@ -4127,13 +4380,18 @@ fn buflo_kernel_protected_selection_wait_with_clock(
         }
     }
     BufloKernelProtectedSelectionStep::Ready(BufloKernelProtectedSelectionWaitEntry {
-        schema_version: 1,
+        schema_version: if identity.preparation_deadline_tai_ns.is_some() {
+            2
+        } else {
+            1
+        },
         slot: identity.slot,
         tick: identity.tick,
         tick_zero: identity.tick_zero,
         admission_tai_ns: identity.admission_tai_ns,
         selection_tai_ns: identity.selection_tai_ns,
         release_tai_ns: identity.release_tai_ns,
+        preparation_deadline_tai_ns: identity.preparation_deadline_tai_ns,
         entered_tai_ns: Some(entered_tai_ns),
         completed_tai_ns: Some(current_tai_ns),
         staging_confirmed_tai_ns: None,
@@ -4201,6 +4459,7 @@ fn buflo_kernel_confirm_protected_selection_with_clock(
         admission_tai_ns: entry.admission_tai_ns,
         selection_tai_ns: entry.selection_tai_ns,
         release_tai_ns: entry.release_tai_ns,
+        preparation_deadline_tai_ns: entry.preparation_deadline_tai_ns,
     };
     let previous_tai_ns = if confirmation_phase == "dispatch" && entry.tick_zero {
         entry.staging_confirmed_tai_ns
@@ -4256,7 +4515,7 @@ fn buflo_kernel_confirm_protected_selection_with_clock(
         ));
         return Err(Error::DefenseExecution(detail));
     }
-    if current_tai_ns >= entry.release_tai_ns {
+    if current_tai_ns >= identity.preparation_deadline() {
         let detail = buflo_kernel_selection_expired_detail(&identity);
         entry.outcome = "failed";
         entry.failure = Some(buflo_kernel_protected_selection_failure(
@@ -4296,17 +4555,42 @@ fn buflo_kernel_confirm_protected_selection_with_clock(
 }
 
 #[cfg(target_os = "linux")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the receipt builder independently recomputes every serialized protected-wait invariant"
-)]
 fn build_buflo_kernel_protected_selection_wait_receipt(
     entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
     defense_start_tai_ns: Option<u64>,
 ) -> (BufloKernelProtectedSelectionWaitReceipt, bool) {
+    build_buflo_kernel_protected_selection_wait_receipt_with_policy(
+        entries,
+        defense_start_tai_ns,
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the receipt builder independently recomputes every serialized protected-wait invariant"
+)]
+fn build_buflo_kernel_protected_selection_wait_receipt_with_policy(
+    entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
+    defense_start_tai_ns: Option<u64>,
+    preparation_reserve: bool,
+) -> (BufloKernelProtectedSelectionWaitReceipt, bool) {
     let window_ns = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
     let cadence_ns = duration_as_u64_nanos(Duration::from_millis(20));
     let mut valid = entries.iter().enumerate().all(|(index, entry)| {
+        let expected_preparation_deadline = if preparation_reserve {
+            if entry.tick_zero {
+                Some(entry.release_tai_ns)
+            } else {
+                entry.release_tai_ns.checked_add(4_000_000)
+            }
+        } else {
+            None
+        };
+        let preparation_deadline = entry
+            .preparation_deadline_tai_ns
+            .unwrap_or(entry.release_tai_ns);
         let expected_slot = u64::try_from(index)
             .ok()
             .and_then(|index| index.checked_mul(2));
@@ -4334,10 +4618,10 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
                 });
         let completed_selection_valid = entry.completed_tai_ns.is_some_and(|completed| {
             completed >= entry.selection_tai_ns
-                && completed < entry.release_tai_ns
+                && completed < preparation_deadline
                 && entry.entered_tai_ns.is_some_and(|entered| {
                     entered >= entry.admission_tai_ns
-                        && entered < entry.release_tai_ns
+                        && entered < preparation_deadline
                         && completed.saturating_sub(entered) == entry.wait_duration_ns
                         && (entered < entry.selection_tai_ns || completed == entered)
                 })
@@ -4363,13 +4647,13 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
         let staging_order_valid = entry.staging_confirmed_tai_ns.is_none_or(|staging| {
             entry
                 .completed_tai_ns
-                .is_some_and(|completed| staging >= completed && staging < entry.release_tai_ns)
+                .is_some_and(|completed| staging >= completed && staging < preparation_deadline)
         });
         let dispatch_order_valid = entry.dispatch_confirmed_tai_ns.is_none_or(|dispatch| {
             entry
                 .staging_confirmed_tai_ns
                 .or(entry.completed_tai_ns)
-                .is_some_and(|previous| dispatch >= previous && dispatch < entry.release_tai_ns)
+                .is_some_and(|previous| dispatch >= previous && dispatch < preparation_deadline)
         });
         let phase_shape_valid = match (entry.tick_zero, entry.confirmation_attempts, entry.outcome)
         {
@@ -4392,7 +4676,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
             _ => false,
         };
         let failure_identity_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
-            failure.schema_version == 1
+            failure.schema_version == (if preparation_reserve { 2 } else { 1 })
                 && failure.slot == entry.slot
                 && failure.tick == entry.tick
                 && failure.tick_zero == entry.tick_zero
@@ -4404,6 +4688,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
                 && failure.admission_tai_ns == entry.admission_tai_ns
                 && failure.selection_tai_ns == entry.selection_tai_ns
                 && failure.release_tai_ns == entry.release_tai_ns
+                && failure.preparation_deadline_tai_ns == entry.preparation_deadline_tai_ns
                 && failure.entered_tai_ns == entry.entered_tai_ns
                 && failure.clock_read_attempts == entry.clock_read_attempts
         };
@@ -4413,7 +4698,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
                 && match failure.kind {
                     "selection-expired" => entry.entered_tai_ns.is_some_and(|entered| {
                         failure.observed_tai_ns.is_some_and(|observed| {
-                            observed >= entry.release_tai_ns
+                            observed >= preparation_deadline
                                 && observed >= entered
                                 && failure.previous_tai_ns.is_some()
                                 && observed.saturating_sub(entered) == entry.wait_duration_ns
@@ -4457,7 +4742,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
                 && failure.previous_tai_ns == expected_previous
                 && match failure.kind {
                     "selection-expired" => failure.observed_tai_ns.is_some_and(|observed| {
-                        observed >= entry.release_tai_ns
+                        observed >= preparation_deadline
                             && expected_previous.is_some_and(|previous| observed >= previous)
                     }),
                     "clock-regression" => failure.observed_tai_ns.is_some_and(|observed| {
@@ -4475,7 +4760,9 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
             }),
             _ => false,
         };
-        entry.schema_version == 1
+        entry.schema_version == (if preparation_reserve { 2 } else { 1 })
+            && entry.preparation_deadline_tai_ns == expected_preparation_deadline
+            && (!preparation_reserve || expected_preparation_deadline.is_some())
             && expected_slot == Some(entry.slot)
             && entry.tick == u64::try_from(index).unwrap_or(u64::MAX)
             && entry.tick_zero == (index == 0)
@@ -4539,8 +4826,12 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
         .and_then(|entry| entry.failure.clone());
     valid &= (failed_count == 1) == last_failure.is_some();
     let receipt = BufloKernelProtectedSelectionWaitReceipt {
-        schema_version: 2,
-        semantics: BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS,
+        schema_version: if preparation_reserve { 3 } else { 2 },
+        semantics: if preparation_reserve {
+            BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS
+        } else {
+            BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS
+        },
         entry_count: entries.len(),
         completed_count,
         failed_count,
@@ -4605,7 +4896,11 @@ fn buflo_kernel_protected_selection_job_binding_valid(
                             .completed_tai_ns
                             .zip(entry.dispatch_confirmed_tai_ns)
                             .is_some_and(|(completed, dispatch)| {
-                                completed <= dispatch && dispatch < entry.release_tai_ns
+                                completed <= dispatch
+                                    && dispatch
+                                        < entry
+                                            .preparation_deadline_tai_ns
+                                            .unwrap_or(entry.release_tai_ns)
                             })
                 }
         })
@@ -5089,7 +5384,11 @@ impl BufloKernelTxRuntime {
             prebuild_selection_cutoff_lead_ns: duration_as_u64_nanos(
                 BUFLO_KERNEL_TX_SELECTION_CUTOFF,
             ),
-            prebuild_selection_semantics: BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS,
+            prebuild_selection_semantics: if incoming_policy.preparation_reserve() {
+                BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS
+            } else {
+                BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS
+            },
             post_main_inventory_semantics: "residual_scheduled_incoming_credit_is_deduplicated_by_endpoint_owner; at_most_one_immediate_datagram_per_owner_per_job; a_second_datagram_for_the_same_owner_is_a_hard_failure; same_endpoint_credit_may_be_coalesced_in_the_exact_main_datagram",
             max_post_main_datagrams: helper.max_post_main_datagrams(),
         };
@@ -5108,6 +5407,7 @@ impl BufloKernelTxRuntime {
             jobs,
             next_item_id: 0,
             incoming_credit_release_window: incoming_policy.incoming_window(),
+            preparation_reserve: incoming_policy.preparation_reserve(),
         })
     }
 
@@ -5231,6 +5531,17 @@ impl BufloKernelTxRuntime {
             admission_tai_ns,
             selection_tai_ns,
             release_tai_ns,
+            preparation_deadline_tai_ns: if self.preparation_reserve {
+                Some(if guard.slot.0 == 0 && guard.packet.timestamp().is_zero() {
+                    release_tai_ns
+                } else {
+                    release_tai_ns.checked_add(4_000_000).ok_or_else(|| {
+                        Error::DefenseExecution("BuFLO V12 preparation deadline overflow".into())
+                    })?
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -5257,6 +5568,7 @@ impl BufloKernelTxRuntime {
             admission_tai_ns,
             selection_tai_ns,
             release_tai_ns,
+            preparation_deadline_tai_ns: self.preparation_reserve.then_some(release_tai_ns),
         })
     }
 
@@ -6869,10 +7181,18 @@ impl BufloKernelTxRuntime {
             });
         }
         let (protected_selection_wait, protected_selection_wait_structurally_valid) =
-            build_buflo_kernel_protected_selection_wait_receipt(
-                protected_selection_wait_entries,
-                epoch.map(|epoch| epoch.start_tai_ns),
-            );
+            if self.preparation_reserve {
+                build_buflo_kernel_protected_selection_wait_receipt_with_policy(
+                    protected_selection_wait_entries,
+                    epoch.map(|epoch| epoch.start_tai_ns),
+                    true,
+                )
+            } else {
+                build_buflo_kernel_protected_selection_wait_receipt(
+                    protected_selection_wait_entries,
+                    epoch.map(|epoch| epoch.start_tai_ns),
+                )
+            };
         let protected_selection_wait_job_binding_valid =
             buflo_kernel_protected_selection_job_binding_valid(
                 &protected_selection_wait,
@@ -6902,17 +7222,30 @@ impl BufloKernelTxRuntime {
             })
             .max()
             .unwrap_or(0);
-        let helper_evidence_success = buflo_kernel_helper_evidence_complete(
-            &self.runtime_contract,
-            &self.qdisc_contract,
-            &endpoint_tuples,
-            jobs.len(),
-            jobs.last().map(|job| job.job_id),
-            flat_items
-                .iter()
-                .filter(|item| item.send_path == "ordered-after-exact")
-                .count(),
-        );
+        let immediate_datagram_count = flat_items
+            .iter()
+            .filter(|item| item.send_path == "ordered-after-exact")
+            .count();
+        let helper_evidence_success = if self.preparation_reserve {
+            buflo_kernel_helper_evidence_complete_with_policy(
+                &self.runtime_contract,
+                &self.qdisc_contract,
+                &endpoint_tuples,
+                jobs.len(),
+                jobs.last().map(|job| job.job_id),
+                immediate_datagram_count,
+                true,
+            )
+        } else {
+            buflo_kernel_helper_evidence_complete(
+                &self.runtime_contract,
+                &self.qdisc_contract,
+                &endpoint_tuples,
+                jobs.len(),
+                jobs.last().map(|job| job.job_id),
+                immediate_datagram_count,
+            )
+        };
         if !helper_evidence_success {
             terminal_errors.push(
                 "BuFLO timed-egress helper lifecycle or shutdown evidence was not clean".into(),
@@ -7002,8 +7335,19 @@ impl BufloKernelTxRuntime {
         };
         let terminal_outcome = aggregate.terminal_outcome.to_string();
         BufloKernelTxReceipt {
-            schema_version: BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION,
-            semantics: BUFLO_KERNEL_TX_SEMANTICS,
+            schema_version: if self.preparation_reserve {
+                12
+            } else {
+                BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION
+            },
+            semantics: if self.preparation_reserve {
+                BUFLO_KERNEL_RESERVE_TX_SEMANTICS
+            } else {
+                BUFLO_KERNEL_TX_SEMANTICS
+            },
+            preparation_policy: self
+                .preparation_reserve
+                .then(buflo_kernel_preparation_policy_marker),
             incoming_credit_release_window_ns: duration_as_u64_nanos(
                 self.incoming_credit_release_window,
             ),
@@ -8010,10 +8354,33 @@ impl RunnerWakeupMetrics {
         // Serialise and retain the total raw receipt before validating the
         // legacy-metric exclusion. A validation failure must not erase the
         // helper/clock/packet evidence that explains the failed attempt.
+        let preparation_reserve = receipt
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(12);
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION;
+        self.schema_version = if preparation_reserve {
+            21
+        } else {
+            BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
+        };
+        let retention_semantics = if preparation_reserve {
+            BUFLO_KERNEL_RESERVE_RUNNER_RETENTION_SEMANTICS
+        } else {
+            BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS
+        };
+        let kernel_semantics = if preparation_reserve {
+            BUFLO_KERNEL_RESERVE_TX_SEMANTICS
+        } else {
+            BUFLO_KERNEL_TX_SEMANTICS
+        };
+        let wait_semantics = if preparation_reserve {
+            BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS
+        } else {
+            BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS
+        };
         self.semantics = format!(
-            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; {BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS}; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={BUFLO_KERNEL_TX_SEMANTICS}; buflo_kernel_protected_selection_wait_semantics={BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
+            "{RUNNER_WAKEUP_METRICS_SEMANTICS}; {retention_semantics}; buflo_legacy_exact_release_guard_metrics_are_zero_with_kernel_tx=true; buflo_kernel_tx_raw_semantics={kernel_semantics}; buflo_kernel_protected_selection_wait_semantics={wait_semantics}; post_veth_and_qdisc_end_state_are_separate_lab_evidence=true"
         );
         if !self.legacy_buflo_metrics_neutral() {
             let detail =
@@ -14237,9 +14604,7 @@ async fn execute_run_inner(
         && spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|source| {
-                source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
-            })
+            .is_some_and(|source| source.6.acknowledged_start())
     {
         controller.enable_buflo_acknowledged_incoming_startup()?;
     }
@@ -14254,7 +14619,7 @@ async fn execute_run_inner(
     if terminal_primary_partial_cell_policy_receipt(spec).is_some() {
         controller.enable_terminal_primary_partial_cell_policy()?;
     }
-    if front_v3_padding_window_enabled(spec) {
+    if front_v3_padding_window_enabled(spec) || front_v4_preparation_reserve_enabled(spec) {
         controller.enable_front_padding_outgoing_window()?;
     }
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
@@ -14263,6 +14628,12 @@ async fn execute_run_inner(
         .contract
         .as_deref()
         .is_some_and(is_etf_scheduler_contract);
+    if incoming_policy.preparation_reserve() && !etf_scheduler_requested {
+        return Err(Error::RunAborted(
+            "the prospective BuFLO preparation reserve requires the actual ETF scheduler contract"
+                .into(),
+        ));
+    }
     if !process_scheduler_ready_for_network_execution(&scheduler_initial, &spec.config.defense) {
         return Err(Error::RunAborted(
             "client scheduler evidence changed before network execution".into(),
@@ -14300,9 +14671,7 @@ async fn execute_run_inner(
             && spec
                 .application_workload_source
                 .as_ref()
-                .is_some_and(|source| {
-                    source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
-                }));
+                .is_some_and(|source| source.6.acknowledged_start()));
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
     let bound_ordinary_work = matches!(&spec.config.defense, DefenseConfig::Buflo(_));
 
@@ -15529,9 +15898,7 @@ fn create_endpoint_inventory(
                     && spec
                         .application_workload_source
                         .as_ref()
-                        .is_some_and(|source| {
-                            source.6 == BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart
-                        }),
+                        .is_some_and(|source| source.6.acknowledged_start()),
                 terminal_primary_partial_enabled: terminal_primary_partial_cell_policy_receipt(
                     spec,
                 )
@@ -17501,6 +17868,53 @@ fn register_action_batch(
     Ok(incoming_fanout_slots)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrontPreparationAdmission {
+    Unchanged,
+    Reserved,
+    Expired,
+}
+
+/// Give only prospectively bound FRONT V4 padding a shorter construction
+/// window. The runner retains the original action's socket deadline. Expiring
+/// this adapter target before packet selection cannot consume STREAM or
+/// mandatory control bytes; those remain ordinary transport work.
+fn reserve_front_padding_preparation(
+    policy: SocketHandoffPolicy,
+    action: &mut QcsdAction,
+) -> Result<FrontPreparationAdmission, Error> {
+    if policy != SocketHandoffPolicy::FrontV4PreparationReserve {
+        return Ok(FrontPreparationAdmission::Unchanged);
+    }
+    let QcsdAction::SendPacket {
+        packet,
+        not_before_after_us,
+        deadline_after_us,
+        allow_stream_data,
+        send_policy,
+        ..
+    } = action
+    else {
+        return Ok(FrontPreparationAdmission::Unchanged);
+    };
+    let window = deadline_after_us.checked_sub(*not_before_after_us);
+    if packet.direction() != Direction::Outgoing
+        || packet.length() != 1_200
+        || *allow_stream_data
+        || *send_policy != QcsdSendPolicy::Exact
+        || !matches!(window, Some(1..=10_000))
+    {
+        return Err(Error::SlotInvariant(
+            "FRONT V4 preparation reserve requires an original fixed pure-padding ten-millisecond target".into(),
+        ));
+    }
+    if window.is_some_and(|remaining| remaining <= FrontCapturePolicy::PREPARATION_RESERVE_US) {
+        return Ok(FrontPreparationAdmission::Expired);
+    }
+    *deadline_after_us -= FrontCapturePolicy::PREPARATION_RESERVE_US;
+    Ok(FrontPreparationAdmission::Reserved)
+}
+
 #[derive(Debug)]
 struct ReceiveBatchPreflight {
     expected: Vec<Option<QcsdReceiveLimitOutcome>>,
@@ -18562,6 +18976,105 @@ fn apply_action(
         endpoint.pending_chaff_requests.push_back(action);
         return Ok(());
     }
+    let preparation_admission =
+        reserve_front_padding_preparation(endpoint.socket_handoff_policy, &mut action)?;
+    if preparation_admission == FrontPreparationAdmission::Expired {
+        let (own_endpoint, packet, slot) = scheduled_action
+            .expect("only a validated fixed padding target exhausts its construction window");
+        let socket_deadline = scheduled_packet
+            .expect("validated fixed outgoing target")
+            .deadline;
+        let construction_deadline = socket_deadline
+            .checked_sub(Duration::from_micros(
+                FrontCapturePolicy::PREPARATION_RESERVE_US,
+            ))
+            .ok_or_else(|| Error::SlotInvariant("FRONT construction deadline underflow".into()))?;
+        // No target reaches transport and no frame is selected. Pending
+        // application/control work stays live, while this omitted padding
+        // opportunity receives its actual controller resolution time.
+        controller.observe(
+            QcsdObservation::SlotMissed {
+                endpoint: own_endpoint,
+                packet,
+                slot,
+                reason: MissedSlotReason::DeadlineExpired,
+            },
+            defense_elapsed,
+        );
+        schedule_terminal_row(
+            traces,
+            &ScheduleTraceRow {
+                action_time_us,
+                endpoint: Some(own_endpoint),
+                packet,
+                satisfaction: "missed",
+                observed: None,
+                miss_reason: "DeadlineExpired",
+                slot,
+                qcsd: QcsdTraceColumns::default(),
+                terminal_defense_elapsed_us: require_controller_terminal_resolution(
+                    controller,
+                    slot,
+                    defense_elapsed,
+                )?,
+            },
+            TerminalActionSemantics::OpportunityResolution,
+        )?;
+        traces.event(
+            now,
+            endpoint_id,
+            "front_padding_preparation_window",
+            "expired_before_registration",
+            &json!({
+                "schema_version": 1,
+                "policy": FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+                "original_action": trace_action,
+                "construction_deadline_monotonic_ns": duration_as_u64_nanos(
+                    construction_deadline.saturating_duration_since(endpoint.receive_loop.origin)
+                ),
+                "socket_deadline_monotonic_ns": duration_as_u64_nanos(
+                    socket_deadline.saturating_duration_since(endpoint.receive_loop.origin)
+                ),
+                "preparation_reserve_us": FrontCapturePolicy::PREPARATION_RESERVE_US,
+                "transport_output_mutated": false,
+                "socket_handoff_succeeded": false,
+            }),
+        )?;
+        traces.event(
+            now,
+            endpoint_id,
+            "action",
+            "expired_construction_window",
+            &trace_action,
+        )?;
+        return Ok(());
+    }
+    let preparation_window = if preparation_admission == FrontPreparationAdmission::Reserved {
+        let QcsdAction::SendPacket {
+            deadline_after_us, ..
+        } = &action
+        else {
+            unreachable!("only a SendPacket action receives a preparation reserve")
+        };
+        let construction_deadline = transport_at
+            .checked_add(Duration::from_micros(*deadline_after_us))
+            .ok_or_else(|| Error::SlotInvariant("FRONT construction deadline overflow".into()))?;
+        Some(json!({
+            "schema_version": 1,
+            "policy": FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+            "transport_action": action,
+            "construction_deadline_monotonic_ns": duration_as_u64_nanos(
+                construction_deadline.saturating_duration_since(endpoint.receive_loop.origin)
+            ),
+            "socket_deadline_monotonic_ns": duration_as_u64_nanos(
+                scheduled_packet.expect("validated fixed outgoing target").deadline
+                    .saturating_duration_since(endpoint.receive_loop.origin)
+            ),
+            "preparation_reserve_us": FrontCapturePolicy::PREPARATION_RESERVE_US,
+        }))
+    } else {
+        None
+    };
     match endpoint.client.apply_qcsd_action(transport_at, action) {
         Ok(chaff_stream) => {
             if let QcsdAction::PrearmPacket {
@@ -18706,6 +19219,15 @@ fn apply_action(
                 }
                 record.outcome = chaff_cancellation_receipt_outcome(cancellation_reason);
                 finish_stream(endpoint, stream_id, None)?;
+            }
+            if let Some(window) = preparation_window {
+                traces.event(
+                    now,
+                    endpoint_id,
+                    "front_padding_preparation_window",
+                    "registered",
+                    &window,
+                )?;
             }
             traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
         }
@@ -20974,6 +21496,15 @@ fn validate_buflo_kernel_main(
     guard: &BufloExactReleaseGuard,
     prepared: &PreparedOutputMicrostep,
 ) -> Result<(), Error> {
+    validate_buflo_kernel_main_with_policy(guard, prepared, false)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_buflo_kernel_main_with_policy(
+    guard: &BufloExactReleaseGuard,
+    prepared: &PreparedOutputMicrostep,
+    preparation_reserve: bool,
+) -> Result<(), Error> {
     if prepared.batch.iter().count() != 1
         || prepared.batch.data().len() != 1_200
         || prepared.attributed_datagrams.len() != 1
@@ -20993,7 +21524,14 @@ fn validate_buflo_kernel_main(
     if satisfied.slot != guard.slot
         || satisfied.observed_size != 1_200
         || attribution.observed != 1_200
-        || attribution.composition.lateness_us != 0
+        || (if preparation_reserve {
+            // Preserve the actual construction lateness. CLOCK_TAI dispatch
+            // confirmation authorizes only the earlier +4ms cutoff; actual
+            // enqueue and TX must still satisfy the independent +5ms guard.
+            attribution.composition.lateness_us >= 5_000
+        } else {
+            attribution.composition.lateness_us != 0
+        })
         || !qcsd_composition_exact_wire_accounting(&attribution.composition, 1_200)
     {
         let built_production =
@@ -21580,7 +22118,12 @@ async fn dispatch_buflo_kernel_release(
             ));
         }
     };
-    if let Err(error) = validate_buflo_kernel_main(guard, &prepared) {
+    let validation = if runtime.preparation_reserve {
+        validate_buflo_kernel_main_with_policy(guard, &prepared, true)
+    } else {
+        validate_buflo_kernel_main(guard, &prepared)
+    };
+    if let Err(error) = validation {
         return Err(retain_buflo_prepared_output_failure(
             runtime,
             job_id,
@@ -23198,8 +23741,11 @@ fn front_v3_post_input_output_due(
     defense_start: Option<Instant>,
     observed_at: Instant,
 ) -> bool {
-    if endpoint.socket_handoff_policy != SocketHandoffPolicy::FrontV3ScheduledPadding
-        || !endpoint.network_active
+    if !matches!(
+        endpoint.socket_handoff_policy,
+        SocketHandoffPolicy::FrontV3ScheduledPadding
+            | SocketHandoffPolicy::FrontV4PreparationReserve
+    ) || !endpoint.network_active
         || !controller.has_fixed_schedule_staging()
     {
         return false;
@@ -23608,6 +24154,15 @@ async fn process_output_once_with_clock(
     semantic_handoff_interrupt: Option<Duration>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
+    // V4 admission uses a fresh physical clock after all prior reduction and
+    // action work. A stale loop timestamp must not reopen the reserved final
+    // millisecond. Other policies retain their established clock seam.
+    let drive_now =
+        if endpoint.socket_handoff_policy == SocketHandoffPolicy::FrontV4PreparationReserve {
+            drive_now.max(monotonic_clock())
+        } else {
+            drive_now
+        };
     let prepared = match prepare_output_once_with_clock(endpoint, drive_now).await? {
         PreparedOutputDrive::Datagram(prepared) => prepared,
         PreparedOutputDrive::Callback(wakeup) => return Ok(OutputDrive::Callback(wakeup)),
@@ -23641,7 +24196,7 @@ async fn process_output_once_with_clock(
                 .iter()
                 .any(|attribution| attribution.satisfied.is_some()),
         );
-        match attempt_socket_handoff_timestamped(
+        let handoff = attempt_socket_handoff_timestamped(
             &target_deadlines,
             hard_unshaped_handoff_interrupt(
                 defense_clock.uses_kernel_tai(),
@@ -23661,7 +24216,61 @@ async fn process_output_once_with_clock(
                 socket_handoff_policy.send(&endpoint.socket, &prepared.batch)
             },
             &mut *monotonic_clock,
-        )? {
+        );
+        let handoff = match handoff {
+            Ok(handoff) => handoff,
+            Err(error)
+                if endpoint.socket_handoff_policy
+                    == SocketHandoffPolicy::FrontV4PreparationReserve =>
+            {
+                let failed_at = match &error {
+                    Error::AdapterDeadlinePreHandoff { attempted_at, .. } => *attempted_at,
+                    _ => monotonic_clock(),
+                };
+                let (error, receipt) =
+                    PreparedOutputFailure::from_prepared("front-socket-handoff", error, &prepared)
+                        .into_parts();
+                let packet_builds: Vec<_> = prepared
+                    .observations
+                    .iter()
+                    .filter_map(|record| match record.observation() {
+                        QcsdObservation::ClassifiedDatagram {
+                            direction: Direction::Outgoing,
+                            composition,
+                            ..
+                        } => Some(json!({
+                            "produced_monotonic_ns": record.produced_monotonic_ns(),
+                            "sequence": record.sequence(),
+                            "composition": composition,
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let datagrams: Vec<_> = prepared.attributed_datagrams.iter().map(|attribution| {
+                    json!({
+                        "observed_udp_bytes": attribution.observed,
+                        "slot_id": attribution.satisfied.map(|target| target.slot.0),
+                        "composition": attribution.composition,
+                        "socket_deadline_monotonic_ns": attribution.satisfied.map(|target| {
+                            duration_as_u64_nanos(target.deadline.saturating_duration_since(endpoint.receive_loop.origin))
+                        }),
+                    })
+                }).collect();
+                traces.event(failed_at, Some(endpoint.id), "front_prepared_output_failure", "not_sent", &json!({
+                    "schema_version": 1,
+                    "policy": FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+                    "socket_handoff_succeeded": false,
+                    "preparation_started_monotonic_ns": duration_as_u64_nanos(drive_now.saturating_duration_since(endpoint.receive_loop.origin)),
+                    "failed_monotonic_ns": duration_as_u64_nanos(failed_at.saturating_duration_since(endpoint.receive_loop.origin)),
+                    "receipt": receipt,
+                    "packet_builds": packet_builds,
+                    "datagrams": datagrams,
+                }))?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        match handoff {
             SocketHandoff::Sent(sent_at) => {
                 let (elapsed, crossed) = match defense_start {
                     Some(started) => match semantic_handoff_interrupt {
@@ -24029,6 +24638,9 @@ fn render_run_json(
     });
     if let Some(policy) = buflo_incoming_credit_release_receipt(spec) {
         run["buflo_incoming_credit_release_policy"] = policy;
+    }
+    if let Some(policy) = buflo_kernel_preparation_policy_receipt(spec) {
+        run["buflo_kernel_preparation_policy"] = policy;
     }
     if let Some(policy) = tamaraw_capture_policy_receipt(spec) {
         run["tamaraw_capture_policy"] = policy;
@@ -36231,6 +36843,27 @@ mod tests {
         Instant,
         Packet,
     ) {
+        front_padding_post_input_fixture(
+            output,
+            started,
+            clock,
+            SocketHandoffPolicy::FrontV3ScheduledPadding,
+        )
+    }
+
+    fn front_padding_post_input_fixture(
+        output: &Path,
+        started: Instant,
+        clock: &QcsdObservationClock,
+        policy: SocketHandoffPolicy,
+    ) -> (
+        Vec<super::Endpoint>,
+        neqo_http3::Http3Server,
+        QcsdController,
+        TraceFiles,
+        Instant,
+        Packet,
+    ) {
         // StaticSchedule preserves ordinary due-time generation by default.
         // This deterministic FRONT fixture opts into the same exact snapshot
         // protocol as Front, while retaining both original test targets.
@@ -36280,7 +36913,7 @@ mod tests {
             5_000,
         );
         drop(endpoint.client.qcsd_timestamped_observations());
-        endpoint.socket_handoff_policy = SocketHandoffPolicy::FrontV3ScheduledPadding;
+        endpoint.socket_handoff_policy = policy;
         let packet = Packet::new(Duration::from_secs(1), Direction::Outgoing, 1_200)
             .expect("fixed padding packet");
         let mut controller = QcsdController::with_defense(
@@ -37129,8 +37762,10 @@ mod tests {
                 super::FrontCapturePolicy::RapidV5BoundedCongestionOmission
             } else if policy == super::FrontCapturePolicy::RAPID_V5_PADDING_NAME {
                 super::FrontCapturePolicy::RapidV5BoundedPaddingOmission
-            } else {
+            } else if policy == super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME {
                 super::FrontCapturePolicy::RapidV5BoundedPaddingWindow
+            } else {
+                super::FrontCapturePolicy::RapidV5PaddingPreparationReserve
             }
         );
         let mut spec =
@@ -37497,6 +38132,554 @@ mod tests {
                 SocketHandoffPolicy::for_defense(&spec.config.defense)
             );
         }
+    }
+
+    #[test]
+    fn front_v4_marker_binds_construction_reserve_without_widening_older_policies() {
+        let mut spec = front_capture_policy_spec_for(
+            super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+        );
+        super::validate_front_capture_policy(&spec).expect("bound prospective V4");
+        let marker = super::front_capture_policy_receipt(&spec).expect("V4 receipt");
+        assert_eq!(marker["schema_version"], 4);
+        assert_eq!(
+            marker["policy"],
+            super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME
+        );
+        assert_eq!(marker["outgoing_construction_window_us"], 9_000);
+        assert_eq!(marker["outgoing_preparation_reserve_us"], 1_000);
+        assert_eq!(marker["outgoing_release_window_us"], 10_000);
+        assert_eq!(marker["outgoing_omission_ratio_denominator"], 10);
+        assert_eq!(marker["require_pure_padding"], true);
+        assert_eq!(marker["expired_construction_target"], "not-built-not-sent");
+        assert_eq!(
+            SocketHandoffPolicy::for_run(&spec),
+            SocketHandoffPolicy::FrontV4PreparationReserve
+        );
+        assert!(!super::front_v3_padding_window_enabled(&spec));
+        for policy in [
+            super::FrontCapturePolicy::RAPID_V5_NAME,
+            super::FrontCapturePolicy::RAPID_V5_PADDING_NAME,
+            super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME,
+        ] {
+            let old = front_capture_policy_spec_for(policy);
+            assert!(!super::front_v4_preparation_reserve_enabled(&old));
+            assert!(
+                super::front_capture_policy_receipt(&old)
+                    .expect("old marker")
+                    .get("outgoing_preparation_reserve_us")
+                    .is_none()
+            );
+        }
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "unused.json".into(),
+            }),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            assert!(!super::front_v4_preparation_reserve_enabled(&spec));
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+            assert_eq!(
+                SocketHandoffPolicy::for_run(&spec),
+                SocketHandoffPolicy::for_defense(&spec.config.defense)
+            );
+        }
+        let mut invalid = front_capture_policy_spec_for(
+            super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+        );
+        invalid.workload.resources.pop();
+        assert!(super::validate_front_capture_policy(&invalid).is_err());
+        assert!(super::front_capture_policy_receipt(&invalid).is_none());
+    }
+
+    #[test]
+    fn front_v4_reserve_rejects_data_targets_and_changes_only_the_construction_deadline() {
+        let original = QcsdAction::SendPacket {
+            endpoint: QcsdEndpointId(0),
+            packet: Packet::new(Duration::from_micros(59_972), Direction::Outgoing, 1_200)
+                .expect("padding"),
+            slot: QcsdSlotId(119),
+            not_before_after_us: 59_972,
+            deadline_after_us: 69_972,
+            allow_stream_data: false,
+            send_policy: QcsdSendPolicy::Exact,
+        };
+        let mut shortened = original.clone();
+        assert_eq!(
+            super::reserve_front_padding_preparation(
+                SocketHandoffPolicy::FrontV4PreparationReserve,
+                &mut shortened
+            )
+            .expect("padding reserve"),
+            super::FrontPreparationAdmission::Reserved
+        );
+        let mut expected = serde_json::to_value(&original).expect("original action");
+        expected["deadline_after_us"] = json!(68_972);
+        assert_eq!(
+            serde_json::to_value(&shortened).expect("shortened action"),
+            expected
+        );
+        for policy in [
+            SocketHandoffPolicy::HistoricalBestEffort,
+            SocketHandoffPolicy::CandidateFidelityStrict,
+            SocketHandoffPolicy::FrontV3ScheduledPadding,
+        ] {
+            let mut unchanged = original.clone();
+            assert_eq!(
+                super::reserve_front_padding_preparation(policy, &mut unchanged)
+                    .expect("old behavior"),
+                super::FrontPreparationAdmission::Unchanged
+            );
+            assert_eq!(
+                serde_json::to_value(&unchanged).expect("unchanged"),
+                serde_json::to_value(&original).expect("original")
+            );
+        }
+        for change in 0..4 {
+            let mut invalid = original.clone();
+            let QcsdAction::SendPacket {
+                allow_stream_data,
+                send_policy,
+                deadline_after_us,
+                packet,
+                ..
+            } = &mut invalid
+            else {
+                unreachable!()
+            };
+            match change {
+                0 => *allow_stream_data = true,
+                1 => *send_policy = QcsdSendPolicy::CongestionSensitive,
+                2 => *deadline_after_us += 1,
+                _ => {
+                    *packet = Packet::new(Duration::from_micros(59_972), Direction::Incoming, 1_200)
+                        .expect("wrong direction")
+                }
+            }
+            let before = serde_json::to_value(&invalid).expect("invalid target");
+            assert!(
+                super::reserve_front_padding_preparation(
+                    SocketHandoffPolicy::FrontV4PreparationReserve,
+                    &mut invalid
+                )
+                .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(&invalid).expect("unmutated target"),
+                before
+            );
+        }
+        let mut late = original.clone();
+        let QcsdAction::SendPacket {
+            not_before_after_us,
+            deadline_after_us,
+            ..
+        } = &mut late
+        else {
+            unreachable!()
+        };
+        *not_before_after_us = 0;
+        *deadline_after_us = 1_000;
+        let before = serde_json::to_value(&late).expect("late target");
+        assert_eq!(
+            super::reserve_front_padding_preparation(
+                SocketHandoffPolicy::FrontV4PreparationReserve,
+                &mut late
+            )
+            .expect("unbuilt omission"),
+            super::FrontPreparationAdmission::Expired
+        );
+        assert_eq!(
+            serde_json::to_value(&late).expect("no adapter mutation"),
+            before
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v4_construction_window_is_half_open_and_retains_the_socket_deadline() {
+        for offset_ns in [8_999_999_u64, 9_000_000, 9_999_999, 10_000_000] {
+            let output = trace_output_dir("front-v4-construction-boundary");
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let (mut endpoints, server, _controller, mut traces, action_at, packet) =
+                front_padding_post_input_fixture(
+                    &output,
+                    started,
+                    &clock,
+                    SocketHandoffPolicy::FrontV4PreparationReserve,
+                );
+            let release = action_at + packet.timestamp();
+            let at = release + Duration::from_nanos(offset_ns);
+            assert_eq!(
+                endpoints[0].scheduled_outgoing[0].deadline,
+                release + Duration::from_millis(10)
+            );
+            let _physical_now = TestMonotonicNowOverride::fixed(at);
+            let output_step = super::prepare_output_once_with_clock(&mut endpoints[0], at)
+                .await
+                .expect("actual target construction");
+            if offset_ns < 9_000_000 {
+                let super::PreparedOutputDrive::Datagram(prepared) = output_step else {
+                    panic!("target must remain eligible before construction cutoff")
+                };
+                assert!(
+                    prepared
+                        .attributed_datagrams
+                        .iter()
+                        .any(|item| item.satisfied.is_some())
+                );
+                assert_eq!(
+                    prepared.attributed_datagrams[0]
+                        .composition
+                        .application_stream_bytes,
+                    0
+                );
+            } else {
+                let observations = match output_step {
+                    super::PreparedOutputDrive::Datagram(prepared) => {
+                        assert!(
+                            prepared
+                                .attributed_datagrams
+                                .iter()
+                                .all(|item| item.satisfied.is_none())
+                        );
+                        prepared.observations
+                    }
+                    _ => endpoints[0].client.qcsd_timestamped_observations(),
+                };
+                assert_eq!(
+                    observations
+                        .iter()
+                        .filter(|item| matches!(
+                            item.observation(),
+                            QcsdObservation::SlotMissed {
+                                reason: MissedSlotReason::DeadlineExpired,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    2
+                );
+                assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 0);
+            }
+            traces
+                .flush_events()
+                .expect("persist registration evidence");
+            drop(traces);
+            let events = fs::read_to_string(output.join("events.csv")).expect("registration trace");
+            assert_eq!(
+                events
+                    .lines()
+                    .filter(|row| row.contains(",front_padding_preparation_window,registered,"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                fs::read_to_string(output.join("packets.csv"))
+                    .expect("no handoff")
+                    .lines()
+                    .count(),
+                1
+            );
+            drop(endpoints);
+            drop(server);
+            fs::remove_dir_all(output).expect("remove boundary fixture");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v4_fresh_clock_expires_padding_before_build_and_sends_application_bytes() {
+        let output = trace_output_dir("front-v4-fresh-clock-application");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, mut traces, action_at, packet) =
+            front_padding_post_input_fixture(
+                &output,
+                started,
+                &clock,
+                SocketHandoffPolicy::FrontV4PreparationReserve,
+            );
+        let receiver = tokio::net::UdpSocket::bind(endpoints[0].remote_addr)
+            .await
+            .expect("real UDP peer");
+        endpoints[0]
+            .socket
+            .writable()
+            .await
+            .expect("actual send readiness");
+        let release = action_at + packet.timestamp();
+        stage_unshaped_runner_request_for_output(&mut endpoints[0], release, 4_433);
+        let fresh = release + Duration::from_millis(9);
+        let _physical_now = TestMonotonicNowOverride::fixed(fresh);
+        let mut calls = 0;
+        let mut monotonic_clock = || {
+            calls += 1;
+            fresh
+        };
+        super::process_output_once_with_clock(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            &clock,
+            release + Duration::from_nanos(8_999_999),
+            Some(action_at),
+            None,
+            None,
+            super::RunnerDefenseClock::Monotonic,
+            None,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect("ordinary application output survives padding expiry");
+        assert!(
+            calls >= 2,
+            "fresh preparation clock precedes physical send time"
+        );
+        let mut buffer = [0_u8; 1_500];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+                .await
+                .expect("bounded actual receive")
+                .expect("application datagram received");
+        assert!(length > 0);
+        assert!(endpoints[0].scheduled_outgoing.is_empty());
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("physical send trace");
+        let header: Vec<_> = packets
+            .lines()
+            .next()
+            .expect("packet header")
+            .split(',')
+            .collect();
+        let row: Vec<_> = packets
+            .lines()
+            .nth(1)
+            .expect("actual physical datagram")
+            .split(',')
+            .collect();
+        assert_eq!(
+            row[header
+                .iter()
+                .position(|name| *name == "slot_id")
+                .expect("slot column")],
+            ""
+        );
+        assert!(
+            row[header
+                .iter()
+                .position(|name| *name == "application_stream_bytes")
+                .expect("application column")]
+            .parse::<u16>()
+            .expect("actual application bytes")
+                > 0
+        );
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("padding omissions");
+        assert_eq!(
+            schedule
+                .lines()
+                .filter(|row| row.contains("DeadlineExpired"))
+                .count(),
+            2
+        );
+        assert!(!schedule.contains(",satisfied,"));
+        drop(endpoints);
+        drop(server);
+        drop(receiver);
+        fs::remove_dir_all(output).expect("remove application fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v4_physical_handoff_keeps_the_original_half_open_ten_millisecond_window() {
+        for at_deadline in [false, true] {
+            let output = trace_output_dir("front-v4-physical-boundary");
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let (mut endpoints, server, mut controller, mut traces, action_at, packet) =
+                front_padding_post_input_fixture(
+                    &output,
+                    started,
+                    &clock,
+                    SocketHandoffPolicy::FrontV4PreparationReserve,
+                );
+            let receiver = tokio::net::UdpSocket::bind(endpoints[0].remote_addr)
+                .await
+                .expect("real UDP peer");
+            endpoints[0]
+                .socket
+                .writable()
+                .await
+                .expect("actual send readiness");
+            let release = action_at + packet.timestamp();
+            let construction_at = release + Duration::from_millis(8);
+            let deadline = release + Duration::from_millis(10);
+            let attempted_at = deadline - Duration::from_nanos(1);
+            let physical_at = if at_deadline { deadline } else { attempted_at };
+            let _physical_now = TestMonotonicNowOverride::fixed(physical_at);
+            let mut times = VecDeque::from([construction_at, attempted_at]);
+            let mut monotonic_clock = || times.pop_front().unwrap_or(physical_at);
+            let result = super::process_output_once_with_clock(
+                &mut endpoints[0],
+                &mut controller,
+                &mut traces,
+                &clock,
+                construction_at,
+                Some(action_at),
+                None,
+                None,
+                super::RunnerDefenseClock::Monotonic,
+                None,
+                &mut monotonic_clock,
+            )
+            .await;
+            if at_deadline {
+                assert!(
+                    matches!(result, Err(Error::AdapterDeadlineLateHandoff { sent_at, deadline: expected }) if sent_at == deadline && expected == deadline)
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "a target built before9ms can physically send before10ms"
+                );
+            }
+            let mut buffer = [0_u8; 1_500];
+            let (length, _) =
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+                    .await
+                    .expect("bounded physical receipt")
+                    .expect("actual physical padding datagram");
+            assert_eq!(length, 1_200);
+            assert!(
+                traces.is_slot_terminal(QcsdSlotId(0)),
+                "successful syscall remains recorded even when physically late"
+            );
+            drop(traces);
+            assert_eq!(
+                fs::read_to_string(output.join("packets.csv"))
+                    .expect("physical trace")
+                    .lines()
+                    .count(),
+                2
+            );
+            assert!(
+                !fs::read_to_string(output.join("events.csv"))
+                    .expect("physical events")
+                    .contains(",front_prepared_output_failure,not_sent,")
+            );
+            drop(endpoints);
+            drop(server);
+            drop(receiver);
+            fs::remove_dir_all(output).expect("remove handoff fixture");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_v4_reserve_overrun_retains_non_send_composition_and_aborts() {
+        let output = trace_output_dir("front-v4-reserve-overrun");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, mut traces, action_at, packet) =
+            front_padding_post_input_fixture(
+                &output,
+                started,
+                &clock,
+                SocketHandoffPolicy::FrontV4PreparationReserve,
+            );
+        let release = action_at + packet.timestamp();
+        stage_unshaped_runner_request_for_output(&mut endpoints[0], release, 4_433);
+        let preparation_at = release + Duration::from_millis(8);
+        let deadline = release + Duration::from_millis(10);
+        let _physical_now = TestMonotonicNowOverride::fixed(preparation_at);
+        let mut times = VecDeque::from([preparation_at, deadline]);
+        let mut monotonic_clock = || times.pop_front().unwrap_or(deadline);
+        let error = super::process_output_once_with_clock(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            &clock,
+            preparation_at,
+            Some(action_at),
+            None,
+            None,
+            super::RunnerDefenseClock::Monotonic,
+            None,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect_err("the unchanged physical deadline rejects reserve overrun");
+        assert!(
+            matches!(error, Error::AdapterDeadlinePreHandoff { attempted_at, deadline: expected } if attempted_at == deadline && expected == deadline)
+        );
+        assert!(
+            endpoints[0].client.qcsd_has_pending_stream_send(),
+            "padding construction never consumes the queued application request"
+        );
+        assert!(
+            !traces.is_slot_terminal(QcsdSlotId(0)),
+            "unsent built target never earns success"
+        );
+        traces.flush_events().expect("durable failure receipt");
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("failure trace");
+        let raw = events
+            .lines()
+            .find(|row| row.contains(",front_prepared_output_failure,not_sent,"))
+            .expect("non-send receipt")
+            .splitn(5, ',')
+            .nth(4)
+            .expect("receipt column");
+        let last_quote = raw.rfind('"').expect("CSV closing quote");
+        let receipt: serde_json::Value =
+            serde_json::from_str(&raw[1..last_quote].replace("\"\"", "\""))
+                .expect("actual failure JSON");
+        assert_eq!(receipt["socket_handoff_succeeded"], false);
+        assert_eq!(receipt["receipt"]["batch_datagram_lengths"], json!([1_200]));
+        assert_eq!(
+            receipt["receipt"]["batch_sha256"]
+                .as_str()
+                .expect("built bytes hash")
+                .len(),
+            64
+        );
+        assert_eq!(receipt["datagrams"][0]["slot_id"], 0);
+        assert_eq!(
+            receipt["datagrams"][0]["composition"]["application_stream_bytes"],
+            0
+        );
+        assert!(
+            receipt["datagrams"][0]["composition"]["defense_control_bytes"]
+                .as_u64()
+                .expect("actual scheduled PING bytes")
+                > 0
+        );
+        assert_eq!(
+            receipt["packet_builds"]
+                .as_array()
+                .expect("actual construction observations")
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("packets.csv"))
+                .expect("physical trace")
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("schedule.csv"))
+                .expect("no false outcome")
+                .lines()
+                .count(),
+            1
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove overrun fixture");
     }
 
     #[test]
@@ -47625,6 +48808,837 @@ mod tests {
             admission_tai_ns: release_tai_ns - 10_000_000,
             selection_tai_ns: release_tai_ns - 5_000_000,
             release_tai_ns,
+            preparation_deadline_tai_ns: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn buflo_v12_selection_identity(
+        slot: u64,
+        tick_zero: bool,
+    ) -> super::BufloKernelProtectedSelectionIdentity {
+        let mut identity = synthetic_protected_selection_identity(slot, tick_zero);
+        identity.preparation_deadline_tai_ns = Some(if tick_zero {
+            identity.release_tai_ns
+        } else {
+            identity.release_tai_ns + 4_000_000
+        });
+        identity
+    }
+
+    #[test]
+    fn buflo_duration200_actual_parameter_admission_and_raw_provenance_are_explicit() {
+        let mut spec = buflo_incoming_credit_release_policy_spec_for(
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME,
+        );
+        let output = trace_output_dir("buflo-duration200-actual-provenance");
+        let parameter_path = output.join("buflo.json");
+        let mut parameters = json!({
+            "schema_version": 1,
+            "interval_us": 20_000,
+            "minimum_duration_us": 10_000_000,
+            "packet_size": 1_200,
+            "max_events": 6_000,
+            "implementation_scope": "client_only_quic",
+            "paper_equivalent": false,
+        });
+        spec.config.defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: parameter_path.to_str().expect("UTF-8 parameters").into(),
+        });
+        fs::write(
+            &parameter_path,
+            serde_json::to_vec(&parameters).expect("legacy parameters"),
+        )
+        .expect("write legacy parameters");
+        spec.defense_parameters = super::defense_parameter_provenance(&spec.config)
+            .expect("actual legacy 6000-cell admission");
+        super::validate_buflo_incoming_credit_release_policy(&spec)
+            .expect("unchanged legacy incoming admission");
+        let legacy = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            legacy["defense_parameters"]
+                .as_object()
+                .expect("legacy provenance")
+                .len(),
+            5
+        );
+        assert!(
+            legacy["defense_parameters"]
+                .get("buflo_duration_budget")
+                .is_none()
+        );
+        assert!(legacy.get("buflo_kernel_preparation_policy").is_none());
+        for max_events in [6_001, 10_000] {
+            parameters["max_events"] = json!(max_events);
+            fs::write(
+                &parameter_path,
+                serde_json::to_vec(&parameters).expect("legacy overflow"),
+            )
+            .expect("write legacy overflow");
+            assert!(super::defense_parameter_provenance(&spec.config).is_err());
+        }
+        parameters["duration_budget_policy"] = json!("rapid-v6-fixed-200s-duration-budget-v1");
+        let parameter_bytes = serde_json::to_vec(&parameters).expect("explicit parameters");
+        fs::write(&parameter_path, &parameter_bytes).expect("write opted-in parameters");
+        spec.defense_parameters = super::defense_parameter_provenance(&spec.config)
+            .expect("actual fixed 200-second admission");
+        let original_resources = spec
+            .application_workload_source
+            .as_ref()
+            .expect("bound Source")
+            .0
+            .resources
+            .clone();
+        let mut source = variable_primary_document_source();
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME);
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        source["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        source["preparation"]["buflo_kernel_preparation_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::PREPARATION_RESERVE_NAME);
+        let source_path = output.join("prepared.json");
+        fs::write(
+            &source_path,
+            serde_json::to_vec(&source).expect("explicit V12 Source"),
+        )
+        .expect("write explicit Source");
+        spec.application_workload_source = Some(
+            super::load_application_workload_source(&source_path).expect("authenticate V12 Source"),
+        );
+        assert_eq!(
+            spec.application_workload_source
+                .as_ref()
+                .expect("reopened Source")
+                .0
+                .resources,
+            original_resources,
+            "the prospective preparation policy preserves the complete original graph",
+        );
+        let policy = super::bound_buflo_incoming_credit_release_policy(&spec)
+            .expect("actual duration and V12 admission");
+        assert!(policy.preparation_reserve());
+        assert_eq!(policy.incoming_window(), Duration::from_micros(10_000));
+        fs::remove_file(&parameter_path).expect("rendering never rereads parameters");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["defense_parameters"]["sha256"],
+            sha256(&parameter_bytes).expect("exact hash")
+        );
+        assert_eq!(
+            run["defense_parameters"]["buflo_duration_budget"],
+            json!({
+                "schema_version": 1,
+                "policy": "rapid-v6-fixed-200s-duration-budget-v1",
+                "interval_us": 20_000,
+                "minimum_duration_us": 10_000_000,
+                "packet_size": 1_200,
+                "max_events": 10_000,
+                "duration_budget_us": 200_000_000,
+            })
+        );
+        assert_eq!(
+            run["buflo_kernel_preparation_policy"],
+            super::buflo_kernel_preparation_policy_marker()
+        );
+        let provenance = spec.defense_parameters.as_mut().expect("provenance");
+        provenance
+            .buflo_duration_budget
+            .as_mut()
+            .expect("resolved budget")
+            .max_events = 6_000;
+        assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
+        spec.defense_parameters
+            .as_mut()
+            .expect("provenance")
+            .buflo_duration_budget
+            .as_mut()
+            .expect("budget")
+            .max_events = 10_000;
+        spec.defense_parameters
+            .as_mut()
+            .expect("provenance")
+            .buflo_parameters
+            .as_mut()
+            .expect("parsed parameters")
+            .duration_budget_policy = None;
+        assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
+        spec.defense_parameters
+            .as_mut()
+            .expect("provenance")
+            .buflo_parameters
+            .as_mut()
+            .expect("parsed parameters")
+            .duration_budget_policy =
+            Some(neqo_csdef::BufloDurationBudgetPolicy::RapidV6Fixed200Seconds);
+        spec.defense_parameters
+            .as_mut()
+            .expect("provenance")
+            .buflo_duration_budget = None;
+        assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
+        fs::remove_dir_all(output).expect("fixture cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_duration200_later_incoming_ticks_keep_v12_and_legacy_kernel_boundaries() {
+        let parameters = neqo_csdef::BufloParameters::from_json(
+            r#"{"schema_version":1,"interval_us":20000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v6-fixed-200s-duration-budget-v1"}"#,
+            1_200,
+        ).expect("actual opted-in parameters");
+        let mut defense = neqo_csdef::Buflo::from_parameters(parameters);
+        let mut final_incoming = None;
+        for tick in 0..=6_001 {
+            let elapsed = Duration::from_micros(tick * 20_000);
+            for direction in [Direction::Outgoing, Direction::Incoming] {
+                let packet = defense
+                    .next_event(elapsed)
+                    .expect("actual later scheduled event");
+                assert_eq!(packet.direction(), direction);
+                if tick == 6_001 && direction == Direction::Incoming {
+                    final_incoming = Some(packet);
+                }
+            }
+        }
+        assert_eq!(defense.diagnostics().buflo_scheduled_incoming_cells, 6_002);
+        assert!(defense.terminal_failure().is_none());
+        let packet = final_incoming.expect("incoming tick beyond legacy bound");
+        assert_eq!(packet.timestamp_us(), 120_020_000);
+        assert_eq!(packet.length(), 1_200);
+        let identity = buflo_v12_selection_identity(12_002, false);
+        assert_eq!(identity.tick, 6_001);
+        assert_eq!(
+            identity.preparation_deadline_tai_ns,
+            Some(identity.release_tai_ns + 4_000_000)
+        );
+        let mut samples = VecDeque::from([identity.release_tai_ns + 1_000_000]);
+        let super::BufloKernelProtectedSelectionStep::Ready(entry) =
+            super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                Ok(samples.pop_front().expect("actual seam sample"))
+            })
+        else {
+            panic!("late selection within the V12 reserve remains eligible");
+        };
+        assert_eq!(entry.tick, 6_001);
+        const EPOCH: u64 = SYNTHETIC_PROTECTED_SELECTION_EPOCH_TAI_NS;
+        let phase = synthetic_buflo_clock_phase_with_offsets(0, 0, EPOCH, 10, 10);
+        let mut runtime = synthetic_buflo_kernel_runtime(phase.clone(), None, Vec::new());
+        let start = Instant::now();
+        runtime.epoch = Some(super::BufloKernelEpoch {
+            start,
+            start_monotonic_ns: EPOCH,
+            start_tai_ns: EPOCH,
+            instant_anchor: super::BufloKernelInstantAnchor {
+                instant: start,
+                monotonic_ns: EPOCH,
+                receipt: synthetic_buflo_instant_alignment_for(&phase),
+            },
+            tick_zero_application_ready: true,
+            tick_zero_staged: true,
+        });
+        let (mono, tai, mono_deadline, tai_deadline) = runtime
+            .job_times(6_001)
+            .expect("kernel cadence has no hidden 6000-cell cap");
+        assert_eq!(tai, identity.release_tai_ns);
+        assert_eq!(mono, tai);
+        assert_eq!(mono_deadline - mono, 5_000_000);
+        assert_eq!(tai_deadline - tai, 5_000_000);
+        assert!(matches!(
+            super::buflo_kernel_incoming_retry_step(tai + 9_999_999, tai, tai + 10_000_000)
+                .expect("one nanosecond before unchanged deadline"),
+            super::BufloKernelIncomingRetryStep::Open { .. }
+        ));
+        assert!(matches!(
+            super::buflo_kernel_incoming_retry_step(tai + 10_000_000, tai, tai + 10_000_000)
+                .expect("exact unchanged deadline"),
+            super::BufloKernelIncomingRetryStep::Expired
+        ));
+        // No fixture job or physical send is fabricated by this timing check.
+        let legacy_raw = synthetic_buflo_kernel_runtime(phase.clone(), None, Vec::new())
+            .finish(Some("test-only absence of physical execution".into()));
+        assert_eq!(legacy_raw.schema_version, 11);
+        assert!(legacy_raw.preparation_policy.is_none());
+        assert_eq!(legacy_raw.terminal_outcome, "failed");
+        runtime.preparation_reserve = true;
+        runtime.incoming_credit_release_window = Duration::from_micros(10_000);
+        runtime.runtime_contract.prebuild_selection_semantics =
+            super::BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS;
+        let reserve_raw = runtime.finish(Some("test-only absence of physical execution".into()));
+        assert_eq!(reserve_raw.schema_version, 12);
+        assert_eq!(
+            reserve_raw.preparation_policy,
+            Some(super::buflo_kernel_preparation_policy_marker())
+        );
+        assert_eq!(reserve_raw.incoming_credit_release_window_ns, 10_000_000);
+        assert_eq!(reserve_raw.terminal_outcome, "failed");
+    }
+
+    #[test]
+    fn buflo_v12_policy_is_explicit_source_bound_and_preserves_incoming_and_other_modes() {
+        let mut source = variable_primary_document_source();
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME);
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        source["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        source["preparation"]["buflo_kernel_preparation_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::PREPARATION_RESERVE_NAME);
+        assert_terminal_http_error_source(&source, true);
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!(4000),
+            json!("unknown-policy"),
+        ] {
+            let mut changed = source.clone();
+            changed["preparation"]["buflo_kernel_preparation_policy"] = invalid;
+            assert_terminal_http_error_source(&changed, false);
+        }
+        let mut wrong_incoming = source.clone();
+        wrong_incoming["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_NAME);
+        assert_terminal_http_error_source(&wrong_incoming, false);
+        let mut wrong_application = source.clone();
+        wrong_application["preparation"]["application_response_policy"] = json!("http-2xx-only-v1");
+        assert_terminal_http_error_source(&wrong_application, false);
+        let mut wrong_primary = source.clone();
+        wrong_primary["preparation"]["primary_document_identity_policy"] =
+            json!("exact-response-body-v1");
+        assert_terminal_http_error_source(&wrong_primary, false);
+        let mut spec = buflo_incoming_credit_release_policy_spec_for(
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME,
+        );
+        let output = trace_output_dir("buflo-v12-explicit-preparation-source");
+        let path = output.join("prepared.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&source).expect("serialize explicit Source"),
+        )
+        .expect("write explicit Source");
+        spec.application_workload_source = Some(
+            super::load_application_workload_source(&path)
+                .expect("authenticate actual preparation Source"),
+        );
+        let policy = super::bound_buflo_incoming_credit_release_policy(&spec)
+            .expect("bound opted-in preparation policy");
+        assert!(policy.preparation_reserve());
+        assert!(policy.acknowledged_start());
+        assert_eq!(policy.incoming_window(), Duration::from_micros(10_000));
+        assert_eq!(
+            policy.name(),
+            Some(super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME)
+        );
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["buflo_kernel_preparation_policy"],
+            super::buflo_kernel_preparation_policy_marker()
+        );
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"]["policy"],
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME
+        );
+        let mut legacy_source = source.clone();
+        legacy_source["preparation"]
+            .as_object_mut()
+            .expect("preparation")
+            .remove("buflo_kernel_preparation_policy");
+        let legacy_path = output.join("prepared-without-reserve.json");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&legacy_source).expect("serialize legacy Source"),
+        )
+        .expect("write legacy Source");
+        spec.application_workload_source = Some(
+            super::load_application_workload_source(&legacy_path)
+                .expect("absence preserves the existing ACK-start policy"),
+        );
+        assert_eq!(
+            super::bound_buflo_incoming_credit_release_policy(&spec)
+                .expect("legacy incoming policy remains valid"),
+            super::BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStart,
+        );
+        assert!(super::buflo_kernel_preparation_policy_receipt(&spec).is_none());
+        spec.application_workload_source = Some(
+            super::load_application_workload_source(&path).expect("reopen the unchanged Source"),
+        );
+        spec.config.defense = DefenseConfig::None;
+        assert_eq!(
+            super::bound_buflo_incoming_credit_release_policy(&spec)
+                .expect("other mode stays legacy"),
+            super::BufloIncomingCreditReleasePolicy::LegacyControlInterval
+        );
+        assert!(super::buflo_kernel_preparation_policy_receipt(&spec).is_none());
+        fs::remove_dir_all(output).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn front_v4_buflo_v12_shared_preparation_keeps_mode_specific_authority() {
+        // Source hashing must use the certificate fixture, because NSS initialization is global.
+        test_fixture::fixture_init();
+        let mut source = variable_primary_document_source();
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        source["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME);
+        source["preparation"]["buflo_kernel_preparation_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::PREPARATION_RESERVE_NAME);
+        source["preparation"]["front_capture_policy"] =
+            json!(super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME);
+        let output = trace_output_dir("front-v4-buflo-v12-shared-preparation");
+        let path = output.join("prepared.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&source).expect("serialize shared preparation"),
+        )
+        .expect("write exact shared Source");
+        let bound = super::load_application_workload_source(&path)
+            .expect("both prospective policies must parse under one complete application Source");
+        let mut buflo = buflo_incoming_credit_release_policy_spec_for(
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME,
+        );
+        buflo.application_workload_source = Some(bound.clone());
+        assert!(super::buflo_kernel_preparation_policy_receipt(&buflo).is_some());
+        assert!(!super::front_v4_preparation_reserve_enabled(&buflo));
+        assert!(super::front_capture_policy_receipt(&buflo).is_none());
+        let mut front = front_capture_policy_spec_for(
+            super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+        );
+        front.application_workload_source = Some(bound);
+        assert!(super::front_v4_preparation_reserve_enabled(&front));
+        assert!(super::front_capture_policy_receipt(&front).is_some());
+        assert!(super::buflo_kernel_preparation_policy_receipt(&front).is_none());
+        assert_eq!(
+            super::bound_buflo_incoming_credit_release_policy(&front)
+                .expect("FRONT never obtains BuFLO kernel authority"),
+            super::BufloIncomingCreditReleasePolicy::LegacyControlInterval,
+        );
+        front.config.defense = DefenseConfig::None;
+        assert!(!super::front_v4_preparation_reserve_enabled(&front));
+        assert!(super::front_capture_policy_receipt(&front).is_none());
+        assert!(super::buflo_kernel_preparation_policy_receipt(&front).is_none());
+        fs::remove_dir_all(output).expect("fixture cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_v12_recorded_sample_gap_is_admitted_only_under_the_prospective_cutoff() {
+        const RELEASE: u64 = 1_791_102_694_241_617_526;
+        let identity = super::BufloKernelProtectedSelectionIdentity {
+            slot: 938,
+            tick: 469,
+            tick_zero: false,
+            admission_tai_ns: RELEASE - 10_000_000,
+            selection_tai_ns: RELEASE - 5_000_000,
+            release_tai_ns: RELEASE,
+            preparation_deadline_tai_ns: Some(RELEASE + 4_000_000),
+        };
+        let samples = [
+            RELEASE - 9_751_545,
+            RELEASE - 5_097_489,
+            RELEASE + 1_417_690,
+        ];
+        let mut historical = identity;
+        historical.preparation_deadline_tai_ns = None;
+        let mut old_samples = VecDeque::from(samples);
+        let super::BufloKernelProtectedSelectionStep::Failed { entry: old, .. } =
+            super::buflo_kernel_protected_selection_wait_with_clock(&historical, || {
+                Ok(old_samples
+                    .pop_front()
+                    .expect("historical CLOCK_TAI sample"))
+            })
+        else {
+            panic!("historical before-release contract must reject this recorded gap");
+        };
+        assert_eq!(
+            old.failure.as_ref().expect("historical failure").kind,
+            "selection-expired"
+        );
+        assert_eq!(old.max_sample_gap_ns, 6_515_179);
+        let mut new_samples = VecDeque::from(samples);
+        let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+            super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                Ok(new_samples
+                    .pop_front()
+                    .expect("prospective CLOCK_TAI sample"))
+            })
+        else {
+            panic!("V12 recorded gap is before its preparation deadline");
+        };
+        assert_eq!(entry.schema_version, 2);
+        assert_eq!(entry.completed_tai_ns, Some(RELEASE + 1_417_690));
+        assert_eq!(
+            entry.clock_read_attempts, 3,
+            "scripted samples are recorded exactly"
+        );
+        assert_eq!(entry.max_sample_gap_ns, 6_515_179);
+        assert_eq!(entry.wait_duration_ns, 11_169_235);
+        super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+            Ok(RELEASE + 1_417_691)
+        })
+        .expect("fresh dispatch confirmation remains before the prospective cutoff");
+        assert_eq!(entry.clock_read_attempts, 4);
+        assert_eq!(entry.dispatch_confirmed_tai_ns, Some(RELEASE + 1_417_691));
+        assert!(entry.failure.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_v12_half_open_preparation_cutoffs_keep_fresh_clock_and_tick_zero_guards() {
+        for (slot, tick_zero) in [(0, true), (2, false)] {
+            let identity = buflo_v12_selection_identity(slot, tick_zero);
+            let cutoff = identity
+                .preparation_deadline_tai_ns
+                .expect("explicit cutoff");
+            for offset in [0, 1] {
+                let super::BufloKernelProtectedSelectionStep::Failed { entry, .. } =
+                    super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                        Ok(cutoff + offset)
+                    })
+                else {
+                    panic!("half-open preparation cutoff must reject equality or later");
+                };
+                let failure = entry.failure.expect("typed failure");
+                assert_eq!(failure.schema_version, 2);
+                assert_eq!(failure.preparation_deadline_tai_ns, Some(cutoff));
+                assert_eq!(failure.kind, "selection-expired");
+                assert!(entry.completed_tai_ns.is_none());
+                assert!(entry.dispatch_confirmed_tai_ns.is_none());
+            }
+            let super::BufloKernelProtectedSelectionStep::Ready(mut timely) =
+                super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                    Ok(cutoff - 1)
+                })
+            else {
+                panic!("cutoff minus one is eligible");
+            };
+            super::buflo_kernel_confirm_protected_selection_with_clock(&mut timely, || {
+                Ok(cutoff - 1)
+            })
+            .expect("fresh CLOCK_TAI confirmation minus one");
+            for (sample, kind) in [
+                (Some(cutoff), "selection-expired"),
+                (Some(cutoff - 3), "clock-regression"),
+                (None, "clock-read-error"),
+            ] {
+                let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+                    super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                        Ok(cutoff - 2)
+                    })
+                else {
+                    panic!("initial sample remains eligible");
+                };
+                super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                    sample.ok_or_else(|| {
+                        Error::DefenseExecution("scripted fresh clock failure".into())
+                    })
+                })
+                .expect_err("a stale readiness sample cannot authorize dispatch");
+                assert_eq!(entry.failure.as_ref().expect("fresh failure").kind, kind);
+                assert_eq!(entry.completed_tai_ns, Some(cutoff - 2));
+                assert_eq!(entry.clock_read_attempts, 2);
+                assert!(entry.dispatch_confirmed_tai_ns.is_none());
+            }
+            if tick_zero {
+                assert_eq!(cutoff, identity.release_tai_ns);
+            } else {
+                assert_eq!(cutoff, identity.release_tai_ns + 4_000_000);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_v12_wait_receipt_binds_exact_cutoffs_epoch_and_unchanged_physical_jobs() {
+        let zero = buflo_v12_selection_identity(0, true);
+        let rolling = buflo_v12_selection_identity(2, false);
+        let mut entries = Vec::new();
+        for identity in [zero, rolling] {
+            let completed = if identity.tick_zero {
+                identity.selection_tai_ns
+            } else {
+                identity.release_tai_ns + 1_417_690
+            };
+            let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+                super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                    Ok(completed)
+                })
+            else {
+                panic!("eligible selection");
+            };
+            if identity.tick_zero {
+                super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                    Ok(completed + 1)
+                })
+                .expect("tick-zero staging");
+            }
+            super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                Ok(completed + 2)
+            })
+            .expect("fresh dispatch");
+            entries.push(entry);
+        }
+        let (receipt, valid) =
+            super::build_buflo_kernel_protected_selection_wait_receipt_with_policy(
+                entries.clone(),
+                Some(zero.release_tai_ns),
+                true,
+            );
+        assert!(valid);
+        assert_eq!(receipt.schema_version, 3);
+        assert_eq!(
+            receipt.semantics,
+            super::BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS
+        );
+        let jobs = [
+            synthetic_protected_selection_job(0, zero.release_tai_ns),
+            synthetic_protected_selection_job(1, rolling.release_tai_ns),
+        ];
+        assert!(super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt, &jobs, true, false
+        ));
+        assert!(
+            !super::build_buflo_kernel_protected_selection_wait_receipt(
+                entries.clone(),
+                Some(zero.release_tai_ns)
+            )
+            .1,
+            "schema11 cannot authorize new cutoff metadata"
+        );
+        for delta in [-1_i64, 1] {
+            let mut changed = entries.clone();
+            changed[1].preparation_deadline_tai_ns = Some(
+                (i128::from(rolling.release_tai_ns) + 4_000_000 + i128::from(delta))
+                    .try_into()
+                    .expect("small cutoff"),
+            );
+            assert!(
+                !super::build_buflo_kernel_protected_selection_wait_receipt_with_policy(
+                    changed,
+                    Some(zero.release_tai_ns),
+                    true
+                )
+                .1
+            );
+        }
+        let mut moved_deadline = jobs.clone();
+        moved_deadline[1].deadline_tai_ns += 1;
+        assert!(!super::buflo_kernel_protected_selection_job_binding_valid(
+            &receipt,
+            &moved_deadline,
+            true,
+            false
+        ));
+        let mut runtime = synthetic_buflo_kernel_runtime(
+            synthetic_buflo_clock_phase(10_000, 0),
+            None,
+            Vec::new(),
+        );
+        runtime.preparation_reserve = true;
+        runtime.incoming_credit_release_window = Duration::from_micros(10_000);
+        runtime.runtime_contract.prebuild_selection_semantics =
+            super::BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS;
+        let raw = runtime.finish(Some("test-only pre-arm failure".into()));
+        assert_eq!(raw.schema_version, 12);
+        assert_eq!(
+            raw.preparation_policy,
+            Some(super::buflo_kernel_preparation_policy_marker())
+        );
+        assert_eq!(raw.protected_selection_wait.schema_version, 3);
+        assert_eq!(raw.incoming_credit_release_window_ns, 10_000_000);
+        assert_eq!(
+            raw.terminal_outcome, "failed",
+            "a marker cannot invent physical success"
+        );
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics
+            .attach_buflo_kernel_tx(&raw)
+            .expect("retain raw failed V12 receipt");
+        assert_eq!(metrics.schema_version, 21);
+        assert!(
+            metrics
+                .semantics
+                .contains(super::BUFLO_KERNEL_RESERVE_RUNNER_RETENTION_SEMANTICS)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_v12_retains_five_ms_physical_guard_and_exact_helper_contract() {
+        const RELEASE: u64 = 1_791_064_435_310_641_760;
+        let phase = synthetic_buflo_clock_phase_with_offsets(0, 0, RELEASE + 11_000_000, 10, 10);
+        let mut job = synthetic_buflo_kernel_raw_job(Vec::new());
+        job.release_tai_ns = RELEASE;
+        job.release_monotonic_ns = RELEASE;
+        job.deadline_tai_ns = RELEASE + 5_000_000;
+        job.deadline_monotonic_ns = RELEASE + 5_000_000;
+        let mut runtime = synthetic_buflo_kernel_runtime(phase.clone(), None, vec![job]);
+        runtime.preparation_reserve = true;
+        let start = Instant::now();
+        runtime.epoch = Some(super::BufloKernelEpoch {
+            start,
+            start_monotonic_ns: RELEASE,
+            start_tai_ns: RELEASE,
+            instant_anchor: super::BufloKernelInstantAnchor {
+                instant: start,
+                monotonic_ns: RELEASE,
+                receipt: synthetic_buflo_instant_alignment_for(&phase),
+            },
+            tick_zero_application_ready: true,
+            tick_zero_staged: true,
+        });
+        for offset in [1_417_690, 4_000_000, 4_999_999, 5_000_000, 5_000_001] {
+            assert_eq!(
+                runtime
+                    .check_physical_window(0, false, RELEASE + offset, &phase, (0, 0))
+                    .is_ok(),
+                offset < 5_000_000
+            );
+        }
+        let (mut helper, qdisc, endpoints) = synthetic_buflo_helper_contracts();
+        helper.prebuild_selection_semantics =
+            super::BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS;
+        assert!(super::buflo_kernel_helper_evidence_complete_with_policy(
+            &helper,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+            true
+        ));
+        assert!(!super::buflo_kernel_helper_evidence_complete(
+            &helper,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1
+        ));
+        helper.prebuild_selection_semantics = super::BUFLO_KERNEL_PREBUILD_SELECTION_SEMANTICS;
+        assert!(!super::buflo_kernel_helper_evidence_complete_with_policy(
+            &helper,
+            &qdisc,
+            &endpoints,
+            1,
+            Some(0),
+            1,
+            true
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn buflo_v12_late_real_application_composition_is_preserved_without_socket_credit() {
+        for lateness_us in [1_418, 4_999] {
+            let output = trace_output_dir(&format!("buflo-v12-pending-stream-{lateness_us}"));
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let packet =
+                Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("target");
+            let mut controller = rolling_abort_controller(packet);
+            let preview = controller
+                .drain_actions()
+                .find(|action| matches!(action, QcsdAction::PrearmPacket { .. }))
+                .expect("preview");
+            let mut endpoints = vec![connected_runner_endpoint(&output, started, &clock)];
+            drop(endpoints[0].client.qcsd_timestamped_observations());
+            stage_unshaped_runner_request_for_output(&mut endpoints[0], started, 4_433);
+            endpoints[0].client.qcsd_enable_send_shaping(true);
+            assert!(endpoints[0].client.qcsd_has_pending_stream_send());
+            let mut traces = TraceFiles::new(&output, started).expect("traces");
+            apply_action_batch(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                started,
+                Duration::ZERO,
+                vec![preview],
+            )
+            .expect("prearm the actual pending request");
+            let release = started + packet.timestamp();
+            controller
+                .reconcile_due_rolling(packet.timestamp())
+                .expect("commit nominal target");
+            controller.flush_defense_observations();
+            apply_queued_actions(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                release,
+                packet.timestamp(),
+            )
+            .expect("commit the same target");
+            let defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "fixture-1200-20000.json".into(),
+            });
+            let guard = next_buflo_exact_release_guard(&defense, &controller, &endpoints)
+                .expect("guard")
+                .expect("same pending target");
+            let prepared = match super::prepare_output_once_with_evidence(
+                &mut endpoints[0],
+                release + Duration::from_micros(lateness_us),
+            )
+            .await
+            .unwrap_or_else(|failure| panic!("actual preparation failed: {}", failure.into_error()))
+            {
+                PreparedOutputDrive::Datagram(prepared) => prepared,
+                PreparedOutputDrive::Callback(_) | PreparedOutputDrive::None => {
+                    panic!("exact application datagram required")
+                }
+            };
+            assert_eq!(prepared.batch.num_datagrams(), 1);
+            assert_eq!(prepared.batch.data().len(), 1_200);
+            assert!(
+                prepared.attributed_datagrams[0]
+                    .composition
+                    .application_stream_bytes
+                    > 0,
+                "actual queued request bytes must remain application STREAM bytes"
+            );
+            assert_eq!(
+                prepared.attributed_datagrams[0].composition.lateness_us,
+                lateness_us
+            );
+            super::validate_buflo_kernel_main_with_policy(&guard, &prepared, true)
+                .expect("V12 retains truthful within-window composition");
+            let old_error = super::validate_buflo_kernel_main(&guard, &prepared)
+                .expect_err("old11 still rejects nonzero construction lateness");
+            let failure = super::PreparedOutputFailure::from_prepared(
+                "main-validation",
+                old_error,
+                &prepared,
+            );
+            assert_eq!(failure.receipt.batch_datagram_lengths, vec![1_200]);
+            assert_eq!(failure.receipt.built_composition_count, 1);
+            assert!(
+                controller
+                    .pending_slots()
+                    .iter()
+                    .any(|(slot, _)| *slot == guard.slot)
+            );
+            assert!(
+                !traces.is_slot_terminal(guard.slot),
+                "preparation never invents a physical handoff"
+            );
+            let mut expired = prepared;
+            expired.attributed_datagrams[0].composition.lateness_us = 5_000;
+            assert!(super::validate_buflo_kernel_main_with_policy(&guard, &expired, true).is_err());
+            drop(traces);
+            assert_eq!(
+                fs::read_to_string(output.join("packets.csv"))
+                    .expect("packet trace")
+                    .lines()
+                    .count(),
+                1
+            );
+            drop(endpoints);
+            fs::remove_dir_all(output).expect("fixture cleanup");
         }
     }
 
@@ -48442,6 +50456,7 @@ mod tests {
             jobs,
             next_item_id,
             incoming_credit_release_window: Duration::from_micros(5_000),
+            preparation_reserve: false,
         }
     }
 
@@ -48683,6 +50698,7 @@ mod tests {
             max_events: 10_000,
             implementation_scope: neqo_csdef::QcsdImplementationScope::ClientOnlyQuic,
             paper_equivalent: false,
+            duration_budget_policy: None,
         };
         for ack_start in [false, true] {
             let mut controller = QcsdController::with_defense(

@@ -112,6 +112,106 @@ streams. Scheduled 1-RTT output uses application frames before chaff, then
 `PING` and `PADDING` to reach the exact UDP-payload target. Packet protection,
 path validation, congestion control, pacing, mandatory frames, and path MTU
 remain authoritative; unsafe or late slots receive one explicit miss reason.
+
+### Prospective BuFLO V12 preparation reserve
+
+The historical BuFLO kernel schema 11 remains the default. A new, explicit
+prepared Source flag opts in to schema 12:
+
+```json
+"buflo_kernel_preparation_policy": "rapid-v6-buflo-kernel-preparation-cutoff-release-plus-4000us-reserve-1000us-v1"
+```
+
+This flag requires the existing `rapid-v5-half-period-10000us-ack-start-v2`
+incoming policy, approved origins, variable primary document and completed
+terminal HTTP response policies, fixed 1200-byte/20-ms BuFLO settings, and the
+actual ETF scheduler contract. It has no effect on another defense. It is a
+prospective client adaptation and makes no paper equivalence or scientific
+credit claim by itself.
+
+For a rolling outgoing cell, selection and a fresh CLOCK_TAI dispatch
+confirmation must finish strictly before release + 4 ms. This leaves a 1 ms
+reserve before the original, unchanged release + 5 ms physical deadline.
+Tick zero still requires selection, staging and dispatch before release.
+Nominal admission remains release − 10 ms and nominal selection release − 5 ms.
+Every preparation deadline is recorded in schema-2 wait/failure entries under
+a schema-3 protected-wait receipt; raw kernel schema 12 and outer runner schema
+21 carry the exact opt-in marker and their distinct semantics.
+
+This addresses a measured sample gap at slot 938: the next CLOCK_TAI reading
+was 1.417690 ms after release, with 3.582310 ms left before the original
+physical deadline. The gap does not establish whether descheduling or a clock
+step caused it. A schema-11 attempt still fails under its original rules and
+is never relabelled as successful.
+
+Actual construction lateness is retained and must be below 5000 us for this
+opt-in path. Application STREAM data, retransmissions, control bytes, exact
+slot identity and full wire accounting retain their existing ownership. A
+prepared application datagram is never converted into a padding omission.
+Preparation alone gives no successful-send credit. Any preparation, enqueue,
+clock, helper, kernel TX or post-veth failure stays an explicit failed attempt.
+There is no omission allowance or catch-up send.
+
+The enqueue cutoff and exact physical TX/post-veth window remain half-open at
+release + 5 ms. SCM_TXTIME remains release + 10 ms, ETF delta remains 10 ms,
+and deadline mode/offload remain disabled. Incoming credit keeps its existing
+10 ms ACK-start contract. Generic EDF and other defenses are unchanged.
+
+A delayed Python UDP/ETF probe demonstrated enqueue at +1.571969 ms, kernel TX
+at at most +1.679667 ms and post-veth observation at at most +1.699866 ms, with
+matching 1200 bytes and no TXTIME errors. That proves the measured UDP/kernel
+path only. Native compilation, focused QUIC regressions, a fresh Source-bound
+runtime and the original failing-seed full-graph repeat are still required
+before this policy can authorize capture.
+
+### Prospective fixed BuFLO 200-second event budget
+
+Larger complete resource graphs need more than the historical 6000 incoming
+cells (7,200,000 scheduled receive bytes shared across all origins). A separate
+explicit parameter flag permits one fixed larger budget:
+
+```json
+{
+  "schema_version": 1,
+  "interval_us": 20000,
+  "minimum_duration_us": 10000000,
+  "packet_size": 1200,
+  "max_events": 10000,
+  "implementation_scope": "client_only_quic",
+  "paper_equivalent": false,
+  "duration_budget_policy": "rapid-v6-fixed-200s-duration-budget-v1"
+}
+```
+
+The public `BufloDurationBudgetPolicy::RapidV6Fixed200Seconds` accepts only that
+fixed combination. Omitting the optional parameter retains the existing
+120-second validation bound and exact historical serialized key set. Unknown
+policies, arbitrary duration values, changed fixed settings, and overflowing
+duration arithmetic are rejected. Recorded `defense_parameters.buflo_duration_budget`
+retains the actual explicit policy; it is never inferred from a timeout.
+
+The unchanged 20-ms cadence permits at most 10000 cells in each direction over
+a 200-second budget. It offers 12,000,000 incoming scheduled receive bytes
+across the whole graph; origins do not multiply that capacity. The application
+may finish earlier after the existing minimum duration and terminal conditions.
+Exhausting the event guard before normal completion remains a typed failure.
+Cell size, the kernel V12 marker/raw/outer schemas, release − 10-ms admission,
+release − 5-ms selection, release + 4-ms preparation cutoff, release + 5-ms
+physical deadline, 10-ms incoming window, ETF delta/SCM_TXTIME, clock checks,
+application bytes, other defenses and omission rules are unchanged.
+
+Matching prospective Lab settings must apply a 240-second native timeout and
+300-second recorder duration only to BuFLO, bind this fresh traffic receipt,
+and verify a fresh per-mode canary. For a future common 50-site cohort, use one
+prospectively declared total baseline body threshold of at most 10,000,000
+bytes per complete graph. The remaining scheduled capacity is conservative
+headroom for framing, chaff and ACK-start delay; it does not guarantee a
+successful defense canary or stable later responses. The 16-MiB per-response
+cap does not imply this total graph-size condition. Existing admissions,
+complete graphs and failed attempts must remain intact and must not be
+retroactively marked rejected by the future threshold. Authoring and HOST
+fixtures give no compilation, physical-send or formal-trace credit.
+
 For application streams, the runner seeds Figure-7's known-capacity floor from
 the workload resource's effective length, capped by the run's response limit.
 This keeps shaped receive credit available to a reviewed response even when the
@@ -161,6 +261,69 @@ direction to the published modulo completion rule. Their generators reproduce
 the published algorithms and control semantics; deterministic equality is
 defined against this implementation's pinned generator, not the historical
 `rand` crate's seed-to-sample mapping.
+
+### Prospective FRONT V4 preparation reserve
+
+The source-bound policy
+`rapid-v5-front-bounded-outgoing-padding-omission-10pct-window-10000us-reserve-1000us-v4`
+addresses a local construction-to-send race. In a four-seed diagnostic of V3,
+two attempts aborted before the socket call, 3,765 ns and 8,419 ns after their
+padding deadlines. Two other attempts completed all 260 resources across four
+origins. Those failed attempts remain failed V3 evidence. Their existing
+traces do not retain the rejected prepared datagram, so its exact coalesced
+composition cannot be inferred from nearby packets.
+
+V3 decides eligibility before building and encrypting a packet, then checks
+the clock again before the socket call. Starting construction immediately
+before the deadline can consume the remaining time. V4 reserves a full
+millisecond before that unchanged physical deadline:
+
+| Boundary, relative to the padding target | V4 behavior |
+| --- | --- |
+| Before release | Padding target remains ineligible. |
+| Release through less than 9 ms | Padding construction is eligible. |
+| At or after 9 ms | Unbuilt padding target expires; ordinary application and control work remains eligible. |
+| Before 10 ms | An already built target may reach the socket. |
+| At or after 10 ms | Physical target handoff remains a hard failure. |
+
+The adapter's construction deadline is exactly 1,000 microseconds earlier than
+the original socket deadline. Existing upward release and downward deadline
+rounding is retained; actual relative windows can be one microsecond shorter.
+The output operation takes a fresh monotonic sample immediately before
+construction so prior controller, trace or HTTP work cannot leave it using a
+stale eligibility time. A target first registered during its reserved tail is
+recorded as an unbuilt omission without reaching transport.
+
+Expiration occurs before transport selects or encrypts frames. It does not
+cancel, consume or discard application STREAM, retransmission, reviewed-chaff
+STREAM or mandatory control work. That work can produce an ordinary datagram
+in the same output operation. FRONT targets remain 1,200-byte chaff-only
+targets; the original outgoing and incoming generators are unchanged.
+
+The run records a schema-4 policy marker with the 9,000-microsecond
+construction window, the 1,000-microsecond reserve and the original
+10,000-microsecond physical window. Each target registration also records
+`front_padding_preparation_window`: the shortened transport action and both
+absolute deadlines. `DeadlineExpired` refers to the recorded construction
+deadline for an unbuilt V4 outgoing target. The existing 10% bound on
+outgoing pure-padding omissions remains; V4 does not authorize omissions of
+realized application or control bytes, or waive incoming completion.
+
+The reserve is not a real-time guarantee. If an operation still exceeds its
+physical deadline, it fails. A pre-handoff failure records
+`front_prepared_output_failure` with the built datagram hash, exact byte
+composition, preparation and observation timestamps, target identity and
+socket deadline. It does not create a physical packet or satisfied-slot
+receipt. A syscall that succeeds too late retains its actual physical packet
+and slot evidence before the run fails. Neither case can become an accepted
+pure-padding omission.
+
+V4 requires its exact marker in the authenticated prepared workload and the
+unchanged research1200 FRONT parameters. It is inert for other modes and does
+not change V1–V3 behavior, generic deadline/clock guards, incoming credit,
+congestion decisions or the complete application resource graph. Lab-side
+policy validation and a prospective study amendment must recognize V4 before
+new formal traces can use it; old policy markers and receipts are preserved.
 
 Traffic Morphing pads each natural client-egress 1-RTT datagram in place after
 normal frame selection. Its workload-bound padding-only matrix never selects a
