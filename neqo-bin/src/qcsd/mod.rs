@@ -244,6 +244,9 @@ enum SocketHandoffPolicy {
     /// Candidate fidelity runs must fail closed if the OS did not accept the
     /// defense datagram; otherwise the slot could be falsely receipted.
     CandidateFidelityStrict,
+    /// Only source-bound FRONT V3 scheduled padding uses immediate successful
+    /// socket timestamps. Unshaped application output retains legacy behavior.
+    FrontV3ScheduledPadding,
 }
 
 impl SocketHandoffPolicy {
@@ -262,9 +265,27 @@ impl SocketHandoffPolicy {
         }
     }
 
+    fn for_run(spec: &RunSpec) -> Self {
+        if front_v3_padding_window_enabled(spec) {
+            Self::FrontV3ScheduledPadding
+        } else {
+            Self::for_defense(&spec.config.defense)
+        }
+    }
+
+    const fn for_scheduled_targets(self, target_bearing: bool) -> Self {
+        match self {
+            Self::FrontV3ScheduledPadding if target_bearing => Self::CandidateFidelityStrict,
+            Self::FrontV3ScheduledPadding => Self::HistoricalBestEffort,
+            policy => policy,
+        }
+    }
+
     fn send(self, socket: &Socket, batch: &datagram::Batch) -> io::Result<Option<Instant>> {
         match self {
-            Self::HistoricalBestEffort => socket.send(batch).map(|()| None),
+            Self::HistoricalBestEffort | Self::FrontV3ScheduledPadding => {
+                socket.send(batch).map(|()| None)
+            }
             Self::CandidateFidelityStrict => socket.send_qcsd_timestamped(batch, now).map(Some),
         }
     }
@@ -1545,6 +1566,7 @@ enum FrontCapturePolicy {
     Legacy,
     RapidV5BoundedCongestionOmission,
     RapidV5BoundedPaddingOmission,
+    RapidV5BoundedPaddingWindow,
 }
 
 impl FrontCapturePolicy {
@@ -1552,6 +1574,8 @@ impl FrontCapturePolicy {
         "rapid-v5-front-bounded-outgoing-congestion-omission-1pct-v1";
     const RAPID_V5_PADDING_NAME: &'static str =
         "rapid-v5-front-bounded-outgoing-padding-omission-1pct-v2";
+    const RAPID_V5_PADDING_WINDOW_NAME: &'static str =
+        "rapid-v5-front-bounded-outgoing-padding-omission-10pct-window-10000us-v3";
 
     fn from_preparation(
         preparation: &serde_json::Value,
@@ -1562,7 +1586,9 @@ impl FrontCapturePolicy {
         match preparation.get("front_capture_policy") {
             None => Ok(Self::Legacy),
             Some(serde_json::Value::String(policy))
-                if policy == Self::RAPID_V5_NAME || policy == Self::RAPID_V5_PADDING_NAME =>
+                if policy == Self::RAPID_V5_NAME
+                    || policy == Self::RAPID_V5_PADDING_NAME
+                    || policy == Self::RAPID_V5_PADDING_WINDOW_NAME =>
             {
                 if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
                     || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
@@ -1577,8 +1603,10 @@ impl FrontCapturePolicy {
                 }
                 Ok(if policy == Self::RAPID_V5_NAME {
                     Self::RapidV5BoundedCongestionOmission
-                } else {
+                } else if policy == Self::RAPID_V5_PADDING_NAME {
                     Self::RapidV5BoundedPaddingOmission
+                } else {
+                    Self::RapidV5BoundedPaddingWindow
                 })
             }
             Some(_) => Err(Error::Argument(
@@ -1882,9 +1910,12 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
         "paper_equivalent": false,
         "scientific_credit": false,
     });
-    if spec.application_workload_source.as_ref()?.8
-        == FrontCapturePolicy::RapidV5BoundedPaddingOmission
-    {
+    let policy = spec.application_workload_source.as_ref()?.8;
+    if matches!(
+        policy,
+        FrontCapturePolicy::RapidV5BoundedPaddingOmission
+            | FrontCapturePolicy::RapidV5BoundedPaddingWindow
+    ) {
         let fields = marker.as_object_mut()?;
         fields.insert("schema_version".into(), json!(2));
         fields.insert(
@@ -1897,8 +1928,26 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
             json!(["CongestionLimited", "DeadlineExpired"]),
         );
         fields.insert("require_pure_padding".into(), json!(true));
+        if policy == FrontCapturePolicy::RapidV5BoundedPaddingWindow {
+            fields.insert("schema_version".into(), json!(3));
+            fields.insert(
+                "policy".into(),
+                json!(FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME),
+            );
+            fields.insert("outgoing_omission_ratio_denominator".into(), json!(10));
+            fields.insert("outgoing_release_window_us".into(), json!(10_000));
+            fields.insert("historical_outgoing_release_window_us".into(), json!(5_000));
+        }
     }
     Some(marker)
+}
+
+fn front_v3_padding_window_enabled(spec: &RunSpec) -> bool {
+    matches!(spec.config.defense, DefenseConfig::Front(_))
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| source.8 == FrontCapturePolicy::RapidV5BoundedPaddingWindow)
 }
 
 fn terminal_primary_partial_cell_size(spec: &RunSpec) -> Option<u16> {
@@ -14223,6 +14272,9 @@ async fn execute_run_inner(
     if terminal_primary_partial_cell_policy_receipt(spec).is_some() {
         controller.enable_terminal_primary_partial_cell_policy()?;
     }
+    if front_v3_padding_window_enabled(spec) {
+        controller.enable_front_padding_outgoing_window()?;
+    }
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
     let scheduler_initial = process_scheduler.clone();
     let etf_scheduler_requested = scheduler_initial
@@ -15502,7 +15554,7 @@ fn create_endpoint_inventory(
                 deferred_data_readable: VecDeque::new(),
                 scheduled_outgoing: VecDeque::new(),
                 prearmed_outgoing: VecDeque::new(),
-                socket_handoff_policy: SocketHandoffPolicy::for_defense(&spec.config.defense),
+                socket_handoff_policy: SocketHandoffPolicy::for_run(spec),
                 traffic_morphing_activation: if matches!(
                     &spec.config.defense,
                     DefenseConfig::TrafficMorphing(_)
@@ -23508,7 +23560,12 @@ async fn process_output_once_with_clock(
         let force_socket_handoff_success = endpoint.test_force_socket_handoff_success;
         #[cfg(test)]
         let strict_socket_handoff_error = endpoint.test_strict_socket_handoff_error.take();
-        let socket_handoff_policy = endpoint.socket_handoff_policy;
+        let socket_handoff_policy = endpoint.socket_handoff_policy.for_scheduled_targets(
+            prepared
+                .attributed_datagrams
+                .iter()
+                .any(|attribution| attribution.satisfied.is_some()),
+        );
         match attempt_socket_handoff_timestamped(
             &target_deadlines,
             hard_unshaped_handoff_interrupt(
@@ -36724,8 +36781,10 @@ mod tests {
             bound.8,
             if policy == super::FrontCapturePolicy::RAPID_V5_NAME {
                 super::FrontCapturePolicy::RapidV5BoundedCongestionOmission
-            } else {
+            } else if policy == super::FrontCapturePolicy::RAPID_V5_PADDING_NAME {
                 super::FrontCapturePolicy::RapidV5BoundedPaddingOmission
+            } else {
+                super::FrontCapturePolicy::RapidV5BoundedPaddingWindow
             }
         );
         let mut spec =
@@ -37034,6 +37093,173 @@ mod tests {
                 "changed {change}"
             );
             assert!(super::front_capture_policy_receipt(&spec).is_none());
+        }
+    }
+
+    #[test]
+    fn front_v3_marker_is_exact_and_legacy_modes_remain_inert() {
+        let mut spec =
+            front_capture_policy_spec_for(super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME);
+        super::validate_front_capture_policy(&spec).expect("source-bound V3");
+        assert_eq!(
+            super::front_capture_policy_receipt(&spec),
+            Some(json!({
+                "schema_version": 3, "source": "bound-preparation-v1",
+                "policy": super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME,
+                "outgoing_omission_reasons": ["CongestionLimited", "DeadlineExpired"],
+                "require_pure_padding": true,
+                "outgoing_omission_ratio_numerator": 1,
+                "outgoing_omission_ratio_denominator": 10,
+                "rounding": "exact-cross-multiplication-no-minimum-one",
+                "packet_size": 1_200, "n_client_packets": 900, "n_server_packets": 1_200,
+                "outgoing_release_window_us": 10_000,
+                "historical_outgoing_release_window_us": 5_000,
+                "paper_equivalent": false, "scientific_credit": false,
+            }))
+        );
+        for policy in [
+            super::FrontCapturePolicy::RAPID_V5_NAME,
+            super::FrontCapturePolicy::RAPID_V5_PADDING_NAME,
+        ] {
+            let legacy = front_capture_policy_spec_for(policy);
+            assert!(!super::front_v3_padding_window_enabled(&legacy));
+            assert_eq!(
+                SocketHandoffPolicy::for_run(&legacy),
+                SocketHandoffPolicy::HistoricalBestEffort
+            );
+            assert_eq!(
+                super::front_capture_policy_receipt(&legacy).expect("old marker")["outgoing_omission_ratio_denominator"],
+                100
+            );
+        }
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "unused.json".into(),
+            }),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            super::validate_front_capture_policy(&spec).expect("other mode remains inert");
+            assert!(!super::front_v3_padding_window_enabled(&spec));
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+            assert_eq!(
+                SocketHandoffPolicy::for_run(&spec),
+                SocketHandoffPolicy::for_defense(&spec.config.defense)
+            );
+        }
+    }
+
+    #[test]
+    fn front_v3_rejects_unbound_source_and_changed_controller_parameters() {
+        for change in 0..9 {
+            let mut spec = front_capture_policy_spec_for(
+                super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME,
+            );
+            match change {
+                0 => spec.config.control_interval_us = 10_000,
+                1 => spec.config.max_udp_payload_size = 1_500,
+                2 => spec.config.drop_unsatisfied_events = true,
+                3 => {
+                    spec.application_workload_source.as_mut().expect("source").1 = "invalid".into()
+                }
+                4 => {
+                    spec.application_workload_source.as_mut().expect("source").3 =
+                        ApplicationResponsePolicy::default()
+                }
+                5 => {
+                    spec.application_workload_source.as_mut().expect("source").4 =
+                        super::QualifiedChaffOriginPolicy::default()
+                }
+                6 => {
+                    spec.application_workload_source.as_mut().expect("source").5 =
+                        super::PrimaryDocumentIdentityPolicy::default()
+                }
+                7 => {
+                    spec.workload.resources.pop();
+                }
+                _ => {
+                    let DefenseConfig::Front(parameters) = &mut spec.config.defense else {
+                        unreachable!()
+                    };
+                    parameters.packet_size = 1_300;
+                }
+            }
+            assert!(
+                super::validate_front_capture_policy(&spec).is_err(),
+                "change {change}"
+            );
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+        }
+        let source = front_capture_policy_source();
+        let origin = super::QualifiedChaffOriginPolicy::from_preparation(&source["preparation"])
+            .expect("approved origin identity");
+        let prepared = json!({"front_capture_policy": super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME});
+        assert!(
+            super::FrontCapturePolicy::from_preparation(
+                &prepared,
+                ApplicationResponsePolicy::default(),
+                super::PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody,
+                &origin
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn front_v3_actual_target_socket_timestamp_keeps_application_legacy() {
+        let spec =
+            front_capture_policy_spec_for(super::FrontCapturePolicy::RAPID_V5_PADDING_WINDOW_NAME);
+        let policy = SocketHandoffPolicy::for_run(&spec);
+        assert_eq!(policy, SocketHandoffPolicy::FrontV3ScheduledPadding);
+        assert!(!is_candidate_defense(&spec.config.defense));
+        let socket = super::Socket::bind("127.0.0.1:0").expect("actual sender");
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("actual receiver");
+        let batch: super::datagram::Batch = super::datagram::Datagram::new(
+            socket.local_addr().expect("sender address"),
+            receiver.local_addr().expect("receiver address"),
+            neqo_common::Tos::default(),
+            vec![7_u8; 37],
+        )
+        .into();
+        for target_bearing in [false, true] {
+            tokio::time::timeout(Duration::from_secs(1), socket.writable())
+                .await
+                .expect("bounded send readiness")
+                .expect("writable");
+            let selected = policy.for_scheduled_targets(target_bearing);
+            assert_eq!(
+                selected,
+                if target_bearing {
+                    SocketHandoffPolicy::CandidateFidelityStrict
+                } else {
+                    SocketHandoffPolicy::HistoricalBestEffort
+                }
+            );
+            let before = now();
+            let handoff = selected.send(&socket, &batch).expect("actual UDP handoff");
+            let after = now();
+            if target_bearing {
+                let handoff = handoff.expect("immediate successful socket timestamp");
+                assert!(before <= handoff && handoff <= after);
+            } else {
+                assert_eq!(handoff, None);
+            }
+            let mut received = [0_u8; 37];
+            let (length, peer) =
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut received))
+                    .await
+                    .expect("bounded actual receive")
+                    .expect("received UDP packet");
+            assert_eq!(
+                (length, peer, received),
+                (37, socket.local_addr().expect("actual sender"), [7_u8; 37])
+            );
         }
     }
 

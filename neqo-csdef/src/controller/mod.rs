@@ -394,6 +394,7 @@ pub struct QcsdController {
     /// Incoming releases can still complete across real transport callbacks;
     /// slotless parser bootstrap never becomes scheduled ownership afterward.
     tamaraw_rapid_capture_policy: bool,
+    front_padding_outgoing_window: bool,
     terminal_primary_partial_cell_policy: bool,
     terminal_primary_stream: Option<(QcsdEndpointId, QcsdStreamId)>,
     terminal_primary_partial_cell: Option<TerminalPrimaryPartialCellDiagnostics>,
@@ -629,6 +630,7 @@ impl QcsdController {
             buflo_startup_requested_chaff: HashMap::new(),
             buflo_incoming_half_period_window: false,
             tamaraw_rapid_capture_policy: false,
+            front_padding_outgoing_window: false,
             terminal_primary_partial_cell_policy: false,
             terminal_primary_stream: None,
             terminal_primary_partial_cell: None,
@@ -728,6 +730,61 @@ impl QcsdController {
         }
         self.tamaraw_rapid_capture_policy = true;
         Ok(())
+    }
+
+    /// Enable the prospectively source-bound FRONT V3 pure-padding window.
+    ///
+    /// Only scheduled outgoing padding receives a 10 ms half-open allowance;
+    /// control polling, incoming work, and unshaped application output stay
+    /// unchanged. The caller must validate the prepared source policy.
+    ///
+    /// # Errors
+    /// Rejects changed research parameters, another mode, repeated opt-in, or
+    /// any controller whose fixed schedule or live work has already advanced.
+    pub fn enable_front_padding_outgoing_window(&mut self) -> Result<()> {
+        if !matches!(&self.config.defense, DefenseConfig::Front(parameters)
+            if parameters.n_client_packets == 900
+                && parameters.n_server_packets == 1_200
+                && parameters.packet_size == 1_200
+                && parameters.peak_minimum_seconds == 0.1
+                && parameters.peak_maximum_seconds == 2.5)
+            || self.config.control_interval_us != 5_000
+            || self.config.max_udp_payload_size != 1_200
+            || self.config.drop_unsatisfied_events
+            || self.defense.mode() != DefenseMode::ChaffOnly
+            || self.front_padding_outgoing_window
+            || self.fixed_schedule.as_ref().is_none_or(|staging| {
+                staging.outgoing_prearmed
+                    || u64::try_from(staging.events.len()).ok() != Some(self.control.next_slot_id)
+            })
+            || self.control.last_incoming_boundary_us.is_some()
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "FRONT V3 padding window requires an unstarted source-bound research1200 fixed schedule with unchanged5000-us control".into(),
+            ));
+        }
+        self.front_padding_outgoing_window = true;
+        Ok(())
+    }
+
+    fn outgoing_realization_window(&self) -> Duration {
+        if self.tamaraw_rapid_capture_policy || self.front_padding_outgoing_window {
+            Duration::from_micros(10_000)
+        } else {
+            self.config.control_interval()
+        }
+    }
+
+    fn fixed_outgoing_realization_window(&self) -> Duration {
+        if self.front_padding_outgoing_window {
+            Duration::from_micros(10_000)
+        } else {
+            self.config.control_interval()
+        }
     }
 
     fn incoming_requires_explicit_physical_ownership(&self) -> bool {
@@ -4039,6 +4096,7 @@ impl QcsdController {
     }
 
     fn prearm_fixed_outgoing(&mut self, elapsed: Duration) {
+        let realization_window = self.fixed_outgoing_realization_window();
         let Some(staging) = self.fixed_schedule.as_mut() else {
             return;
         };
@@ -4055,10 +4113,7 @@ impl QcsdController {
 
         for event in outgoing {
             self.pending_slots.insert(event.slot, event.packet);
-            let deadline = event
-                .packet
-                .timestamp()
-                .saturating_add(self.config.control_interval());
+            let deadline = event.packet.timestamp().saturating_add(realization_window);
             let not_before_after_us =
                 duration_as_ceil_micros(event.packet.timestamp().saturating_sub(elapsed));
             let deadline_after_us = duration_as_floor_micros(deadline.saturating_sub(elapsed));
@@ -4282,11 +4337,7 @@ impl QcsdController {
         let pending = std::mem::take(&mut self.control.outgoing);
         for outgoing in pending {
             let send_policy = self.defense.outgoing_send_policy();
-            let realization_window = if self.tamaraw_rapid_capture_policy {
-                Duration::from_micros(10_000)
-            } else {
-                self.config.control_interval()
-            };
+            let realization_window = self.outgoing_realization_window();
             let deadline = outgoing
                 .packet
                 .timestamp()
@@ -8957,6 +9008,170 @@ mod tests {
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
+    }
+
+    fn front_v3_controller(enabled: bool) -> QcsdController {
+        let mut controller = QcsdController::new(
+            QcsdConfig {
+                max_udp_payload_size: 1_200,
+                control_interval_us: 5_000,
+                drop_unsatisfied_events: false,
+                defense: DefenseConfig::Front(FrontConfig {
+                    packet_size: 1_200,
+                    ..FrontConfig::default()
+                }),
+                ..QcsdConfig::default()
+            },
+            42,
+            None,
+        )
+        .expect("research FRONT controller");
+        if enabled {
+            controller
+                .enable_front_padding_outgoing_window()
+                .expect("prospective V3 opt-in");
+        }
+        controller
+    }
+
+    #[test]
+    fn front_v3_window_opt_in_requires_original_unstarted_research_schedule() {
+        let valid = front_v3_controller(false).config.clone();
+        for change in 0..9 {
+            let mut config = valid.clone();
+            match change {
+                0 => config.defense = DefenseConfig::None,
+                1 => config.control_interval_us = 6_000,
+                2 => config.max_udp_payload_size = 1_500,
+                3 => config.drop_unsatisfied_events = true,
+                _ => {
+                    let DefenseConfig::Front(parameters) = &mut config.defense else {
+                        unreachable!()
+                    };
+                    match change {
+                        4 => parameters.n_client_packets = 901,
+                        5 => parameters.n_server_packets = 1_201,
+                        6 => {
+                            parameters.packet_size = 1_300;
+                            config.max_udp_payload_size = 1_300;
+                        }
+                        7 => parameters.peak_minimum_seconds = 0.2,
+                        _ => parameters.peak_maximum_seconds = 2.6,
+                    }
+                }
+            }
+            let mut controller =
+                QcsdController::new(config, 42, None).expect("changed but valid config");
+            assert!(
+                controller.enable_front_padding_outgoing_window().is_err(),
+                "change {change}"
+            );
+        }
+        let mut repeated = front_v3_controller(true);
+        assert!(repeated.enable_front_padding_outgoing_window().is_err());
+        let mut active = front_v3_controller(false);
+        ready(&mut active, 1, "https://front.example");
+        assert!(active.enable_front_padding_outgoing_window().is_err());
+        let mut started = front_v3_controller(false);
+        started.poll(Duration::ZERO);
+        assert!(started.enable_front_padding_outgoing_window().is_err());
+        let mut consumed = front_v3_controller(false);
+        consumed
+            .fixed_schedule
+            .as_mut()
+            .expect("fixed schedule")
+            .events
+            .pop_front();
+        assert!(consumed.enable_front_padding_outgoing_window().is_err());
+    }
+
+    #[test]
+    fn front_v3_prearm_window_is_half_open_and_preserves_full_schedule_and_incoming() {
+        let old = front_v3_controller(false);
+        let new = front_v3_controller(true);
+        let tamaraw = rapid_tamaraw_controller(true, false);
+        assert_eq!(
+            tamaraw.fixed_outgoing_realization_window(),
+            Duration::from_micros(5_000)
+        );
+        assert_eq!(
+            tamaraw.outgoing_realization_window(),
+            Duration::from_micros(10_000)
+        );
+        assert_eq!(old.config, new.config);
+        assert_eq!(
+            old.fixed_schedule.as_ref().expect("old schedule").events,
+            new.fixed_schedule.as_ref().expect("new schedule").events
+        );
+        assert_eq!(
+            new.exact_incoming_release_window(),
+            Duration::from_micros(5_000)
+        );
+        for enabled in [false, true] {
+            for late_us in [4_999, 5_000, 9_999, 10_000] {
+                let mut controller = front_v3_controller(enabled);
+                let target = *controller
+                    .fixed_schedule
+                    .as_ref()
+                    .expect("fixed schedule")
+                    .events
+                    .iter()
+                    .find(|event| event.packet.direction() == Direction::Outgoing)
+                    .expect("outgoing target");
+                let window = if enabled { 10_000 } else { 5_000 };
+                ready(&mut controller, 1, "https://front.example");
+                controller.prearm_fixed_outgoing(
+                    target.packet.timestamp() + Duration::from_micros(late_us),
+                );
+                let actions: Vec<_> = controller.drain_actions().collect();
+                if late_us < window {
+                    assert!(actions.iter().any(|action| matches!(action,
+                        QcsdAction::SendPacket { packet, slot, not_before_after_us: 0, deadline_after_us, allow_stream_data: false, .. }
+                        if *packet == target.packet && *slot == target.slot && *deadline_after_us == window - late_us)));
+                } else {
+                    assert!(!actions.iter().any(|action| matches!(action, QcsdAction::SendPacket { slot, .. } if *slot == target.slot)));
+                    assert!(actions.iter().any(|action| matches!(action,
+                        QcsdAction::SlotMissed { slot, reason: MissedSlotReason::DeadlineExpired, .. } if *slot == target.slot)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn front_v3_dynamic_outgoing_fallback_keeps_same_padding_deadline() {
+        for enabled in [false, true] {
+            for late_us in [4_999, 5_000, 9_999, 10_000] {
+                let mut controller = front_v3_controller(enabled);
+                let target = *controller
+                    .fixed_schedule
+                    .as_ref()
+                    .expect("fixed schedule")
+                    .events
+                    .iter()
+                    .find(|event| event.packet.direction() == Direction::Outgoing)
+                    .expect("outgoing target");
+                let window = if enabled { 10_000 } else { 5_000 };
+                ready(&mut controller, 1, "https://front.example");
+                controller.pending_slots.insert(target.slot, target.packet);
+                controller.control.outgoing.push(super::PendingOutgoing {
+                    packet: target.packet,
+                    slot: target.slot,
+                });
+                controller
+                    .process_outgoing(target.packet.timestamp() + Duration::from_micros(late_us));
+                let actions: Vec<_> = controller.drain_actions().collect();
+                assert_eq!(
+                    actions.iter().any(|action| matches!(action,
+                    QcsdAction::SendPacket { slot, deadline_after_us, allow_stream_data: false, .. }
+                    if *slot == target.slot && *deadline_after_us == window - late_us)),
+                    late_us < window
+                );
+                if late_us >= window {
+                    assert!(actions.iter().any(|action| matches!(action,
+                        QcsdAction::SlotMissed { slot, reason: MissedSlotReason::DeadlineExpired, .. } if *slot == target.slot)));
+                }
+            }
+        }
     }
 
     fn rapid_tamaraw_controller(enabled: bool, chaff: bool) -> QcsdController {
