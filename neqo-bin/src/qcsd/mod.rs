@@ -1544,11 +1544,14 @@ enum FrontCapturePolicy {
     #[default]
     Legacy,
     RapidV5BoundedCongestionOmission,
+    RapidV5BoundedPaddingOmission,
 }
 
 impl FrontCapturePolicy {
     const RAPID_V5_NAME: &'static str =
         "rapid-v5-front-bounded-outgoing-congestion-omission-1pct-v1";
+    const RAPID_V5_PADDING_NAME: &'static str =
+        "rapid-v5-front-bounded-outgoing-padding-omission-1pct-v2";
 
     fn from_preparation(
         preparation: &serde_json::Value,
@@ -1558,7 +1561,9 @@ impl FrontCapturePolicy {
     ) -> Result<Self, Error> {
         match preparation.get("front_capture_policy") {
             None => Ok(Self::Legacy),
-            Some(serde_json::Value::String(policy)) if policy == Self::RAPID_V5_NAME => {
+            Some(serde_json::Value::String(policy))
+                if policy == Self::RAPID_V5_NAME || policy == Self::RAPID_V5_PADDING_NAME =>
+            {
                 if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
                     || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
                     || !matches!(
@@ -1570,7 +1575,11 @@ impl FrontCapturePolicy {
                         "FRONT bounded congestion omission policy requires bound variable-primary, terminal-HTTP, and prepared-approved-origin policies".into(),
                     ));
                 }
-                Ok(Self::RapidV5BoundedCongestionOmission)
+                Ok(if policy == Self::RAPID_V5_NAME {
+                    Self::RapidV5BoundedCongestionOmission
+                } else {
+                    Self::RapidV5BoundedPaddingOmission
+                })
             }
             Some(_) => Err(Error::Argument(
                 "prepared FRONT capture policy is invalid".into(),
@@ -1854,12 +1863,12 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
         || !spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|source| source.8 == FrontCapturePolicy::RapidV5BoundedCongestionOmission)
+            .is_some_and(|source| source.8 != FrontCapturePolicy::Legacy)
         || validate_front_capture_policy(spec).is_err()
     {
         return None;
     }
-    Some(json!({
+    let mut marker = json!({
         "schema_version": 1,
         "source": "bound-preparation-v1",
         "policy": FrontCapturePolicy::RAPID_V5_NAME,
@@ -1872,7 +1881,24 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
         "n_server_packets": 1_200,
         "paper_equivalent": false,
         "scientific_credit": false,
-    }))
+    });
+    if spec.application_workload_source.as_ref()?.8
+        == FrontCapturePolicy::RapidV5BoundedPaddingOmission
+    {
+        let fields = marker.as_object_mut()?;
+        fields.insert("schema_version".into(), json!(2));
+        fields.insert(
+            "policy".into(),
+            json!(FrontCapturePolicy::RAPID_V5_PADDING_NAME),
+        );
+        fields.remove("outgoing_omission_reason");
+        fields.insert(
+            "outgoing_omission_reasons".into(),
+            json!(["CongestionLimited", "DeadlineExpired"]),
+        );
+        fields.insert("require_pure_padding".into(), json!(true));
+    }
+    Some(marker)
 }
 
 fn terminal_primary_partial_cell_size(spec: &RunSpec) -> Option<u16> {
@@ -36681,16 +36707,26 @@ mod tests {
     }
 
     fn front_capture_policy_spec() -> RunSpec {
+        front_capture_policy_spec_for(super::FrontCapturePolicy::RAPID_V5_NAME)
+    }
+
+    fn front_capture_policy_spec_for(policy: &str) -> RunSpec {
         test_fixture::fixture_init();
         let output = trace_output_dir("front-bounded-congestion-policy-source");
         let path = output.join("prepared.json");
-        let raw = serde_json::to_vec(&front_capture_policy_source()).expect("prepared policy");
+        let mut source = front_capture_policy_source();
+        source["preparation"]["front_capture_policy"] = json!(policy);
+        let raw = serde_json::to_vec(&source).expect("prepared policy");
         fs::write(&path, &raw).expect("frozen source");
         let bound = super::load_application_workload_source(&path).expect("bound policy source");
         assert_eq!(bound.1, sha256(&raw).expect("actual frozen-source hash"));
         assert_eq!(
             bound.8,
-            super::FrontCapturePolicy::RapidV5BoundedCongestionOmission
+            if policy == super::FrontCapturePolicy::RAPID_V5_NAME {
+                super::FrontCapturePolicy::RapidV5BoundedCongestionOmission
+            } else {
+                super::FrontCapturePolicy::RapidV5BoundedPaddingOmission
+            }
         );
         let mut spec =
             terminal_http_error_spec(ApplicationResponsePolicy::CompletedTerminalHttpErrors);
@@ -36857,6 +36893,145 @@ mod tests {
             assert!(
                 super::validate_front_capture_policy(&spec).is_err(),
                 "changed field {change}"
+            );
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+        }
+    }
+
+    #[test]
+    fn front_padding_policy_marker_is_exact_and_preserves_other_modes() {
+        let mut spec =
+            front_capture_policy_spec_for(super::FrontCapturePolicy::RAPID_V5_PADDING_NAME);
+        super::validate_front_capture_policy(&spec).expect("fixed source-bound FRONT V2");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["front_capture_policy"],
+            json!({
+                "schema_version": 2, "source": "bound-preparation-v1",
+                "policy": super::FrontCapturePolicy::RAPID_V5_PADDING_NAME,
+                "outgoing_omission_reasons": ["CongestionLimited", "DeadlineExpired"],
+                "require_pure_padding": true,
+                "outgoing_omission_ratio_numerator": 1,
+                "outgoing_omission_ratio_denominator": 100,
+                "rounding": "exact-cross-multiplication-no-minimum-one",
+                "packet_size": 1_200, "n_client_packets": 900, "n_server_packets": 1_200,
+                "paper_equivalent": false, "scientific_credit": false,
+            })
+        );
+        assert_eq!(
+            run["front_capture_policy"]
+                .as_object()
+                .expect("marker")
+                .len(),
+            13
+        );
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "unused.json".into(),
+            }),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            super::validate_front_capture_policy(&spec).expect("other mode flag is inert");
+            assert!(super::front_capture_policy_receipt(&spec).is_none());
+        }
+    }
+
+    #[test]
+    fn front_padding_policy_requires_complete_prepared_identity_contract() {
+        let source = front_capture_policy_source();
+        let origin = super::QualifiedChaffOriginPolicy::from_preparation(&source["preparation"])
+            .expect("canonical approved origins");
+        let prepared =
+            json!({"front_capture_policy": super::FrontCapturePolicy::RAPID_V5_PADDING_NAME});
+        let application = ApplicationResponsePolicy::CompletedTerminalHttpErrors;
+        let primary = super::PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody;
+        assert_eq!(
+            super::FrontCapturePolicy::from_preparation(&prepared, application, primary, &origin)
+                .expect("explicit V2"),
+            super::FrontCapturePolicy::RapidV5BoundedPaddingOmission
+        );
+        for change in 0..3 {
+            let (application, primary, origin) = match change {
+                0 => (
+                    ApplicationResponsePolicy::default(),
+                    primary,
+                    origin.clone(),
+                ),
+                1 => (
+                    application,
+                    super::PrimaryDocumentIdentityPolicy::default(),
+                    origin.clone(),
+                ),
+                _ => (
+                    application,
+                    primary,
+                    super::QualifiedChaffOriginPolicy::default(),
+                ),
+            };
+            assert!(
+                super::FrontCapturePolicy::from_preparation(
+                    &prepared,
+                    application,
+                    primary,
+                    &origin
+                )
+                .is_err()
+            );
+        }
+        for value in [
+            json!(null),
+            json!(true),
+            json!(2),
+            json!([]),
+            json!("unknown"),
+        ] {
+            let prepared = json!({"front_capture_policy": value});
+            assert!(
+                super::FrontCapturePolicy::from_preparation(
+                    &prepared,
+                    application,
+                    primary,
+                    &origin
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn front_padding_policy_rejects_changed_parameters_source_and_graph() {
+        for change in 0..7 {
+            let mut spec =
+                front_capture_policy_spec_for(super::FrontCapturePolicy::RAPID_V5_PADDING_NAME);
+            match change {
+                0 => spec.config.control_interval_us = 10_000,
+                1 => spec.config.max_udp_payload_size = 1_300,
+                2 => spec.config.drop_unsatisfied_events = true,
+                3 => {
+                    spec.application_workload_source.as_mut().expect("source").1 = "invalid".into()
+                }
+                4 => {
+                    spec.workload.resources.pop();
+                }
+                5 => {
+                    spec.application_workload_source.as_mut().expect("source").5 =
+                        super::PrimaryDocumentIdentityPolicy::default()
+                }
+                _ => {
+                    let DefenseConfig::Front(parameters) = &mut spec.config.defense else {
+                        unreachable!()
+                    };
+                    parameters.packet_size = 1_199;
+                }
+            }
+            assert!(
+                super::validate_front_capture_policy(&spec).is_err(),
+                "changed {change}"
             );
             assert!(super::front_capture_policy_receipt(&spec).is_none());
         }
