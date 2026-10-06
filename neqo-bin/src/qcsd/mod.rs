@@ -14570,6 +14570,13 @@ fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
     Ok(())
 }
 
+fn bounds_active_ordinary_work(defense: &DefenseConfig) -> bool {
+    // Both defenses have a strict local receive-credit deadline. Retain queued
+    // socket/HTTP work and revisit the existing deadline-priority seam between
+    // bounded units instead of draining an entire busy origin first.
+    matches!(defense, DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_))
+}
+
 #[expect(
     clippy::cognitive_complexity,
     clippy::future_not_send,
@@ -14673,7 +14680,7 @@ async fn execute_run_inner(
                 .as_ref()
                 .is_some_and(|source| source.6.acknowledged_start()));
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
-    let bound_ordinary_work = matches!(&spec.config.defense, DefenseConfig::Buflo(_));
+    let bound_ordinary_work = bounds_active_ordinary_work(&spec.config.defense);
 
     let mut loop_result: Result<(), Error> = async {
         macro_rules! defense_elapsed_at {
@@ -24860,7 +24867,7 @@ mod tests {
         activate_traffic_morphing, application_send_halves_peer_confirmed, apply_action_batch,
         apply_queued_actions, attempt_socket_handoff, attempt_socket_handoff_timestamped,
         await_unshaped_socket_retry, bind_qualified_chaff_stream_limits,
-        bounded_qualification_wait, buflo_exact_incoming_identities,
+        bounded_qualification_wait, bounds_active_ordinary_work, buflo_exact_incoming_identities,
         buflo_exact_incoming_identity_is_pending,
         buflo_exact_release_failure_watchdog_cadence_validated,
         buflo_exact_release_guard_excluding_candidates, buflo_exact_release_guard_from_candidates,
@@ -32312,12 +32319,11 @@ mod tests {
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
-    #[tokio::test]
     #[expect(
         clippy::too_many_lines,
         reason = "the connected response fixture proves bounded reads preserve the complete body lifecycle"
     )]
-    async fn bounded_data_readable_resumes_without_losing_body_or_terminal_cleanup() {
+    async fn assert_bounded_data_readable_resumes(max_events: Option<usize>) {
         let output = trace_output_dir("bounded-data-readable");
         let started = test_fixture::now();
         let observation_clock = QcsdObservationClock::new(started);
@@ -32409,9 +32415,9 @@ mod tests {
             .expect("finish response");
         test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
 
-        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, Some(1))
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, max_events)
             .expect("consume response headers");
-        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, Some(1))
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, max_events)
             .expect("consume first bounded data chunk");
         assert_eq!(
             endpoints[0]
@@ -32426,7 +32432,7 @@ mod tests {
             VecDeque::from([stream_id]),
             "the same event is retained for the next bounded runner turn"
         );
-        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, Some(1))
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, max_events)
             .expect("consume final bounded data chunk");
 
         assert!(endpoints[0].streams.is_empty());
@@ -36185,6 +36191,122 @@ mod tests {
         drop(endpoints);
         drop(server);
         fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test]
+    async fn cs_busy_http_yields_and_retains_the_complete_body() {
+        let defense = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "test-only-cs-selection.json".into(),
+        });
+        // This is the same limit expression used by execute_run_inner. Removing
+        // the CS arm makes the genuine HTTP fixture drain its complete body on
+        // the first call and fail the retained-chunk assertions.
+        assert_bounded_data_readable_resumes(bounds_active_ordinary_work(&defense).then_some(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cs_active_socket_work_returns_after_one_received_batch() {
+        let defense = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "test-only-cs-selection.json".into(),
+        });
+        let bounded = bounds_active_ordinary_work(&defense);
+        assert!(bounded);
+        assert_actual_receive_observation_clocks(!bounded, Some(Duration::ZERO)).await;
+    }
+
+    #[test]
+    fn cs_work_bounds_preserve_the_other_mode_selections() {
+        assert!(bounds_active_ordinary_work(&DefenseConfig::Buflo(
+            neqo_csdef::BufloConfig::default()
+        )));
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+        ] {
+            assert!(!bounds_active_ordinary_work(&defense));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_data_readable_resumes_without_losing_body_or_terminal_cleanup() {
+        assert_bounded_data_readable_resumes(Some(1)).await;
+    }
+
+    #[test]
+    fn cs_bounded_work_keeps_the_exact_incoming_deadline_fail_closed() {
+        // The production controller and its unchanged half-open deadline are
+        // exercised with a finite event provider. These explicit instants are
+        // a guard regression, not measured busy-work durations or wire proof.
+        for advertised_at_us in [Some(4_999), Some(5_000), None] {
+            let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 600)
+                .expect("fixed-size incoming opportunity");
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    control_interval_us: 5_000,
+                    initial_max_stream_data: 16,
+                    max_stream_data_excess: 1_000,
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(RollingOutgoingSequence {
+                    events: VecDeque::from([incoming]),
+                    exact_incoming_window: true,
+                }),
+            )
+            .expect("unchanged exact-window controller");
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint: QcsdEndpointId(0),
+                    origin: "https://127.0.0.1:4433".into(),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(0),
+                    stream: QcsdStreamId(0),
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(10_000),
+                },
+                Duration::ZERO,
+            );
+            controller.poll(Duration::ZERO);
+            let (slot, absolute_limit) = controller
+                .drain_actions()
+                .find_map(|action| match action {
+                    QcsdAction::IncreaseReceiveLimit {
+                        slot,
+                        absolute_limit,
+                        ..
+                    } => Some((slot, absolute_limit)),
+                    _ => None,
+                })
+                .expect("genuine scheduled receive-credit ledger");
+            if let Some(at_us) = advertised_at_us {
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        absolute_limit,
+                        slot: Some(slot),
+                    },
+                    Duration::from_micros(at_us),
+                );
+            }
+            controller.poll(Duration::from_micros(5_000));
+            let expired = controller.drain_actions().any(|action| matches!(
+                action,
+                QcsdAction::SlotMissed {
+                    slot: observed,
+                    reason: MissedSlotReason::DeadlineExpired,
+                    ..
+                } if observed == slot
+            ));
+            assert_eq!(expired, advertised_at_us != Some(4_999));
+        }
     }
 
     #[test]
