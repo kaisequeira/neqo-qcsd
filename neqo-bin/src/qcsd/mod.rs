@@ -11256,7 +11256,9 @@ struct ReceivePollReturn {
     disposition: ReceivePollDisposition,
 }
 
-/// The latest actual input-call return, retained until the event loop ends.
+/// The latest actual input outcome, retained until the event loop ends.
+/// A successful drain retains the prospective entry clock of the actual empty
+/// UDP receive, not a later clock sampled after returning to the caller.
 /// Completing an HTTP stream does not retire its endpoint's UDP receive loop.
 struct ReceiveLoopState {
     origin: Instant,
@@ -24374,12 +24376,19 @@ fn process_input(
     if !endpoint.network_active {
         return Ok(());
     }
+    let mut final_drain_sample = None;
     let result = (|| -> Result<ReceivePollDisposition, Error> {
         let transport_at = endpoint.transport_instant(input_now);
-        while let Some(datagrams) = endpoint
-            .socket
-            .recv(endpoint.local_addr, &mut endpoint.recv_buf)?
-        {
+        loop {
+            let (received, syscall_entry) = endpoint.socket.recv_qcsd_timestamped(
+                endpoint.local_addr,
+                &mut endpoint.recv_buf,
+                || (now(), unix_nanos()),
+            );
+            let Some(datagrams) = received? else {
+                final_drain_sample = Some(syscall_entry);
+                break;
+            };
             // Stamp the returned batch after the actual socket receive, while
             // retaining the caller's transport and controller input clocks.
             let received_at = now();
@@ -24412,11 +24421,12 @@ fn process_input(
         }
         Ok(ReceivePollDisposition::DrainedToWouldBlock)
     })();
-    // These fresh samples follow the actual receive-call return. The UNIX
-    // sample comes last and provides a conservative post-drain wall-clock
-    // bound for host PCAP evidence; neither uses the captured input-call time.
-    let returned_at = now();
-    let returned_unix_ns = unix_nanos();
+    // Only an actual empty receive proves a final drain. Its two clocks were
+    // sampled prospectively before the syscall, after every previously logged
+    // batch. A post-return sample could place an unread later packet before the
+    // alleged boundary. Bounded and failed calls still have no eligible drain.
+    let (returned_at, returned_unix_ns) =
+        final_drain_sample.unwrap_or_else(|| (now(), unix_nanos()));
     endpoint.receive_loop.record_return(
         returned_at,
         returned_unix_ns,
@@ -41059,6 +41069,71 @@ mod tests {
                 timestamp_us: 12_345,
             }
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_receive_drain_logs_packets_despite_unpolled_tokio_readiness() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("actual-final-drain-readiness");
+        let started = now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoint = create_endpoints(&spec, started, &clock)
+            .expect("real socket endpoint")
+            .remove(0);
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        assert!(
+            endpoint
+                .socket
+                .recv(endpoint.local_addr, &mut endpoint.recv_buf)
+                .expect("initial cached unreadiness")
+                .is_none()
+        );
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("loopback sender");
+        sender
+            .send_to(&[0_u8; 37], endpoint.local_addr)
+            .expect("actual queued packet");
+        // The current-thread reactor cannot refresh its readiness cache before
+        // this call. The Native path must nevertheless drain and log the packet.
+        super::process_input(
+            &mut endpoint,
+            &mut controller,
+            &mut traces,
+            &clock,
+            now(),
+            None,
+            true,
+        )
+        .expect("actual final receive drain");
+        let drain = endpoint.receive_loop.receipt(true);
+        assert_eq!(drain["disposition"], "drained_to_would_block");
+        traces.flush_events().expect("flush traces");
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        let rows: Vec<_> = packets.lines().skip(1).collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the actual UDP packet must remain in raw Native evidence"
+        );
+        let row: Vec<_> = rows[0].split(',').collect();
+        assert_eq!(row[0], "incoming");
+        assert_eq!(row[3], "37");
+        let observed_us: u64 = row[1].parse().expect("actual packet time");
+        let drain_ns = drain["polling_stopped_at_elapsed_ns"]
+            .as_u64()
+            .expect("prospective empty receive time");
+        assert!(observed_us * 1_000 <= drain_ns);
+        let unix = drain["polling_stopped_at_unix_ns"]
+            .as_u64()
+            .expect("prospective wall time");
+        assert!(u128::from(unix) <= super::unix_nanos());
+        fs::remove_dir_all(output).expect("remove trace fixture");
     }
 
     #[expect(

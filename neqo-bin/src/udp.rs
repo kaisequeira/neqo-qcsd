@@ -167,6 +167,53 @@ impl Socket {
             })
     }
 
+    /// Receive fidelity-sensitive QCSD input and sample its actual syscall entry.
+    ///
+    /// Tokio may return `WouldBlock` from cached readiness without invoking the
+    /// receive closure. Confirm that case with a real UDP receive before
+    /// publishing an empty-drain boundary. Both paths sample before the syscall,
+    /// so a packet arriving after an empty receive cannot precede a later receipt
+    /// timestamp merely because the caller was delayed after that receive.
+    #[cfg(feature = "qcsd")]
+    pub fn recv_qcsd_timestamped<'a, T, F: FnMut() -> T>(
+        &self,
+        local_address: SocketAddr,
+        recv_buf: &'a mut RecvBuf,
+        mut clock: F,
+    ) -> (Result<Option<DatagramIter<'a>>, io::Error>, T) {
+        // Move this reference only when the closure actually runs. If Tokio
+        // skips the closure, the same untouched buffer belongs to the fallback.
+        let mut pending_buffer = Some(recv_buf);
+        let mut sampled = None;
+        let result = self.inner.try_io(tokio::io::Interest::READABLE, || {
+            let Some(buffer) = pending_buffer.take() else {
+                return Err(io::Error::other("QCSD receive buffer already consumed"));
+            };
+            sampled = Some(clock());
+            neqo_udp::recv_inner(local_address, &self.state, &self.inner, buffer)
+        });
+        let (result, sampled) = if let Some(sampled) = sampled {
+            (result, sampled)
+        } else {
+            let sampled = clock();
+            let result = pending_buffer.map_or_else(
+                || Err(io::Error::other("QCSD receive buffer unavailable")),
+                |buffer| neqo_udp::recv_inner(local_address, &self.state, &self.inner, buffer),
+            );
+            (result, sampled)
+        };
+        (
+            result.map(Some).or_else(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }),
+            sampled,
+        )
+    }
+
     pub fn max_gso_segments(&self) -> usize {
         self.state.max_gso_segments()
     }
@@ -176,5 +223,95 @@ impl Socket {
     /// Returns `false` on targets which employ e.g. the `IPV6_DONTFRAG` socket option.
     pub fn may_fragment(&self) -> bool {
         self.state.may_fragment()
+    }
+}
+
+#[cfg(all(test, feature = "qcsd"))]
+mod qcsd_receive_tests {
+    use std::{cell::Cell, net::UdpSocket, time::Instant};
+
+    use neqo_udp::RecvBuf;
+
+    use super::Socket;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "real receive boundary regression"
+    )]
+    fn receive_test_now() -> Instant {
+        Instant::now()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn qcsd_recv_confirms_cached_unreadiness_with_an_actual_syscall() {
+        let socket = Socket::bind_for_direct_capture("127.0.0.1:0").expect("QCSD receiver");
+        let address = socket.local_addr().expect("bound address");
+        let mut buffer = RecvBuf::default();
+        assert!(
+            socket
+                .recv(address, &mut buffer)
+                .expect("cached unreadiness")
+                .is_none()
+        );
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        let payload = [7_u8; 37];
+        sender.send_to(&payload, address).expect("queued UDP packet");
+
+        // No await between send and receive: the Tokio reactor has not had a
+        // turn to refresh readiness. Its generic API still reports None.
+        assert!(
+            socket
+                .recv(address, &mut buffer)
+                .expect("unpolled readiness")
+                .is_none()
+        );
+        let samples = Cell::new(0);
+        let (received, boundary) = socket.recv_qcsd_timestamped(address, &mut buffer, || {
+            samples.set(samples.get() + 1);
+            123_u64
+        });
+        let datagrams: Vec<_> = received
+            .expect("real receive")
+            .expect("queued packet")
+            .collect();
+        assert_eq!(samples.get(), 1);
+        assert_eq!(boundary, 123);
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0].len(), payload.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn qcsd_recv_empty_boundary_precedes_late_packet_and_delayed_caller_clock() {
+        let socket = Socket::bind_for_direct_capture("127.0.0.1:0").expect("QCSD receiver");
+        let address = socket.local_addr().expect("bound address");
+        let mut buffer = RecvBuf::default();
+        let samples = Cell::new(0);
+        let (received, empty_receive_entry) = socket.recv_qcsd_timestamped(address, &mut buffer, || {
+            samples.set(samples.get() + 1);
+            receive_test_now()
+        });
+        assert!(received.expect("actual empty receive").is_none());
+        let after_empty_receive = receive_test_now();
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        sender
+            .send_to(&[9_u8; 32], address)
+            .expect("late UDP packet");
+        // This wait represents delayed caller-side receipt rendering. The
+        // retained boundary must not move to this later wall/monotonic sample.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let delayed_caller_clock = receive_test_now();
+        assert_eq!(samples.get(), 1);
+        assert!(empty_receive_entry <= after_empty_receive);
+        assert!(after_empty_receive < delayed_caller_clock);
+        let (received, next_entry) =
+            socket.recv_qcsd_timestamped(address, &mut buffer, receive_test_now);
+        assert_eq!(
+            received
+                .expect("late actual receive")
+                .expect("late packet")
+                .count(),
+            1
+        );
+        assert!(empty_receive_entry < next_entry);
     }
 }
