@@ -251,6 +251,7 @@ enum SocketHandoffPolicy {
     /// FRONT V4 reserves the final millisecond for construction and handoff.
     /// Its physical deadline and unshaped application behavior remain strict.
     FrontV4PreparationReserve,
+    FrontV5LightPreparationReserve,
 }
 
 impl SocketHandoffPolicy {
@@ -270,7 +271,9 @@ impl SocketHandoffPolicy {
     }
 
     fn for_run(spec: &RunSpec) -> Self {
-        if front_v4_preparation_reserve_enabled(spec) {
+        if front_v5_light_enabled(spec) {
+            Self::FrontV5LightPreparationReserve
+        } else if front_v4_preparation_reserve_enabled(spec) {
             Self::FrontV4PreparationReserve
         } else if front_v3_padding_window_enabled(spec) {
             Self::FrontV3ScheduledPadding
@@ -279,14 +282,33 @@ impl SocketHandoffPolicy {
         }
     }
 
+    const fn has_front_preparation_reserve(self) -> bool {
+        matches!(
+            self,
+            Self::FrontV4PreparationReserve | Self::FrontV5LightPreparationReserve
+        )
+    }
+
+    const fn front_preparation_policy(self) -> &'static str {
+        if matches!(self, Self::FrontV5LightPreparationReserve) {
+            FrontCapturePolicy::RAPID_V7_LIGHT_NAME
+        } else {
+            FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME
+        }
+    }
+
     const fn for_scheduled_targets(self, target_bearing: bool) -> Self {
         match self {
-            Self::FrontV3ScheduledPadding | Self::FrontV4PreparationReserve if target_bearing => {
+            Self::FrontV3ScheduledPadding
+            | Self::FrontV4PreparationReserve
+            | Self::FrontV5LightPreparationReserve
+                if target_bearing =>
+            {
                 Self::CandidateFidelityStrict
             }
-            Self::FrontV3ScheduledPadding | Self::FrontV4PreparationReserve => {
-                Self::HistoricalBestEffort
-            }
+            Self::FrontV3ScheduledPadding
+            | Self::FrontV4PreparationReserve
+            | Self::FrontV5LightPreparationReserve => Self::HistoricalBestEffort,
             policy => policy,
         }
     }
@@ -295,7 +317,8 @@ impl SocketHandoffPolicy {
         match self {
             Self::HistoricalBestEffort
             | Self::FrontV3ScheduledPadding
-            | Self::FrontV4PreparationReserve => socket.send(batch).map(|()| None),
+            | Self::FrontV4PreparationReserve
+            | Self::FrontV5LightPreparationReserve => socket.send(batch).map(|()| None),
             Self::CandidateFidelityStrict => socket.send_qcsd_timestamped(batch, now).map(Some),
         }
     }
@@ -963,18 +986,18 @@ fn buflo_duration_budget_evidence(
         .interval_us
         .checked_mul(parameters.max_events)
         .ok_or_else(|| Error::Argument("BuFLO duration budget provenance overflow".into()))?;
-    if policy != BufloDurationBudgetPolicy::RapidV6Fixed200Seconds
-        || parameters.schema_version != 1
-        || parameters.interval_us != 20_000
+    let (interval_us, max_events, budget_us) = policy.fixed_tuple();
+    if parameters.schema_version != 1
+        || parameters.interval_us != interval_us
         || parameters.minimum_duration_us != 10_000_000
         || parameters.packet_size != 1_200
-        || parameters.max_events != 10_000
-        || duration_budget_us != 200_000_000
+        || parameters.max_events != max_events
+        || duration_budget_us != budget_us
         || parameters.implementation_scope != neqo_csdef::QcsdImplementationScope::ClientOnlyQuic
         || parameters.paper_equivalent
     {
         return Err(Error::Argument(
-            "BuFLO duration budget provenance requires the exact explicit fixed 200-second parameters"
+            "BuFLO duration budget provenance requires the exact explicit fixed cadence/budget parameters"
                 .into(),
         ));
     }
@@ -1524,23 +1547,32 @@ enum BufloIncomingCreditReleasePolicy {
     // The incoming contract remains ACK-start V2. This independently declared
     // preparation opt-in is carried with its already authenticated Source.
     RapidV5HalfPeriodAckStartPreparationReserve,
+    RapidV7Cadence64msAckStartPreparationReserve,
 }
 
 impl BufloIncomingCreditReleasePolicy {
     const RAPID_V5_NAME: &'static str = "rapid-v5-half-period-10000us-v1";
     const RAPID_V5_ACK_START_NAME: &'static str = "rapid-v5-half-period-10000us-ack-start-v2";
+    const CADENCE64_ACK_START_NAME: &'static str = "rapid-v7-half-period-32000us-ack-start-v1";
+    const CADENCE64_PREPARATION_RESERVE_NAME: &'static str = "rapid-v7-buflo-cadence64ms-kernel-preparation-cutoff-release-plus-4000us-reserve-1000us-v1";
     const PREPARATION_RESERVE_NAME: &'static str =
         "rapid-v6-buflo-kernel-preparation-cutoff-release-plus-4000us-reserve-1000us-v1";
 
     const fn acknowledged_start(self) -> bool {
         matches!(
             self,
-            Self::RapidV5HalfPeriodAckStart | Self::RapidV5HalfPeriodAckStartPreparationReserve
+            Self::RapidV5HalfPeriodAckStart
+                | Self::RapidV5HalfPeriodAckStartPreparationReserve
+                | Self::RapidV7Cadence64msAckStartPreparationReserve
         )
     }
 
     const fn preparation_reserve(self) -> bool {
-        matches!(self, Self::RapidV5HalfPeriodAckStartPreparationReserve)
+        matches!(
+            self,
+            Self::RapidV5HalfPeriodAckStartPreparationReserve
+                | Self::RapidV7Cadence64msAckStartPreparationReserve
+        )
     }
 
     const fn name(self) -> Option<&'static str> {
@@ -1550,15 +1582,23 @@ impl BufloIncomingCreditReleasePolicy {
             Self::RapidV5HalfPeriodAckStart | Self::RapidV5HalfPeriodAckStartPreparationReserve => {
                 Some(Self::RAPID_V5_ACK_START_NAME)
             }
+            Self::RapidV7Cadence64msAckStartPreparationReserve => {
+                Some(Self::CADENCE64_ACK_START_NAME)
+            }
+        }
+    }
+
+    const fn period_us(self) -> u64 {
+        match self {
+            Self::RapidV7Cadence64msAckStartPreparationReserve => 64_000,
+            _ => 20_000,
         }
     }
 
     const fn incoming_window(self) -> Duration {
         match self {
             Self::LegacyControlInterval => Duration::from_micros(5_000),
-            Self::RapidV5HalfPeriod
-            | Self::RapidV5HalfPeriodAckStart
-            | Self::RapidV5HalfPeriodAckStartPreparationReserve => Duration::from_micros(10_000),
+            _ => Duration::from_micros(self.period_us() / 2),
         }
     }
 
@@ -1576,6 +1616,9 @@ impl BufloIncomingCreditReleasePolicy {
             Some(serde_json::Value::String(value)) if value == Self::RAPID_V5_ACK_START_NAME => {
                 Self::RapidV5HalfPeriodAckStart
             }
+            Some(serde_json::Value::String(value)) if value == Self::CADENCE64_ACK_START_NAME => {
+                Self::RapidV7Cadence64msAckStartPreparationReserve
+            }
             Some(_) => {
                 return Err(Error::Argument(
                     "prepared BuFLO incoming credit release policy is invalid".into(),
@@ -1583,14 +1626,20 @@ impl BufloIncomingCreditReleasePolicy {
             }
         };
         match preparation.get("buflo_kernel_preparation_policy") {
-            None => (),
+            None if policy != Self::RapidV7Cadence64msAckStartPreparationReserve => (),
+            Some(serde_json::Value::String(value))
+                if value == Self::CADENCE64_PREPARATION_RESERVE_NAME
+                    && policy == Self::RapidV7Cadence64msAckStartPreparationReserve =>
+            {
+                ()
+            }
             Some(serde_json::Value::String(value))
                 if value == Self::PREPARATION_RESERVE_NAME
                     && policy == Self::RapidV5HalfPeriodAckStart =>
             {
                 policy = Self::RapidV5HalfPeriodAckStartPreparationReserve;
             }
-            Some(_) => {
+            _ => {
                 return Err(Error::Argument(
                     "BuFLO kernel preparation reserve requires its explicit policy and unchanged ACK-start incoming contract".into(),
                 ));
@@ -1621,6 +1670,12 @@ impl BufloIncomingCreditReleasePolicy {
 }
 
 #[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CADENCE64_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v13; historical_schema11_and12_unchanged=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=64000000; packet_bytes=1200; incoming_window=bound_half_period_32000000ns; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CADENCE64_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; nominal_selection=release_minus_5ms; rolling_preparation_deadline=release_plus_4ms; tick_zero_preparation_deadline=release; completed_and_confirmed_before_recorded_preparation_deadline=true; preparation_reserve_ns=1000000; physical_deadline_unchanged_release_plus_5ms=true; exact_read_counts_and_failure_evidence=true; no_omissions_or_catch_up=true; cadence_ns=64000000_bound_to_exact_prospective_parameters";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema22_retains_schema21_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema13=true";
+#[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RESERVE_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v12; historical_schema11_default_unchanged=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=20000000; packet_bytes=1200; incoming_window=unchanged_bound_preparation; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; nominal_selection=release_minus_5ms; rolling_preparation_deadline=release_plus_4ms; tick_zero_preparation_deadline=release; completed_and_confirmed_before_recorded_preparation_deadline=true; preparation_reserve_ns=1000000; physical_deadline_unchanged_release_plus_5ms=true; exact_read_counts_and_failure_evidence=true; no_omissions_or_catch_up=true";
@@ -1636,6 +1691,17 @@ fn buflo_kernel_preparation_policy_marker() -> serde_json::Value {
         "rolling_preparation_after_release_us": 4000, "outgoing_physical_window_us": 5000,
         "preparation_reserve_us": 1000, "tick_zero_before_release": true,
         "allow_omissions": false, "paper_equivalent": false, "scientific_credit": false})
+}
+
+fn buflo_kernel_preparation_policy_marker_for_period(period_us: u64) -> serde_json::Value {
+    assert!(matches!(period_us, 20_000 | 64_000));
+    let mut marker = buflo_kernel_preparation_policy_marker();
+    if period_us == 64_000 {
+        marker["policy"] =
+            json!(BufloIncomingCreditReleasePolicy::CADENCE64_PREPARATION_RESERVE_NAME);
+        marker["period_us"] = json!(period_us);
+    }
+    marker
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1685,6 +1751,7 @@ enum FrontCapturePolicy {
     RapidV5BoundedPaddingOmission,
     RapidV5BoundedPaddingWindow,
     RapidV5PaddingPreparationReserve,
+    RapidV7LightTrafficPreparationReserve,
 }
 
 impl FrontCapturePolicy {
@@ -1696,6 +1763,9 @@ impl FrontCapturePolicy {
         "rapid-v5-front-bounded-outgoing-padding-omission-10pct-window-10000us-v3";
     const RAPID_V5_PREPARATION_RESERVE_NAME: &'static str =
         "rapid-v5-front-bounded-outgoing-padding-omission-10pct-window-10000us-reserve-1000us-v4";
+    const RAPID_V7_LIGHT_NAME: &'static str = "rapid-v7-front-450-600-sigma1-4-incoming10000us-padding-10pct-window10000us-reserve1000us-v5";
+    const RAPID_V7_LIGHT_CONFIGURATION_SHA256: &'static str =
+        "910c4988276b74e25cfba20bcaefdaf2f7b25032e6110711145e197ddb4d6996";
     const PREPARATION_RESERVE_US: u64 = 1_000;
 
     fn from_preparation(
@@ -1710,7 +1780,8 @@ impl FrontCapturePolicy {
                 if policy == Self::RAPID_V5_NAME
                     || policy == Self::RAPID_V5_PADDING_NAME
                     || policy == Self::RAPID_V5_PADDING_WINDOW_NAME
-                    || policy == Self::RAPID_V5_PREPARATION_RESERVE_NAME =>
+                    || policy == Self::RAPID_V5_PREPARATION_RESERVE_NAME
+                    || policy == Self::RAPID_V7_LIGHT_NAME =>
             {
                 if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
                     || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
@@ -1729,8 +1800,10 @@ impl FrontCapturePolicy {
                     Self::RapidV5BoundedPaddingOmission
                 } else if policy == Self::RAPID_V5_PADDING_WINDOW_NAME {
                     Self::RapidV5BoundedPaddingWindow
-                } else {
+                } else if policy == Self::RAPID_V5_PREPARATION_RESERVE_NAME {
                     Self::RapidV5PaddingPreparationReserve
+                } else {
+                    Self::RapidV7LightTrafficPreparationReserve
                 })
             }
             Some(_) => Err(Error::Argument(
@@ -1883,7 +1956,9 @@ fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), E
                     .buflo_parameters
                     .as_ref()
                     .is_some_and(|parameters| {
-                        parameters.packet_size == 1_200 && parameters.interval_us == 20_000
+                        parameters.packet_size == 1_200 && parameters.interval_us == policy.period_us()
+                            && (*policy != BufloIncomingCreditReleasePolicy::RapidV7Cadence64msAckStartPreparationReserve
+                                || parameters.duration_budget_policy == Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
                     })
         });
         if !valid_parameters || spec.config.control_interval_us != 5_000 {
@@ -1906,13 +1981,14 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
     {
         return None;
     }
-    let policy = spec.application_workload_source.as_ref()?.6.name()?;
+    let selected = spec.application_workload_source.as_ref()?.6;
+    let policy = selected.name()?;
     Some(json!({
         "schema_version": 1,
         "source": "bound-preparation-v1",
         "policy": policy,
-        "incoming_release_window_us": 10_000,
-        "period_us": 20_000,
+        "incoming_release_window_us": selected.period_us() / 2,
+        "period_us": selected.period_us(),
         "cell_bytes": 1_200,
         "scientific_credit": false,
     }))
@@ -1940,7 +2016,9 @@ fn buflo_kernel_preparation_policy_receipt(spec: &RunSpec) -> Option<serde_json:
             .as_ref()
             .is_some_and(|source| source.6.preparation_reserve())
     {
-        Some(buflo_kernel_preparation_policy_marker())
+        Some(buflo_kernel_preparation_policy_marker_for_period(
+            spec.application_workload_source.as_ref()?.6.period_us(),
+        ))
     } else {
         None
     }
@@ -2037,6 +2115,14 @@ fn validate_front_capture_policy(spec: &RunSpec) -> Result<(), Error> {
     }
     spec.application_response_policy
         .validate_source_binding(&spec.workload, source)?;
+    if *policy == FrontCapturePolicy::RapidV7LightTrafficPreparationReserve {
+        if matches!(spec.config.defense, DefenseConfig::Front(_))
+            && spec.config != QcsdConfig::front_v5_light_configuration()
+        {
+            return Err(Error::Argument("FRONT V5 requires its complete exact 450/600 sigma1-4 control10000-us configuration".into()));
+        }
+        return Ok(());
+    }
     if let DefenseConfig::Front(parameters) = &spec.config.defense
         && (parameters.packet_size != 1_200
             || parameters.n_client_packets != 900
@@ -2128,7 +2214,39 @@ fn front_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
             }
         }
     }
+    if policy == FrontCapturePolicy::RapidV7LightTrafficPreparationReserve {
+        marker = json!({
+            "schema_version": 5, "source": "bound-preparation-v1",
+            "policy": FrontCapturePolicy::RAPID_V7_LIGHT_NAME,
+            "outgoing_omission_reasons": ["CongestionLimited", "DeadlineExpired"],
+            "outgoing_omission_ratio_numerator": 1,
+            "outgoing_omission_ratio_denominator": 10,
+            "rounding": "exact-cross-multiplication-no-minimum-one",
+            "packet_size": 1_200, "n_client_packets": 450, "n_server_packets": 600,
+            "peak_minimum_seconds": 1.0, "peak_maximum_seconds": 4.0,
+            "control_interval_us": 10_000, "incoming_release_window_us": 10_000,
+            "configuration_sha256": FrontCapturePolicy::RAPID_V7_LIGHT_CONFIGURATION_SHA256,
+            "require_pure_padding": true,
+            "outgoing_release_window_us": 10_000,
+            "historical_outgoing_release_window_us": 5_000,
+            "outgoing_construction_window_us": 9_000,
+            "outgoing_preparation_reserve_us": 1_000,
+            "expired_construction_target": "not-built-not-sent",
+            "paper_equivalent": false, "scientific_credit": false,
+        });
+    }
     Some(marker)
+}
+
+fn front_v5_light_enabled(spec: &RunSpec) -> bool {
+    matches!(spec.config.defense, DefenseConfig::Front(_))
+        && spec
+            .application_workload_source
+            .as_ref()
+            .is_some_and(|source| {
+                source.8 == FrontCapturePolicy::RapidV7LightTrafficPreparationReserve
+            })
+        && validate_front_capture_policy(spec).is_ok()
 }
 
 fn front_v3_padding_window_enabled(spec: &RunSpec) -> bool {
@@ -2182,6 +2300,10 @@ fn validate_terminal_primary_partial_cell_policy(spec: &RunSpec) -> Result<(), E
     if terminal_primary_partial_cell_size(spec).is_none() {
         return Ok(());
     }
+    let source_policy_period = spec
+        .application_workload_source
+        .as_ref()
+        .map_or(20_000, |source| source.6.period_us());
     let valid_mode = match &spec.config.defense {
         DefenseConfig::Tamaraw(parameters) => {
             *tamaraw == TamarawCapturePolicy::RapidV5OwnedRetry
@@ -2195,7 +2317,11 @@ fn validate_terminal_primary_partial_cell_policy(spec: &RunSpec) -> Result<(), E
                 && proof.path == config.parameters
                 && lower_hex_sha256(&proof.sha256)
                 && proof.buflo_parameters.as_ref().is_some_and(|parameters| {
-                    parameters.packet_size == 1_200 && parameters.interval_us == 20_000
+                    parameters.packet_size == 1_200
+                        && parameters.interval_us == source_policy_period
+                        && (source_policy_period == 20_000
+                            || parameters.duration_budget_policy
+                                == Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
                 })
         }),
         DefenseConfig::CsBuflo(config) => spec.defense_parameters.as_ref().is_some_and(|proof| {
@@ -3228,6 +3354,7 @@ struct BufloKernelTxRuntime {
     jobs: Vec<BufloKernelRawJob>,
     next_item_id: u64,
     incoming_credit_release_window: Duration,
+    cadence: Duration,
     preparation_reserve: bool,
 }
 
@@ -4567,216 +4694,239 @@ fn build_buflo_kernel_protected_selection_wait_receipt(
 }
 
 #[cfg(target_os = "linux")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the receipt builder independently recomputes every serialized protected-wait invariant"
-)]
 fn build_buflo_kernel_protected_selection_wait_receipt_with_policy(
     entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
     defense_start_tai_ns: Option<u64>,
     preparation_reserve: bool,
 ) -> (BufloKernelProtectedSelectionWaitReceipt, bool) {
+    build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
+        entries,
+        defense_start_tai_ns,
+        preparation_reserve,
+        Duration::from_millis(20),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "independent finite cadence/selection receipt validation"
+)]
+fn build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
+    entries: Vec<BufloKernelProtectedSelectionWaitEntry>,
+    defense_start_tai_ns: Option<u64>,
+    preparation_reserve: bool,
+    cadence: Duration,
+) -> (BufloKernelProtectedSelectionWaitReceipt, bool) {
     let window_ns = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
-    let cadence_ns = duration_as_u64_nanos(Duration::from_millis(20));
-    let mut valid = entries.iter().enumerate().all(|(index, entry)| {
-        let expected_preparation_deadline = if preparation_reserve {
-            if entry.tick_zero {
-                Some(entry.release_tai_ns)
-            } else {
-                entry.release_tai_ns.checked_add(4_000_000)
-            }
-        } else {
-            None
-        };
-        let preparation_deadline = entry
-            .preparation_deadline_tai_ns
-            .unwrap_or(entry.release_tai_ns);
-        let expected_slot = u64::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_mul(2));
-        let ordered_boundaries = entry
-            .admission_tai_ns
-            .checked_add(window_ns)
-            .is_some_and(|selection| selection == entry.selection_tai_ns)
-            && entry
-                .selection_tai_ns
-                .checked_add(window_ns)
-                .is_some_and(|release| release == entry.release_tai_ns);
-        let epoch_cadence_valid = defense_start_tai_ns.is_some_and(|start_tai_ns| {
-            entry
-                .tick
-                .checked_mul(cadence_ns)
-                .and_then(|offset| start_tai_ns.checked_add(offset))
-                == Some(entry.release_tai_ns)
-        });
-        let entered_lateness_valid =
-            entry
-                .entered_tai_ns
-                .map_or(entry.entry_lateness_ns == 0, |entered| {
-                    entered >= entry.admission_tai_ns
-                        && entered.saturating_sub(entry.admission_tai_ns) == entry.entry_lateness_ns
-                });
-        let completed_selection_valid = entry.completed_tai_ns.is_some_and(|completed| {
-            completed >= entry.selection_tai_ns
-                && completed < preparation_deadline
-                && entry.entered_tai_ns.is_some_and(|entered| {
-                    entered >= entry.admission_tai_ns
-                        && entered < preparation_deadline
-                        && completed.saturating_sub(entered) == entry.wait_duration_ns
-                        && (entered < entry.selection_tai_ns || completed == entered)
-                })
-        });
-        let clock_read_attempts_valid = if entry.completed_tai_ns.is_some() {
-            if entry
-                .entered_tai_ns
-                .is_some_and(|entered| entered >= entry.selection_tai_ns)
-            {
-                entry
-                    .confirmation_attempts
-                    .checked_add(1)
-                    .is_some_and(|exact| entry.clock_read_attempts == exact)
-            } else {
-                entry
-                    .confirmation_attempts
-                    .checked_add(2)
-                    .is_some_and(|minimum| entry.clock_read_attempts >= minimum)
-            }
-        } else {
-            entry.clock_read_attempts > 0
-        };
-        let staging_order_valid = entry.staging_confirmed_tai_ns.is_none_or(|staging| {
-            entry
-                .completed_tai_ns
-                .is_some_and(|completed| staging >= completed && staging < preparation_deadline)
-        });
-        let dispatch_order_valid = entry.dispatch_confirmed_tai_ns.is_none_or(|dispatch| {
-            entry
-                .staging_confirmed_tai_ns
-                .or(entry.completed_tai_ns)
-                .is_some_and(|previous| dispatch >= previous && dispatch < preparation_deadline)
-        });
-        let phase_shape_valid = match (entry.tick_zero, entry.confirmation_attempts, entry.outcome)
-        {
-            (true | false, 0, _) | (true | false, 1, "failed") => {
-                entry.staging_confirmed_tai_ns.is_none()
-                    && entry.dispatch_confirmed_tai_ns.is_none()
-            }
-            (true, 2, "selection-reached") => {
-                entry.staging_confirmed_tai_ns.is_some()
-                    && entry.dispatch_confirmed_tai_ns.is_some()
-            }
-            (true, 1, "selection-reached") | (true, 2, "failed") => {
-                entry.staging_confirmed_tai_ns.is_some()
-                    && entry.dispatch_confirmed_tai_ns.is_none()
-            }
-            (false, 1, "selection-reached") => {
-                entry.staging_confirmed_tai_ns.is_none()
-                    && entry.dispatch_confirmed_tai_ns.is_some()
-            }
-            _ => false,
-        };
-        let failure_identity_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
-            failure.schema_version == (if preparation_reserve { 2 } else { 1 })
-                && failure.slot == entry.slot
-                && failure.tick == entry.tick
-                && failure.tick_zero == entry.tick_zero
-                && matches!(
-                    failure.kind,
-                    "selection-expired" | "clock-regression" | "clock-read-error"
-                )
-                && !failure.detail.is_empty()
-                && failure.admission_tai_ns == entry.admission_tai_ns
-                && failure.selection_tai_ns == entry.selection_tai_ns
-                && failure.release_tai_ns == entry.release_tai_ns
-                && failure.preparation_deadline_tai_ns == entry.preparation_deadline_tai_ns
-                && failure.entered_tai_ns == entry.entered_tai_ns
-                && failure.clock_read_attempts == entry.clock_read_attempts
-        };
-        let wait_failure_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
-            entry.confirmation_attempts == 0
-                && entry.completed_tai_ns.is_none()
-                && match failure.kind {
-                    "selection-expired" => entry.entered_tai_ns.is_some_and(|entered| {
-                        failure.observed_tai_ns.is_some_and(|observed| {
-                            observed >= preparation_deadline
-                                && observed >= entered
-                                && failure.previous_tai_ns.is_some()
-                                && observed.saturating_sub(entered) == entry.wait_duration_ns
-                        })
-                    }),
-                    "clock-regression" => entry.entered_tai_ns.is_some_and(|entered| {
-                        failure
-                            .previous_tai_ns
-                            .zip(failure.observed_tai_ns)
-                            .is_some_and(|(previous, observed)| {
-                                previous >= entered
-                                    && observed < previous
-                                    && previous.saturating_sub(entered) == entry.wait_duration_ns
-                            })
-                    }),
-                    "clock-read-error" => match (
-                        entry.entered_tai_ns,
-                        failure.previous_tai_ns,
-                        failure.observed_tai_ns,
-                    ) {
-                        (None, None, None) => {
-                            entry.clock_read_attempts == 1 && entry.wait_duration_ns == 0
-                        }
-                        (Some(entered), Some(previous), None) => {
-                            previous >= entered
-                                && previous.saturating_sub(entered) == entry.wait_duration_ns
-                        }
-                        _ => false,
-                    },
-                    _ => false,
+    let cadence_ns = duration_as_u64_nanos(cadence);
+    let mut valid = matches!(cadence_ns, 20_000_000 | 64_000_000)
+        && (cadence_ns == 20_000_000 || preparation_reserve)
+        && entries.iter().enumerate().all(|(index, entry)| {
+            let expected_preparation_deadline = if preparation_reserve {
+                if entry.tick_zero {
+                    Some(entry.release_tai_ns)
+                } else {
+                    entry.release_tai_ns.checked_add(4_000_000)
                 }
-        };
-        let confirmation_failure_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
-            let expected_previous = if entry.tick_zero && entry.confirmation_attempts == 2 {
-                entry.staging_confirmed_tai_ns
             } else {
-                entry.completed_tai_ns
+                None
             };
-            entry.confirmation_attempts > 0
-                && completed_selection_valid
-                && failure.previous_tai_ns == expected_previous
-                && match failure.kind {
-                    "selection-expired" => failure.observed_tai_ns.is_some_and(|observed| {
-                        observed >= preparation_deadline
-                            && expected_previous.is_some_and(|previous| observed >= previous)
-                    }),
-                    "clock-regression" => failure.observed_tai_ns.is_some_and(|observed| {
-                        expected_previous.is_some_and(|previous| observed < previous)
-                    }),
-                    "clock-read-error" => failure.observed_tai_ns.is_none(),
-                    _ => false,
+            let preparation_deadline = entry
+                .preparation_deadline_tai_ns
+                .unwrap_or(entry.release_tai_ns);
+            let expected_slot = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(2));
+            let ordered_boundaries = entry
+                .admission_tai_ns
+                .checked_add(window_ns)
+                .is_some_and(|selection| selection == entry.selection_tai_ns)
+                && entry
+                    .selection_tai_ns
+                    .checked_add(window_ns)
+                    .is_some_and(|release| release == entry.release_tai_ns);
+            let epoch_cadence_valid = defense_start_tai_ns.is_some_and(|start_tai_ns| {
+                entry
+                    .tick
+                    .checked_mul(cadence_ns)
+                    .and_then(|offset| start_tai_ns.checked_add(offset))
+                    == Some(entry.release_tai_ns)
+            });
+            let entered_lateness_valid =
+                entry
+                    .entered_tai_ns
+                    .map_or(entry.entry_lateness_ns == 0, |entered| {
+                        entered >= entry.admission_tai_ns
+                            && entered.saturating_sub(entry.admission_tai_ns)
+                                == entry.entry_lateness_ns
+                    });
+            let completed_selection_valid = entry.completed_tai_ns.is_some_and(|completed| {
+                completed >= entry.selection_tai_ns
+                    && completed < preparation_deadline
+                    && entry.entered_tai_ns.is_some_and(|entered| {
+                        entered >= entry.admission_tai_ns
+                            && entered < preparation_deadline
+                            && completed.saturating_sub(entered) == entry.wait_duration_ns
+                            && (entered < entry.selection_tai_ns || completed == entered)
+                    })
+            });
+            let clock_read_attempts_valid = if entry.completed_tai_ns.is_some() {
+                if entry
+                    .entered_tai_ns
+                    .is_some_and(|entered| entered >= entry.selection_tai_ns)
+                {
+                    entry
+                        .confirmation_attempts
+                        .checked_add(1)
+                        .is_some_and(|exact| entry.clock_read_attempts == exact)
+                } else {
+                    entry
+                        .confirmation_attempts
+                        .checked_add(2)
+                        .is_some_and(|minimum| entry.clock_read_attempts >= minimum)
                 }
-        };
-        let outcome_valid = match entry.outcome {
-            "selection-reached" => entry.failure.is_none() && completed_selection_valid,
-            "failed" => entry.failure.as_ref().is_some_and(|failure| {
-                failure_identity_valid(failure)
-                    && (wait_failure_valid(failure) || confirmation_failure_valid(failure))
-            }),
-            _ => false,
-        };
-        entry.schema_version == (if preparation_reserve { 2 } else { 1 })
-            && entry.preparation_deadline_tai_ns == expected_preparation_deadline
-            && (!preparation_reserve || expected_preparation_deadline.is_some())
-            && expected_slot == Some(entry.slot)
-            && entry.tick == u64::try_from(index).unwrap_or(u64::MAX)
-            && entry.tick_zero == (index == 0)
-            && ordered_boundaries
-            && epoch_cadence_valid
-            && entered_lateness_valid
-            && clock_read_attempts_valid
-            && entry.confirmation_attempts <= if entry.tick_zero { 2 } else { 1 }
-            && entry.max_sample_gap_ns <= entry.wait_duration_ns
-            && staging_order_valid
-            && dispatch_order_valid
-            && phase_shape_valid
-            && outcome_valid
-    });
+            } else {
+                entry.clock_read_attempts > 0
+            };
+            let staging_order_valid = entry.staging_confirmed_tai_ns.is_none_or(|staging| {
+                entry
+                    .completed_tai_ns
+                    .is_some_and(|completed| staging >= completed && staging < preparation_deadline)
+            });
+            let dispatch_order_valid = entry.dispatch_confirmed_tai_ns.is_none_or(|dispatch| {
+                entry
+                    .staging_confirmed_tai_ns
+                    .or(entry.completed_tai_ns)
+                    .is_some_and(|previous| dispatch >= previous && dispatch < preparation_deadline)
+            });
+            let phase_shape_valid =
+                match (entry.tick_zero, entry.confirmation_attempts, entry.outcome) {
+                    (true | false, 0, _) | (true | false, 1, "failed") => {
+                        entry.staging_confirmed_tai_ns.is_none()
+                            && entry.dispatch_confirmed_tai_ns.is_none()
+                    }
+                    (true, 2, "selection-reached") => {
+                        entry.staging_confirmed_tai_ns.is_some()
+                            && entry.dispatch_confirmed_tai_ns.is_some()
+                    }
+                    (true, 1, "selection-reached") | (true, 2, "failed") => {
+                        entry.staging_confirmed_tai_ns.is_some()
+                            && entry.dispatch_confirmed_tai_ns.is_none()
+                    }
+                    (false, 1, "selection-reached") => {
+                        entry.staging_confirmed_tai_ns.is_none()
+                            && entry.dispatch_confirmed_tai_ns.is_some()
+                    }
+                    _ => false,
+                };
+            let failure_identity_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
+                failure.schema_version == (if preparation_reserve { 2 } else { 1 })
+                    && failure.slot == entry.slot
+                    && failure.tick == entry.tick
+                    && failure.tick_zero == entry.tick_zero
+                    && matches!(
+                        failure.kind,
+                        "selection-expired" | "clock-regression" | "clock-read-error"
+                    )
+                    && !failure.detail.is_empty()
+                    && failure.admission_tai_ns == entry.admission_tai_ns
+                    && failure.selection_tai_ns == entry.selection_tai_ns
+                    && failure.release_tai_ns == entry.release_tai_ns
+                    && failure.preparation_deadline_tai_ns == entry.preparation_deadline_tai_ns
+                    && failure.entered_tai_ns == entry.entered_tai_ns
+                    && failure.clock_read_attempts == entry.clock_read_attempts
+            };
+            let wait_failure_valid = |failure: &BufloKernelProtectedSelectionFailureReceipt| {
+                entry.confirmation_attempts == 0
+                    && entry.completed_tai_ns.is_none()
+                    && match failure.kind {
+                        "selection-expired" => entry.entered_tai_ns.is_some_and(|entered| {
+                            failure.observed_tai_ns.is_some_and(|observed| {
+                                observed >= preparation_deadline
+                                    && observed >= entered
+                                    && failure.previous_tai_ns.is_some()
+                                    && observed.saturating_sub(entered) == entry.wait_duration_ns
+                            })
+                        }),
+                        "clock-regression" => entry.entered_tai_ns.is_some_and(|entered| {
+                            failure
+                                .previous_tai_ns
+                                .zip(failure.observed_tai_ns)
+                                .is_some_and(|(previous, observed)| {
+                                    previous >= entered
+                                        && observed < previous
+                                        && previous.saturating_sub(entered)
+                                            == entry.wait_duration_ns
+                                })
+                        }),
+                        "clock-read-error" => match (
+                            entry.entered_tai_ns,
+                            failure.previous_tai_ns,
+                            failure.observed_tai_ns,
+                        ) {
+                            (None, None, None) => {
+                                entry.clock_read_attempts == 1 && entry.wait_duration_ns == 0
+                            }
+                            (Some(entered), Some(previous), None) => {
+                                previous >= entered
+                                    && previous.saturating_sub(entered) == entry.wait_duration_ns
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+            };
+            let confirmation_failure_valid =
+                |failure: &BufloKernelProtectedSelectionFailureReceipt| {
+                    let expected_previous = if entry.tick_zero && entry.confirmation_attempts == 2 {
+                        entry.staging_confirmed_tai_ns
+                    } else {
+                        entry.completed_tai_ns
+                    };
+                    entry.confirmation_attempts > 0
+                        && completed_selection_valid
+                        && failure.previous_tai_ns == expected_previous
+                        && match failure.kind {
+                            "selection-expired" => {
+                                failure.observed_tai_ns.is_some_and(|observed| {
+                                    observed >= preparation_deadline
+                                        && expected_previous
+                                            .is_some_and(|previous| observed >= previous)
+                                })
+                            }
+                            "clock-regression" => failure.observed_tai_ns.is_some_and(|observed| {
+                                expected_previous.is_some_and(|previous| observed < previous)
+                            }),
+                            "clock-read-error" => failure.observed_tai_ns.is_none(),
+                            _ => false,
+                        }
+                };
+            let outcome_valid = match entry.outcome {
+                "selection-reached" => entry.failure.is_none() && completed_selection_valid,
+                "failed" => entry.failure.as_ref().is_some_and(|failure| {
+                    failure_identity_valid(failure)
+                        && (wait_failure_valid(failure) || confirmation_failure_valid(failure))
+                }),
+                _ => false,
+            };
+            entry.schema_version == (if preparation_reserve { 2 } else { 1 })
+                && entry.preparation_deadline_tai_ns == expected_preparation_deadline
+                && (!preparation_reserve || expected_preparation_deadline.is_some())
+                && expected_slot == Some(entry.slot)
+                && entry.tick == u64::try_from(index).unwrap_or(u64::MAX)
+                && entry.tick_zero == (index == 0)
+                && ordered_boundaries
+                && epoch_cadence_valid
+                && entered_lateness_valid
+                && clock_read_attempts_valid
+                && entry.confirmation_attempts <= if entry.tick_zero { 2 } else { 1 }
+                && entry.max_sample_gap_ns <= entry.wait_duration_ns
+                && staging_order_valid
+                && dispatch_order_valid
+                && phase_shape_valid
+                && outcome_valid
+        });
     valid &= entries.is_empty() || defense_start_tai_ns.is_some();
     let failed_entries: Vec<_> = entries
         .iter()
@@ -4826,8 +4976,16 @@ fn build_buflo_kernel_protected_selection_wait_receipt_with_policy(
         .and_then(|entry| entry.failure.clone());
     valid &= (failed_count == 1) == last_failure.is_some();
     let receipt = BufloKernelProtectedSelectionWaitReceipt {
-        schema_version: if preparation_reserve { 3 } else { 2 },
-        semantics: if preparation_reserve {
+        schema_version: if cadence_ns == 64_000_000 {
+            4
+        } else if preparation_reserve {
+            3
+        } else {
+            2
+        },
+        semantics: if cadence_ns == 64_000_000 {
+            BUFLO_KERNEL_CADENCE64_SELECTION_WAIT_SEMANTICS
+        } else if preparation_reserve {
             BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS
         } else {
             BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS
@@ -5198,11 +5356,24 @@ fn reserve_buflo_kernel_receipt_vectors(
     ),
     Error,
 > {
+    reserve_buflo_kernel_receipt_vectors_for_cadence(timeout_seconds, Duration::from_millis(20))
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_buflo_kernel_receipt_vectors_for_cadence(
+    timeout_seconds: u64,
+    cadence: Duration,
+) -> Result<
+    (
+        Vec<BufloKernelProtectedSelectionWaitEntry>,
+        Vec<BufloKernelRawJob>,
+    ),
+    Error,
+> {
     // The process timeout bounds every possible 20 ms release, including
     // tick zero. Reserve before arming so retaining a selection or job cannot
     // relocate its accumulated history inside the protected build window.
-    let releases =
-        Duration::from_secs(timeout_seconds).as_nanos() / Duration::from_millis(20).as_nanos() + 1;
+    let releases = Duration::from_secs(timeout_seconds).as_nanos() / cadence.as_nanos() + 1;
     let capacity = usize::try_from(releases)
         .map_err(|_| Error::RunAborted("BuFLO kernel receipt timeout capacity overflow".into()))?;
     let mut selections = Vec::new();
@@ -5259,8 +5430,14 @@ impl BufloKernelTxRuntime {
         } else {
             timed_egress::HelperThreadContract::RR1_CPU11_V1
         };
-        let (protected_selection_wait_entries, jobs) =
-            reserve_buflo_kernel_receipt_vectors(timeout_seconds)?;
+        let (protected_selection_wait_entries, jobs) = if incoming_policy.period_us() == 20_000 {
+            reserve_buflo_kernel_receipt_vectors(timeout_seconds)?
+        } else {
+            reserve_buflo_kernel_receipt_vectors_for_cadence(
+                timeout_seconds,
+                Duration::from_micros(incoming_policy.period_us()),
+            )?
+        };
         let interface = std::env::var("QCSD_CAPTURE_ETF_INTERFACE").map_err(|_| {
             Error::RunAborted(
                 "QCSD_CAPTURE_ETF_INTERFACE is required by the ETF scheduler contract".into(),
@@ -5407,6 +5584,7 @@ impl BufloKernelTxRuntime {
             jobs,
             next_item_id: 0,
             incoming_credit_release_window: incoming_policy.incoming_window(),
+            cadence: Duration::from_micros(incoming_policy.period_us()),
             preparation_reserve: incoming_policy.preparation_reserve(),
         })
     }
@@ -5699,7 +5877,7 @@ impl BufloKernelTxRuntime {
     fn job_times(&self, tick: u64) -> Result<(u64, u64, u64, u64), Error> {
         let epoch = self.epoch()?;
         let offset = tick
-            .checked_mul(duration_as_u64_nanos(Duration::from_millis(20)))
+            .checked_mul(duration_as_u64_nanos(self.cadence))
             .ok_or_else(|| Error::DefenseExecution("BuFLO job cadence overflow".into()))?;
         let release_monotonic_ns = epoch
             .start_monotonic_ns
@@ -5723,11 +5901,11 @@ impl BufloKernelTxRuntime {
     }
 
     fn begin_job(&mut self, guard: &BufloExactReleaseGuard) -> Result<u64, Error> {
-        let cadence_ns = duration_as_u64_nanos(Duration::from_millis(20));
+        let cadence_ns = duration_as_u64_nanos(self.cadence);
         let timestamp_ns = duration_as_u64_nanos(guard.packet.timestamp());
         if !timestamp_ns.is_multiple_of(cadence_ns) {
             return Err(Error::SlotInvariant(format!(
-                "BuFLO kernel slot {} timestamp was not on the 20 ms cadence",
+                "BuFLO kernel slot {} timestamp was not on its bound cadence",
                 guard.slot.0
             )));
         }
@@ -6863,8 +7041,7 @@ impl BufloKernelTxRuntime {
         let mut expected_item_id = 0_u64;
         for (expected_job_index, raw_job) in self.jobs.into_iter().enumerate() {
             let expected_job_id = u64::try_from(expected_job_index).unwrap_or(u64::MAX);
-            let expected_offset =
-                expected_job_id.checked_mul(duration_as_u64_nanos(Duration::from_millis(20)));
+            let expected_offset = expected_job_id.checked_mul(duration_as_u64_nanos(self.cadence));
             let job_identity_and_timing_valid =
                 expected_offset.zip(epoch).is_some_and(|(offset, epoch)| {
                     raw_job.job_id == expected_job_id
@@ -7182,10 +7359,11 @@ impl BufloKernelTxRuntime {
         }
         let (protected_selection_wait, protected_selection_wait_structurally_valid) =
             if self.preparation_reserve {
-                build_buflo_kernel_protected_selection_wait_receipt_with_policy(
+                build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
                     protected_selection_wait_entries,
                     epoch.map(|epoch| epoch.start_tai_ns),
                     true,
+                    self.cadence,
                 )
             } else {
                 build_buflo_kernel_protected_selection_wait_receipt(
@@ -7335,19 +7513,25 @@ impl BufloKernelTxRuntime {
         };
         let terminal_outcome = aggregate.terminal_outcome.to_string();
         BufloKernelTxReceipt {
-            schema_version: if self.preparation_reserve {
+            schema_version: if self.cadence == Duration::from_micros(64_000) {
+                13
+            } else if self.preparation_reserve {
                 12
             } else {
                 BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION
             },
-            semantics: if self.preparation_reserve {
+            semantics: if self.cadence == Duration::from_micros(64_000) {
+                BUFLO_KERNEL_CADENCE64_TX_SEMANTICS
+            } else if self.preparation_reserve {
                 BUFLO_KERNEL_RESERVE_TX_SEMANTICS
             } else {
                 BUFLO_KERNEL_TX_SEMANTICS
             },
-            preparation_policy: self
-                .preparation_reserve
-                .then(buflo_kernel_preparation_policy_marker),
+            preparation_policy: self.preparation_reserve.then(|| {
+                buflo_kernel_preparation_policy_marker_for_period(
+                    duration_as_u64_nanos(self.cadence) / 1_000,
+                )
+            }),
             incoming_credit_release_window_ns: duration_as_u64_nanos(
                 self.incoming_credit_release_window,
             ),
@@ -8354,27 +8538,36 @@ impl RunnerWakeupMetrics {
         // Serialise and retain the total raw receipt before validating the
         // legacy-metric exclusion. A validation failure must not erase the
         // helper/clock/packet evidence that explains the failed attempt.
-        let preparation_reserve = receipt
+        let schema = receipt
             .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(12);
+            .and_then(serde_json::Value::as_u64);
+        let cadence64 = schema == Some(13);
+        let preparation_reserve = schema == Some(12) || cadence64;
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = if preparation_reserve {
+        self.schema_version = if cadence64 {
+            22
+        } else if preparation_reserve {
             21
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         };
-        let retention_semantics = if preparation_reserve {
+        let retention_semantics = if cadence64 {
+            BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS
+        } else if preparation_reserve {
             BUFLO_KERNEL_RESERVE_RUNNER_RETENTION_SEMANTICS
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS
         };
-        let kernel_semantics = if preparation_reserve {
+        let kernel_semantics = if cadence64 {
+            BUFLO_KERNEL_CADENCE64_TX_SEMANTICS
+        } else if preparation_reserve {
             BUFLO_KERNEL_RESERVE_TX_SEMANTICS
         } else {
             BUFLO_KERNEL_TX_SEMANTICS
         };
-        let wait_semantics = if preparation_reserve {
+        let wait_semantics = if cadence64 {
+            BUFLO_KERNEL_CADENCE64_SELECTION_WAIT_SEMANTICS
+        } else if preparation_reserve {
             BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS
         } else {
             BUFLO_KERNEL_PROTECTED_SELECTION_WAIT_SEMANTICS
@@ -14607,7 +14800,8 @@ async fn execute_run_inner(
     )?;
     let incoming_policy = bound_buflo_incoming_credit_release_policy(spec)?;
     if incoming_policy != BufloIncomingCreditReleasePolicy::LegacyControlInterval {
-        controller.enable_buflo_half_period_incoming_window()?;
+        controller
+            .enable_buflo_half_period_incoming_window_for_interval(incoming_policy.period_us())?;
     }
     if matches!(spec.config.defense, DefenseConfig::Buflo(_))
         && spec
@@ -14628,7 +14822,9 @@ async fn execute_run_inner(
     if terminal_primary_partial_cell_policy_receipt(spec).is_some() {
         controller.enable_terminal_primary_partial_cell_policy()?;
     }
-    if front_v3_padding_window_enabled(spec) || front_v4_preparation_reserve_enabled(spec) {
+    if front_v5_light_enabled(spec) {
+        controller.enable_front_v5_light_padding_window()?;
+    } else if front_v3_padding_window_enabled(spec) || front_v4_preparation_reserve_enabled(spec) {
         controller.enable_front_padding_outgoing_window()?;
     }
     let mut dependencies = DependencyTracker::new(spec.workload.clone())?;
@@ -17892,7 +18088,7 @@ fn reserve_front_padding_preparation(
     policy: SocketHandoffPolicy,
     action: &mut QcsdAction,
 ) -> Result<FrontPreparationAdmission, Error> {
-    if policy != SocketHandoffPolicy::FrontV4PreparationReserve {
+    if !policy.has_front_preparation_reserve() {
         return Ok(FrontPreparationAdmission::Unchanged);
     }
     let QcsdAction::SendPacket {
@@ -19036,7 +19232,7 @@ fn apply_action(
             "expired_before_registration",
             &json!({
                 "schema_version": 1,
-                "policy": FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+                "policy": endpoint.socket_handoff_policy.front_preparation_policy(),
                 "original_action": trace_action,
                 "construction_deadline_monotonic_ns": duration_as_u64_nanos(
                     construction_deadline.saturating_duration_since(endpoint.receive_loop.origin)
@@ -19070,7 +19266,7 @@ fn apply_action(
             .ok_or_else(|| Error::SlotInvariant("FRONT construction deadline overflow".into()))?;
         Some(json!({
             "schema_version": 1,
-            "policy": FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+            "policy": endpoint.socket_handoff_policy.front_preparation_policy(),
             "transport_action": action,
             "construction_deadline_monotonic_ns": duration_as_u64_nanos(
                 construction_deadline.saturating_duration_since(endpoint.receive_loop.origin)
@@ -23754,6 +23950,7 @@ fn front_v3_post_input_output_due(
         endpoint.socket_handoff_policy,
         SocketHandoffPolicy::FrontV3ScheduledPadding
             | SocketHandoffPolicy::FrontV4PreparationReserve
+            | SocketHandoffPolicy::FrontV5LightPreparationReserve
     ) || !endpoint.network_active
         || !controller.has_fixed_schedule_staging()
     {
@@ -24166,12 +24363,14 @@ async fn process_output_once_with_clock(
     // V4 admission uses a fresh physical clock after all prior reduction and
     // action work. A stale loop timestamp must not reopen the reserved final
     // millisecond. Other policies retain their established clock seam.
-    let drive_now =
-        if endpoint.socket_handoff_policy == SocketHandoffPolicy::FrontV4PreparationReserve {
-            drive_now.max(monotonic_clock())
-        } else {
-            drive_now
-        };
+    let drive_now = if endpoint
+        .socket_handoff_policy
+        .has_front_preparation_reserve()
+    {
+        drive_now.max(monotonic_clock())
+    } else {
+        drive_now
+    };
     let prepared = match prepare_output_once_with_clock(endpoint, drive_now).await? {
         PreparedOutputDrive::Datagram(prepared) => prepared,
         PreparedOutputDrive::Callback(wakeup) => return Ok(OutputDrive::Callback(wakeup)),
@@ -24229,8 +24428,9 @@ async fn process_output_once_with_clock(
         let handoff = match handoff {
             Ok(handoff) => handoff,
             Err(error)
-                if endpoint.socket_handoff_policy
-                    == SocketHandoffPolicy::FrontV4PreparationReserve =>
+                if endpoint
+                    .socket_handoff_policy
+                    .has_front_preparation_reserve() =>
             {
                 let failed_at = match &error {
                     Error::AdapterDeadlinePreHandoff { attempted_at, .. } => *attempted_at,
@@ -24267,7 +24467,7 @@ async fn process_output_once_with_clock(
                 }).collect();
                 traces.event(failed_at, Some(endpoint.id), "front_prepared_output_failure", "not_sent", &json!({
                     "schema_version": 1,
-                    "policy": FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+                    "policy": endpoint.socket_handoff_policy.front_preparation_policy(),
                     "socket_handoff_succeeded": false,
                     "preparation_started_monotonic_ns": duration_as_u64_nanos(drive_now.saturating_duration_since(endpoint.receive_loop.origin)),
                     "failed_monotonic_ns": duration_as_u64_nanos(failed_at.saturating_duration_since(endpoint.receive_loop.origin)),
@@ -36307,14 +36507,16 @@ mod tests {
                 );
             }
             controller.poll(Duration::from_micros(5_000));
-            let expired = controller.drain_actions().any(|action| matches!(
-                action,
-                QcsdAction::SlotMissed {
-                    slot: observed,
-                    reason: MissedSlotReason::DeadlineExpired,
-                    ..
-                } if observed == slot
-            ));
+            let expired = controller.drain_actions().any(|action| {
+                matches!(
+                    action,
+                    QcsdAction::SlotMissed {
+                        slot: observed,
+                        reason: MissedSlotReason::DeadlineExpired,
+                        ..
+                    } if observed == slot
+                )
+            });
             assert_eq!(expired, advertised_at_us != Some(4_999));
         }
     }
@@ -38263,6 +38465,79 @@ mod tests {
                 SocketHandoffPolicy::for_run(&spec),
                 SocketHandoffPolicy::for_defense(&spec.config.defense)
             );
+        }
+    }
+
+    #[test]
+    fn front_v5_light_marker_config_and_socket_policy_are_exact() {
+        let mut spec = front_capture_policy_spec_for(
+            super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+        );
+        spec.application_workload_source
+            .as_mut()
+            .expect("bound full source")
+            .8 = super::FrontCapturePolicy::RapidV7LightTrafficPreparationReserve;
+        spec.config = QcsdConfig::front_v5_light_configuration();
+        super::validate_front_capture_policy(&spec).expect("exact prospective tuple");
+        let marker = super::front_capture_policy_receipt(&spec).expect("genuine resolved marker");
+        assert_eq!(marker["schema_version"], 5);
+        assert_eq!(
+            marker["configuration_sha256"],
+            super::FrontCapturePolicy::RAPID_V7_LIGHT_CONFIGURATION_SHA256
+        );
+        assert_eq!(marker["n_client_packets"], 450);
+        assert_eq!(marker["n_server_packets"], 600);
+        assert_eq!(marker["peak_minimum_seconds"], 1.0);
+        assert_eq!(marker["peak_maximum_seconds"], 4.0);
+        assert_eq!(marker["control_interval_us"], 10_000);
+        assert_eq!(marker["incoming_release_window_us"], 10_000);
+        assert_eq!(marker["outgoing_omission_ratio_denominator"], 10);
+        assert_eq!(marker["outgoing_construction_window_us"], 9_000);
+        assert_eq!(
+            SocketHandoffPolicy::for_run(&spec),
+            SocketHandoffPolicy::FrontV5LightPreparationReserve
+        );
+        assert_eq!(
+            SocketHandoffPolicy::for_run(&spec).front_preparation_policy(),
+            super::FrontCapturePolicy::RAPID_V7_LIGHT_NAME
+        );
+        let mut original = front_capture_policy_spec_for(
+            super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+        );
+        original.config = QcsdConfig::front_v5_light_configuration();
+        original
+            .application_workload_source
+            .as_mut()
+            .expect("source")
+            .8 = super::FrontCapturePolicy::RapidV5PaddingPreparationReserve;
+        assert!(super::validate_front_capture_policy(&original).is_err());
+        for change in 0..5 {
+            let mut changed = front_capture_policy_spec_for(
+                super::FrontCapturePolicy::RAPID_V5_PREPARATION_RESERVE_NAME,
+            );
+            changed
+                .application_workload_source
+                .as_mut()
+                .expect("source")
+                .8 = super::FrontCapturePolicy::RapidV7LightTrafficPreparationReserve;
+            changed.config = QcsdConfig::front_v5_light_configuration();
+            match change {
+                0 => changed.config.control_interval_us = 5_000,
+                1 => changed.config.initial_max_stream_data = 17,
+                2 => changed.config.tail_wait_us = 1,
+                3 => changed.workload.resources.pop().map(|_| ()).unwrap_or(()),
+                _ => {
+                    let DefenseConfig::Front(parameters) = &mut changed.config.defense else {
+                        unreachable!()
+                    };
+                    parameters.n_client_packets = 900;
+                }
+            }
+            assert!(
+                super::validate_front_capture_policy(&changed).is_err(),
+                "change {change}"
+            );
+            assert!(super::front_capture_policy_receipt(&changed).is_none());
         }
     }
 
@@ -50653,6 +50928,7 @@ mod tests {
             jobs,
             next_item_id,
             incoming_credit_release_window: Duration::from_micros(5_000),
+            cadence: Duration::from_micros(20_000),
             preparation_reserve: false,
         }
     }
@@ -51551,5 +51827,242 @@ mod tests {
             super::BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         );
         assert_eq!(receipt["runner_wakeup_metrics"]["buflo_kernel_tx"], raw);
+    }
+    fn buflo_cadence64_bound_spec() -> RunSpec {
+        test_fixture::fixture_init();
+        let mut spec = buflo_incoming_credit_release_policy_spec_for(
+            super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME,
+        );
+        let output = trace_output_dir("buflo-cadence64-bound-source");
+        let mut source = variable_primary_document_source();
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::CADENCE64_ACK_START_NAME);
+        source["preparation"]["buflo_kernel_preparation_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::CADENCE64_PREPARATION_RESERVE_NAME);
+        source["preparation"]["terminal_primary_partial_cell_policy"] =
+            json!(super::TerminalPrimaryPartialCellPolicy::RAPID_V5_NAME);
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        source["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        let source_path = output.join("prepared.json");
+        fs::write(
+            &source_path,
+            serde_json::to_vec(&source).expect("source bytes"),
+        )
+        .expect("write source");
+        spec.application_workload_source = Some(
+            super::load_application_workload_source(&source_path).expect("complete bound source"),
+        );
+        let parameter_path = output.join("buflo64.json");
+        fs::write(&parameter_path, serde_json::to_vec(&json!({
+            "schema_version":1, "interval_us":64_000, "minimum_duration_us":10_000_000,
+            "packet_size":1_200, "max_events":10_000, "implementation_scope":"client_only_quic",
+            "paper_equivalent":false, "duration_budget_policy":"rapid-v7-fixed-64ms-640s-duration-budget-v1"
+        })).expect("parameters")).expect("write parameters");
+        spec.config.defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: parameter_path.to_str().expect("path").into(),
+        });
+        spec.defense_parameters =
+            super::defense_parameter_provenance(&spec.config).expect("exact parameter provenance");
+        fs::remove_dir_all(output).expect("parsed parameters retained");
+        spec
+    }
+
+    #[test]
+    fn buflo_cadence64_source_parameter_ack_preparation_and_terminal_policy_join() {
+        let mut spec = buflo_cadence64_bound_spec();
+        super::validate_buflo_incoming_credit_release_policy(&spec)
+            .expect("exact prospective source and parameters");
+        super::validate_terminal_primary_partial_cell_policy(&spec)
+            .expect("same owned terminal FIN policy");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"]["incoming_release_window_us"],
+            32_000
+        );
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"]["period_us"],
+            64_000
+        );
+        assert_eq!(
+            run["buflo_kernel_preparation_policy"]["outgoing_physical_window_us"],
+            5_000
+        );
+        assert_eq!(
+            run["buflo_kernel_preparation_policy"]["rolling_preparation_after_release_us"],
+            4_000
+        );
+        assert_eq!(
+            run["defense_parameters"]["buflo_duration_budget"]["duration_budget_us"],
+            640_000_000
+        );
+        spec.application_workload_source.as_mut().expect("source").6 =
+            super::BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStartPreparationReserve;
+        assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
+        assert!(super::validate_terminal_primary_partial_cell_policy(&spec).is_err());
+    }
+
+    #[test]
+    fn buflo_cadence64_refuses_missing_or_mixed_source_policy() {
+        let origin = super::QualifiedChaffOriginPolicy::PreparedApprovedOrigins(BTreeSet::from([
+            "https://example.com".into(),
+        ]));
+        for preparation in [
+            json!({"buflo_incoming_credit_release_policy": super::BufloIncomingCreditReleasePolicy::CADENCE64_ACK_START_NAME}),
+            json!({"buflo_incoming_credit_release_policy": super::BufloIncomingCreditReleasePolicy::CADENCE64_ACK_START_NAME,
+                "buflo_kernel_preparation_policy": super::BufloIncomingCreditReleasePolicy::PREPARATION_RESERVE_NAME}),
+            json!({"buflo_incoming_credit_release_policy": super::BufloIncomingCreditReleasePolicy::RAPID_V5_ACK_START_NAME,
+                "buflo_kernel_preparation_policy": super::BufloIncomingCreditReleasePolicy::CADENCE64_PREPARATION_RESERVE_NAME}),
+        ] {
+            assert!(
+                super::BufloIncomingCreditReleasePolicy::from_preparation(
+                    &preparation,
+                    ApplicationResponsePolicy::CompletedTerminalHttpErrors,
+                    super::PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody,
+                    &origin
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_cadence64_kernel_receipts_keep_outgoing_guard_and_half_open_incoming_bound() {
+        const RELEASE: u64 = 1_791_064_435_310_641_760;
+        let phase = synthetic_buflo_clock_phase_with_offsets(0, 0, RELEASE + 21_858_679, 10, 10);
+        let mut runtime = synthetic_buflo_kernel_runtime(phase.clone(), None, Vec::new());
+        runtime.cadence = Duration::from_micros(64_000);
+        runtime.incoming_credit_release_window = Duration::from_micros(32_000);
+        runtime.preparation_reserve = true;
+        let start = Instant::now();
+        runtime.epoch = Some(super::BufloKernelEpoch {
+            start,
+            start_monotonic_ns: RELEASE,
+            start_tai_ns: RELEASE,
+            instant_anchor: super::BufloKernelInstantAnchor {
+                instant: start,
+                monotonic_ns: RELEASE,
+                receipt: synthetic_buflo_instant_alignment_for(&phase),
+            },
+            tick_zero_application_ready: true,
+            tick_zero_staged: true,
+        });
+        let (release_mono, release_tai, deadline_mono, deadline_tai) =
+            runtime.job_times(1).expect("derived second tick");
+        assert_eq!(release_mono, RELEASE + 64_000_000);
+        assert_eq!(release_tai, RELEASE + 64_000_000);
+        assert_eq!(deadline_mono - release_mono, 5_000_000);
+        assert_eq!(deadline_tai - release_tai, 5_000_000);
+        assert!(matches!(
+            super::buflo_kernel_incoming_retry_after_inventory(
+                false,
+                || Ok(RELEASE + 21_858_679),
+                RELEASE,
+                RELEASE + 32_000_000
+            )
+            .expect("observed delay under new bound"),
+            Some(super::BufloKernelIncomingRetryStep::Open { .. })
+        ));
+        assert!(matches!(
+            super::buflo_kernel_incoming_retry_after_inventory(
+                false,
+                || Ok(RELEASE + 32_000_000),
+                RELEASE,
+                RELEASE + 32_000_000
+            )
+            .expect("strict boundary"),
+            Some(super::BufloKernelIncomingRetryStep::Expired)
+        ));
+        let receipt = runtime.finish(Some("synthetic unfinished execution".into()));
+        assert_eq!(receipt.schema_version, 13);
+        assert_eq!(receipt.incoming_credit_release_window_ns, 32_000_000);
+        assert_eq!(
+            receipt.preparation_policy.as_ref().expect("marker")["period_us"],
+            64_000
+        );
+        assert_eq!(receipt.protected_selection_wait.schema_version, 4);
+        assert_eq!(receipt.terminal_outcome, "failed");
+        let mut metrics = RunnerWakeupMetrics::new();
+        metrics
+            .attach_buflo_kernel_tx(&receipt)
+            .expect("total raw failed receipt retained");
+        assert_eq!(metrics.schema_version, 22);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_cadence64_selection_receipt_refuses_another_cadence_or_unreserved_policy() {
+        const START: u64 = 1_000_000_000;
+        let entries: Vec<_> = (0_u64..2)
+            .map(|tick| {
+                let release = START + tick * 64_000_000;
+                let identity = super::BufloKernelProtectedSelectionIdentity {
+                    slot: tick * 2,
+                    tick,
+                    tick_zero: tick == 0,
+                    admission_tai_ns: release - 10_000_000,
+                    selection_tai_ns: release - 5_000_000,
+                    release_tai_ns: release,
+                    preparation_deadline_tai_ns: Some(if tick == 0 {
+                        release
+                    } else {
+                        release + 4_000_000
+                    }),
+                };
+                let super::BufloKernelProtectedSelectionStep::Ready(mut entry) =
+                    super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                        Ok(release - 5_000_000)
+                    })
+                else {
+                    panic!("valid prospective selection");
+                };
+                if tick == 0 {
+                    super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                        Ok(release - 4_000_000)
+                    })
+                    .expect("tick zero staging");
+                }
+                super::buflo_kernel_confirm_protected_selection_with_clock(&mut entry, || {
+                    Ok(if tick == 0 {
+                        release - 3_000_000
+                    } else {
+                        release + 3_999_999
+                    })
+                })
+                .expect("independent strict preparation confirmation");
+                entry
+            })
+            .collect();
+        let (receipt, valid) =
+            super::build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
+                entries.clone(),
+                Some(START),
+                true,
+                Duration::from_micros(64_000),
+            );
+        assert!(valid);
+        assert_eq!(receipt.schema_version, 4);
+        for (reserve, cadence) in [(true, 20_000_u64), (true, 64_001), (false, 64_000)] {
+            assert!(
+                !super::build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
+                    entries.clone(),
+                    Some(START),
+                    reserve,
+                    Duration::from_micros(cadence)
+                )
+                .1
+            );
+        }
+    }
+
+    #[test]
+    fn buflo_cadence64_source_never_emits_bf_markers_for_another_mode() {
+        let mut spec = buflo_cadence64_bound_spec();
+        spec.config.defense = DefenseConfig::None;
+        spec.defense_parameters = None;
+        assert!(super::buflo_incoming_credit_release_receipt(&spec).is_none());
+        assert!(super::buflo_kernel_preparation_policy_receipt(&spec).is_none());
     }
 }

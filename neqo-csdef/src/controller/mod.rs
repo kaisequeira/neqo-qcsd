@@ -429,7 +429,7 @@ pub struct QcsdController {
     buflo_startup_requested_chaff: HashMap<(QcsdEndpointId, u64), u32>,
     /// Only an independently validated prepared BuFLO policy may widen the
     /// incoming advertisement window; outgoing deadlines stay unchanged.
-    buflo_incoming_half_period_window: bool,
+    buflo_incoming_half_period_window: Option<Duration>,
     /// Prospective source-bound Tamaraw receive ownership and outgoing window.
     /// Incoming releases can still complete across real transport callbacks;
     /// slotless parser bootstrap never becomes scheduled ownership afterward.
@@ -672,7 +672,7 @@ impl QcsdController {
             endpoint_origins: HashMap::new(),
             buflo_chaff_ack_observed_at: HashMap::new(),
             buflo_startup_requested_chaff: HashMap::new(),
-            buflo_incoming_half_period_window: false,
+            buflo_incoming_half_period_window: None,
             tamaraw_rapid_capture_policy: false,
             front_padding_outgoing_window: false,
             terminal_primary_partial_cell_policy: false,
@@ -817,6 +817,32 @@ impl QcsdController {
         Ok(())
     }
 
+    /// Enable only the exact source-bound lighter FRONT V5 fixed schedule.
+    /// The runner authenticates the prepared opt-in before invoking this.
+    /// Full graphs, credit ownership, tail completion, and half-open outgoing
+    /// physical deadlines use the existing fixed-schedule implementation.
+    pub fn enable_front_v5_light_padding_window(&mut self) -> Result<()> {
+        if self.config != QcsdConfig::front_v5_light_configuration()
+            || self.defense.mode() != DefenseMode::ChaffOnly
+            || self.front_padding_outgoing_window
+            || self.fixed_schedule.as_ref().is_none_or(|staging| {
+                staging.outgoing_prearmed
+                    || u64::try_from(staging.events.len()).ok() != Some(self.control.next_slot_id)
+            })
+            || self.control.last_incoming_boundary_us.is_some()
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "FRONT V5 requires its complete exact unstarted 450/600 sigma1-4 control10000-us fixed configuration".into(),
+            ));
+        }
+        self.front_padding_outgoing_window = true;
+        Ok(())
+    }
+
     fn outgoing_realization_window(&self) -> Duration {
         if self.tamaraw_rapid_capture_policy || self.front_padding_outgoing_window {
             Duration::from_micros(10_000)
@@ -901,7 +927,7 @@ impl QcsdController {
             || !self.defense.enable_buflo_acknowledged_incoming_startup()
         {
             return Err(crate::Error::InvalidConfig(
-                "acknowledged BuFLO incoming startup requires an unstarted fixed1200-byte/20000-us defense".into(),
+                "acknowledged BuFLO incoming startup requires an unstarted supported fixed1200-byte defense".into(),
             ));
         }
         Ok(())
@@ -916,31 +942,41 @@ impl QcsdController {
     /// Rejects another mode, changed control parameters, repeated opt-in, or
     /// a controller that has already scheduled work.
     pub fn enable_buflo_half_period_incoming_window(&mut self) -> Result<()> {
-        if !matches!(self.config.defense, DefenseConfig::Buflo(_))
+        self.enable_buflo_half_period_incoming_window_for_interval(20_000)
+    }
+
+    /// Enable the incoming half-period after the runner authenticates one exact
+    /// supported parameter/source policy. Outgoing control remains 5 ms.
+    ///
+    /// # Errors
+    /// Rejects another cadence, changed control or a started controller.
+    pub fn enable_buflo_half_period_incoming_window_for_interval(
+        &mut self,
+        interval_us: u64,
+    ) -> Result<()> {
+        if !matches!(interval_us, 20_000 | 64_000)
+            || !matches!(self.config.defense, DefenseConfig::Buflo(_))
             || self.config.control_interval_us != 5_000
             || self.config.max_udp_payload_size != 1_200
             || self.config.drop_unsatisfied_events
             || self.defense.mode() != DefenseMode::ChaffAndShape
             || !self.defense.incoming_slot_must_resolve_in_window()
             || self.fixed_schedule.is_some()
-            || self.buflo_incoming_half_period_window
+            || self.buflo_incoming_half_period_window.is_some()
             || self.control.next_slot_id != 0
             || !self.pending_slots.is_empty()
         {
             return Err(crate::Error::InvalidConfig(
-                "BuFLO half-period incoming window requires an unstarted bound fixed1200-byte/20000-us defense with unchanged5000-us control".into(),
+                "BuFLO half-period incoming window requires an unstarted bound supported fixed1200-byte defense with unchanged5000-us control".into(),
             ));
         }
-        self.buflo_incoming_half_period_window = true;
+        self.buflo_incoming_half_period_window = Some(Duration::from_micros(interval_us / 2));
         Ok(())
     }
 
     fn exact_incoming_release_window(&self) -> Duration {
-        if self.buflo_incoming_half_period_window {
-            Duration::from_micros(10_000)
-        } else {
-            self.config.control_interval()
-        }
+        self.buflo_incoming_half_period_window
+            .unwrap_or_else(|| self.config.control_interval())
     }
 
     /// The source-validated BuFLO-only incoming override. Absence preserves
@@ -948,7 +984,6 @@ impl QcsdController {
     #[must_use]
     pub fn buflo_incoming_release_window(&self) -> Option<Duration> {
         self.buflo_incoming_half_period_window
-            .then_some(Duration::from_micros(10_000))
     }
 
     fn arm_buflo_incoming_if_ready(&mut self, elapsed: Duration) {
@@ -3980,9 +4015,13 @@ impl QcsdController {
             && packet.direction() == Direction::Outgoing
             && let Some(startup) = self.defense.diagnostics().buflo_incoming_startup
             && let Ok(timestamp_us) = u64::try_from(packet.timestamp().as_micros())
-            && packet.timestamp().as_nanos().is_multiple_of(20_000_000)
-            && let Some(previous_incoming_us) = timestamp_us.checked_sub(20_000)
-            && let Some(expected_outgoing_id) = (timestamp_us / 20_000).checked_mul(2)
+            && matches!(startup.period_us, 20_000 | 64_000)
+            && packet
+                .timestamp()
+                .as_nanos()
+                .is_multiple_of(u128::from(startup.period_us) * 1_000)
+            && let Some(previous_incoming_us) = timestamp_us.checked_sub(startup.period_us)
+            && let Some(expected_outgoing_id) = (timestamp_us / startup.period_us).checked_mul(2)
             && self.control.next_slot_id.checked_add(1) == Some(expected_outgoing_id)
             && (!startup.armed
                 || startup
@@ -9140,6 +9179,55 @@ mod tests {
         assert_eq!(diagnostics.walkie_talkie_source_envelope_overflow_cells, 0);
         assert_eq!(diagnostics.walkie_talkie_application_batches_completed, 1);
         assert_eq!(diagnostics.walkie_talkie_batch_lifecycle_errors, 0);
+    }
+
+    #[test]
+    fn front_v5_light_opt_in_requires_complete_tuple_and_preserves_old_opt_in() {
+        let valid = QcsdConfig::front_v5_light_configuration();
+        valid.validate().expect("valid prospective fixed config");
+        let mut current =
+            QcsdController::new(valid.clone(), 42, None).expect("actual FRONT schedule");
+        assert_eq!(
+            current.config.control_interval(),
+            Duration::from_micros(10_000)
+        );
+        assert!(current.enable_front_padding_outgoing_window().is_err());
+        current
+            .enable_front_v5_light_padding_window()
+            .expect("exact new opt-in");
+        assert_eq!(
+            current.fixed_outgoing_realization_window(),
+            Duration::from_micros(10_000)
+        );
+        assert!(current.enable_front_v5_light_padding_window().is_err());
+        let mut old = front_v3_controller(false);
+        assert!(old.enable_front_v5_light_padding_window().is_err());
+        old.enable_front_padding_outgoing_window()
+            .expect("original exact opt-in");
+        for change in 0..7 {
+            let mut config = valid.clone();
+            match change {
+                0 => config.control_interval_us = 5_000,
+                1 => config.initial_max_stream_data = 17,
+                2 => config.tail_wait_us = 1,
+                _ => {
+                    let DefenseConfig::Front(parameters) = &mut config.defense else {
+                        unreachable!()
+                    };
+                    match change {
+                        3 => parameters.n_client_packets = 451,
+                        4 => parameters.n_server_packets = 601,
+                        5 => parameters.peak_minimum_seconds = 0.1,
+                        _ => parameters.peak_maximum_seconds = 2.5,
+                    }
+                }
+            }
+            let mut changed = QcsdController::new(config, 42, None).expect("valid changed config");
+            assert!(
+                changed.enable_front_v5_light_padding_window().is_err(),
+                "change {change}"
+            );
+        }
     }
 
     fn front_v3_controller(enabled: bool) -> QcsdController {
@@ -24305,5 +24393,304 @@ mod tests {
                 outcome: EventOutcome::Missed(MissedSlotReason::ReceiveCreditRetired),
             },
         })));
+    }
+    #[test]
+    fn buflo_cadence64_half_period_keeps_owned_physical_boundaries() {
+        for opted_in in [false, true] {
+            for advertised_at_us in [4_999_u64, 5_000, 21_858, 31_999, 32_000] {
+                let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200)
+                    .expect("fixed incoming cell");
+                let (defense, outcomes) = ExactIncomingOneShot::new(packet);
+                let mut controller = QcsdController::with_defense(
+                    QcsdConfig {
+                        defense: DefenseConfig::Buflo(crate::BufloConfig {
+                            parameters: "bound-fixed-buflo.json".into(),
+                        }),
+                        max_udp_payload_size: 1_200,
+                        control_interval_us: 5_000,
+                        ..QcsdConfig::default()
+                    },
+                    None,
+                    Box::new(defense),
+                )
+                .expect("isolated strict incoming controller");
+                if opted_in {
+                    controller
+                        .enable_buflo_half_period_incoming_window_for_interval(64_000)
+                        .expect("independently bound incoming policy");
+                }
+                ready(&mut controller, 0, "https://example.com");
+                controller.observe(
+                    QcsdObservation::StreamOpened {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        role: QcsdRequestRole::Application,
+                        expected_response_length: Some(10_000),
+                    },
+                    Duration::ZERO,
+                );
+                controller.drain_actions().for_each(drop);
+                controller.poll(Duration::ZERO);
+                let QcsdAction::IncreaseReceiveLimit {
+                    absolute_limit,
+                    slot,
+                    ..
+                } = controller
+                    .next_action()
+                    .expect("actual whole credit action")
+                else {
+                    panic!("expected receive action");
+                };
+                controller.drain_actions().for_each(drop);
+                controller.flush_defense_observations();
+                let window_us = if opted_in { 32_000 } else { 5_000 };
+                assert_eq!(
+                    controller.next_deadline(),
+                    Some(Duration::from_micros(window_us))
+                );
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        absolute_limit,
+                        slot: Some(slot),
+                    },
+                    Duration::from_micros(advertised_at_us),
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint: QcsdEndpointId(0),
+                        stream: QcsdStreamId(0),
+                        bytes: absolute_limit,
+                    },
+                    Duration::from_millis(50),
+                );
+                controller.poll(Duration::from_millis(50));
+                let timely = advertised_at_us < window_us;
+                assert_eq!(
+                    outcomes.borrow().as_slice(),
+                    [if timely {
+                        EventOutcome::Satisfied { observed: 1_200 }
+                    } else {
+                        EventOutcome::Missed(MissedSlotReason::DeadlineExpired)
+                    }]
+                );
+                let metrics = controller.defense_diagnostics();
+                assert_eq!(metrics.scheduled_incoming_requested_bytes, 1_200);
+                assert_eq!(metrics.scheduled_incoming_advertised_bytes, 1_200);
+                assert_eq!(
+                    metrics.scheduled_incoming_consumed_bytes,
+                    if timely { 1_200 } else { 0 }
+                );
+                assert_eq!(
+                    metrics.scheduled_incoming_retired_bytes,
+                    if timely { 0 } else { 1_200 }
+                );
+                assert_eq!(metrics.scheduled_incoming_unresolved_bytes, 0);
+            }
+        }
+    }
+
+    fn startup_cadence64_controller(known_valid: bool) -> QcsdController {
+        let params = BufloParameters {
+            schema_version: 1,
+            interval_us: 64_000,
+            minimum_duration_us: 10_000_000,
+            packet_size: 1_200,
+            max_events: 10_000,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+            duration_budget_policy: Some(
+                crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds,
+            ),
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: DefenseConfig::Buflo(crate::BufloConfig {
+                    parameters: "fixed-buflo-1200-64000us.json".into(),
+                }),
+                low_watermark: 24_000,
+                max_chaff_streams: 1,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            Some(ResourceManifest {
+                resources: vec![Resource {
+                    id: 14,
+                    url: "https://cdn.example/image".into(),
+                    kind: "Image".into(),
+                    content_length: Some(24_064),
+                    data_length: 24_064,
+                    chaff_priority: true,
+                    known_valid,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                }],
+            }),
+            Box::new(Buflo::from_parameters(params)),
+        )
+        .expect("source-bound startup controller");
+        controller
+            .enable_buflo_acknowledged_incoming_startup()
+            .expect("prospective opt-in");
+        controller
+            .enable_buflo_half_period_incoming_window_for_interval(64_000)
+            .expect("exact half period");
+        ready(&mut controller, 1, "https://cdn.example");
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        controller
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boundary ACK and multiple suppressed cadences exercise the complete live allocation order"
+    )]
+    fn buflo_cadence64_ack_start_preserves_real_suppressed_identity_holes() {
+        for (ack_us, ready_us, first_incoming_us) in
+            [(63_999, 64_000, 128_000), (154_165, 154_280, 192_000)]
+        {
+            let mut controller = startup_cadence64_controller(true);
+            controller.poll(Duration::ZERO);
+            let initial: Vec<_> = controller.drain_actions().collect();
+            let request_id = initial
+                .iter()
+                .find_map(|action| match action {
+                    QcsdAction::RequestChaff { request_id, .. } => Some(*request_id),
+                    _ => None,
+                })
+                .expect("real qualified request issued");
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(4);
+            let role = QcsdRequestRole::Chaff {
+                resource_id: 14,
+                request_id: Some(request_id),
+            };
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role,
+                    expected_response_length: None,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamDataTransmitted {
+                    endpoint,
+                    stream,
+                    role,
+                    offset: 0,
+                    bytes: 185,
+                    fin: true,
+                    slot: Some(QcsdSlotId(0)),
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::SlotSatisfied {
+                    endpoint,
+                    slot: QcsdSlotId(0),
+                    observed_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+
+            let mut next_tick_us = 64_000;
+            while next_tick_us < ready_us {
+                controller.poll(Duration::from_micros(next_tick_us));
+                let actions: Vec<_> = controller.drain_actions().collect();
+                assert!(actions.iter().any(|action| matches!(action,
+                    QcsdAction::CommitPrearmedPacket { packet, slot, .. }
+                        if packet.timestamp_us() == next_tick_us
+                        && slot.0 == 2 * (next_tick_us / 64_000))));
+                assert!(!actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::SlotMissed { .. }
+                )));
+                controller.observe(
+                    QcsdObservation::SlotSatisfied {
+                        endpoint,
+                        slot: QcsdSlotId(2 * (next_tick_us / 64_000)),
+                        observed_size: 1_200,
+                    },
+                    Duration::from_micros(next_tick_us),
+                );
+                next_tick_us += 64_000;
+            }
+            controller.observe(
+                QcsdObservation::StreamDataAcknowledged {
+                    endpoint,
+                    stream,
+                    role,
+                    offset: 0,
+                    bytes: 185,
+                    fin: true,
+                },
+                Duration::from_micros(ack_us),
+            );
+            controller.poll(Duration::from_micros(ready_us));
+            let startup = controller
+                .defense_diagnostics()
+                .buflo_incoming_startup
+                .expect("armed receipt");
+            assert!(startup.armed);
+            assert_eq!(startup.armed_at_us, Some(first_incoming_us));
+            assert_eq!(
+                startup.startup_suppressed_opportunities,
+                first_incoming_us / 64_000
+            );
+            if next_tick_us == ready_us {
+                controller.observe(
+                    QcsdObservation::SlotSatisfied {
+                        endpoint,
+                        slot: QcsdSlotId(2 * (next_tick_us / 64_000)),
+                        observed_size: 1_200,
+                    },
+                    Duration::from_micros(next_tick_us),
+                );
+                next_tick_us += 64_000;
+            }
+            controller.drain_actions().for_each(drop);
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .buflo_scheduled_incoming_cells,
+                0
+            );
+            controller.poll(Duration::from_micros(next_tick_us));
+            assert_eq!(next_tick_us, first_incoming_us);
+            let actions: Vec<_> = controller.drain_actions().collect();
+            assert!(actions.iter().any(|action| matches!(action,
+                QcsdAction::CommitPrearmedPacket { packet, slot, .. }
+                    if packet.timestamp_us() == first_incoming_us
+                    && slot.0 == 2 * (first_incoming_us / 64_000))));
+            assert!(actions.iter().any(|action| matches!(action,
+                QcsdAction::IncreaseReceiveLimit { packet, slot, .. }
+                    if packet.timestamp_us() == first_incoming_us && packet.length() == 1_200
+                    && slot.0 == 2 * (first_incoming_us / 64_000) + 1)));
+            for suppressed_tick in 0..(first_incoming_us / 64_000) {
+                let absent = QcsdSlotId(2 * suppressed_tick + 1);
+                assert!(!controller.pending_slots.contains_key(&absent));
+                assert!(!controller.incoming_credit_ledger.contains_key(&absent));
+                assert!(!controller.terminal_slot_resolution_at.contains_key(&absent));
+            }
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.buflo_scheduled_incoming_cells, 1);
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+        }
     }
 }

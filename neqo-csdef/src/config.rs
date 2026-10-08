@@ -65,6 +65,24 @@ impl Default for QcsdConfig {
 }
 
 impl QcsdConfig {
+    /// Complete finite prospective FRONT V5 traffic setting. Historical defaults
+    /// and profiles retain their original values.
+    #[must_use]
+    pub fn front_v5_light_configuration() -> Self {
+        Self {
+            control_interval_us: 10_000,
+            max_udp_payload_size: 1_200,
+            defense: DefenseConfig::Front(FrontConfig {
+                n_client_packets: 450,
+                n_server_packets: 600,
+                packet_size: 1_200,
+                peak_minimum_seconds: 1.0,
+                peak_maximum_seconds: 4.0,
+            }),
+            ..Self::default()
+        }
+    }
+
     /// Load a versioned configuration from TOML.
     ///
     /// # Errors
@@ -321,13 +339,27 @@ pub struct CsBufloConfig {
 
 /// Explicit prospective duration allowance for one fixed `BuFLO` study.
 ///
-/// Absence retains the historical 120-second guard. This policy changes only
-/// the event budget, never packet size, cadence, physical windows, or omissions.
+/// Absence retains the historical 120-second guard. Named prospective policies
+/// select exact cadence/event-budget tuples; no omissions are authorized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum BufloDurationBudgetPolicy {
     /// Fixed 1200-byte/20-ms/minimum-10-second/10000-cell, 200-second budget.
     #[serde(rename = "rapid-v6-fixed-200s-duration-budget-v1")]
     RapidV6Fixed200Seconds,
+    /// Prospective fixed 1200-byte/64-ms/minimum-10-second/10000-cell budget.
+    #[serde(rename = "rapid-v7-fixed-64ms-640s-duration-budget-v1")]
+    RapidV7Fixed64ms640Seconds,
+}
+
+impl BufloDurationBudgetPolicy {
+    /// Closed exact tuples; arbitrary cadence or duration widening is refused.
+    #[must_use]
+    pub const fn fixed_tuple(self) -> (u64, u64, u64) {
+        match self {
+            Self::RapidV6Fixed200Seconds => (20_000, 10_000, 200_000_000),
+            Self::RapidV7Fixed64ms640Seconds => (64_000, 10_000, 640_000_000),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for BufloDurationBudgetPolicy {
@@ -337,9 +369,13 @@ impl<'de> Deserialize<'de> for BufloDurationBudgetPolicy {
         let policy = String::deserialize(deserializer)?;
         match policy.as_str() {
             "rapid-v6-fixed-200s-duration-budget-v1" => Ok(Self::RapidV6Fixed200Seconds),
+            "rapid-v7-fixed-64ms-640s-duration-budget-v1" => Ok(Self::RapidV7Fixed64ms640Seconds),
             _ => Err(serde::de::Error::unknown_variant(
                 &policy,
-                &["rapid-v6-fixed-200s-duration-budget-v1"],
+                &[
+                    "rapid-v6-fixed-200s-duration-budget-v1",
+                    "rapid-v7-fixed-64ms-640s-duration-budget-v1",
+                ],
             )),
         }
     }
@@ -414,18 +450,19 @@ impl BufloParameters {
             })?;
         let guard_limit_us = match self.duration_budget_policy {
             None => 120_000_000,
-            Some(BufloDurationBudgetPolicy::RapidV6Fixed200Seconds) => {
-                if self.interval_us != 20_000
+            Some(policy) => {
+                let (interval_us, max_events, budget_us) = policy.fixed_tuple();
+                if self.interval_us != interval_us
                     || self.minimum_duration_us != 10_000_000
                     || self.packet_size != 1_200
-                    || self.max_events != 10_000
+                    || self.max_events != max_events
                 {
                     return Err(Error::InvalidConfig(
-                        "BuFLO fixed 200-second duration policy requires interval_us=20000, minimum_duration_us=10000000, packet_size=1200, and max_events=10000"
+                        "BuFLO prospective duration policy requires its exact supported cadence/minimum-duration/packet-size/event-budget tuple"
                             .into(),
                     ));
                 }
-                200_000_000
+                budget_us
             }
         };
         if guard_duration_us > guard_limit_us || self.minimum_duration_us >= guard_duration_us {
@@ -1209,5 +1246,42 @@ mod tests {
             CsBufloPaddingMode::Payload
         );
         assert!(parse("oracle_only").is_err());
+    }
+    #[test]
+    fn buflo_cadence64_budget640_requires_the_exact_explicit_tuple() {
+        let raw = r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v7-fixed-64ms-640s-duration-budget-v1"}"#;
+        let parameters = BufloParameters::from_json(raw, 1_200).expect("prospective exact tuple");
+        assert_eq!(
+            parameters.interval_us.checked_mul(parameters.max_events),
+            Some(640_000_000)
+        );
+        assert_eq!(
+            parameters.duration_budget_policy,
+            Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds)
+        );
+        assert_eq!(
+            serde_json::to_string(&parameters).expect("retained bytes"),
+            raw
+        );
+        for (key, value) in [
+            ("interval_us", serde_json::json!(20_000)),
+            ("interval_us", serde_json::json!(64_001)),
+            ("max_events", serde_json::json!(3_125)),
+            ("minimum_duration_us", serde_json::json!(10_000_001)),
+            ("packet_size", serde_json::json!(1_199)),
+            (
+                "duration_budget_policy",
+                serde_json::json!("rapid-v6-fixed-200s-duration-budget-v1"),
+            ),
+            ("duration_budget_policy", serde_json::Value::Null),
+        ] {
+            let mut altered: serde_json::Value = serde_json::from_str(raw).expect("fixture");
+            altered[key] = value;
+            assert!(
+                BufloParameters::from_json(&altered.to_string(), 1_200).is_err(),
+                "{key}"
+            );
+        }
+        assert!(BufloParameters::from_json(raw, 1_199).is_err());
     }
 }

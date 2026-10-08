@@ -267,7 +267,16 @@ impl Buflo {
 impl Defense for Buflo {
     fn enable_buflo_acknowledged_incoming_startup(&mut self) -> bool {
         if self.parameters.packet_size != 1_200
-            || self.parameters.interval_us != 20_000
+            || !matches!(self.parameters.interval_us, 20_000 | 64_000)
+            || self.parameters.interval_us == 64_000
+                && (self.parameters.schema_version != 1
+                    || self.parameters.minimum_duration_us != 10_000_000
+                    || self.parameters.max_events != 10_000
+                    || self.parameters.duration_budget_policy
+                        != Some(crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds)
+                    || self.parameters.implementation_scope
+                        != crate::QcsdImplementationScope::ClientOnlyQuic
+                    || self.parameters.paper_equivalent)
             || self.scheduled_outgoing != 0
             || self.scheduled_incoming != 0
             || self.incoming_startup.is_some()
@@ -278,7 +287,7 @@ impl Defense for Buflo {
             schema_version: 1,
             policy: "qualified-chaff-terminal-ack-cadence-start-v1",
             time_basis: "native-controller-defense-elapsed-us-v1",
-            period_us: 20_000,
+            period_us: self.parameters.interval_us,
             packet_size_bytes: 1_200,
             armed: false,
             armed_at_us: None,
@@ -300,7 +309,7 @@ impl Defense for Buflo {
             || ready.schema_version != 1
             || ready.policy != "qualified-chaff-terminal-ack-cadence-start-v1"
             || ready.time_basis != "native-controller-defense-elapsed-us-v1"
-            || ready.period_us != 20_000
+            || ready.period_us != self.parameters.interval_us
             || ready.packet_size_bytes != 1_200
             || ready.armed
             || ready.armed_at_us.is_some()
@@ -324,14 +333,14 @@ impl Defense for Buflo {
         }
         let Some(first_us) = ready
             .ready_at_us
-            .and_then(|at| (at / 20_000).checked_add(1))
-            .and_then(|tick| tick.checked_mul(20_000))
+            .and_then(|at| (at / self.parameters.interval_us).checked_add(1))
+            .and_then(|tick| tick.checked_mul(self.parameters.interval_us))
         else {
             return false;
         };
         ready.armed = true;
         ready.armed_at_us = Some(first_us);
-        ready.startup_suppressed_opportunities = first_us / 20_000;
+        ready.startup_suppressed_opportunities = first_us / self.parameters.interval_us;
         self.next_incoming_us = first_us;
         self.incoming_startup = Some(ready);
         true
@@ -1283,6 +1292,144 @@ mod tests {
             assert_eq!(diagnostics.buflo_catch_up_outgoing_cells, 1);
             assert_eq!(diagnostics.buflo_catch_up_incoming_cells, 1);
             assert!(delayed.terminal_failure().is_some());
+        }
+    }
+    fn acknowledged_startup_cadence64_defense() -> Buflo {
+        let mut params = parameters();
+        params.interval_us = 64_000;
+        params.minimum_duration_us = 10_000_000;
+        params.max_events = 10_000;
+        params.duration_budget_policy =
+            Some(crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds);
+        let mut defense = Buflo::from_parameters(params);
+        assert!(defense.enable_buflo_acknowledged_incoming_startup());
+        defense
+    }
+
+    #[test]
+    fn acknowledged_startup_cadence64_uses_real_exact_next_grid() {
+        for ack_at in [1, 63_999, 64_000, 64_001] {
+            let mut defense = acknowledged_startup_cadence64_defense();
+            let first = defense.next_event(Duration::ZERO).expect("shaped tickzero");
+            assert_eq!(
+                (first.direction(), first.timestamp_us(), first.length()),
+                (Direction::Outgoing, 0, 1_200)
+            );
+            assert!(defense.next_event(Duration::ZERO).is_none());
+            assert_eq!(defense.next_event_at(), Some(Duration::from_micros(64_000)));
+            if ack_at >= 64_000 {
+                assert_eq!(
+                    defense
+                        .next_event(Duration::from_micros(64_000))
+                        .expect("outgoing tickone")
+                        .direction(),
+                    Direction::Outgoing
+                );
+            }
+            assert!(defense.arm_buflo_incoming_after_ack(ready_startup(&defense, ack_at)));
+            let first_incoming = (ack_at / 64_000 + 1) * 64_000;
+            let startup = defense
+                .diagnostics()
+                .buflo_incoming_startup
+                .expect("receipt");
+            assert_eq!(startup.armed_at_us, Some(first_incoming));
+            assert_eq!(
+                startup.startup_suppressed_opportunities,
+                first_incoming / 64_000
+            );
+            assert!(
+                defense
+                    .next_event(Duration::from_micros(first_incoming - 1))
+                    .is_none()
+            );
+            let outgoing = defense
+                .next_event(Duration::from_micros(first_incoming))
+                .expect("same-grid outgoing first");
+            assert_eq!(
+                (outgoing.direction(), outgoing.timestamp_us()),
+                (Direction::Outgoing, first_incoming)
+            );
+            let incoming = defense
+                .next_event(Duration::from_micros(first_incoming))
+                .expect("first incoming");
+            assert_eq!(
+                (
+                    incoming.direction(),
+                    incoming.timestamp_us(),
+                    incoming.length()
+                ),
+                (Direction::Incoming, first_incoming, 1_200)
+            );
+            assert!(
+                defense
+                    .next_event(Duration::from_micros(first_incoming))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn acknowledged_startup_cadence64_refuses_mutated_ready_proofs() {
+        let mut base = acknowledged_startup_cadence64_defense();
+        base.next_event(Duration::ZERO).expect("outgoing");
+        let valid = ready_startup(&base, 1);
+        for variant in 0..13 {
+            let mut ready = valid;
+            match variant {
+                0 => ready.schema_version = 2,
+                1 => ready.policy = "unknown",
+                2 => ready.time_basis = "unknown",
+                3 => ready.period_us = 20_000,
+                4 => ready.packet_size_bytes = 600,
+                5 => ready.armed = true,
+                6 => ready.armed_at_us = Some(0),
+                7 => ready.startup_suppressed_opportunities += 1,
+                8 => ready.ack_observed_at_us = Some(2),
+                9 => ready.eligible_exact_capacity_bytes = Some(1_199),
+                10 => ready.request_stream_final_size = Some(0),
+                11 => ready.ready_request_id = None,
+                _ => ready.ready_at_us = Some(u64::MAX),
+            }
+            assert!(
+                !base.arm_buflo_incoming_after_ack(ready),
+                "variant{variant}"
+            );
+            assert!(
+                !base
+                    .diagnostics()
+                    .buflo_incoming_startup
+                    .expect("receipt")
+                    .armed
+            );
+        }
+        assert!(base.arm_buflo_incoming_after_ack(valid));
+        assert!(
+            !base.arm_buflo_incoming_after_ack(valid),
+            "cannot move a sealed incoming epoch"
+        );
+    }
+
+    #[test]
+    fn acknowledged_startup_cadence64_refuses_unregistered_parameter_tuples() {
+        let baseline = acknowledged_startup_cadence64_defense();
+        for variant in 0..7 {
+            let mut parameters = baseline.parameters.clone();
+            match variant {
+                0 => parameters.interval_us = 64_001,
+                1 => parameters.duration_budget_policy = None,
+                2 => {
+                    parameters.duration_budget_policy =
+                        Some(crate::BufloDurationBudgetPolicy::RapidV6Fixed200Seconds)
+                }
+                3 => parameters.minimum_duration_us = 10_000_001,
+                4 => parameters.max_events = 3_125,
+                5 => parameters.packet_size = 1_199,
+                _ => parameters.paper_equivalent = true,
+            }
+            assert!(
+                !Buflo::from_parameters(parameters).enable_buflo_acknowledged_incoming_startup(),
+                "variant{variant}"
+            );
         }
     }
 }
