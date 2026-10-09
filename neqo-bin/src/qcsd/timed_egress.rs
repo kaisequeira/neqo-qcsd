@@ -17,6 +17,7 @@
 )]
 
 use std::{
+    collections::VecDeque,
     fs, io,
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
@@ -46,6 +47,15 @@ const REPORT_FLAGS: libc::c_int = (libc::SOF_TIMESTAMPING_SOFTWARE
     .cast_signed();
 const REQUEST_FLAGS: libc::c_int =
     (libc::SOF_TIMESTAMPING_TX_SCHED | libc::SOF_TIMESTAMPING_TX_SOFTWARE).cast_signed();
+// Linux networking/timestamping documents TX_SCHED at every virtual-device
+// scheduler layer. These bounds limit memory and classification work; they
+// never authorize missing reports or enlarge any realization/clock window.
+// An unsupported path (over 16 reports per datagram), overlong socket run,
+// or report delayed beyond 128 completed datagrams fails closed. The full
+// accepted-event inventory survives history eviction for independent replay.
+pub(super) const COMPLETED_TIMESTAMP_HISTORY_LIMIT: usize = 128;
+pub(super) const TIMESTAMP_EVENTS_PER_TRANSMISSION_LIMIT: usize = 16;
+pub(super) const TIMESTAMP_EVENT_INVENTORY_LIMIT: usize = 1_048_576;
 const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const PR_CAP_AMBIENT: libc::c_int = 47;
 const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
@@ -368,6 +378,8 @@ impl PreparedTimedEgressSocket {
             setup_receipt: self.receipt,
             privilege_receipt: privilege,
             pending: None,
+            timestamp_feedback: TimestampFeedback::default(),
+            layered_timestamp_feedback: false,
             poison: None,
         })
     }
@@ -787,6 +799,222 @@ struct PendingTransmission {
     kernel_timestamp_id: Option<u32>,
     tx_sched_realtime_ns: Option<u64>,
     tx_software_realtime_ns: Option<u64>,
+    timestamp_state: TimestampState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampFeedbackPhase {
+    Pending,
+    BeforeTimedEnqueue,
+    BeforeImmediateEnqueue,
+    Shutdown,
+}
+
+/// Every accepted timestamp report, including reports from later virtual
+/// device layers. Additional reports never replace the first required pair.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TimestampEventReceipt {
+    pub sequence: usize,
+    pub kernel_timestamp_id: u32,
+    pub kind: TimestampKind,
+    pub realtime_ns: u64,
+    pub phase: TimestampFeedbackPhase,
+    pub required_first_of_kind: bool,
+    pub already_completed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SocketTimestampInventoryReceipt {
+    pub schema_version: u32,
+    pub socket_index: usize,
+    pub local_address: SocketAddr,
+    pub completed_history_limit: usize,
+    pub events_per_transmission_limit: usize,
+    pub event_inventory_limit: usize,
+    pub completed_transmissions: usize,
+    pub evicted_completed_ids: usize,
+    pub highest_completed_id: Option<u32>,
+    pub observed_timestamp_events: usize,
+    pub events: Vec<TimestampEventReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TimestampState {
+    last_sched_realtime_ns: Option<u64>,
+    last_software_realtime_ns: Option<u64>,
+    event_count: usize,
+}
+
+impl TimestampState {
+    fn record(
+        &mut self,
+        kind: TimestampKind,
+        kernel_id: u32,
+        realtime_ns: u64,
+    ) -> Result<bool, TimedEgressError> {
+        if self.event_count >= TIMESTAMP_EVENTS_PER_TRANSMISSION_LIMIT {
+            return Err(TimedEgressError::TimestampFeedbackOverflow {
+                scope: "per-transmission",
+                limit: TIMESTAMP_EVENTS_PER_TRANSMISSION_LIMIT,
+            });
+        }
+        let previous = match kind {
+            TimestampKind::Scheduled => self.last_sched_realtime_ns,
+            TimestampKind::Software => self.last_software_realtime_ns,
+        };
+        if previous == Some(realtime_ns) {
+            return Err(TimedEgressError::DuplicateTimestamp { kind, kernel_id });
+        }
+        // The first two kinds may be delivered in either order. Once a kind
+        // repeats, it must advance that kind and the preceding opposite kind.
+        // This admits layered scheduler/driver feedback, never a clock reversal.
+        let preceding_other = match kind {
+            TimestampKind::Scheduled if previous.is_some() => self.last_software_realtime_ns,
+            TimestampKind::Software => self.last_sched_realtime_ns,
+            TimestampKind::Scheduled => None,
+        };
+        let lower_bound = previous.into_iter().chain(preceding_other).max();
+        if let Some(previous) = lower_bound
+            && realtime_ns < previous
+        {
+            return Err(TimedEgressError::TimestampFeedbackOrder {
+                kernel_id,
+                kind,
+                previous,
+                observed: realtime_ns,
+            });
+        }
+        match kind {
+            TimestampKind::Scheduled => self.last_sched_realtime_ns = Some(realtime_ns),
+            TimestampKind::Software => self.last_software_realtime_ns = Some(realtime_ns),
+        }
+        self.event_count += 1;
+        Ok(previous.is_none())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletedTimestampState {
+    kernel_id: u32,
+    state: TimestampState,
+}
+
+#[derive(Debug, Default)]
+struct TimestampFeedback {
+    completed: VecDeque<CompletedTimestampState>,
+    highest_completed_id: Option<u32>,
+    completed_transmissions: usize,
+    evicted_completed_ids: usize,
+    events: Vec<TimestampEventReceipt>,
+}
+
+impl TimestampFeedback {
+    fn require_new_id(&self, kernel_id: u32) -> Result<(), TimedEgressError> {
+        // Ordinary UDP sends can consume IDs, so gaps are valid. Reuse and
+        // u32 wrap are refused for this bounded fresh-process contract; an
+        // evicted old ID can never masquerade as the next pending datagram.
+        if let Some(last_completed) = self.highest_completed_id
+            && kernel_id <= last_completed
+        {
+            return Err(TimedEgressError::KernelIdReuse {
+                last_completed,
+                observed: kernel_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_event(
+        &mut self,
+        kind: TimestampKind,
+        kernel_id: u32,
+        realtime_ns: u64,
+        phase: TimestampFeedbackPhase,
+        required_first_of_kind: bool,
+        already_completed: bool,
+    ) -> Result<(), TimedEgressError> {
+        if self.events.len() >= TIMESTAMP_EVENT_INVENTORY_LIMIT {
+            return Err(TimedEgressError::TimestampFeedbackOverflow {
+                scope: "socket-inventory",
+                limit: TIMESTAMP_EVENT_INVENTORY_LIMIT,
+            });
+        }
+        self.events.push(TimestampEventReceipt {
+            sequence: self.events.len(),
+            kernel_timestamp_id: kernel_id,
+            kind,
+            realtime_ns,
+            phase,
+            required_first_of_kind,
+            already_completed,
+        });
+        Ok(())
+    }
+
+    fn observe_completed(
+        &mut self,
+        kind: TimestampKind,
+        kernel_id: u32,
+        realtime_ns: u64,
+        phase: TimestampFeedbackPhase,
+    ) -> Result<bool, TimedEgressError> {
+        let Some(index) = self
+            .completed
+            .iter()
+            .position(|value| value.kernel_id == kernel_id)
+        else {
+            return Ok(false);
+        };
+        let mut state = self.completed[index].state;
+        let first = state.record(kind, kernel_id, realtime_ns)?;
+        if first {
+            return Err(TimedEgressError::Protocol(
+                "completed timestamp ID lacks its required scheduler/software pair".into(),
+            ));
+        }
+        self.record_event(kind, kernel_id, realtime_ns, phase, false, true)?;
+        self.completed[index].state = state;
+        Ok(true)
+    }
+
+    fn complete(&mut self, kernel_id: u32, state: TimestampState) -> Result<(), TimedEgressError> {
+        self.require_new_id(kernel_id)?;
+        if state.last_sched_realtime_ns.is_none() || state.last_software_realtime_ns.is_none() {
+            return Err(TimedEgressError::Protocol(
+                "timestamp completion requires both scheduler and software reports".into(),
+            ));
+        }
+        if self.completed.len() == COMPLETED_TIMESTAMP_HISTORY_LIMIT {
+            self.completed.pop_front();
+            self.evicted_completed_ids += 1;
+        }
+        self.completed
+            .push_back(CompletedTimestampState { kernel_id, state });
+        self.highest_completed_id = Some(kernel_id);
+        self.completed_transmissions += 1;
+        Ok(())
+    }
+
+    fn receipt(
+        &self,
+        socket_index: usize,
+        local_address: SocketAddr,
+    ) -> SocketTimestampInventoryReceipt {
+        SocketTimestampInventoryReceipt {
+            schema_version: 1,
+            socket_index,
+            local_address,
+            completed_history_limit: COMPLETED_TIMESTAMP_HISTORY_LIMIT,
+            events_per_transmission_limit: TIMESTAMP_EVENTS_PER_TRANSMISSION_LIMIT,
+            event_inventory_limit: TIMESTAMP_EVENT_INVENTORY_LIMIT,
+            completed_transmissions: self.completed_transmissions,
+            evicted_completed_ids: self.evicted_completed_ids,
+            highest_completed_id: self.highest_completed_id,
+            observed_timestamp_events: self.events.len(),
+            events: self.events.clone(),
+        }
+    }
 }
 
 pub struct ActiveTimedEgressSocket {
@@ -797,10 +1025,24 @@ pub struct ActiveTimedEgressSocket {
     setup_receipt: TimedEgressSetupReceipt,
     privilege_receipt: PrivilegeDropReceipt,
     pending: Option<PendingTransmission>,
+    timestamp_feedback: TimestampFeedback,
+    layered_timestamp_feedback: bool,
     poison: Option<String>,
 }
 
 impl ActiveTimedEgressSocket {
+    /// Opt in only for the prospective cadence64 schema-14 producer.
+    pub fn enable_layered_timestamp_feedback(&mut self) -> Result<(), TimedEgressError> {
+        self.ensure_usable()?;
+        if self.pending.is_some() || !self.timestamp_feedback.events.is_empty() {
+            return self.fail(TimedEgressError::Protocol(
+                "layered timestamp contract must be selected before any helper send".into(),
+            ));
+        }
+        self.layered_timestamp_feedback = true;
+        Ok(())
+    }
+
     pub const fn setup_receipt(&self) -> &TimedEgressSetupReceipt {
         &self.setup_receipt
     }
@@ -825,9 +1067,7 @@ impl ActiveTimedEgressSocket {
                 "a timed transmission is already pending".into(),
             ));
         }
-        if let Some(stale) = receive_error_queue_event(self.fd.as_raw_fd())? {
-            return self.fail(TimedEgressError::StaleErrorQueue(format!("{stale:?}")));
-        }
+        self.drain_completed_feedback(TimestampFeedbackPhase::BeforeTimedEnqueue)?;
         validate_exact_batch(batch, self.family, self.local_address)?;
 
         if latest_enqueue_tai_ns >= txtime_tai_ns {
@@ -914,6 +1154,7 @@ impl ActiveTimedEgressSocket {
                 kernel_timestamp_id: None,
                 tx_sched_realtime_ns: None,
                 tx_software_realtime_ns: None,
+                timestamp_state: TimestampState::default(),
             });
         }
         if let Some(source) = raw.post_send_error.take() {
@@ -1047,7 +1288,6 @@ impl ActiveTimedEgressSocket {
         loop {
             while let Some(event) = receive_error_queue_event(self.fd.as_raw_fd())? {
                 if let Some(outcome) = self.observe_event(event)? {
-                    self.pending = None;
                     return Ok(outcome);
                 }
             }
@@ -1087,9 +1327,7 @@ impl ActiveTimedEgressSocket {
                 "post-main send found a pending transmission".into(),
             ));
         }
-        if let Some(stale) = receive_error_queue_event(self.fd.as_raw_fd())? {
-            return self.fail(TimedEgressError::StaleErrorQueue(format!("{stale:?}")));
-        }
+        self.drain_completed_feedback(TimestampFeedbackPhase::BeforeImmediateEnqueue)?;
         validate_exact_batch(batch, self.family, self.local_address)?;
         let priority: libc::c_int = getsockopt(
             self.fd.as_raw_fd(),
@@ -1169,6 +1407,7 @@ impl ActiveTimedEgressSocket {
                 kernel_timestamp_id: None,
                 tx_sched_realtime_ns: None,
                 tx_software_realtime_ns: None,
+                timestamp_state: TimestampState::default(),
             });
         }
         if let Some(source) = raw.post_send_error.take() {
@@ -1319,6 +1558,25 @@ impl ActiveTimedEgressSocket {
         &mut self,
         event: KernelTxEvent,
     ) -> Result<Option<TimedTxOutcome>, TimedEgressError> {
+        self.ensure_usable()?;
+        if self.layered_timestamp_feedback
+            && let KernelTxEvent::Timestamp {
+                kind,
+                kernel_id,
+                realtime_ns,
+            } = event
+        {
+            match self.timestamp_feedback.observe_completed(
+                kind,
+                kernel_id,
+                realtime_ns,
+                TimestampFeedbackPhase::Pending,
+            ) {
+                Ok(true) => return Ok(None),
+                Ok(false) => {}
+                Err(error) => return self.fail(error),
+            }
+        }
         let Some(mut pending) = self.pending else {
             return self.fail(TimedEgressError::Protocol(
                 "observe_event called without a pending transmission".into(),
@@ -1338,14 +1596,51 @@ impl ActiveTimedEgressSocket {
                         observed: kernel_id,
                     });
                 }
+                if pending.kernel_timestamp_id.is_none()
+                    && let Err(error) = self.timestamp_feedback.require_new_id(kernel_id)
+                {
+                    return self.fail(error);
+                }
+                if !self.layered_timestamp_feedback
+                    && match kind {
+                        TimestampKind::Scheduled => pending.tx_sched_realtime_ns.is_some(),
+                        TimestampKind::Software => pending.tx_software_realtime_ns.is_some(),
+                    }
+                {
+                    return self.fail(TimedEgressError::DuplicateTimestamp { kind, kernel_id });
+                }
+                if kind == TimestampKind::Software
+                    && pending.tx_software_realtime_ns.is_none()
+                    && let Some(scheduled) = pending.tx_sched_realtime_ns
+                    && realtime_ns < scheduled
+                {
+                    return self.fail(TimedEgressError::TimestampOrder {
+                        scheduled,
+                        software: realtime_ns,
+                    });
+                }
+                let first = match pending.timestamp_state.record(kind, kernel_id, realtime_ns) {
+                    Ok(first) => first,
+                    Err(error) => return self.fail(error),
+                };
+                if self.layered_timestamp_feedback
+                    && let Err(error) = self.timestamp_feedback.record_event(
+                        kind,
+                        kernel_id,
+                        realtime_ns,
+                        TimestampFeedbackPhase::Pending,
+                        first,
+                        false,
+                    )
+                {
+                    return self.fail(error);
+                }
                 pending.kernel_timestamp_id = Some(kernel_id);
                 let slot = match kind {
                     TimestampKind::Scheduled => &mut pending.tx_sched_realtime_ns,
                     TimestampKind::Software => &mut pending.tx_software_realtime_ns,
                 };
-                if slot.replace(realtime_ns).is_some() {
-                    return self.fail(TimedEgressError::DuplicateTimestamp { kind, kernel_id });
-                }
+                slot.get_or_insert(realtime_ns);
             }
             KernelTxEvent::TxtimeDrop(diagnostic) => {
                 if diagnostic.requested_txtime_tai_ns != pending.requested_txtime_tai_ns {
@@ -1377,6 +1672,14 @@ impl ActiveTimedEgressSocket {
                 software: tx_software_realtime_ns,
             });
         }
+        if self.layered_timestamp_feedback
+            && let Err(error) = self
+                .timestamp_feedback
+                .complete(kernel_timestamp_id, pending.timestamp_state)
+        {
+            return self.fail(error);
+        }
+        self.pending = None;
         Ok(Some(TimedTxOutcome {
             schema_version: 1,
             requested_txtime_tai_ns: pending.requested_txtime_tai_ns,
@@ -1384,6 +1687,52 @@ impl ActiveTimedEgressSocket {
             tx_sched_realtime_ns,
             tx_software_realtime_ns,
         }))
+    }
+
+    fn observe_idle_event(
+        &mut self,
+        event: KernelTxEvent,
+        phase: TimestampFeedbackPhase,
+    ) -> Result<(), TimedEgressError> {
+        let error = match event {
+            KernelTxEvent::Timestamp {
+                kind,
+                kernel_id,
+                realtime_ns,
+            } => {
+                match self
+                    .timestamp_feedback
+                    .observe_completed(kind, kernel_id, realtime_ns, phase)
+                {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => TimedEgressError::StaleErrorQueue(format!(
+                        "unrecognized {kind:?} timestamp id={kernel_id} realtime_ns={realtime_ns} phase={phase:?}; highest_completed_id={:?}",
+                        self.timestamp_feedback.highest_completed_id,
+                    )),
+                    Err(error) => error,
+                }
+            }
+            KernelTxEvent::TxtimeDrop(diagnostic) => TimedEgressError::TxtimeDrop(diagnostic),
+            KernelTxEvent::NetworkError(diagnostic) => TimedEgressError::NetworkError(diagnostic),
+        };
+        self.fail(error)
+    }
+
+    fn drain_completed_feedback(
+        &mut self,
+        phase: TimestampFeedbackPhase,
+    ) -> Result<(), TimedEgressError> {
+        loop {
+            let event = match receive_error_queue_event(self.fd.as_raw_fd()) {
+                Ok(Some(event)) => event,
+                Ok(None) => return Ok(()),
+                Err(error) => return self.fail(error),
+            };
+            if !self.layered_timestamp_feedback {
+                return self.fail(TimedEgressError::StaleErrorQueue(format!("{event:?}")));
+            }
+            self.observe_idle_event(event, phase)?;
+        }
     }
 
     fn ensure_usable(&self) -> Result<(), TimedEgressError> {
@@ -1595,6 +1944,8 @@ pub struct HelperSocketShutdownReceipt {
     pub stale_error_queue_socket_count: usize,
     pub nonzero_priority_socket_count: usize,
     pub inspection_errors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub timestamp_inventories: Vec<SocketTimestampInventoryReceipt>,
     pub clean: bool,
 }
 
@@ -2263,7 +2614,16 @@ fn inspect_socket_shutdown_state(
     let mut stale_error_queue_socket_count = 0;
     let mut nonzero_priority_socket_count = 0;
     let mut inspection_errors = Vec::new();
+    let mut timestamp_inventories = Vec::with_capacity(sockets.len());
+    let layered = sockets
+        .first()
+        .is_some_and(|socket| socket.layered_timestamp_feedback);
     for (index, socket) in sockets.iter_mut().enumerate() {
+        if socket.layered_timestamp_feedback != layered {
+            inspection_errors.push(format!(
+                "socket {index} has a mixed timestamp feedback contract"
+            ));
+        }
         pending_socket_count += usize::from(socket.pending.is_some());
         match getsockopt::<libc::c_int>(
             socket.fd.as_raw_fd(),
@@ -2280,17 +2640,18 @@ fn inspect_socket_shutdown_state(
                 "socket {index} priority inspection failed: {error}"
             )),
         }
-        match receive_error_queue_event(socket.fd.as_raw_fd()) {
-            Ok(None) => {}
-            Ok(Some(event)) => {
-                stale_error_queue_socket_count += 1;
-                inspection_errors.push(format!(
-                    "socket {index} retained error-queue event {event:?}"
-                ));
-            }
-            Err(error) => inspection_errors.push(format!(
+        if let Err(error) = socket.drain_completed_feedback(TimestampFeedbackPhase::Shutdown) {
+            stale_error_queue_socket_count += 1;
+            inspection_errors.push(format!(
                 "socket {index} error-queue inspection failed: {error}"
-            )),
+            ));
+        }
+        if layered {
+            timestamp_inventories.push(
+                socket
+                    .timestamp_feedback
+                    .receipt(index, socket.local_address),
+            );
         }
     }
     let clean = active_job_id.is_none()
@@ -2299,13 +2660,14 @@ fn inspect_socket_shutdown_state(
         && nonzero_priority_socket_count == 0
         && inspection_errors.is_empty();
     HelperSocketShutdownReceipt {
-        schema_version: 1,
+        schema_version: if layered { 2 } else { 1 },
         socket_count: sockets.len(),
         active_job_id,
         pending_socket_count,
         stale_error_queue_socket_count,
         nonzero_priority_socket_count,
         inspection_errors,
+        timestamp_inventories,
         clean,
     }
 }
@@ -2637,7 +2999,7 @@ pub enum TimedEgressError {
     Protocol(String),
     #[error("timed-egress socket is poisoned: {0}")]
     Poisoned(String),
-    #[error("stale error-queue entry before timed enqueue: {0}")]
+    #[error("unrecognized stale error-queue entry: {0}")]
     StaleErrorQueue(String),
     #[error("requested CLOCK_TAI txtime {requested} was not after observed time {observed}")]
     PastTxtime { requested: u64, observed: u64 },
@@ -2647,6 +3009,21 @@ pub enum TimedEgressError {
     ShortSend { expected: usize, observed: usize },
     #[error("kernel timestamp id mismatch: expected {expected}, observed {observed}")]
     KernelIdMismatch { expected: u32, observed: u32 },
+    #[error("kernel timestamp id reuse/wrap: last completed {last_completed}, observed {observed}")]
+    KernelIdReuse { last_completed: u32, observed: u32 },
+    #[error(
+        "{kind:?} timestamp for kernel id {kernel_id} reversed chronology: previous {previous}, observed {observed}"
+    )]
+    TimestampFeedbackOrder {
+        kernel_id: u32,
+        kind: TimestampKind,
+        previous: u64,
+        observed: u64,
+    },
+    #[error(
+        "timestamp feedback exceeded strict {scope} inventory bound {limit}; no reports may be omitted"
+    )]
+    TimestampFeedbackOverflow { scope: &'static str, limit: usize },
     #[error("duplicate {kind:?} timestamp for kernel id {kernel_id}")]
     DuplicateTimestamp { kind: TimestampKind, kernel_id: u32 },
     #[error("TX_SOFTWARE {software} preceded TX_SCHED {scheduled}")]
@@ -2786,6 +3163,9 @@ impl TimedEgressError {
             Self::EnqueueDeadline { .. } => "enqueue_deadline",
             Self::ShortSend { .. } => "short_send",
             Self::KernelIdMismatch { .. } => "kernel_id_mismatch",
+            Self::KernelIdReuse { .. } => "kernel_id_reuse",
+            Self::TimestampFeedbackOrder { .. } => "timestamp_feedback_order",
+            Self::TimestampFeedbackOverflow { .. } => "timestamp_feedback_overflow",
             Self::DuplicateTimestamp { .. } => "duplicate_timestamp",
             Self::TimestampOrder { .. } => "timestamp_order",
             Self::ReportTimeout { .. } => "report_timeout",
@@ -4135,7 +4515,10 @@ mod tests {
                 kernel_timestamp_id: None,
                 tx_sched_realtime_ns: None,
                 tx_software_realtime_ns: None,
+                timestamp_state: TimestampState::default(),
             }),
+            timestamp_feedback: TimestampFeedback::default(),
+            layered_timestamp_feedback: true,
             poison: None,
         }
     }
@@ -5401,6 +5784,365 @@ mod tests {
         ));
     }
 
+    fn complete_timestamp_pair(
+        socket: &mut ActiveTimedEgressSocket,
+        id: u32,
+        base: u64,
+    ) -> TimedTxOutcome {
+        socket.pending = Some(PendingTransmission {
+            requested_txtime_tai_ns: 123,
+            kernel_timestamp_id: None,
+            tx_sched_realtime_ns: None,
+            tx_software_realtime_ns: None,
+            timestamp_state: TimestampState::default(),
+        });
+        assert!(
+            socket
+                .observe_event(timestamp_event(TimestampKind::Scheduled, id, base))
+                .expect("scheduler")
+                .is_none()
+        );
+        socket
+            .observe_event(timestamp_event(TimestampKind::Software, id, base + 10))
+            .expect("software")
+            .expect("first required pair")
+    }
+
+    #[test]
+    fn layered_feedback_preserves_first_pair_across_enqueue_pending_and_shutdown() {
+        let mut socket = pending_socket();
+        let first = complete_timestamp_pair(&mut socket, 0, 1_000);
+        assert!(socket.pending.is_none());
+        socket
+            .observe_idle_event(
+                timestamp_event(TimestampKind::Scheduled, 0, 1_020),
+                TimestampFeedbackPhase::BeforeTimedEnqueue,
+            )
+            .expect("later scheduler layer");
+        // A delayed old software report must not bind the next pending send.
+        socket.pending = Some(PendingTransmission {
+            requested_txtime_tai_ns: 456,
+            kernel_timestamp_id: None,
+            tx_sched_realtime_ns: None,
+            tx_software_realtime_ns: None,
+            timestamp_state: TimestampState::default(),
+        });
+        assert!(
+            socket
+                .observe_event(timestamp_event(TimestampKind::Software, 0, 1_030))
+                .expect("old feedback while pending")
+                .is_none()
+        );
+        assert_eq!(
+            socket
+                .pending
+                .expect("new pending remains")
+                .kernel_timestamp_id,
+            None
+        );
+        assert!(
+            socket
+                .observe_event(timestamp_event(TimestampKind::Scheduled, 3, 2_000))
+                .expect("ID gap from ordinary UDP sends")
+                .is_none()
+        );
+        let second = socket
+            .observe_event(timestamp_event(TimestampKind::Software, 3, 2_010))
+            .expect("new software")
+            .expect("second pair");
+        socket
+            .observe_idle_event(
+                timestamp_event(TimestampKind::Scheduled, 3, 2_020),
+                TimestampFeedbackPhase::BeforeImmediateEnqueue,
+            )
+            .expect("immediate preflight");
+        socket
+            .observe_idle_event(
+                timestamp_event(TimestampKind::Software, 3, 2_030),
+                TimestampFeedbackPhase::Shutdown,
+            )
+            .expect("late known ID at shutdown");
+        let shutdown = inspect_socket_shutdown_state(std::slice::from_mut(&mut socket), None);
+        assert!(shutdown.clean);
+        assert_eq!(shutdown.schema_version, 2);
+        let inventory = &shutdown.timestamp_inventories[0];
+        assert_eq!(inventory.completed_transmissions, 2);
+        assert_eq!(inventory.events.len(), 8);
+        assert_eq!(inventory.events[7].phase, TimestampFeedbackPhase::Shutdown);
+        assert!(inventory.events[7].already_completed);
+        assert!(!inventory.events[7].required_first_of_kind);
+        assert_eq!(
+            (first.tx_sched_realtime_ns, first.tx_software_realtime_ns),
+            (1_000, 1_010)
+        );
+        assert_eq!(
+            (second.tx_sched_realtime_ns, second.tx_software_realtime_ns),
+            (2_000, 2_010)
+        );
+        let endpoints = [(socket.local_address, socket.local_address)];
+        assert!(super::super::buflo_kernel_timestamp_inventories_complete(
+            &shutdown, &endpoints, 2
+        ));
+        let mut missing = shutdown.clone();
+        missing.timestamp_inventories.clear();
+        assert!(!super::super::buflo_kernel_timestamp_inventories_complete(
+            &missing, &endpoints, 2
+        ));
+        let mut wrong_socket = shutdown.clone();
+        wrong_socket.timestamp_inventories[0].local_address =
+            "127.0.0.1:1".parse().expect("address");
+        assert!(!super::super::buflo_kernel_timestamp_inventories_complete(
+            &wrong_socket,
+            &endpoints,
+            2
+        ));
+        assert!(!super::super::buflo_kernel_timestamp_inventories_complete(
+            &shutdown, &endpoints, 3
+        ));
+    }
+
+    #[test]
+    fn repeated_pending_scheduler_reports_do_not_replace_required_first_scheduler() {
+        let mut socket = pending_socket();
+        for time in [1_000, 1_010] {
+            assert!(
+                socket
+                    .observe_event(timestamp_event(TimestampKind::Scheduled, 7, time))
+                    .expect("distinct scheduler layer")
+                    .is_none()
+            );
+        }
+        let outcome = socket
+            .observe_event(timestamp_event(TimestampKind::Software, 7, 1_020))
+            .expect("software")
+            .expect("complete");
+        assert_eq!(outcome.tx_sched_realtime_ns, 1_000);
+        assert_eq!(
+            socket
+                .timestamp_feedback
+                .events
+                .iter()
+                .filter(|event| event.required_first_of_kind)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn layered_feedback_rejects_exact_duplicates_reversal_unknown_and_wrap() {
+        for (kind, time, duplicate) in [
+            (TimestampKind::Software, 1_010, true),
+            (TimestampKind::Scheduled, 1_005, false),
+            (TimestampKind::Software, 999, false),
+        ] {
+            let mut socket = pending_socket();
+            complete_timestamp_pair(&mut socket, 7, 1_000);
+            let error = socket
+                .observe_idle_event(
+                    timestamp_event(kind, 7, time),
+                    TimestampFeedbackPhase::Shutdown,
+                )
+                .expect_err("bad known feedback");
+            if duplicate {
+                assert!(matches!(error, TimedEgressError::DuplicateTimestamp { .. }));
+            } else {
+                assert!(matches!(
+                    error,
+                    TimedEgressError::TimestampFeedbackOrder { .. }
+                ));
+            }
+            assert!(socket.poison.is_some());
+        }
+        let mut unknown = pending_socket();
+        complete_timestamp_pair(&mut unknown, 7, 1_000);
+        assert!(matches!(
+            unknown.observe_idle_event(
+                timestamp_event(TimestampKind::Scheduled, 8, 2_000),
+                TimestampFeedbackPhase::Shutdown
+            ),
+            Err(TimedEgressError::StaleErrorQueue(_))
+        ));
+        let mut wrapped = pending_socket();
+        complete_timestamp_pair(&mut wrapped, u32::MAX, 1_000);
+        wrapped.pending = pending_socket().pending;
+        assert!(matches!(
+            wrapped.observe_event(timestamp_event(TimestampKind::Scheduled, 0, 2_000)),
+            Err(TimedEgressError::KernelIdReuse {
+                last_completed: u32::MAX,
+                observed: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn completed_history_is_bounded_and_evicted_ids_cannot_bind_pending() {
+        let mut socket = pending_socket();
+        for id in 0..=u32::try_from(COMPLETED_TIMESTAMP_HISTORY_LIMIT).expect("small limit") {
+            complete_timestamp_pair(&mut socket, id, u64::from(id) * 100 + 1_000);
+        }
+        assert_eq!(
+            socket.timestamp_feedback.completed.len(),
+            COMPLETED_TIMESTAMP_HISTORY_LIMIT
+        );
+        assert_eq!(socket.timestamp_feedback.evicted_completed_ids, 1);
+        assert_eq!(
+            socket.timestamp_feedback.events.len(),
+            (COMPLETED_TIMESTAMP_HISTORY_LIMIT + 1) * 2
+        );
+        assert!(
+            !socket
+                .timestamp_feedback
+                .observe_completed(
+                    TimestampKind::Scheduled,
+                    0,
+                    50_000,
+                    TimestampFeedbackPhase::Shutdown
+                )
+                .expect("evicted ID unrecognized")
+        );
+        socket.pending = pending_socket().pending;
+        assert!(matches!(
+            socket.observe_event(timestamp_event(TimestampKind::Scheduled, 0, 50_000)),
+            Err(TimedEgressError::KernelIdReuse { observed: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn timestamp_inventory_bounds_fail_without_omitting_reports() {
+        let mut state = TimestampState::default();
+        for index in 0..TIMESTAMP_EVENTS_PER_TRANSMISSION_LIMIT {
+            state
+                .record(
+                    TimestampKind::Scheduled,
+                    7,
+                    u64::try_from(index).expect("small index") + 1,
+                )
+                .expect("bounded layer");
+        }
+        assert!(matches!(
+            state.record(TimestampKind::Scheduled, 7, 100),
+            Err(TimedEgressError::TimestampFeedbackOverflow {
+                scope: "per-transmission",
+                ..
+            })
+        ));
+        // Build the exact boundary inventory, rather than lowering a production
+        // bound in a test-only execution path.
+        let event = TimestampEventReceipt {
+            sequence: 0,
+            kernel_timestamp_id: 7,
+            kind: TimestampKind::Scheduled,
+            realtime_ns: 1,
+            phase: TimestampFeedbackPhase::Pending,
+            required_first_of_kind: true,
+            already_completed: false,
+        };
+        let mut feedback = TimestampFeedback {
+            events: vec![event; TIMESTAMP_EVENT_INVENTORY_LIMIT],
+            ..TimestampFeedback::default()
+        };
+        assert!(matches!(
+            feedback.record_event(
+                TimestampKind::Software,
+                7,
+                2,
+                TimestampFeedbackPhase::Shutdown,
+                false,
+                true
+            ),
+            Err(TimedEgressError::TimestampFeedbackOverflow {
+                scope: "socket-inventory",
+                ..
+            })
+        ));
+        assert_eq!(feedback.events.len(), TIMESTAMP_EVENT_INVENTORY_LIMIT);
+    }
+
+    #[test]
+    fn reversed_delivery_still_requires_chronological_first_pair() {
+        let mut socket = pending_socket();
+        assert!(
+            socket
+                .observe_event(timestamp_event(TimestampKind::Software, 7, 1_100))
+                .expect("software delivered first")
+                .is_none()
+        );
+        assert!(
+            socket
+                .observe_event(timestamp_event(TimestampKind::Scheduled, 7, 1_000))
+                .expect("scheduler delivered later")
+                .is_some()
+        );
+        let mut reversed = pending_socket();
+        reversed
+            .observe_event(timestamp_event(TimestampKind::Software, 7, 1_000))
+            .expect("first software");
+        assert!(matches!(
+            reversed.observe_event(timestamp_event(TimestampKind::Scheduled, 7, 1_100)),
+            Err(TimedEgressError::TimestampOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn completed_id_never_excuses_txtime_or_network_errors() {
+        let drop = TxtimeDropDiagnostic {
+            family: SocketFamily::Ipv4,
+            errno: libc::ECANCELED.cast_unsigned(),
+            kind: TxtimeDropKind::Missed,
+            requested_txtime_tai_ns: 123,
+        };
+        let network = NetworkErrorDiagnostic {
+            family: SocketFamily::Ipv4,
+            errno: libc::ECONNREFUSED.cast_unsigned(),
+            origin: 2,
+            error_type: 3,
+            code: 3,
+            info: 0,
+            data: 7,
+        };
+        for (event, code) in [
+            (KernelTxEvent::TxtimeDrop(drop), "txtime_missed"),
+            (KernelTxEvent::NetworkError(network), "network_error"),
+        ] {
+            let mut socket = pending_socket();
+            complete_timestamp_pair(&mut socket, 7, 1_000);
+            let error = socket
+                .observe_idle_event(event, TimestampFeedbackPhase::Shutdown)
+                .expect_err("completed IDs only classify timestamp-origin reports");
+            assert_eq!(error.terminal_error_code(), code);
+            assert!(socket.poison.is_some());
+            assert_eq!(socket.timestamp_feedback.events.len(), 2);
+        }
+    }
+
+    #[test]
+    fn historical_socket_contract_keeps_schema_one_and_strict_duplicates() {
+        let mut socket = pending_socket();
+        socket.layered_timestamp_feedback = false;
+        complete_timestamp_pair(&mut socket, 7, 1_000);
+        let shutdown = inspect_socket_shutdown_state(std::slice::from_mut(&mut socket), None);
+        assert!(shutdown.clean);
+        assert_eq!(shutdown.schema_version, 1);
+        assert!(shutdown.timestamp_inventories.is_empty());
+        let json = serde_json::to_value(shutdown).expect("serialize historical receipt");
+        assert!(json.get("timestamp_inventories").is_none());
+        let mut duplicate = pending_socket();
+        duplicate.layered_timestamp_feedback = false;
+        duplicate
+            .observe_event(timestamp_event(TimestampKind::Scheduled, 7, 1_000))
+            .expect("first scheduler");
+        assert!(matches!(
+            duplicate.observe_event(timestamp_event(TimestampKind::Scheduled, 7, 1_010)),
+            Err(TimedEgressError::DuplicateTimestamp { .. })
+        ));
+        let mut late_opt_in = pending_socket();
+        late_opt_in.layered_timestamp_feedback = false;
+        assert!(matches!(
+            late_opt_in.enable_layered_timestamp_feedback(),
+            Err(TimedEgressError::Protocol(_))
+        ));
+    }
+
     #[test]
     fn missing_pending_state_is_typed_and_fail_closed() {
         let mut wait_socket = pending_socket();
@@ -5594,13 +6336,14 @@ mod tests {
     #[test]
     fn total_shutdown_receipt_retains_independent_partial_evidence() {
         let socket_state = HelperSocketShutdownReceipt {
-            schema_version: 1,
+            schema_version: 2,
             socket_count: 2,
             active_job_id: None,
             pending_socket_count: 0,
             stale_error_queue_socket_count: 0,
             nonzero_priority_socket_count: 0,
             inspection_errors: Vec::new(),
+            timestamp_inventories: Vec::new(),
             clean: true,
         };
         let receipt = assemble_helper_shutdown_receipt(
