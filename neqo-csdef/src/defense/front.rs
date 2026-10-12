@@ -96,6 +96,10 @@ impl Defense for Front {
     fn mode(&self) -> DefenseMode {
         DefenseMode::ChaffOnly
     }
+
+    fn incoming_exact_capacity_precedes_claims(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

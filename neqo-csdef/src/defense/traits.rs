@@ -881,6 +881,17 @@ pub trait Defense: Debug {
     fn incoming_slot_must_resolve_in_window(&self) -> bool {
         false
     }
+    /// Whether every currently exact stream extent precedes provisional
+    /// framing claims when allocating one due incoming slot.
+    ///
+    /// A framing claim does not advertise credit and can wait on parser or FIN
+    /// progress. FRONT uses another live chaff stream's exact extent first,
+    /// while other defenses retain their established per-stream ordering.
+    /// This neither exposes a future slot nor changes the slot's byte ledger,
+    /// receive limits, physical realization boundary or timing window.
+    fn incoming_exact_capacity_precedes_claims(&self) -> bool {
+        false
+    }
     /// Whether incoming events use slot-bearing local-advertisement and
     /// eventual-consumption signals.
     ///

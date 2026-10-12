@@ -1441,6 +1441,79 @@ impl QcsdController {
             .is_some_and(|ledger| ledger.local_realization_emitted)
     }
 
+    /// Original exact incoming targets covered by one transport advertisement.
+    ///
+    /// Encoding removes the adapter's pending identity before the socket send,
+    /// but these controller-owned ranges remain unadvertised until that send
+    /// succeeds. Include every owner of a physically slotless parser range and
+    /// expired tombstones: neither encoding nor expiry grants a late datagram
+    /// permission to escape its original half-open realization window.
+    /// Unowned parser capacity deliberately contributes no scheduled target.
+    ///
+    /// # Errors
+    /// Returns an invariant error if one owner has contradictory packet data.
+    pub fn exact_incoming_advertisement_targets(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        observed_slot: Option<QcsdSlotId>,
+    ) -> Result<Vec<(QcsdSlotId, crate::Packet)>> {
+        if !self.defense.incoming_slot_must_resolve_in_window() {
+            return Ok(Vec::new());
+        }
+        let scheduled = self.control.credit.iter().copied().filter_map(|credit| {
+            (credit.endpoint == endpoint && credit.stream == stream)
+                .then_some(UnadvertisedReceiveRange::Scheduled(credit))
+        });
+        let parser = self
+            .parser_lease_ranges
+            .get(&(endpoint, stream))
+            .into_iter()
+            .flatten()
+            .filter_map(|range| {
+                (!range.advertised).then_some(UnadvertisedReceiveRange::Parser {
+                    endpoint,
+                    stream,
+                    range: *range,
+                })
+            });
+        let mut targets = BTreeMap::new();
+        for range in scheduled
+            .chain(parser)
+            .chain(self.terminal_unadvertised_incoming_credit.iter().copied())
+            .filter(|range| {
+                range.matches_physical_advertisement(
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    observed_slot,
+                )
+            })
+        {
+            let owner = match range {
+                UnadvertisedReceiveRange::Scheduled(credit) => Some((credit.slot, credit.packet)),
+                UnadvertisedReceiveRange::Parser { range, .. } => {
+                    range.owner.map(|owner| (owner.slot, owner.packet))
+                }
+            };
+            let Some((slot, packet)) = owner else {
+                continue;
+            };
+            if packet.direction() != Direction::Incoming
+                || targets
+                    .insert(slot, packet)
+                    .is_some_and(|old| old != packet)
+            {
+                return Err(crate::Error::ControllerInvariant(format!(
+                    "incoming advertisement owner {} has contradictory packet data",
+                    slot.0
+                )));
+            }
+        }
+        Ok(targets.into_iter().collect())
+    }
+
     /// Terminal consumed-range provenance for a cell that acquired legacy
     /// parser ownership during consumption. It cannot authorize credit or
     /// change a terminal outcome; the runner still needs physical coverage.
@@ -4576,6 +4649,7 @@ impl QcsdController {
         reason = "atomic staged allocation keeps exact credit, claims, rollback, and promotion auditable"
     )]
     fn process_incoming(&mut self, boundary_us: u64, elapsed: Duration) {
+        self.retarget_front_claims_to_exact_capacity(boundary_us);
         let pending = std::mem::take(&mut self.control.incoming);
         let pending_len = pending.len();
         let exact_window = self.defense.incoming_slot_must_resolve_in_window();
@@ -4881,6 +4955,23 @@ impl QcsdController {
             opportunities.sort_by_key(|opportunity| {
                 matches!(opportunity.role, QcsdRequestRole::Chaff { .. })
             });
+            if self.defense.incoming_exact_capacity_precedes_claims() {
+                // FRONT must not park a due owner's remainder on one stream's
+                // non-advertised framing claim while another live chaff stream
+                // can advertise exact known bytes now. Keep the same endpoint
+                // and stream order within each pass, and preserve the existing
+                // partial/claim fallback only after all exact extents.
+                let mut claims = Vec::new();
+                for opportunity in &mut opportunities {
+                    if opportunity.claimable > 0 {
+                        let mut claim = *opportunity;
+                        claim.exact = 0;
+                        claims.push(claim);
+                        opportunity.claimable = 0;
+                    }
+                }
+                opportunities.extend(claims);
+            }
             for opportunity in opportunities {
                 if incoming.remaining == 0 {
                     break;
@@ -5017,6 +5108,112 @@ impl QcsdController {
             }
             if incoming.remaining > 0 {
                 self.unsatisfied_incoming(incoming, miss_reason, elapsed);
+            }
+        }
+    }
+
+    /// Move only the still-unadvertised portion of an already due FRONT owner
+    /// off a framing claim when another eligible stream now has exact extent.
+    ///
+    /// The initial exact-first pass cannot see capacity that appears later.
+    /// Without this pass, a claim remains pinned to its first stream until
+    /// same-stream parser progress or FIN, while a later slot can spend the
+    /// newly available exact bytes. Preserve the original packet and slot,
+    /// restore exactly the old reservation debit, and require a new physical
+    /// advertisement before any local-realization edge. No existing physical
+    /// range, parser lease, target timestamp, or terminal outcome is retagged.
+    fn retarget_front_claims_to_exact_capacity(&mut self, boundary_us: u64) {
+        if !self.defense.incoming_exact_capacity_precedes_claims()
+            || self.incoming_requires_explicit_physical_ownership()
+            || self.control.claims.is_empty()
+        {
+            return;
+        }
+        // This is another allocation turn for an existing owner, whose
+        // original materialization already advanced the incoming cursor.
+        // Inspect its current order without perturbing later new slots, and
+        // inspect the registry only once even when many claims are waiting.
+        let mut opportunities = Vec::new();
+        for endpoint in self.scheduler.incoming_order() {
+            opportunities.extend(
+                self.streams
+                    .allocation_opportunities_excluding(
+                        endpoint,
+                        self.defense.mode(),
+                        &self.control.receiver_continuation_reserves,
+                        self.defense.base_chaff_requires_peer_acknowledgment(),
+                    )
+                    .into_iter()
+                    .filter(|opportunity| opportunity.exact > 0),
+            );
+        }
+        if opportunities.is_empty() {
+            return;
+        }
+        opportunities
+            .sort_by_key(|opportunity| matches!(opportunity.role, QcsdRequestRole::Chaff { .. }));
+        let mut claims = std::mem::take(&mut self.control.claims);
+        claims.sort_by_key(|claim| (claim.packet.timestamp_us(), claim.slot));
+        for mut claim in claims {
+            if !claim.reservation_debited
+                || claim.packet.timestamp_us() > boundary_us
+                || self.control.terminal_incoming.contains(&claim.slot)
+                || !self
+                    .streams
+                    .receive_actions_available(claim.endpoint, claim.stream)
+                || self
+                    .incoming_credit_ledger
+                    .get(&claim.slot)
+                    .is_none_or(|ledger| {
+                        ledger.packet != claim.packet || ledger.local_realization_emitted
+                    })
+            {
+                self.control.claims.push(claim);
+                continue;
+            }
+            for opportunity in &mut opportunities {
+                if claim.remaining == 0 {
+                    break;
+                }
+                if opportunity.exact == 0
+                    || (opportunity.endpoint, opportunity.stream) == (claim.endpoint, claim.stream)
+                {
+                    continue;
+                }
+                let release = self
+                    .streams
+                    .release_stream(
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        claim.remaining.min(opportunity.exact),
+                    )
+                    .expect("snapshotted exact extent remains available");
+                opportunity.exact -= release.increase;
+                self.streams
+                    .restore_claim(claim.endpoint, claim.stream, release.increase);
+                claim.remaining -= release.increase;
+                self.incoming_credit_ledger
+                    .get_mut(&claim.slot)
+                    .expect("live original claim owner")
+                    .assign_endpoint(release.endpoint);
+                self.control.credit.push(PendingCredit {
+                    slot: claim.slot,
+                    packet: claim.packet,
+                    endpoint: release.endpoint,
+                    stream: release.stream,
+                    absolute_limit: release.absolute_limit,
+                    increase: release.increase,
+                });
+                self.actions.push_back(QcsdAction::IncreaseReceiveLimit {
+                    endpoint: release.endpoint,
+                    stream: release.stream,
+                    absolute_limit: release.absolute_limit,
+                    packet: claim.packet,
+                    slot: claim.slot,
+                });
+            }
+            if claim.remaining > 0 {
+                self.control.claims.push(claim);
             }
         }
     }
@@ -5739,6 +5936,21 @@ impl QcsdController {
             }
             self.actions
                 .push_back(QcsdAction::ReleaseApplicationSendShaping { endpoint });
+        }
+    }
+
+    /// Next nominal Tamaraw schedule event, excluding queued observation work.
+    ///
+    /// The runner uses this pure query only to stop admitting ordinary work.
+    /// It does not materialize, advance, prearm, or authorize a target. In
+    /// particular, an observation at elapsed zero must not turn a fairness
+    /// boundary into an endless immediate-service loop.
+    #[must_use]
+    pub fn next_tamaraw_event_at(&self) -> Option<Duration> {
+        if matches!(self.config.defense, DefenseConfig::Tamaraw(_)) {
+            self.defense.next_event_at()
+        } else {
+            None
         }
     }
 
@@ -10953,6 +11165,795 @@ mod tests {
             _ => None,
         });
         assert_eq!(stream, Some(QcsdStreamId(0)));
+    }
+
+    fn front_exact_first_controller(front: bool) -> QcsdController {
+        let defense: Box<dyn Defense> = if front {
+            let defense = crate::Front::new(&FrontConfig::default(), 42);
+            assert!(!defense.is_incoming_complete());
+            Box::new(defense)
+        } else {
+            Box::new(StaticSchedule::with_mode(
+                Trace::new([incoming_packet(Duration::from_secs(1))]),
+                DefenseMode::ChaffOnly,
+            ))
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                low_watermark: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            defense,
+        )
+        .expect("isolated allocator fixture");
+        ready(&mut controller, 1, "https://front.example");
+        controller.drain_actions().for_each(drop);
+        controller
+    }
+
+    fn open_front_exact_first_chaff(controller: &mut QcsdController, stream: u64, exact: u64) {
+        controller.streams.open(
+            QcsdEndpointId(1),
+            QcsdStreamId(stream),
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            16 + exact,
+        );
+    }
+
+    fn allocate_front_exact_first_due(controller: &mut QcsdController) -> QcsdSlotId {
+        let slot = QcsdSlotId(10);
+        controller.materialize_incoming(slot, incoming_packet(Duration::ZERO), Duration::ZERO);
+        controller.process_incoming(0, Duration::ZERO);
+        slot
+    }
+
+    #[test]
+    fn front_exact_first_uses_later_known_extent_before_earlier_framing_claim() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 3_000);
+        let slot = allocate_front_exact_first_due(&mut controller);
+
+        let releases: Vec<_> = controller
+            .control
+            .credit
+            .iter()
+            .map(|credit| (credit.stream, credit.increase, credit.slot))
+            .collect();
+        assert_eq!(
+            releases,
+            [
+                (QcsdStreamId(84), 100, slot),
+                (QcsdStreamId(88), 1_100, slot)
+            ]
+        );
+        assert!(controller.control.claims.is_empty());
+        assert_eq!(controller.control.incoming_backlog(), 0);
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 0);
+        assert_eq!(
+            controller
+                .streams
+                .capacity(QcsdEndpointId(1))
+                .chaff_incoming,
+            1_900
+        );
+    }
+
+    #[test]
+    fn front_exact_first_checks_other_live_endpoints_before_claiming() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        ready(&mut controller, 2, "https://other-front.example");
+        controller.streams.open(
+            QcsdEndpointId(2),
+            QcsdStreamId(88),
+            QcsdRequestRole::Chaff {
+                resource_id: 8,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            3_016,
+        );
+        controller.drain_actions().for_each(drop);
+        let slot = allocate_front_exact_first_due(&mut controller);
+        assert!(controller.control.claims.is_empty());
+        assert!(
+            controller
+                .control
+                .credit
+                .iter()
+                .any(|credit| credit.endpoint == QcsdEndpointId(2))
+        );
+        assert!(
+            controller
+                .control
+                .credit
+                .iter()
+                .all(|credit| credit.slot == slot)
+        );
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(|credit| credit.increase)
+                .sum::<u64>(),
+            1_200
+        );
+    }
+
+    #[test]
+    fn front_exact_first_fanout_keeps_whole_owner_advertisement_boundary() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 3_000);
+        let slot = allocate_front_exact_first_due(&mut controller);
+        let releases = controller.control.credit.clone();
+        controller.drain_actions().for_each(drop);
+        for (index, credit) in releases.iter().enumerate() {
+            // These observations represent proven successful physical carrier
+            // handoffs. Construction alone must not be supplied here by a runner.
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: credit.endpoint,
+                    stream: credit.stream,
+                    absolute_limit: credit.absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_millis(if index == 0 { 10 } else { 20 }),
+            );
+            assert_eq!(
+                controller.incoming_slot_is_locally_realized(slot),
+                index == 1
+            );
+        }
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    }
+
+    #[test]
+    fn front_exact_first_does_not_borrow_future_slot_or_expand_stream_extent() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 3_000);
+        let future = QcsdSlotId(11);
+        controller.materialize_incoming(
+            future,
+            incoming_packet(Duration::from_secs(1)),
+            Duration::ZERO,
+        );
+        let due = allocate_front_exact_first_due(&mut controller);
+        assert!(
+            controller
+                .control
+                .credit
+                .iter()
+                .all(|credit| credit.slot == due)
+        );
+        assert!(controller.control.claims.is_empty());
+        let untouched = controller
+            .control
+            .incoming
+            .iter()
+            .find(|incoming| incoming.slot == future)
+            .expect("future owner remains private");
+        assert_eq!(untouched.remaining, 1_200);
+        assert_eq!(controller.incoming_credit_ledger[&future].advertised, 0);
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 2_400);
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(|credit| credit.increase)
+                .sum::<u64>(),
+            1_200
+        );
+    }
+
+    #[test]
+    fn front_exact_first_partial_all_stream_fallback_retains_unadvertised_claim() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 100);
+        let slot = allocate_front_exact_first_due(&mut controller);
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(|credit| credit.increase)
+                .sum::<u64>(),
+            200
+        );
+        assert_eq!(controller.control.claims.len(), 1);
+        assert_eq!(controller.control.claims[0].remaining, 1_000);
+        assert_eq!(controller.control.claims[0].slot, slot);
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 0);
+        assert_eq!(
+            controller
+                .streams
+                .capacity(QcsdEndpointId(1))
+                .chaff_incoming,
+            0
+        );
+    }
+
+    #[test]
+    fn front_exact_first_fin_returns_fallback_to_same_owner_without_double_credit() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 100);
+        let slot = allocate_front_exact_first_due(&mut controller);
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(88),
+                absolute_limit: 116,
+                slot: Some(slot),
+            },
+            Duration::from_millis(5),
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(84),
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_millis(10),
+        );
+        assert_eq!(controller.control.incoming_backlog(), 1_100);
+        open_front_exact_first_chaff(&mut controller, 92, 2_000);
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        assert!(controller.control.claims.is_empty());
+        let credit = controller.control.credit[0];
+        assert_eq!(
+            (credit.slot, credit.stream, credit.increase),
+            (slot, QcsdStreamId(92), 1_100)
+        );
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: credit.endpoint,
+                stream: credit.stream,
+                absolute_limit: credit.absolute_limit,
+                slot: Some(slot),
+            },
+            Duration::from_millis(21),
+        );
+        assert!(controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(controller.control.incoming_backlog(), 0);
+    }
+
+    #[test]
+    fn front_exact_first_default_non_front_allocator_keeps_per_stream_claim_order() {
+        let mut controller = front_exact_first_controller(false);
+        assert!(!controller.defense.incoming_exact_capacity_precedes_claims());
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 3_000);
+        let slot = allocate_front_exact_first_due(&mut controller);
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(|credit| credit.increase)
+                .sum::<u64>(),
+            200
+        );
+        assert_eq!(controller.control.claims.len(), 1);
+        assert_eq!(
+            (
+                controller.control.claims[0].stream,
+                controller.control.claims[0].remaining
+            ),
+            (QcsdStreamId(84), 1_000)
+        );
+        assert_eq!(controller.control.claims[0].slot, slot);
+        assert_eq!(
+            controller
+                .streams
+                .capacity(QcsdEndpointId(1))
+                .chaff_incoming,
+            2_900
+        );
+    }
+
+    fn front_claim_retarget_fixture(front: bool) -> (QcsdController, QcsdSlotId) {
+        let mut controller = front_exact_first_controller(front);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 100);
+        let slot = allocate_front_exact_first_due(&mut controller);
+        assert_eq!(controller.control.claims.len(), 1);
+        assert_eq!(controller.control.claims[0].remaining, 1_000);
+        controller.drain_actions().for_each(drop);
+        (controller, slot)
+    }
+
+    #[test]
+    fn front_claim_retarget_later_exact_extent_serves_original_owner_before_new_slot() {
+        let (mut controller, original) = front_claim_retarget_fixture(true);
+        // There was no alternate exact extent at the original release. It is
+        // available only on this later controller turn, before any old FIN.
+        open_front_exact_first_chaff(&mut controller, 92, 1_000);
+        let later = QcsdSlotId(11);
+        controller.materialize_incoming(
+            later,
+            incoming_packet(Duration::from_millis(20)),
+            Duration::from_millis(20),
+        );
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        let moved = controller
+            .control
+            .credit
+            .iter()
+            .find(|credit| credit.stream == QcsdStreamId(92))
+            .expect("later exact extent is released");
+        assert_eq!(
+            (moved.slot, moved.packet, moved.increase),
+            (original, incoming_packet(Duration::ZERO), 1_000)
+        );
+        assert!(
+            controller
+                .control
+                .claims
+                .iter()
+                .all(|claim| claim.slot == later)
+        );
+        assert_eq!(controller.control.claim_backlog(), 1_200);
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 2_400);
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 0);
+        assert!(!controller.incoming_slot_is_locally_realized(original));
+        assert!(!controller.incoming_slot_is_locally_realized(later));
+    }
+
+    #[test]
+    fn front_claim_retarget_requires_every_new_physical_advertisement_for_whole_owner() {
+        let (mut controller, slot) = front_claim_retarget_fixture(true);
+        open_front_exact_first_chaff(&mut controller, 92, 1_000);
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        assert!(controller.control.claims.is_empty());
+        assert_eq!(
+            controller
+                .streams
+                .allocation_opportunities(QcsdEndpointId(1), DefenseMode::ChaffOnly,)
+                .iter()
+                .find(|opportunity| opportunity.stream == QcsdStreamId(84))
+                .expect("old framing reservation remains reusable")
+                .claimable,
+            1_000
+        );
+        let credit = controller.control.credit.clone();
+        assert_eq!(
+            credit.iter().map(|range| range.increase).sum::<u64>(),
+            1_200
+        );
+        for (index, range) in credit.iter().enumerate() {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: range.endpoint,
+                    stream: range.stream,
+                    absolute_limit: range.absolute_limit,
+                    slot: Some(slot),
+                },
+                Duration::from_millis(21),
+            );
+            assert_eq!(
+                controller.incoming_slot_is_locally_realized(slot),
+                index == 2
+            );
+        }
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+        controller.drain_actions().for_each(drop);
+        controller.process_incoming(22_000, Duration::from_millis(22));
+        assert!(!controller.drain_actions().any(|action| {
+            matches!(action, QcsdAction::IncreaseReceiveLimit { slot: owner, .. } if owner == slot)
+        }), "completed ownership cannot release duplicate credit");
+    }
+
+    #[test]
+    fn front_claim_retarget_partial_extent_restores_only_the_moved_reservation() {
+        let (mut controller, slot) = front_claim_retarget_fixture(true);
+        open_front_exact_first_chaff(&mut controller, 92, 300);
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        assert_eq!(controller.control.claims.len(), 1);
+        assert_eq!(
+            (
+                controller.control.claims[0].slot,
+                controller.control.claims[0].remaining
+            ),
+            (slot, 700)
+        );
+        assert_eq!(
+            controller
+                .streams
+                .allocation_opportunities(QcsdEndpointId(1), DefenseMode::ChaffOnly,)
+                .iter()
+                .find(|opportunity| opportunity.stream == QcsdStreamId(84))
+                .expect("old framing reservation")
+                .claimable,
+            300
+        );
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(|range| range.increase)
+                .sum::<u64>(),
+            500
+        );
+        controller.process_incoming(25_000, Duration::from_millis(25));
+        assert_eq!(
+            controller.control.claims[0].remaining, 700,
+            "a repeated poll cannot manufacture another exact extent"
+        );
+        assert_eq!(
+            controller
+                .control
+                .credit
+                .iter()
+                .map(|range| range.increase)
+                .sum::<u64>(),
+            500
+        );
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+    }
+
+    #[test]
+    fn front_claim_retarget_keeps_future_terminal_unowned_and_reserved_claims_private() {
+        for guard in 0..5 {
+            let (mut controller, slot) = front_claim_retarget_fixture(true);
+            open_front_exact_first_chaff(&mut controller, 92, 1_000);
+            match guard {
+                0 => {
+                    let future = incoming_packet(Duration::from_secs(1));
+                    controller.control.claims[0].packet = future;
+                    controller
+                        .incoming_credit_ledger
+                        .get_mut(&slot)
+                        .expect("owner")
+                        .packet = future;
+                }
+                1 => {
+                    controller
+                        .incoming_credit_ledger
+                        .get_mut(&slot)
+                        .expect("owner")
+                        .local_realization_emitted = true
+                }
+                2 => controller.control.claims[0].reservation_debited = false,
+                3 => controller
+                    .control
+                    .receiver_continuation_reserves
+                    .push((QcsdEndpointId(1), QcsdStreamId(92))),
+                _ => {
+                    controller.control.terminal_incoming.insert(slot);
+                }
+            }
+            controller.process_incoming(20_000, Duration::from_millis(20));
+            assert_eq!(
+                controller.control.claims[0].remaining, 1_000,
+                "guard {guard}"
+            );
+            assert_eq!(
+                controller
+                    .control
+                    .credit
+                    .iter()
+                    .map(|range| range.increase)
+                    .sum::<u64>(),
+                200
+            );
+            assert_eq!(
+                controller
+                    .streams
+                    .capacity(QcsdEndpointId(1))
+                    .chaff_incoming,
+                1_000
+            );
+            assert!(
+                !controller
+                    .drain_actions()
+                    .any(|action| { matches!(action, QcsdAction::IncreaseReceiveLimit { .. }) })
+            );
+        }
+    }
+
+    #[test]
+    fn front_claim_retarget_non_front_and_absent_exact_capacity_keep_prior_claim() {
+        for front in [false, true] {
+            let (mut controller, slot) = front_claim_retarget_fixture(front);
+            if !front {
+                open_front_exact_first_chaff(&mut controller, 92, 1_000);
+            }
+            controller.process_incoming(20_000, Duration::from_millis(20));
+            assert_eq!(
+                (
+                    controller.control.claims[0].slot,
+                    controller.control.claims[0].remaining
+                ),
+                (slot, 1_000)
+            );
+            assert_eq!(
+                controller
+                    .control
+                    .credit
+                    .iter()
+                    .map(|range| range.increase)
+                    .sum::<u64>(),
+                200
+            );
+            assert!(!controller.incoming_slot_is_locally_realized(slot));
+            assert!(
+                !controller
+                    .drain_actions()
+                    .any(|action| { matches!(action, QcsdAction::IncreaseReceiveLimit { .. }) })
+            );
+        }
+    }
+
+    #[test]
+    fn front_claim_retarget_cross_endpoint_preserves_original_multi_endpoint_owner() {
+        let (mut controller, slot) = front_claim_retarget_fixture(true);
+        ready(&mut controller, 2, "https://other-front.example");
+        controller.streams.open(
+            QcsdEndpointId(2),
+            QcsdStreamId(0),
+            QcsdRequestRole::Chaff {
+                resource_id: 8,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            1_016,
+        );
+        let endpoint_order = controller.scheduler.incoming_order();
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        assert_eq!(
+            controller.scheduler.incoming_order(),
+            endpoint_order,
+            "continuing an existing owner does not advance the next slot cursor"
+        );
+        let moved = controller
+            .control
+            .credit
+            .iter()
+            .find(|range| range.endpoint == QcsdEndpointId(2))
+            .expect("currently exact other endpoint");
+        assert_eq!(
+            (moved.slot, moved.packet, moved.increase),
+            (slot, incoming_packet(Duration::ZERO), 1_000)
+        );
+        assert!(controller.incoming_credit_ledger[&slot].multiple_endpoints);
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 0);
+    }
+
+    #[test]
+    fn front_claim_retarget_preserves_advertised_prefix_owned_parser_and_pending_action() {
+        let mut controller = front_exact_first_controller(true);
+        open_front_exact_first_chaff(&mut controller, 84, 100);
+        open_front_exact_first_chaff(&mut controller, 88, 100);
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(84);
+        // Seed an internally consistent retained prefix: the lifetime unowned
+        // parser allowance was consumed before this slot, then a later exact
+        // header extent exposed another 100 bytes. This is a controller-state
+        // fixture, not a replay of a network or HTTP/3 exchange.
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("source")
+            .receive = crate::stream::ReceiveState::ReceivingHeaders {
+            advertised_limit: 1_016,
+            requested_limit: 1_016,
+            known_limit: 1_116,
+            reservation_capacity: 1_000,
+            reservation_available: 1_000,
+            consumed: 1_016,
+            payload_floor: 1_116,
+            framing_bytes: 0,
+            parser_lease_capacity: 1_000,
+            parser_lease_used: 1_000,
+            parser_lease_exhausted: true,
+            last_parser_lease_boundary: None,
+            pending_parser_boundary: None,
+        };
+        let slot = allocate_front_exact_first_due(&mut controller);
+        assert_eq!(controller.control.claim_backlog(), 1_000);
+        assert!(
+            matches!(controller.next_action(), Some(QcsdAction::IncreaseReceiveLimit {
+            stream: QcsdStreamId(84), absolute_limit: 1_116, slot: owner, ..
+        }) if owner == slot)
+        );
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: 1_116,
+                slot: Some(slot),
+            },
+            Duration::from_millis(5),
+        );
+        controller
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("source")
+            .receive
+            .header_progress(0, true);
+        let lease = controller
+            .streams
+            .parser_lease(endpoint, stream, true, 1_000, None)
+            .expect("real exhausted-allowance parser transition");
+        assert!(lease.scheduled);
+        assert_eq!((lease.absolute_limit, lease.increase), (1_132, 16));
+        let (owner, debited) = controller
+            .take_parser_lease_owner(endpoint, stream, lease.increase)
+            .expect("same original owner backs the parser range");
+        assert!(debited);
+        assert_eq!(
+            (owner.slot, owner.packet),
+            (slot, incoming_packet(Duration::ZERO))
+        );
+        controller.parser_lease_ranges.insert(
+            (endpoint, stream),
+            vec![ParserLeaseRange {
+                start: 1_116,
+                end: 1_132,
+                owner: Some(owner),
+                reservation_debited: debited,
+                unowned: false,
+                advertised: false,
+            }],
+        );
+        controller
+            .actions
+            .push_back(QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit: lease.absolute_limit,
+                increase: lease.increase,
+                owner: Some(owner),
+            });
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, stream),
+            Some((1_116, 1_132))
+        );
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, stream)
+                .expect("source")
+                .receive
+                .claimable(),
+            0
+        );
+        let old_ranges = controller.parser_lease_ranges.clone();
+        let old_advertised = controller.advertised_incoming_credit.clone();
+        let old_actions = controller.actions.clone();
+        let old_pending = controller.control.credit.clone();
+        assert_eq!(old_pending.len(), 1);
+        assert_eq!(
+            (old_pending[0].stream, old_pending[0].increase),
+            (QcsdStreamId(88), 100)
+        );
+        open_front_exact_first_chaff(&mut controller, 92, 984);
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        assert!(controller.control.claims.is_empty());
+        assert_eq!(controller.parser_lease_ranges, old_ranges);
+        assert_eq!(controller.advertised_incoming_credit, old_advertised);
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, stream),
+            Some((1_116, 1_132))
+        );
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, stream)
+                .expect("source")
+                .receive
+                .claimable(),
+            984,
+            "the owned16B parser debit remains reserved"
+        );
+        assert_eq!(
+            controller
+                .actions
+                .iter()
+                .take(old_actions.len())
+                .cloned()
+                .collect::<VecDeque<_>>(),
+            old_actions
+        );
+        let pending = controller.control.credit[0];
+        assert_eq!(
+            (
+                pending.slot,
+                pending.packet,
+                pending.endpoint,
+                pending.stream,
+                pending.absolute_limit,
+                pending.increase
+            ),
+            (
+                old_pending[0].slot,
+                old_pending[0].packet,
+                old_pending[0].endpoint,
+                old_pending[0].stream,
+                old_pending[0].absolute_limit,
+                old_pending[0].increase
+            )
+        );
+        assert_eq!(controller.control.credit[1].increase, 984);
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 100);
+        assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+        assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+    }
+
+    #[test]
+    fn front_claim_retarget_two_existing_claims_give_later_extent_to_oldest_owner() {
+        let (mut controller, oldest) = front_claim_retarget_fixture(true);
+        let younger = QcsdSlotId(11);
+        controller.materialize_incoming(
+            younger,
+            incoming_packet(Duration::from_millis(10)),
+            Duration::from_millis(10),
+        );
+        controller.process_incoming(10_000, Duration::from_millis(10));
+        assert_eq!(controller.control.claims.len(), 2);
+        assert_eq!(controller.control.claim_backlog(), 2_000);
+        assert_eq!(controller.control.incoming_backlog(), 200);
+        controller.control.claims.reverse();
+        open_front_exact_first_chaff(&mut controller, 92, 1_000);
+        controller.process_incoming(20_000, Duration::from_millis(20));
+        let moved = controller
+            .control
+            .credit
+            .iter()
+            .find(|range| range.stream == QcsdStreamId(92))
+            .expect("later exact extent");
+        assert_eq!(
+            (moved.slot, moved.packet, moved.increase),
+            (oldest, incoming_packet(Duration::ZERO), 1_000)
+        );
+        assert!(
+            controller
+                .control
+                .claims
+                .iter()
+                .all(|claim| claim.slot == younger)
+        );
+        assert_eq!(controller.control.claim_backlog(), 1_200);
+        assert_eq!(controller.control.incoming_backlog(), 0);
+        assert_eq!(controller.scheduled_incoming_requested_bytes, 2_400);
+        assert_eq!(controller.scheduled_incoming_advertised_bytes, 0);
+        assert!(!controller.incoming_slot_is_locally_realized(oldest));
+        assert!(!controller.incoming_slot_is_locally_realized(younger));
     }
 
     #[test]
@@ -20708,6 +21709,169 @@ mod tests {
         assert_eq!(&*states.borrow(), &[false, false]);
         controller.poll(Duration::from_micros(1));
         assert_eq!(&*states.borrow(), &[false, false, false, false]);
+    }
+
+    fn advertisement_projection_controller() -> (QcsdController, Packet, PendingCredit) {
+        let packet = Packet::new(Duration::from_micros(10), Direction::Incoming, 100)
+            .expect("incoming packet");
+        let (defense, _) = ExactIncomingOneShot::new(packet);
+        let mut controller =
+            QcsdController::with_defense(QcsdConfig::default(), None, Box::new(defense))
+                .expect("projection controller");
+        let credit = PendingCredit {
+            slot: QcsdSlotId(8),
+            packet,
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(4),
+            absolute_limit: 116,
+            increase: 100,
+        };
+        controller.control.credit.push(credit);
+        (controller, packet, credit)
+    }
+
+    #[test]
+    fn exact_advertisement_projection_binds_endpoint_stream_limit_and_slot() {
+        let (controller, packet, credit) = advertisement_projection_controller();
+        assert_eq!(
+            controller
+                .exact_incoming_advertisement_targets(
+                    credit.endpoint,
+                    credit.stream,
+                    116,
+                    Some(credit.slot),
+                )
+                .expect("exact target"),
+            [(credit.slot, packet)]
+        );
+        for (endpoint, stream, limit, slot) in [
+            (QcsdEndpointId(2), credit.stream, 116, Some(credit.slot)),
+            (credit.endpoint, QcsdStreamId(8), 116, Some(credit.slot)),
+            (credit.endpoint, credit.stream, 115, Some(credit.slot)),
+            (credit.endpoint, credit.stream, 116, Some(QcsdSlotId(9))),
+        ] {
+            assert!(
+                controller
+                    .exact_incoming_advertisement_targets(endpoint, stream, limit, slot,)
+                    .expect("different physical identity")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_advertisement_projection_keeps_all_slotless_owners_once() {
+        let (mut controller, first, credit) = advertisement_projection_controller();
+        let second =
+            Packet::new(Duration::from_micros(20), Direction::Incoming, 100).expect("later packet");
+        controller.control.credit.push(PendingCredit {
+            slot: QcsdSlotId(9),
+            packet: second,
+            absolute_limit: 216,
+            ..credit
+        });
+        controller.parser_lease_ranges.insert(
+            (credit.endpoint, credit.stream),
+            vec![
+                ParserLeaseRange {
+                    start: 216,
+                    end: 220,
+                    owner: Some(QcsdParserLeaseOwner {
+                        slot: credit.slot,
+                        packet: first,
+                    }),
+                    reservation_debited: false,
+                    unowned: false,
+                    advertised: false,
+                },
+                ParserLeaseRange {
+                    start: 220,
+                    end: 224,
+                    owner: None,
+                    reservation_debited: false,
+                    unowned: true,
+                    advertised: false,
+                },
+            ],
+        );
+        assert_eq!(
+            controller
+                .exact_incoming_advertisement_targets(credit.endpoint, credit.stream, 224, None,)
+                .expect("all owners"),
+            [(credit.slot, first), (QcsdSlotId(9), second)]
+        );
+        assert_eq!(
+            controller
+                .exact_incoming_advertisement_targets(
+                    credit.endpoint,
+                    credit.stream,
+                    224,
+                    Some(QcsdSlotId(9)),
+                )
+                .expect("explicit scheduled plus physically covered parser owner"),
+            [(credit.slot, first), (QcsdSlotId(9), second)]
+        );
+    }
+
+    #[test]
+    fn exact_advertisement_projection_keeps_expired_original_deadline_ownership() {
+        let (mut controller, packet, credit) = advertisement_projection_controller();
+        controller.control.credit.clear();
+        controller
+            .terminal_unadvertised_incoming_credit
+            .push(UnadvertisedReceiveRange::Scheduled(credit));
+        assert_eq!(
+            controller
+                .exact_incoming_advertisement_targets(
+                    credit.endpoint,
+                    credit.stream,
+                    116,
+                    Some(credit.slot),
+                )
+                .expect("expired owner remains physically bounded"),
+            [(credit.slot, packet)]
+        );
+    }
+
+    #[test]
+    fn exact_advertisement_projection_does_not_rebind_already_advertised_parser_ranges() {
+        let (mut controller, packet, credit) = advertisement_projection_controller();
+        controller.control.credit.clear();
+        controller.parser_lease_ranges.insert(
+            (credit.endpoint, credit.stream),
+            vec![ParserLeaseRange {
+                start: 16,
+                end: 116,
+                owner: Some(QcsdParserLeaseOwner {
+                    slot: credit.slot,
+                    packet,
+                }),
+                reservation_debited: false,
+                unowned: false,
+                advertised: true,
+            }],
+        );
+        assert!(
+            controller
+                .exact_incoming_advertisement_targets(credit.endpoint, credit.stream, 116, None,)
+                .expect("repeat advertisement is not new scheduled ownership")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_advertisement_projection_refuses_conflicting_owner_packets() {
+        let (mut controller, _, credit) = advertisement_projection_controller();
+        controller.control.credit.push(PendingCredit {
+            packet: Packet::new(Duration::from_micros(11), Direction::Incoming, 100)
+                .expect("different packet"),
+            ..credit
+        });
+        assert!(
+            controller
+                .exact_incoming_advertisement_targets(credit.endpoint, credit.stream, 116, None,)
+                .is_err()
+        );
     }
 
     #[test]

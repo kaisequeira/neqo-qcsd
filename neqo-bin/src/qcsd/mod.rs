@@ -14766,10 +14766,140 @@ fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
 }
 
 fn bounds_active_ordinary_work(defense: &DefenseConfig) -> bool {
-    // Both defenses have a strict local receive-credit deadline. Retain queued
-    // socket/HTTP work and revisit the existing deadline-priority seam between
+    // Retain queued socket/HTTP work and revisit the service boundary between
     // bounded units instead of draining an entire busy origin first.
-    matches!(defense, DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_))
+    matches!(
+        defense,
+        DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_) | DefenseConfig::Tamaraw(_)
+    )
+}
+
+/// Ordinary-work admission stops at the next nominal Tamaraw event. Tick-zero
+/// application dispatch keeps its original order: priority starts only after
+/// the first genuine control poll. This query never advances the schedule.
+fn tamaraw_ordinary_work_boundary(
+    controller: &QcsdController,
+    defense_start: Option<Instant>,
+    first_control_poll_complete: bool,
+) -> Result<Option<OutputWorkBoundary>, Error> {
+    if !first_control_poll_complete {
+        return Ok(None);
+    }
+    let Some((started, relative)) = defense_start.zip(controller.next_tamaraw_event_at()) else {
+        return Ok(None);
+    };
+    let at = started
+        .checked_add(relative)
+        .ok_or_else(|| Error::DefenseExecution("Tamaraw ordinary-work deadline overflow".into()))?;
+    Ok(Some(OutputWorkBoundary::new(at, at)))
+}
+
+/// Keep real HTTP retirement, dependency state and its ordered observation in
+/// one ordinary-work unit before a scheduled-event yield can leave the stage.
+fn reduce_retired_application_progress(
+    endpoint: &mut Endpoint,
+    dependencies: &mut DependencyTracker,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_elapsed: Duration,
+) -> Result<(), Error> {
+    for (resource_id, state) in endpoint.retired_applications.drain(..) {
+        let success = state == ResourceRunState::Succeeded;
+        if success {
+            dependencies.mark_succeeded(resource_id)?;
+        } else {
+            dependencies.mark_failed(resource_id)?;
+        }
+        let record = observation_clock.record(QcsdObservation::ResourceCompleted {
+            resource_id,
+            success,
+        });
+        traces.observation(Some(endpoint.id), &record)?;
+        controller.observe(record.into_observation(), defense_elapsed);
+    }
+    Ok(())
+}
+
+/// The actual T ordinary endpoint turn. Input stops after one receive batch;
+/// HTTP stops after one retained event/read. HTTP finish and dependency
+/// retirement are atomic with respect to yielding to the control reducer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the ordinary unit retains the runner's real endpoint, dependency, trace and clock participants"
+)]
+fn tamaraw_ordinary_endpoint_unit(
+    endpoint: &mut Endpoint,
+    spec: &RunSpec,
+    dependencies: &mut DependencyTracker,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    input_at: Instant,
+    defense_start: Instant,
+    defense_elapsed: Duration,
+    first_control_poll_complete: bool,
+    clock: &mut impl FnMut() -> Instant,
+) -> Result<bool, Error> {
+    let due = |controller: &QcsdController, at| -> Result<bool, Error> {
+        Ok(tamaraw_ordinary_work_boundary(
+            controller,
+            Some(defense_start),
+            first_control_poll_complete,
+        )?
+        .is_some_and(|boundary| boundary.closed_wakeup(at).is_some()))
+    };
+    if due(controller, clock())? {
+        return Ok(true);
+    }
+    process_input(
+        endpoint,
+        controller,
+        traces,
+        observation_clock,
+        input_at,
+        Some(defense_elapsed),
+        false,
+    )?;
+    if due(controller, clock())? {
+        return Ok(true);
+    }
+    handle_http_events(endpoint, spec, input_at, traces, Some(1))?;
+    reduce_retired_application_progress(
+        endpoint,
+        dependencies,
+        controller,
+        traces,
+        observation_clock,
+        defense_elapsed,
+    )?;
+    due(controller, clock())
+}
+
+/// Publish only completion established by the real HTTP/dependency reducer.
+/// A queued but unread HTTP completion is not completion authority.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the completion barrier retains the original controller, trace, and clock participants"
+)]
+fn observe_completed_application(
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    dependencies_complete: bool,
+    application_complete_observed: &mut bool,
+    application_completion: &mut Option<Instant>,
+    control_now: Instant,
+    defense_elapsed: Duration,
+) -> Result<(), Error> {
+    if !*application_complete_observed && dependencies_complete {
+        *application_complete_observed = true;
+        *application_completion = Some(control_now);
+        let record = observation_clock.record(QcsdObservation::ApplicationComplete);
+        traces.observation(None, &record)?;
+        controller.observe(record.into_observation(), defense_elapsed);
+    }
+    Ok(())
 }
 
 #[expect(
@@ -14865,6 +14995,7 @@ async fn execute_run_inner(
     let mut defense_start = None;
     let mut application_completion = None;
     let mut application_complete_observed = false;
+    let mut first_control_poll_complete = false;
     let mut last_egress_backlog = None;
     let mut last_egress_stream_backlog = None;
     let mut application_batches =
@@ -15007,253 +15138,323 @@ async fn execute_run_inner(
                     spec.timeout_seconds,
                 ));
             }
-            yield_to_exact_boundaries!('runner);
-            record_buflo_incoming_startup_ready(
-                &controller,
-                &mut traces,
-                loop_now,
-                &mut buflo_incoming_startup_recorded,
-            )?;
-
-            let elapsed_before_http = defense_elapsed_at!(loop_now);
-            for endpoint_index in 0..endpoints.len() {
+            // Old modes set the same control wake at its original location.
+            // An early T exit selects its next genuine controller deadline.
+            let mut next_wakeup = deadline;
+            let mut controller_deadline_selected = false;
+            'ordinary: {
+                macro_rules! yield_to_tamaraw_service {
+                    () => {
+                        if let Some(boundary) = tamaraw_ordinary_work_boundary(
+                            &controller,
+                            defense_start,
+                            first_control_poll_complete,
+                        )? && boundary.closed_wakeup(now()).is_some()
+                        {
+                            break 'ordinary;
+                        }
+                    };
+                }
                 yield_to_exact_boundaries!('runner);
-                // Socket activity is reduced into defense signals before a due
-                // timer is polled. This lets a real packet cancel a pending
-                // reactive-defense decision.
-                {
-                    let endpoint = &mut endpoints[endpoint_index];
-                    process_input(
-                        endpoint,
+                yield_to_tamaraw_service!();
+                record_buflo_incoming_startup_ready(
+                    &controller,
+                    &mut traces,
+                    loop_now,
+                    &mut buflo_incoming_startup_recorded,
+                )?;
+
+                let elapsed_before_http = defense_elapsed_at!(loop_now);
+                for endpoint_index in 0..endpoints.len() {
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
+                    if matches!(spec.config.defense, DefenseConfig::Tamaraw(_))
+                        && let Some(started) = defense_start
+                    {
+                        let mut unit_clock = now;
+                        if tamaraw_ordinary_endpoint_unit(
+                            &mut endpoints[endpoint_index],
+                            spec,
+                            &mut dependencies,
+                            &mut controller,
+                            &mut traces,
+                            &observation_clock,
+                            loop_now,
+                            started,
+                            elapsed_before_http.unwrap_or(Duration::ZERO),
+                            first_control_poll_complete,
+                            &mut unit_clock,
+                        )? {
+                            break 'ordinary;
+                        }
+                        continue;
+                    }
+                    // Socket activity is reduced into defense signals before a due
+                    // timer is polled. This lets a real packet cancel a pending
+                    // reactive-defense decision.
+                    {
+                        let endpoint = &mut endpoints[endpoint_index];
+                        process_input(
+                            endpoint,
+                            &mut controller,
+                            &mut traces,
+                            &observation_clock,
+                            loop_now,
+                            elapsed_before_http,
+                            !bound_ordinary_work || defense_start.is_none(),
+                        )?;
+                    }
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
+                    {
+                        let endpoint = &mut endpoints[endpoint_index];
+                        handle_http_events(
+                            endpoint,
+                            spec,
+                            loop_now,
+                            &mut traces,
+                            (bound_ordinary_work && defense_start.is_some()).then_some(1),
+                        )?;
+                    }
+                    reduce_retired_application_progress(
+                        &mut endpoints[endpoint_index],
+                        &mut dependencies,
                         &mut controller,
                         &mut traces,
                         &observation_clock,
-                        loop_now,
-                        elapsed_before_http,
-                        !bound_ordinary_work || defense_start.is_none(),
-                    )?;
-                }
-                yield_to_exact_boundaries!('runner);
-                {
-                    let endpoint = &mut endpoints[endpoint_index];
-                    handle_http_events(
-                        endpoint,
-                        spec,
-                        loop_now,
-                        &mut traces,
-                        (bound_ordinary_work && defense_start.is_some()).then_some(1),
-                    )?;
-                }
-                let endpoint = &mut endpoints[endpoint_index];
-                for (resource_id, state) in endpoint.retired_applications.drain(..) {
-                    let success = state == ResourceRunState::Succeeded;
-                    if success {
-                        dependencies.mark_succeeded(resource_id)?;
-                    } else {
-                        dependencies.mark_failed(resource_id)?;
-                    }
-                    let record = observation_clock.record(QcsdObservation::ResourceCompleted {
-                        resource_id,
-                        success,
-                    });
-                    traces.observation(Some(endpoint.id), &record)?;
-                    controller.observe(
-                        record.into_observation(),
                         elapsed_before_http.unwrap_or(Duration::ZERO),
-                    );
+                    )?;
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
                 }
                 yield_to_exact_boundaries!('runner);
-            }
-            yield_to_exact_boundaries!('runner);
+                yield_to_tamaraw_service!();
 
-            activate_needed_endpoints(
-                &mut endpoints,
-                spec,
-                &dependencies,
-                defense_start.is_none() || controller.can_start_application_batch(),
-                loop_now,
-                &mut traces,
-                &observation_clock,
-            )?;
-            if defense_start.is_none() && startup_endpoints_connected(&endpoints) {
-                // Handshake datagrams predate the defense clock even though
-                // their transport classifications can still be queued when
-                // the final endpoint becomes ready.  Retain the endpoint and
-                // stream/capacity observations at elapsed zero, but never let
-                // those pre-defense datagrams arm a reactive defense.
-                handle_defense_activation_observations(
+                activate_needed_endpoints(
                     &mut endpoints,
-                    &mut controller,
+                    spec,
+                    &dependencies,
+                    defense_start.is_none() || controller.can_start_application_batch(),
+                    loop_now,
                     &mut traces,
+                    &observation_clock,
                 )?;
-                #[cfg(target_os = "linux")]
-                if let Some(runtime) = buflo_kernel_tx.as_mut() {
-                    // The application batch is opened below before tick zero is
-                    // selected. The explicit 100 ms arm lead leaves bounded
-                    // setup headroom followed by the receipted 5 ms immutable
-                    // selection cutoff.
-                    defense_start = Some(runtime.arm()?);
-                } else if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
-                    // Direct capture already includes every handshake packet.
-                    // Start only the morpher at the global defense boundary so
-                    // an origin that connected early cannot contribute a
-                    // pre-defense 1-RTT bootstrap bypass at elapsed time zero.
-                    activate_traffic_morphing(&mut endpoints, &spec.config, spec.seed)?;
-                    defense_start = Some(now());
-                } else {
-                    defense_start = Some(loop_now);
-                }
-                #[cfg(not(target_os = "linux"))]
-                if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
-                    activate_traffic_morphing(&mut endpoints, &spec.config, spec.seed)?;
-                    defense_start = Some(now());
-                } else {
-                    defense_start = Some(loop_now);
-                }
-            }
-            yield_to_exact_boundaries!('runner);
-
-            // Refresh after input/HTTP processing: actions reduced below must
-            // never be stamped before the observations that produced them.
-            let barrier_now = now();
-            let barrier_elapsed = defense_elapsed_at!(barrier_now);
-            if let Some(barrier_elapsed) = barrier_elapsed {
-                let rolling_lifecycle_before_batch =
-                    rolling_output_lifecycle_active(&controller, &endpoints);
-                // Drain observations produced while the previous application
-                // batch was retired before closing that batch.  In
-                // particular, BytesRead and stream lifecycle observations
-                // must causally precede ApplicationBatchCompleted.  Complete
-                // the old batch before dispatching the next layer made
-                // eligible by dependency retirement in this same loop turn.
-                handle_all_qcsd_observations(
-                    &mut endpoints,
-                    &mut controller,
-                    &mut traces,
-                    barrier_elapsed,
-                )?;
-                yield_to_exact_boundaries!('runner);
-                let application_stream_in_flight = has_in_flight_application_stream(
-                    endpoints
-                        .iter()
-                        .flat_map(|endpoint| endpoint.streams.values()),
-                );
-                if let Some(observation) =
-                    application_batches.before_dispatch(application_stream_in_flight)
-                {
-                    let record = observation_clock.record(observation);
-                    traces.observation(None, &record)?;
-                    controller.observe(record.into_observation(), barrier_elapsed);
-                }
-                controller.flush_defense_observations();
-                ensure_defense_realizable(&controller)?;
-                yield_to_exact_boundaries!('runner);
-                let reconcile_rolling = rolling_lifecycle_before_batch
-                    || rolling_output_lifecycle_active(&controller, &endpoints);
-                if reconcile_rolling {
-                    if controller.has_rolling_outgoing_prearm()
-                        || controller.has_due_rolling_reconciliation()
-                    {
-                        controller.reconcile_due_rolling(barrier_elapsed)?;
-                        controller.flush_defense_observations();
-                        ensure_defense_realizable(&controller)?;
+                if defense_start.is_none() && startup_endpoints_connected(&endpoints) {
+                    // Handshake datagrams predate the defense clock even though
+                    // their transport classifications can still be queued when
+                    // the final endpoint becomes ready.  Retain the endpoint and
+                    // stream/capacity observations at elapsed zero, but never let
+                    // those pre-defense datagrams arm a reactive defense.
+                    handle_defense_activation_observations(
+                        &mut endpoints,
+                        &mut controller,
+                        &mut traces,
+                    )?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(runtime) = buflo_kernel_tx.as_mut() {
+                        // The application batch is opened below before tick zero is
+                        // selected. The explicit 100 ms arm lead leaves bounded
+                        // setup headroom followed by the receipted 5 ms immutable
+                        // selection cutoff.
+                        defense_start = Some(runtime.arm()?);
+                    } else if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
+                        // Direct capture already includes every handshake packet.
+                        // Start only the morpher at the global defense boundary so
+                        // an origin that connected early cannot contribute a
+                        // pre-defense 1-RTT bootstrap bypass at elapsed time zero.
+                        activate_traffic_morphing(&mut endpoints, &spec.config, spec.seed)?;
+                        defense_start = Some(now());
+                    } else {
+                        defense_start = Some(loop_now);
                     }
-                    apply_queued_actions(
+                    #[cfg(not(target_os = "linux"))]
+                    if matches!(&spec.config.defense, DefenseConfig::TrafficMorphing(_)) {
+                        activate_traffic_morphing(&mut endpoints, &spec.config, spec.seed)?;
+                        defense_start = Some(now());
+                    } else {
+                        defense_start = Some(loop_now);
+                    }
+                }
+                yield_to_exact_boundaries!('runner);
+                yield_to_tamaraw_service!();
+
+                // Refresh after input/HTTP processing: actions reduced below must
+                // never be stamped before the observations that produced them.
+                let barrier_now = now();
+                let barrier_elapsed = defense_elapsed_at!(barrier_now);
+                if let Some(barrier_elapsed) = barrier_elapsed {
+                    let rolling_lifecycle_before_batch =
+                        rolling_output_lifecycle_active(&controller, &endpoints);
+                    // Drain observations produced while the previous application
+                    // batch was retired before closing that batch.  In
+                    // particular, BytesRead and stream lifecycle observations
+                    // must causally precede ApplicationBatchCompleted.  Complete
+                    // the old batch before dispatching the next layer made
+                    // eligible by dependency retirement in this same loop turn.
+                    handle_all_qcsd_observations(
+                        &mut endpoints,
+                        &mut controller,
+                        &mut traces,
+                        barrier_elapsed,
+                    )?;
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
+                    let application_stream_in_flight = has_in_flight_application_stream(
+                        endpoints
+                            .iter()
+                            .flat_map(|endpoint| endpoint.streams.values()),
+                    );
+                    if let Some(observation) =
+                        application_batches.before_dispatch(application_stream_in_flight)
+                    {
+                        let record = observation_clock.record(observation);
+                        traces.observation(None, &record)?;
+                        controller.observe(record.into_observation(), barrier_elapsed);
+                    }
+                    controller.flush_defense_observations();
+                    ensure_defense_realizable(&controller)?;
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
+                    let reconcile_rolling = rolling_lifecycle_before_batch
+                        || rolling_output_lifecycle_active(&controller, &endpoints);
+                    if reconcile_rolling {
+                        if controller.has_rolling_outgoing_prearm()
+                            || controller.has_due_rolling_reconciliation()
+                        {
+                            controller.reconcile_due_rolling(barrier_elapsed)?;
+                            controller.flush_defense_observations();
+                            ensure_defense_realizable(&controller)?;
+                        }
+                        apply_queued_actions(
+                            &mut endpoints,
+                            &mut controller,
+                            spec.chaff_manifest.as_ref(),
+                            &mut traces,
+                            barrier_now,
+                            barrier_elapsed,
+                        )?;
+                        yield_to_exact_boundaries!('runner);
+                        yield_to_tamaraw_service!();
+                    }
+                    let request_work_guard = next_buflo_exact_release_guard(
+                        &spec.config.defense,
+                        &controller,
+                        &endpoints,
+                    )?;
+                    #[cfg(target_os = "linux")]
+                    let (request_work_interrupt, request_work_tai_interrupt_ns) =
+                        match (request_work_guard, buflo_kernel_tx.as_ref()) {
+                            (Some(guard), Some(runtime)) => (
+                                Some(runtime.output_admission_wake_hint(&guard)?),
+                                Some(runtime.output_admission_tai_ns(&guard)?),
+                            ),
+                            (None, Some(_)) => (None, None),
+                            (guard, None) => (guard.map(|guard| guard.output_admission_at), None),
+                        };
+                    #[cfg(not(target_os = "linux"))]
+                    let (request_work_interrupt, request_work_tai_interrupt_ns) = (
+                        request_work_guard.map(|guard| guard.output_admission_at),
+                        None,
+                    );
+                    let request_work_interrupt = request_work_interrupt
+                        .into_iter()
+                        .chain(
+                            tamaraw_ordinary_work_boundary(
+                                &controller,
+                                defense_start,
+                                first_control_poll_complete,
+                            )?
+                            .map(|boundary| boundary.admission_at),
+                        )
+                        .min();
+                    let started_requests = dispatch_ready_requests(
+                        &mut endpoints,
+                        spec,
+                        &mut dependencies,
+                        barrier_now,
+                        &mut traces,
+                        controller.can_start_application_batch(),
+                        request_work_interrupt,
+                        request_work_tai_interrupt_ns,
+                    )?;
+                    #[cfg(target_os = "linux")]
+                    if defense_start.is_some()
+                        && let Some(runtime) = buflo_kernel_tx.as_mut()
+                        && !runtime.tick_zero_application_ready()?
+                    {
+                        runtime.mark_tick_zero_application_ready(started_requests)?;
+                    }
+                    yield_to_exact_boundaries!('runner);
+                    let batch_started = application_batches.after_dispatch(started_requests)?;
+                    handle_all_qcsd_observations(
+                        &mut endpoints,
+                        &mut controller,
+                        &mut traces,
+                        barrier_elapsed,
+                    )?;
+                    if let Some(observation) = batch_started {
+                        let record = observation_clock.record(observation);
+                        traces.observation(None, &record)?;
+                        controller.observe(record.into_observation(), barrier_elapsed);
+                    }
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
+                }
+
+                let wake_base = now();
+                next_wakeup = absolute_wakeup(wake_base, spec.config.control_interval())
+                    .ok_or_else(|| {
+                        Error::DefenseExecution("runner wake deadline overflow".into())
+                    })?;
+                for endpoint_index in 0..endpoints.len() {
+                    yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
+                    // Flush output that was already available (including newly
+                    // dispatched application requests) so its Wire signals precede
+                    // the defense poll.
+                    let output_guard = project_ordinary_buflo_guard!(
+                        next_buflo_exact_release_guard(
+                            &spec.config.defense,
+                            &controller,
+                            &endpoints,
+                        )?,
+                        now()
+                    );
+                    let work_boundary = output_guard.map(|guard| guard.work_boundary).or(
+                        tamaraw_ordinary_work_boundary(
+                            &controller,
+                            defense_start,
+                            first_control_poll_complete,
+                        )?,
+                    );
+                    let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
+                    if let Some(wakeup) = drive_endpoint_output_until(
+                        endpoint_index,
                         &mut endpoints,
                         &mut controller,
                         spec.chaff_manifest.as_ref(),
                         &mut traces,
-                        barrier_now,
-                        barrier_elapsed,
-                    )?;
+                        &observation_clock,
+                        defense_start,
+                        work_boundary,
+                        unshaped_handoff_interrupt,
+                        None,
+                        runner_defense_clock!(),
+                        if matches!(spec.config.defense, DefenseConfig::Tamaraw(_)) {
+                            OutputDriveCardinality::OneDatagram
+                        } else {
+                            OutputDriveCardinality::DrainAvailable
+                        },
+                    )
+                    .await?
+                        && wakeup < next_wakeup
+                    {
+                        next_wakeup = wakeup;
+                        controller_deadline_selected = false;
+                    }
                     yield_to_exact_boundaries!('runner);
+                    yield_to_tamaraw_service!();
                 }
-                let request_work_guard =
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?;
-                #[cfg(target_os = "linux")]
-                let (request_work_interrupt, request_work_tai_interrupt_ns) =
-                    match (request_work_guard, buflo_kernel_tx.as_ref()) {
-                        (Some(guard), Some(runtime)) => (
-                            Some(runtime.output_admission_wake_hint(&guard)?),
-                            Some(runtime.output_admission_tai_ns(&guard)?),
-                        ),
-                        (None, Some(_)) => (None, None),
-                        (guard, None) => (guard.map(|guard| guard.output_admission_at), None),
-                    };
-                #[cfg(not(target_os = "linux"))]
-                let (request_work_interrupt, request_work_tai_interrupt_ns) = (
-                    request_work_guard.map(|guard| guard.output_admission_at),
-                    None,
-                );
-                let started_requests = dispatch_ready_requests(
-                    &mut endpoints,
-                    spec,
-                    &mut dependencies,
-                    barrier_now,
-                    &mut traces,
-                    controller.can_start_application_batch(),
-                    request_work_interrupt,
-                    request_work_tai_interrupt_ns,
-                )?;
-                #[cfg(target_os = "linux")]
-                if defense_start.is_some()
-                    && let Some(runtime) = buflo_kernel_tx.as_mut()
-                    && !runtime.tick_zero_application_ready()?
-                {
-                    runtime.mark_tick_zero_application_ready(started_requests)?;
-                }
-                yield_to_exact_boundaries!('runner);
-                let batch_started = application_batches.after_dispatch(started_requests)?;
-                handle_all_qcsd_observations(
-                    &mut endpoints,
-                    &mut controller,
-                    &mut traces,
-                    barrier_elapsed,
-                )?;
-                if let Some(observation) = batch_started {
-                    let record = observation_clock.record(observation);
-                    traces.observation(None, &record)?;
-                    controller.observe(record.into_observation(), barrier_elapsed);
-                }
-                yield_to_exact_boundaries!('runner);
-            }
-
-            let wake_base = now();
-            let mut next_wakeup = absolute_wakeup(wake_base, spec.config.control_interval())
-                .ok_or_else(|| Error::DefenseExecution("runner wake deadline overflow".into()))?;
-            let mut controller_deadline_selected = false;
-            for endpoint_index in 0..endpoints.len() {
-                yield_to_exact_boundaries!('runner);
-                // Flush output that was already available (including newly
-                // dispatched application requests) so its Wire signals precede
-                // the defense poll.
-                let output_guard = project_ordinary_buflo_guard!(
-                    next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints,)?,
-                    now()
-                );
-                let work_boundary = output_guard.map(|guard| guard.work_boundary);
-                let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
-                if let Some(wakeup) = drive_endpoint_output_until(
-                    endpoint_index,
-                    &mut endpoints,
-                    &mut controller,
-                    spec.chaff_manifest.as_ref(),
-                    &mut traces,
-                    &observation_clock,
-                    defense_start,
-                    work_boundary,
-                    unshaped_handoff_interrupt,
-                    None,
-                    runner_defense_clock!(),
-                    OutputDriveCardinality::DrainAvailable,
-                )
-                .await?
-                    && wakeup < next_wakeup
-                {
-                    next_wakeup = wakeup;
-                    controller_deadline_selected = false;
-                }
-                yield_to_exact_boundaries!('runner);
             }
 
             let control_now = now();
@@ -15320,14 +15521,16 @@ async fn execute_run_inner(
                     traces.observation(None, &record)?;
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
-                if !application_complete_observed && dependencies.is_complete() {
-                    application_complete_observed = true;
-                    application_completion = Some(control_now);
-                    let observation = QcsdObservation::ApplicationComplete;
-                    let record = observation_clock.record(observation);
-                    traces.observation(None, &record)?;
-                    controller.observe(record.into_observation(), defense_elapsed);
-                }
+                observe_completed_application(
+                    &mut controller,
+                    &mut traces,
+                    &observation_clock,
+                    dependencies.is_complete(),
+                    &mut application_complete_observed,
+                    &mut application_completion,
+                    control_now,
+                    defense_elapsed,
+                )?;
                 controller.flush_defense_observations();
                 ensure_defense_realizable(&controller)?;
                 yield_to_exact_boundaries!('runner);
@@ -15351,6 +15554,7 @@ async fn execute_run_inner(
                 let kernel_tick_zero_pending = false;
                 if !kernel_tick_zero_pending {
                     controller.poll(defense_elapsed);
+                    first_control_poll_complete = true;
                     ensure_defense_realizable(&controller)?;
                     apply_queued_actions(
                         &mut endpoints,
@@ -15366,13 +15570,27 @@ async fn execute_run_inner(
 
             for endpoint_index in 0..endpoints.len() {
                 yield_to_exact_boundaries!('runner);
+                if let Some(boundary) = tamaraw_ordinary_work_boundary(
+                    &controller,
+                    defense_start,
+                    first_control_poll_complete,
+                )? && boundary.closed_wakeup(now()).is_some()
+                {
+                    continue 'runner;
+                }
                 // Retain a post-action flush so newly scheduled packet targets can
                 // be placed on the wire without waiting for another loop turn.
                 let output_guard = project_ordinary_buflo_guard!(
                     next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints,)?,
                     now()
                 );
-                let work_boundary = output_guard.map(|guard| guard.work_boundary);
+                let work_boundary = output_guard.map(|guard| guard.work_boundary).or(
+                    tamaraw_ordinary_work_boundary(
+                        &controller,
+                        defense_start,
+                        first_control_poll_complete,
+                    )?,
+                );
                 let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
                 if let Some(wakeup) = drive_endpoint_output_until(
                     endpoint_index,
@@ -15386,7 +15604,11 @@ async fn execute_run_inner(
                     unshaped_handoff_interrupt,
                     None,
                     runner_defense_clock!(),
-                    OutputDriveCardinality::DrainAvailable,
+                    if matches!(spec.config.defense, DefenseConfig::Tamaraw(_)) {
+                        OutputDriveCardinality::OneDatagram
+                    } else {
+                        OutputDriveCardinality::DrainAvailable
+                    },
                 )
                 .await?
                     && wakeup < next_wakeup
@@ -15395,6 +15617,14 @@ async fn execute_run_inner(
                     controller_deadline_selected = false;
                 }
                 yield_to_exact_boundaries!('runner);
+                if let Some(boundary) = tamaraw_ordinary_work_boundary(
+                    &controller,
+                    defense_start,
+                    first_control_poll_complete,
+                )? && boundary.closed_wakeup(now()).is_some()
+                {
+                    continue 'runner;
+                }
                 let endpoint = &mut endpoints[endpoint_index];
                 let input_now = now();
                 let input_elapsed = defense_elapsed_at!(input_now);
@@ -15408,6 +15638,14 @@ async fn execute_run_inner(
                     !bound_ordinary_work || defense_start.is_none(),
                 )?;
                 yield_to_exact_boundaries!('runner);
+                if let Some(boundary) = tamaraw_ordinary_work_boundary(
+                    &controller,
+                    defense_start,
+                    first_control_poll_complete,
+                )? && boundary.closed_wakeup(now()).is_some()
+                {
+                    continue 'runner;
+                }
                 if let Some(wakeup) = drive_front_v3_post_input_output(
                     endpoint_index,
                     &mut endpoints,
@@ -22870,6 +23108,133 @@ enum PreparedOutputDrive {
     None,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CsIncomingHandoffOwner {
+    slot: QcsdSlotId,
+    release: Instant,
+    deadline: Instant,
+}
+
+struct CsIncomingAdvertisementHandoff {
+    observation_index: usize,
+    owners: Vec<CsIncomingHandoffOwner>,
+}
+
+/// Preserve controller ownership after transport encoding removes its pending
+/// action. Every encoded owner constrains the same physical datagram, including
+/// a slotless frame covering multiple original scheduled ranges.
+fn cs_exact_incoming_advertisement_handoffs(
+    controller: &QcsdController,
+    observations: &[TimestampedQcsdObservation],
+    defense_start: Option<Instant>,
+) -> Result<Vec<CsIncomingAdvertisementHandoff>, Error> {
+    if !matches!(controller.config().defense, DefenseConfig::CsBuflo(_)) {
+        return Ok(Vec::new());
+    }
+    let mut advertisements = Vec::new();
+    for (observation_index, record) in observations.iter().enumerate() {
+        let QcsdObservation::ReceiveLimitAdvertised {
+            endpoint,
+            stream,
+            absolute_limit,
+            slot,
+        } = record.observation()
+        else {
+            continue;
+        };
+        let mut owners = Vec::new();
+        for (slot, packet) in controller.exact_incoming_advertisement_targets(
+            *endpoint,
+            *stream,
+            *absolute_limit,
+            *slot,
+        )? {
+            let started = defense_start.ok_or_else(|| {
+                Error::SlotInvariant(
+                    "CS-BuFLO owned receive advertisement preceded defense activation".into(),
+                )
+            })?;
+            let release = started.checked_add(packet.timestamp()).ok_or_else(|| {
+                Error::SlotInvariant("CS-BuFLO receive handoff release overflow".into())
+            })?;
+            let deadline = release
+                .checked_add(controller.config().control_interval())
+                .ok_or_else(|| {
+                    Error::SlotInvariant("CS-BuFLO receive handoff deadline overflow".into())
+                })?;
+            owners.push(CsIncomingHandoffOwner {
+                slot,
+                release,
+                deadline,
+            });
+        }
+        advertisements.push(CsIncomingAdvertisementHandoff {
+            observation_index,
+            owners,
+        });
+    }
+    Ok(advertisements)
+}
+
+/// Evidence emitted only after the physical attempt (or a no-output return).
+/// It cannot authorize a slot, replace its first physical timestamp, or change
+/// the original timing window. Callbacks/None retain the accepted identities
+/// that still need encoding, rather than guessing a transport failure reason.
+fn record_cs_incoming_output_phase(
+    endpoint: &Endpoint,
+    traces: &mut TraceFiles,
+    at: Instant,
+    phase: &str,
+    pending: &[QcsdReceiveActionIdentity],
+    details: serde_json::Value,
+) -> Result<(), Error> {
+    if pending.is_empty() && details.get("advertisements").is_none() {
+        return Ok(());
+    }
+    traces.event(
+        at,
+        Some(endpoint.id),
+        "cs_exact_incoming_output_phase",
+        phase,
+        &json!({
+            "schema_version": 1,
+            "policy": "cs-buflo-owned-receive-physical-handoff-v1",
+            "pending_receive_actions": pending.iter().map(|identity| json!({
+                "endpoint": identity.endpoint().0,
+                "stream": identity.stream().0,
+                "absolute_limit": identity.absolute_limit(),
+                "slot": identity.slot().map(|slot| slot.0),
+            })).collect::<Vec<_>>(),
+            "details": details,
+        }),
+    )
+}
+
+fn cs_incoming_advertisement_evidence(
+    endpoint: &Endpoint,
+    prepared: &PreparedOutputMicrostep,
+    advertisements: &[CsIncomingAdvertisementHandoff],
+) -> Vec<serde_json::Value> {
+    advertisements
+        .iter()
+        .map(|advertisement| {
+            let record = &prepared.observations[advertisement.observation_index];
+            json!({
+                "production_sequence": record.sequence(),
+                "production_monotonic_ns": record.produced_monotonic_ns(),
+                "observation": record.observation(),
+                "owners": advertisement.owners.iter().map(|owner| json!({
+                    "slot": owner.slot.0,
+                    "release_monotonic_ns": duration_as_u64_nanos(
+                        owner.release.saturating_duration_since(endpoint.receive_loop.origin)),
+                    "exclusive_deadline_monotonic_ns": duration_as_u64_nanos(
+                        owner.deadline.saturating_duration_since(endpoint.receive_loop.origin)),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct PreparedOutputFailureReceipt {
     schema_version: u32,
@@ -23686,7 +24051,23 @@ async fn drive_endpoint_output_with_clock_until(
         } else {
             None
         };
-        if let Some(boundary) = work_boundary
+        let tamaraw_owner = if matches!(controller.config().defense, DefenseConfig::Tamaraw(_)) {
+            sampled_drive_elapsed.and_then(|elapsed| {
+                due_tamaraw_output_target(
+                    endpoints.iter().enumerate().flat_map(|(index, endpoint)| {
+                        endpoint
+                            .scheduled_outgoing
+                            .iter()
+                            .map(move |scheduled| (index, scheduled))
+                    }),
+                    elapsed,
+                )
+            })
+        } else {
+            None
+        };
+        if tamaraw_owner.is_none()
+            && let Some(boundary) = work_boundary
             && let Some(wakeup) = defense_clock.closed_output_wakeup(&boundary, drive_now)?
         {
             return Ok(Some(wakeup));
@@ -23750,7 +24131,9 @@ async fn drive_endpoint_output_with_clock_until(
                         .chain([ordinary_guard.release])
                         .min();
                 }
-                if let Some(boundary) = work_boundary {
+                if tamaraw_owner.is_none()
+                    && let Some(boundary) = work_boundary
+                {
                     drive_now = monotonic_clock();
                     if let Some(wakeup) =
                         defense_clock.closed_output_wakeup(&boundary, drive_now)?
@@ -23760,6 +24143,25 @@ async fn drive_endpoint_output_with_clock_until(
                 }
             }
             let mut rolling_adapter_release = None;
+            if let Some((priority, not_before, deadline)) = tamaraw_owner {
+                let owner = &endpoints[priority];
+                if !owner.network_active
+                    || !owner.connected
+                    || !matches!(owner.client.state(), Http3State::Connected)
+                {
+                    return Err(Error::SlotInvariant(
+                        "assigned Tamaraw outgoing owner is no longer live".into(),
+                    ));
+                }
+                if drive_now >= deadline {
+                    return Err(Error::AdapterDeadlinePreHandoff {
+                        attempted_at: drive_now,
+                        deadline,
+                    });
+                }
+                output_endpoint_index = priority;
+                rolling_adapter_release = Some(not_before);
+            }
             if rolling_output_lifecycle_active(controller, endpoints) {
                 if let Some((priority, not_before)) = due_rolling_output_target(
                     endpoints.iter().enumerate().flat_map(|(index, endpoint)| {
@@ -23925,6 +24327,22 @@ fn rolling_output_lifecycle_active(controller: &QcsdController, endpoints: &[End
                     .iter()
                     .any(|scheduled| scheduled.rolling_prearmed)
         })
+}
+
+/// Select an already assigned Tamaraw target's genuine owner before ordinary
+/// output on another endpoint. The caller gates this to Tamaraw; this function
+/// neither changes rolling identity nor creates or extends any packet target.
+fn due_tamaraw_output_target<'a>(
+    scheduled: impl IntoIterator<Item = (usize, &'a ScheduledOutgoing)>,
+    drive_elapsed: Duration,
+) -> Option<(usize, Instant, Instant)> {
+    scheduled
+        .into_iter()
+        .filter(|(_, scheduled)| {
+            !scheduled.rolling_prearmed && scheduled.packet.timestamp() <= drive_elapsed
+        })
+        .min_by_key(|(_, scheduled)| (scheduled.packet.timestamp(), scheduled.slot))
+        .map(|(index, scheduled)| (index, scheduled.not_before, scheduled.deadline))
 }
 
 fn due_rolling_output_target<'a>(
@@ -24371,17 +24789,100 @@ async fn process_output_once_with_clock(
     } else {
         drive_now
     };
-    let prepared = match prepare_output_once_with_clock(endpoint, drive_now).await? {
-        PreparedOutputDrive::Datagram(prepared) => prepared,
-        PreparedOutputDrive::Callback(wakeup) => return Ok(OutputDrive::Callback(wakeup)),
-        PreparedOutputDrive::None => return Ok(OutputDrive::None),
+    let cs_incoming = matches!(controller.config().defense, DefenseConfig::CsBuflo(_));
+    let pending_receive_actions = if cs_incoming {
+        endpoint.client.qcsd_pending_receive_action_identities()
+    } else {
+        Vec::new()
     };
+    let preparation_started = if cs_incoming {
+        monotonic_clock()
+    } else {
+        drive_now
+    };
+    let prepared_output = prepare_output_once_with_clock(endpoint, drive_now).await;
+    let preparation_completed = if cs_incoming {
+        monotonic_clock()
+    } else {
+        drive_now
+    };
+    let phase_times = cs_incoming.then(|| {
+        json!({
+            "transport_drive_monotonic_ns": duration_as_u64_nanos(
+                drive_now.saturating_duration_since(endpoint.receive_loop.origin)),
+            "preparation_started_monotonic_ns": duration_as_u64_nanos(
+                preparation_started.saturating_duration_since(endpoint.receive_loop.origin)),
+            "preparation_completed_monotonic_ns": duration_as_u64_nanos(
+                preparation_completed.saturating_duration_since(endpoint.receive_loop.origin)),
+        })
+    });
+    let prepared = match prepared_output {
+        Err(error) => {
+            if cs_incoming {
+                record_cs_incoming_output_phase(
+                    endpoint,
+                    traces,
+                    preparation_completed,
+                    "preparation_failed",
+                    &pending_receive_actions,
+                    json!({"phase_times": phase_times, "error": error.to_string()}),
+                )?;
+            }
+            return Err(error);
+        }
+        Ok(PreparedOutputDrive::Callback(wakeup)) => {
+            if cs_incoming {
+                record_cs_incoming_output_phase(
+                    endpoint,
+                    traces,
+                    preparation_completed,
+                    "callback",
+                    &pending_receive_actions,
+                    json!({
+                        "phase_times": phase_times,
+                        "callback_monotonic_ns": duration_as_u64_nanos(
+                            wakeup.saturating_duration_since(endpoint.receive_loop.origin)),
+                    }),
+                )?;
+            }
+            return Ok(OutputDrive::Callback(wakeup));
+        }
+        Ok(PreparedOutputDrive::None) => {
+            if cs_incoming {
+                record_cs_incoming_output_phase(
+                    endpoint,
+                    traces,
+                    preparation_completed,
+                    "none",
+                    &pending_receive_actions,
+                    json!({"phase_times": phase_times}),
+                )?;
+            }
+            return Ok(OutputDrive::None);
+        }
+        Ok(PreparedOutputDrive::Datagram(prepared)) => prepared,
+    };
+    let incoming_advertisements = cs_exact_incoming_advertisement_handoffs(
+        controller,
+        &prepared.observations,
+        defense_start,
+    )?;
     let mut target_deadlines: Vec<_> = prepared
         .attributed_datagrams
         .iter()
         .filter_map(|attribution| attribution.satisfied.map(|target| target.deadline))
         .collect();
     target_deadlines.extend(absolute_handoff_deadline);
+    target_deadlines.extend(
+        incoming_advertisements
+            .iter()
+            .flat_map(|advertisement| advertisement.owners.iter().map(|owner| owner.deadline)),
+    );
+    let mut guarded_handoff_attempts = 0_u64;
+    let mut socket_api_attempts = 0_u64;
+    let mut socket_would_block_returns = 0_u64;
+    let mut last_handoff_guard_entry = preparation_completed;
+    let mut last_socket_api_entry = None;
     let (sent_at, late_handoff, semantic_wire_elapsed, semantic_interrupt_crossed) = loop {
         if let (Some(started), Some(interrupt_elapsed)) =
             (defense_start, semantic_handoff_interrupt)
@@ -24404,6 +24905,10 @@ async fn process_output_once_with_clock(
                 .iter()
                 .any(|attribution| attribution.satisfied.is_some()),
         );
+        if !incoming_advertisements.is_empty() {
+            last_handoff_guard_entry = monotonic_clock();
+            guarded_handoff_attempts = guarded_handoff_attempts.saturating_add(1);
+        }
         let handoff = attempt_socket_handoff_timestamped(
             &target_deadlines,
             hard_unshaped_handoff_interrupt(
@@ -24411,6 +24916,10 @@ async fn process_output_once_with_clock(
                 unshaped_handoff_interrupt,
             ),
             || {
+                if !incoming_advertisements.is_empty() {
+                    socket_api_attempts = socket_api_attempts.saturating_add(1);
+                    last_socket_api_entry = Some(now());
+                }
                 #[cfg(test)]
                 if force_socket_handoff_success {
                     return Ok(None);
@@ -24421,7 +24930,15 @@ async fn process_output_once_with_clock(
                 {
                     return Err(io::Error::from_raw_os_error(raw_os_error));
                 }
-                socket_handoff_policy.send(&endpoint.socket, &prepared.batch)
+                let result = socket_handoff_policy.send(&endpoint.socket, &prepared.batch);
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+                {
+                    socket_would_block_returns = socket_would_block_returns.saturating_add(1);
+                }
+                result
             },
             &mut *monotonic_clock,
         );
@@ -24477,7 +24994,36 @@ async fn process_output_once_with_clock(
                 }))?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if !incoming_advertisements.is_empty() {
+                    record_cs_incoming_output_phase(
+                        endpoint,
+                        traces,
+                        monotonic_clock(),
+                        "handoff_refused",
+                        &pending_receive_actions,
+                        json!({
+                            "phase_times": phase_times,
+                            "advertisements": cs_incoming_advertisement_evidence(
+                                endpoint, &prepared, &incoming_advertisements),
+                            "guarded_handoff_attempts": guarded_handoff_attempts,
+                            "socket_api_attempts": socket_api_attempts,
+                            "socket_would_block_returns": socket_would_block_returns,
+                            "last_socket_api_entry_monotonic_ns": last_socket_api_entry.map(|at| {
+                                duration_as_u64_nanos(at.saturating_duration_since(
+                                    endpoint.receive_loop.origin))
+                            }),
+                            "last_handoff_guard_entry_monotonic_ns": duration_as_u64_nanos(
+                                last_handoff_guard_entry.saturating_duration_since(
+                                    endpoint.receive_loop.origin)),
+                            "explicit_handoff_deadline_supplied": absolute_handoff_deadline.is_some(),
+                            "socket_handoff_succeeded": false,
+                            "error": error.to_string(),
+                        }),
+                    )?;
+                }
+                return Err(error);
+            }
         };
         match handoff {
             SocketHandoff::Sent(sent_at) => {
@@ -24539,7 +25085,7 @@ async fn process_output_once_with_clock(
             }
         }
     };
-    finalize_prepared_output_with_elapsed(
+    let finalized = finalize_prepared_output_with_elapsed(
         endpoint,
         controller,
         traces,
@@ -24549,7 +25095,36 @@ async fn process_output_once_with_clock(
         sent_at,
         semantic_wire_elapsed,
         sent_at,
-    )?;
+    );
+    if !incoming_advertisements.is_empty() {
+        record_cs_incoming_output_phase(
+            endpoint,
+            traces,
+            sent_at,
+            "successful_socket_handoff",
+            &pending_receive_actions,
+            json!({
+                "phase_times": phase_times,
+                "advertisements": cs_incoming_advertisement_evidence(
+                    endpoint, &prepared, &incoming_advertisements),
+                "guarded_handoff_attempts": guarded_handoff_attempts,
+                "socket_api_attempts": socket_api_attempts,
+                "socket_would_block_returns": socket_would_block_returns,
+                "last_socket_api_entry_monotonic_ns": last_socket_api_entry.map(|at| {
+                    duration_as_u64_nanos(at.saturating_duration_since(endpoint.receive_loop.origin))
+                }),
+                "last_handoff_guard_entry_monotonic_ns": duration_as_u64_nanos(
+                    last_handoff_guard_entry.saturating_duration_since(endpoint.receive_loop.origin)),
+                "explicit_handoff_deadline_supplied": absolute_handoff_deadline.is_some(),
+                "socket_handoff_succeeded": true,
+                "successful_socket_handoff_monotonic_ns": duration_as_u64_nanos(
+                    sent_at.saturating_duration_since(endpoint.receive_loop.origin)),
+                "late_handoff": late_handoff.is_some(),
+                "controller_finalization_error": finalized.as_ref().err().map(ToString::to_string),
+            }),
+        )?;
+    }
+    finalized?;
     if semantic_interrupt_crossed {
         return Err(Error::DefenseExecution(
             "BuFLO ordinary socket handoff crossed its CLOCK_TAI semantic interrupt".into(),
@@ -25022,7 +25597,7 @@ fn now() -> Instant {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-        fs,
+        fs, io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         num::NonZeroU64,
         path::{Path, PathBuf},
@@ -25047,9 +25622,9 @@ mod tests {
         QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
         ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification,
         ResponseOnlyChaffQualificationV4, ResponseOnlyQualifiedChaffResource,
-        ResponseOnlyQualifiedChaffResourceV4, SignalKind, StaticSchedule, TamarawConfig, Trace,
-        TrafficMorphingConfig, WalkieTalkieConfig, WalkieTalkieQualificationBinding, WtfPad,
-        WtfPadConfig, sanitize_chaff_headers,
+        ResponseOnlyQualifiedChaffResourceV4, SignalKind, StaticSchedule, TamarawConfig,
+        TimestampedQcsdObservation, Trace, TrafficMorphingConfig, WalkieTalkieConfig,
+        WalkieTalkieQualificationBinding, WtfPad, WtfPadConfig, sanitize_chaff_headers,
     };
     use neqo_udp::RecvBuf;
     use serde_json::json;
@@ -25092,15 +25667,16 @@ mod tests {
         drive_buflo_unadvertised_scheduled_receive_credit, drive_endpoint_output,
         drive_endpoint_output_until, drive_endpoint_output_with_clock,
         drive_endpoint_output_with_clock_until, due_rolling_output_target,
-        duration_as_trace_micros, duration_as_u64_nanos, duration_to_counter_ticks_ceil,
-        endpoint_candidate_egress_backlog, endpoint_egress_backlog_pending, endpoint_send_terminal,
-        ensure_defense_realizable, exact_incoming_retry_times,
-        expected_application_response_length, expire_buflo_exact_incoming_credit,
-        finalize_prepared_output, finish_application_record, finish_chaff_record, finish_stream,
-        forward_counter_delta, forward_qcsd_observation, handle_all_qcsd_observations,
-        handle_http_events, has_in_flight_application_stream, is_candidate_defense,
-        is_public_network_address, late_socket_handoff_error, next_buflo_exact_release_guard,
-        normalize_rolling_prearm_window, now, pending_receive_identity_is_reconciled,
+        due_tamaraw_output_target, duration_as_trace_micros, duration_as_u64_nanos,
+        duration_to_counter_ticks_ceil, endpoint_candidate_egress_backlog,
+        endpoint_egress_backlog_pending, endpoint_send_terminal, ensure_defense_realizable,
+        exact_incoming_retry_times, expected_application_response_length,
+        expire_buflo_exact_incoming_credit, finalize_prepared_output, finish_application_record,
+        finish_chaff_record, finish_stream, forward_counter_delta, forward_qcsd_observation,
+        handle_all_qcsd_observations, handle_http_events, has_in_flight_application_stream,
+        is_candidate_defense, is_public_network_address, late_socket_handoff_error,
+        next_buflo_exact_release_guard, normalize_rolling_prearm_window, now,
+        observe_completed_application, pending_receive_identity_is_reconciled,
         prefix_application_batches, prefix_numeric_profile_sha256, prefix_receipts_pass,
         prefix_targetless_stream_bytes, preflight_receive_actions_with, prepare_chaff_cancellation,
         prepare_output_once_with_clock, projected_ael, projected_identity_chaff_headers,
@@ -25112,7 +25688,8 @@ mod tests {
         response_qualification_mode, rolling_output_lifecycle_active, run_error_class,
         sanitize_chaff_action_headers, sha256, shapes_stream_sends,
         sustained_qualification_content_encoding, sustained_representation_failure,
-        sustained_requests_are_classifiable, terminalize_pending_slots,
+        sustained_requests_are_classifiable, tamaraw_ordinary_endpoint_unit,
+        tamaraw_ordinary_work_boundary, terminalize_pending_slots,
         trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles},
         traffic_morphing_endpoint_seed, validate_chaff_cancellation_target,
         validate_chaff_manifest_defense, validate_prefix_capacity_plan, validate_prefix_pack_spec,
@@ -29665,6 +30242,24 @@ mod tests {
             },
             ..QcsdConfig::default()
         };
+        connected_runner_endpoint_with_server_config(
+            output,
+            started,
+            clock,
+            endpoint_id,
+            port,
+            config,
+        )
+    }
+
+    fn connected_runner_endpoint_with_server_config(
+        output: &Path,
+        started: Instant,
+        clock: &QcsdObservationClock,
+        endpoint_id: QcsdEndpointId,
+        port: u16,
+        config: QcsdConfig,
+    ) -> (super::Endpoint, neqo_http3::Http3Server) {
         let first_port = port.saturating_sub(u16::try_from(endpoint_id.0).unwrap_or(u16::MAX));
         let resources = (0..=endpoint_id.0)
             .map(|index| {
@@ -29708,6 +30303,442 @@ mod tests {
         endpoint.connected = true;
         endpoint.pending.clear();
         (endpoint, server)
+    }
+
+    fn tamaraw_service_test_config() -> QcsdConfig {
+        QcsdConfig {
+            max_udp_payload_size: 1_200,
+            control_interval_us: 5_000,
+            // The HTTP body-retention fixture needs one complete 32KiB chunk
+            // before its first service turn; this is test setup receive credit,
+            // not a change to the issued scientific receive-credit contract.
+            initial_max_stream_data: 64 * 1024,
+            drop_unsatisfied_events: false,
+            defense: DefenseConfig::Tamaraw(TamarawConfig {
+                incoming_interval_us: 5_000,
+                outgoing_interval_us: 20_000,
+                packet_size: 1_200,
+                modulo: 100,
+            }),
+            ..QcsdConfig::default()
+        }
+    }
+
+    fn tamaraw_service_test_controller() -> QcsdController {
+        let mut controller = QcsdController::new(tamaraw_service_test_config(), 42, None)
+            .expect("genuine fixed Tamaraw controller");
+        controller
+            .enable_tamaraw_rapid_capture_policy()
+            .expect("unchanged 10ms policy");
+        controller
+    }
+
+    #[test]
+    fn tamaraw_scheduled_service_query_ignores_queued_observation_work() {
+        let started = test_fixture::now();
+        let mut controller = tamaraw_service_test_controller();
+        assert!(
+            tamaraw_ordinary_work_boundary(&controller, Some(started), false)
+                .expect("tick-zero boundary")
+                .is_none()
+        );
+        controller.poll(Duration::ZERO);
+        controller.drain_actions().for_each(drop);
+        let next = controller
+            .next_tamaraw_event_at()
+            .expect("next nominal T event");
+        assert_eq!(next, Duration::from_micros(5_000));
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(1_000),
+        );
+        assert_eq!(controller.next_deadline(), Some(Duration::ZERO));
+        assert_eq!(controller.next_tamaraw_event_at(), Some(next));
+        let boundary = tamaraw_ordinary_work_boundary(&controller, Some(started), true)
+            .expect("service boundary")
+            .expect("active T boundary");
+        assert_eq!(boundary.admission_at, started + next);
+        assert!(
+            boundary
+                .closed_wakeup(started + next - Duration::from_nanos(1))
+                .is_none()
+        );
+        assert_eq!(boundary.closed_wakeup(started + next), Some(started + next));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_tick_zero_dispatch_precedes_first_control_poll() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("tamaraw-tick-zero-dispatch");
+        let started = test_fixture::now();
+        let _clock = TestMonotonicNowOverride::fixed(started);
+        let observation_clock = QcsdObservationClock::new(started);
+        let mut spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        spec.config = tamaraw_service_test_config();
+        let mut endpoints =
+            create_endpoints(&spec, started, &observation_clock).expect("genuine T endpoint");
+        let mut server = test_fixture::default_http3_server();
+        let trailing = test_fixture::connect_peers(&mut endpoints[0].client, &mut server);
+        let peer_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, peer_output);
+        endpoints[0].connected = true;
+        let mut controller = tamaraw_service_test_controller();
+        let mut dependencies = DependencyTracker::new(spec.workload.clone()).expect("dependencies");
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        let interrupt = tamaraw_ordinary_work_boundary(&controller, Some(started), false)
+            .expect("pre-poll admission")
+            .map(|boundary| boundary.admission_at);
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                interrupt,
+                None
+            )
+            .expect("real tick-zero dispatch"),
+            1
+        );
+        assert!(!endpoints[0].streams.is_empty());
+        controller.poll(Duration::ZERO);
+        assert_eq!(
+            tamaraw_ordinary_work_boundary(&controller, Some(started), true)
+                .expect("post-poll admission")
+                .expect("next T tick")
+                .admission_at,
+            started + Duration::from_micros(5_000)
+        );
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove fixture");
+    }
+
+    /// Actual connected T clients, production action dispatch and real UDP
+    /// syscall. Only the clock and optional Callback are deterministic seams;
+    /// test_force_socket_handoff_success remains false on both endpoints.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one owned-output fixture covers callback, expiry and stale owner without fabricating a send"
+    )]
+    async fn assert_tamaraw_assigned_owner_priority(case: u8) {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("tamaraw-assigned-owner");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (first, server0) = connected_runner_endpoint_with_server_config(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            tamaraw_service_test_config(),
+        );
+        let (second, server1) = connected_runner_endpoint_with_server_config(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(1),
+            4_434,
+            tamaraw_service_test_config(),
+        );
+        let mut endpoints = vec![first, second];
+        // Separate completed handshake observations at the activation boundary,
+        // as production does before issuing defense-owned actions.
+        drop(super::take_all_qcsd_observations(&mut endpoints));
+        // Prime real socket readiness before issuing defense-owned actions.
+        tokio::time::timeout(Duration::from_secs(1), endpoints[1].socket.writable())
+            .await
+            .expect("bounded socket readiness")
+            .expect("sender socket writable");
+        let mut controller = tamaraw_service_test_controller();
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(1),
+                origin: "https://127.0.0.1:4434".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let slot = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::SendPacket {
+                    endpoint: QcsdEndpointId(1),
+                    slot,
+                    packet,
+                    ..
+                } if packet.timestamp() == Duration::ZERO => Some(*slot),
+                _ => None,
+            })
+            .expect("real controller assigned outgoing tick zero to later endpoint");
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("real action adapter");
+        let owned = *endpoints[1]
+            .scheduled_outgoing
+            .front()
+            .expect("assigned target");
+        assert_eq!(owned.slot, slot);
+        assert!(!owned.rolling_prearmed);
+        assert_eq!(owned.deadline, started + Duration::from_micros(10_000));
+        assert!(
+            !endpoints
+                .iter()
+                .any(|endpoint| endpoint.test_force_socket_handoff_success)
+        );
+        let at = started + Duration::from_micros(if case == 2 { 10_000 } else { 5_000 });
+        let boundary = OutputWorkBoundary::new(
+            started + Duration::from_micros(5_000),
+            started + Duration::from_micros(5_000),
+        );
+        endpoints[0]
+            .test_output_drives
+            .push_back(TestOutputDrive::ErrorAt(at));
+        if case == 0 {
+            endpoints[1]
+                .test_output_drives
+                .push_back(TestOutputDrive::CallbackAt(at));
+        } else if case == 1 {
+            endpoints[1].network_active = false;
+        }
+        let mut clock = || at;
+        let first_result = drive_endpoint_output_with_clock_until(
+            0,
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            &observation_clock,
+            Some(started),
+            Some(boundary),
+            None,
+            None,
+            RunnerDefenseClock::Monotonic,
+            true,
+            OutputDriveCardinality::OneDatagram,
+            PostOutputRollingBarrier::Apply,
+            &mut clock,
+        )
+        .await;
+        if case == 1 {
+            assert!(matches!(first_result, Err(Error::SlotInvariant(message))
+                if message.contains("assigned Tamaraw outgoing owner is no longer live")));
+        } else if case == 2 {
+            assert!(matches!(
+                first_result,
+                Err(Error::AdapterDeadlinePreHandoff { .. })
+            ));
+        } else {
+            assert_eq!(first_result.expect("owner callback"), Some(at));
+            assert_eq!(
+                endpoints[1]
+                    .scheduled_outgoing
+                    .front()
+                    .expect("callback retains owner")
+                    .slot,
+                slot
+            );
+            assert_eq!(
+                drive_endpoint_output_with_clock_until(
+                    0,
+                    &mut endpoints,
+                    &mut controller,
+                    None,
+                    &mut traces,
+                    &observation_clock,
+                    Some(started),
+                    Some(boundary),
+                    None,
+                    None,
+                    RunnerDefenseClock::Monotonic,
+                    true,
+                    OutputDriveCardinality::OneDatagram,
+                    PostOutputRollingBarrier::Apply,
+                    &mut clock,
+                )
+                .await
+                .expect("real owned socket handoff"),
+                None
+            );
+            assert!(endpoints[1].scheduled_outgoing.is_empty());
+            assert_eq!(
+                controller.terminal_slot_resolution_at(slot),
+                Some(Duration::from_micros(5_000))
+            );
+        }
+        assert_eq!(
+            endpoints[0].test_output_drives.len(),
+            1,
+            "earlier ordinary endpoint cannot consume the owned T microstep"
+        );
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packets");
+        assert_eq!(packets.lines().count(), if case == 0 { 2 } else { 1 });
+        if case == 0 {
+            assert!(
+                packets
+                    .lines()
+                    .nth(1)
+                    .expect("real packet")
+                    .contains("1200")
+            );
+        }
+        drop(endpoints);
+        drop(server0);
+        drop(server1);
+        fs::remove_dir_all(output).expect("remove fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_due_owner_callback_and_real_send_precede_earlier_ordinary_output() {
+        assert_tamaraw_assigned_owner_priority(0).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_due_owner_closed_endpoint_refuses_without_retargeting() {
+        assert_tamaraw_assigned_owner_priority(1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_due_owner_keeps_original_half_open_socket_deadline() {
+        assert_tamaraw_assigned_owner_priority(2).await;
+    }
+
+    #[test]
+    fn tamaraw_owner_selector_retains_nominal_time_identity_and_ignores_future_or_rolling() {
+        let started = test_fixture::now();
+        let packet =
+            Packet::new(Duration::from_millis(20), Direction::Outgoing, 1_200).expect("packet");
+        let target = ScheduledOutgoing {
+            slot: QcsdSlotId(7),
+            packet,
+            not_before: started + Duration::from_millis(20),
+            deadline: started + Duration::from_millis(30),
+            rolling_prearmed: false,
+        };
+        assert!(due_tamaraw_output_target([(1, &target)], Duration::from_micros(19_999)).is_none());
+        assert_eq!(
+            due_tamaraw_output_target([(1, &target)], Duration::from_millis(20)),
+            Some((1, target.not_before, target.deadline))
+        );
+        let rolling = ScheduledOutgoing {
+            rolling_prearmed: true,
+            ..target
+        };
+        assert!(due_tamaraw_output_target([(1, &rolling)], Duration::from_millis(20)).is_none());
+        let later = ScheduledOutgoing {
+            slot: QcsdSlotId(9),
+            packet: Packet::new(Duration::from_millis(40), Direction::Outgoing, 1_200)
+                .expect("later packet"),
+            ..target
+        };
+        assert_eq!(
+            due_tamaraw_output_target([(0, &later), (1, &target)], Duration::from_millis(40)),
+            Some((1, target.not_before, target.deadline)),
+            "crossing the next tick cannot steal an older owner"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_active_service_stops_ordinary_output_at_next_nominal_tick() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("tamaraw-padding-service");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, server) = connected_runner_endpoint_with_server_config(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            tamaraw_service_test_config(),
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        let mut endpoints = vec![endpoint];
+        let mut controller = tamaraw_service_test_controller();
+        let mut traces = TraceFiles::new(&output, started).expect("traces");
+        controller.poll(Duration::ZERO);
+        controller.drain_actions().for_each(drop);
+        let boundary = tamaraw_ordinary_work_boundary(&controller, Some(started), true)
+            .expect("active boundary")
+            .expect("active T has nominal events");
+        assert_eq!(
+            boundary.admission_at,
+            started + Duration::from_micros(5_000)
+        );
+        endpoints[0]
+            .test_output_drives
+            .push_back(TestOutputDrive::ErrorAt(boundary.admission_at));
+        let mut reads = 0;
+        let mut clock = || {
+            reads += 1;
+            if reads == 1 {
+                boundary.admission_at - Duration::from_nanos(1)
+            } else {
+                boundary.admission_at
+            }
+        };
+        assert_eq!(
+            drive_endpoint_output_with_clock_until(
+                0,
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                &observation_clock,
+                Some(started),
+                Some(boundary),
+                None,
+                None,
+                RunnerDefenseClock::Monotonic,
+                true,
+                OutputDriveCardinality::OneDatagram,
+                PostOutputRollingBarrier::Apply,
+                &mut clock,
+            )
+            .await
+            .expect("ordinary drive yields before transport preparation"),
+            Some(boundary.resume_at)
+        );
+        assert_eq!(
+            endpoints[0].test_output_drives.len(),
+            1,
+            "queued ordinary HTTP output remains for a later turn"
+        );
+        controller.poll(Duration::from_micros(5_000));
+        assert_eq!(
+            controller.next_tamaraw_event_at(),
+            Some(Duration::from_micros(10_000)),
+            "the same production reducer services the due tick without rebasing it"
+        );
+        drop(traces);
+        assert_eq!(
+            fs::read_to_string(output.join("packets.csv"))
+                .expect("packets")
+                .lines()
+                .count(),
+            1
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove fixture");
     }
 
     fn connected_runner_endpoint(
@@ -29799,6 +30830,278 @@ mod tests {
         )
         .expect("apply receive credit");
         (endpoints, server, controller, incoming_slot, traces)
+    }
+
+    // Isolated mechanism fixture: actual connected HTTP/3 transport and
+    // controller-owned ChaffOnly credit, with a fixed FRONT-mode schedule.
+    // Its synthetic controller role is not a qualified live chaff workload.
+    fn front_owned_ordinary_output_fixture(
+        output: &Path,
+        started: Instant,
+        clock: &QcsdObservationClock,
+    ) -> (
+        Vec<super::Endpoint>,
+        neqo_http3::Http3Server,
+        QcsdController,
+        Vec<QcsdSlotId>,
+        TraceFiles,
+    ) {
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server(
+            output,
+            started,
+            clock,
+            QcsdEndpointId(0),
+            4_433,
+            10_000,
+        );
+        let stream =
+            open_controlled_runner_stream(&mut endpoint, &mut server, started, 4_433, 5_000);
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200)
+            .expect("original incoming owner");
+        let sentinel = Packet::new(Duration::from_secs(10), Direction::Incoming, 1_200)
+            .expect("keep a middle-of-flight schedule");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::front_v5_light_configuration()
+            },
+            Some(ResourceManifest {
+                resources: vec![Resource {
+                    id: 1,
+                    url: "https://127.0.0.1:4433/chaff".into(),
+                    kind: "Image".into(),
+                    content_length: Some(5_000),
+                    data_length: 5_000,
+                    chaff_priority: false,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                }],
+            }),
+            Box::new(StaticSchedule::new(
+                Trace::new([packet, packet, sentinel]),
+                true,
+            )),
+        )
+        .expect("unchanged FRONT allocation lifecycle");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(0),
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Chaff {
+                    resource_id: 1,
+                    request_id: None,
+                },
+                expected_response_length: Some(5_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let slots: Vec<_> = actions
+            .iter()
+            .filter_map(|action| action.receive_identity()?.slot())
+            .collect();
+        assert_eq!(slots.len(), 2);
+        let mut traces = TraceFiles::new(output, started).expect("FRONT phase traces");
+        endpoint.socket_handoff_policy = SocketHandoffPolicy::CandidateFidelityStrict;
+        endpoint.test_force_socket_handoff_success = true;
+        let mut endpoints = vec![endpoint];
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            actions
+                .into_iter()
+                .filter(|action| !matches!(action, QcsdAction::RequestChaff { .. }))
+                .collect(),
+        )
+        .expect("stage actual receive actions without outgoing owners");
+        assert!(endpoints[0].scheduled_outgoing.is_empty());
+        assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 0);
+        (endpoints, server, controller, slots, traces)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_ordinary_callback_and_none_keep_original_accepted_receive_identities() {
+        for callback in [true, false] {
+            let output = trace_output_dir("front-ordinary-no-output");
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let (mut endpoints, server, mut controller, slots, mut traces) =
+                front_owned_ordinary_output_fixture(&output, started, &clock);
+            let pending = endpoints[0].client.qcsd_pending_receive_action_identities();
+            assert_eq!(pending.len(), 2);
+            let at = started + Duration::from_millis(70);
+            let _api_clock = TestMonotonicNowOverride::fixed(at);
+            if callback {
+                endpoints[0]
+                    .test_output_drives
+                    .push_back(TestOutputDrive::Callback(Duration::from_millis(2)));
+            } else {
+                endpoints[0].test_observation_on_next_output =
+                    Some(clock.record_at(QcsdObservation::EgressBacklog { pending: false }, at));
+            }
+            let mut monotonic_clock = || at;
+            let result = super::process_output_once_with_clock(
+                &mut endpoints[0],
+                &mut controller,
+                &mut traces,
+                &clock,
+                at,
+                Some(started),
+                None,
+                None,
+                RunnerDefenseClock::Monotonic,
+                None,
+                &mut monotonic_clock,
+            )
+            .await
+            .expect("unchanged no-output branch");
+            assert!(matches!(
+                (callback, result),
+                (true, super::OutputDrive::Callback(_)) | (false, super::OutputDrive::None)
+            ));
+            assert_eq!(
+                endpoints[0].client.qcsd_pending_receive_action_identities(),
+                pending
+            );
+            assert!(
+                slots
+                    .iter()
+                    .all(|slot| !controller.incoming_slot_is_locally_realized(*slot))
+            );
+            drop(traces);
+            let packets = fs::read_to_string(output.join("packets.csv")).expect("no carrier trace");
+            assert_eq!(
+                packets.lines().count(),
+                1,
+                "Callback/None is not physical advertisement"
+            );
+            drop(endpoints);
+            drop(server);
+            fs::remove_dir_all(output).expect("remove no-output FRONT fixture");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn front_ordinary_coalesced_carrier_keeps_late_physical_time_and_both_owner_ids() {
+        let output = trace_output_dir("front-ordinary-coalesced-late");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, slots, mut traces) =
+            front_owned_ordinary_output_fixture(&output, started, &clock);
+        let at = Instant::now().max(started) + Duration::from_millis(70);
+        let _api_clock = TestMonotonicNowOverride::fixed(at);
+        // Transport observation production keeps its real immutable clock.
+        // Only the runner's physical test seam is shifted beyond50ms; do not
+        // assign that synthetic physical clock to the production records.
+        let mut monotonic_clock = || Instant::now().max(started) + Duration::from_millis(70);
+        let result = super::process_output_once_with_clock(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            &clock,
+            at,
+            Some(started),
+            None,
+            None,
+            RunnerDefenseClock::Monotonic,
+            None,
+            &mut monotonic_clock,
+        )
+        .await
+        .expect("current non-exact FRONT lifecycle can advertise late ordinary credit");
+        assert!(matches!(result, super::OutputDrive::Datagram));
+        assert!(
+            slots
+                .iter()
+                .all(|slot| controller.incoming_slot_is_locally_realized(*slot))
+        );
+        assert!(
+            endpoints[0]
+                .client
+                .qcsd_pending_receive_action_identities()
+                .is_empty()
+        );
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("physical carrier");
+        let header: Vec<_> = packets.lines().next().expect("header").split(',').collect();
+        let rows: Vec<_> = packets.lines().skip(1).collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one physical carrier, two original incoming owners"
+        );
+        let row: Vec<_> = rows[0].split(',').collect();
+        let field = |name| {
+            row[header
+                .iter()
+                .position(|column| *column == name)
+                .expect("column")]
+        };
+        let physical_us = field("monotonic_us")
+            .parse::<u64>()
+            .expect("physical packet clock");
+        assert!(
+            physical_us >= 70_000,
+            "physical carrier remains beyond the unchanged50ms gate"
+        );
+        assert_eq!(
+            field("slot_id"),
+            "",
+            "ordinary carrier has no outgoing schedule owner"
+        );
+        let events = fs::read_to_string(output.join("events.csv")).expect("production evidence");
+        let advertisements: Vec<serde_json::Value> = events
+            .lines()
+            .filter(|line| line.contains(",observation,recorded,"))
+            .filter_map(|line| {
+                let raw = line.splitn(5, ',').nth(4)?;
+                let closing = raw.rfind('"')?;
+                serde_json::from_str::<serde_json::Value>(&raw[1..closing].replace("\"\"", "\""))
+                    .ok()
+            })
+            .filter(|value| value["type"] == "receive_limit_advertised")
+            .collect();
+        assert_eq!(
+            advertisements.len(),
+            2,
+            "coalescing preserves each accepted owner record"
+        );
+        assert_ne!(
+            advertisements[0]["production_sequence"],
+            advertisements[1]["production_sequence"]
+        );
+        for slot in slots {
+            let owner = advertisements
+                .iter()
+                .find(|value| value["slot"] == slot.0)
+                .expect("same original owner in immutable production record");
+            assert_eq!(owner["absolute_limit"], 2_416);
+            let production_ns = owner["production_monotonic_ns"]
+                .as_u64()
+                .expect("unaltered typed original production clock");
+            assert!(
+                production_ns < (physical_us + 1) * 1_000,
+                "original construction precedes the synthetic successful physical boundary"
+            );
+        }
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove coalesced FRONT fixture");
     }
 
     struct CrossEndpointExactPairFixture {
@@ -32667,6 +33970,353 @@ mod tests {
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the connected response fixture proves bounded reads preserve the complete body lifecycle"
+    )]
+    async fn assert_tamaraw_http_completion_order(completion_before_due_poll: bool) {
+        let output = trace_output_dir(if completion_before_due_poll {
+            "tamaraw-completion-99"
+        } else {
+            "tamaraw-unread-completion-100"
+        });
+        test_fixture::fixture_init();
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let origin = "https://127.0.0.1:4433";
+        let body = vec![0x5a_u8; 32 * 1024 + 1];
+        let mut resource = request(1, origin, Vec::new());
+        resource.content_length = Some(u64::try_from(body.len()).expect("body length"));
+        resource.data_length = u64::try_from(body.len()).expect("body length");
+        let workload = ResourceManifest {
+            resources: vec![resource],
+        };
+        let spec = RunSpec {
+            method: "GET",
+            workload: workload.clone(),
+            workload_hash: "bounded-data-readable".into(),
+            application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
+            config: tamaraw_service_test_config(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 7,
+            output_dir: output.clone(),
+            max_response_bytes: u64::try_from(body.len()).expect("body length"),
+            timeout_seconds: 1,
+        };
+        let mut endpoints =
+            create_endpoints(&spec, started, &observation_clock).expect("construct endpoint");
+        let mut server = test_fixture::default_http3_server();
+        let trailing = test_fixture::connect_peers(&mut endpoints[0].client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, server_output);
+        endpoints[0].connected = true;
+        while endpoints[0].client.next_event().is_some() {}
+        drop(endpoints[0].client.qcsd_timestamped_observations());
+
+        // Only fixture setup exchanges HTTP without schedule targets. The
+        // tested completion unit below uses the genuine T RunSpec and reducer.
+        endpoints[0].client.qcsd_enable_send_shaping(false);
+        let mut controller = tamaraw_service_test_controller();
+        let mut dependencies = DependencyTracker::new(workload).expect("dependency tracker");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        assert_eq!(
+            dispatch_ready_requests(
+                &mut endpoints,
+                &spec,
+                &mut dependencies,
+                started,
+                &mut traces,
+                true,
+                None,
+                None,
+            )
+            .expect("dispatch request"),
+            1
+        );
+        let stream_id = *endpoints[0]
+            .streams
+            .keys()
+            .next()
+            .expect("application stream");
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+        let request_stream = server
+            .events()
+            .find_map(|event| match event {
+                neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                    assert!(fin, "GET request finishes in its header block");
+                    Some(stream)
+                }
+                _ => None,
+            })
+            .expect("server receives request");
+        let content_length = body.len().to_string();
+        request_stream
+            .send_headers(&[
+                neqo_common::Header::new(":status", "200"),
+                neqo_common::Header::new("content-length", content_length.as_str()),
+            ])
+            .expect("send response headers");
+        assert_eq!(
+            request_stream
+                .send_data(&body, started)
+                .expect("buffer response body"),
+            body.len()
+        );
+        request_stream
+            .stream_close_send(started)
+            .expect("finish response");
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, Some(1))
+            .expect("consume response headers");
+        handle_http_events(&mut endpoints[0], &spec, started, &mut traces, Some(1))
+            .expect("consume first bounded data chunk");
+        assert_eq!(
+            endpoints[0]
+                .streams
+                .get(&stream_id)
+                .expect("stream remains active after one chunk")
+                .bytes,
+            32 * 1024
+        );
+        assert_eq!(
+            endpoints[0].deferred_data_readable,
+            VecDeque::from([stream_id]),
+            "the same event is retained for the next bounded runner turn"
+        );
+        let due = Duration::from_micros(99 * 20_000);
+        let due_at = started + due;
+        let _clock = TestMonotonicNowOverride::fixed(due_at);
+        // Materialize 99 nominal outgoing events using the production
+        // controller. These schedule-only setup actions are not sent and do
+        // not assert a physical capture or successful slot realization.
+        controller.poll(due - Duration::from_micros(5_000));
+        controller.drain_actions().for_each(drop);
+        assert!(
+            !dependencies.is_complete(),
+            "unread final body/FIN is not completion"
+        );
+        let mut observed = false;
+        let mut completed_at = None;
+        observe_completed_application(
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            dependencies.is_complete(),
+            &mut observed,
+            &mut completed_at,
+            due_at,
+            due,
+        )
+        .expect("unread completion barrier");
+        assert!(!observed);
+        if !completion_before_due_poll {
+            controller.poll(due);
+            controller.drain_actions().for_each(drop);
+        } else {
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("actual input sender");
+            sender
+                .send_to(&[0_u8; 37], endpoints[0].local_addr)
+                .expect("queue actual UDP input");
+            let mut reads = 0;
+            let mut crossing_clock = || {
+                reads += 1;
+                if reads == 1 {
+                    due_at - Duration::from_nanos(1)
+                } else {
+                    due_at
+                }
+            };
+            assert!(
+                tamaraw_ordinary_endpoint_unit(
+                    &mut endpoints[0],
+                    &spec,
+                    &mut dependencies,
+                    &mut controller,
+                    &mut traces,
+                    &observation_clock,
+                    due_at,
+                    started,
+                    due,
+                    true,
+                    &mut crossing_clock,
+                )
+                .expect("real input batch yields before queued HTTP work")
+            );
+            assert!(!dependencies.is_complete());
+            assert_eq!(
+                endpoints[0]
+                    .streams
+                    .get(&stream_id)
+                    .expect("unread HTTP stream")
+                    .bytes,
+                32 * 1024
+            );
+            assert_eq!(
+                endpoints[0].receive_loop.receipt(false)["disposition"],
+                "bounded_one_batch"
+            );
+        }
+        let mut reads = 0;
+        let mut completion_clock = || {
+            reads += 1;
+            if reads < 3 {
+                due_at - Duration::from_nanos(1)
+            } else {
+                due_at
+            }
+        };
+        assert_eq!(
+            tamaraw_ordinary_endpoint_unit(
+                &mut endpoints[0],
+                &spec,
+                &mut dependencies,
+                &mut controller,
+                &mut traces,
+                &observation_clock,
+                due_at,
+                started,
+                due,
+                true,
+                &mut completion_clock,
+            )
+            .expect("real HTTP finish and dependency retirement before yield"),
+            completion_before_due_poll
+        );
+        handle_all_qcsd_observations(&mut endpoints, &mut controller, &mut traces, due)
+            .expect("drain observations produced by the real HTTP finish");
+        assert!(dependencies.is_complete());
+        observe_completed_application(
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            dependencies.is_complete(),
+            &mut observed,
+            &mut completed_at,
+            due_at,
+            due,
+        )
+        .expect("production completion barrier");
+        assert!(observed);
+        assert_eq!(completed_at, Some(due_at));
+        controller.flush_defense_observations();
+        controller.poll(due);
+        let mut tail: Vec<_> = controller.drain_actions().collect();
+        if completion_before_due_poll {
+            // This is the same genuinely finished HTTP resource and controller,
+            // now in its padding tail. An unread ordinary transport turn cannot
+            // consume the next incoming tick's service boundary (Guim-shaped
+            // phase, without claiming a reproduction of the captured gap).
+            let boundary = tamaraw_ordinary_work_boundary(&controller, Some(started), true)
+                .expect("completed HTTP padding boundary")
+                .expect("padding remains");
+            assert_eq!(
+                boundary.admission_at,
+                started + Duration::from_micros(1_985_000)
+            );
+            endpoints[0]
+                .test_output_drives
+                .push_back(TestOutputDrive::ErrorAt(boundary.admission_at));
+            let mut reads = 0;
+            let mut clock = || {
+                reads += 1;
+                if reads == 1 {
+                    boundary.admission_at - Duration::from_nanos(1)
+                } else {
+                    boundary.admission_at
+                }
+            };
+            assert_eq!(
+                drive_endpoint_output_with_clock_until(
+                    0,
+                    &mut endpoints,
+                    &mut controller,
+                    None,
+                    &mut traces,
+                    &observation_clock,
+                    Some(started),
+                    Some(boundary),
+                    None,
+                    None,
+                    RunnerDefenseClock::Monotonic,
+                    true,
+                    OutputDriveCardinality::OneDatagram,
+                    PostOutputRollingBarrier::Apply,
+                    &mut clock,
+                )
+                .await
+                .expect("completed-state output yields"),
+                Some(boundary.resume_at)
+            );
+            assert_eq!(endpoints[0].test_output_drives.len(), 1);
+            controller.poll(Duration::from_micros(1_985_000));
+            tail.extend(controller.drain_actions());
+            assert_eq!(
+                controller.next_tamaraw_event_at(),
+                Some(Duration::from_micros(1_990_000))
+            );
+        }
+        controller.poll(Duration::from_secs(4));
+        tail.extend(controller.drain_actions());
+        let last_outgoing = tail
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::SendPacket { packet, .. } | QcsdAction::SlotMissed { packet, .. }
+                    if packet.direction() == Direction::Outgoing =>
+                {
+                    Some(packet.timestamp())
+                }
+                _ => None,
+            })
+            .max()
+            .expect("actual generated outgoing tail");
+        assert_eq!(
+            last_outgoing,
+            Duration::from_micros(if completion_before_due_poll {
+                99 * 20_000
+            } else {
+                199 * 20_000
+            }),
+            "real HTTP completion before count100 keeps100; after count100 keeps200"
+        );
+        assert_eq!(controller.next_tamaraw_event_at(), None);
+
+        assert!(endpoints[0].streams.is_empty());
+        assert!(endpoints[0].deferred_data_readable.is_empty());
+        assert_eq!(
+            endpoints[0].retired_applications,
+            Vec::<(u32, ResourceRunState)>::new()
+        );
+        assert_eq!(endpoints[0].completed.len(), 1);
+        let completed = &endpoints[0].completed[0];
+        assert_eq!(
+            completed.bytes,
+            u64::try_from(body.len()).expect("body length")
+        );
+        assert_eq!(completed.body, body);
+        assert!(completed.complete);
+        assert_eq!(completed.outcome, "succeeded");
+
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_real_http_completion_before_due_poll_preserves_99_to_100_tail() {
+        assert_tamaraw_http_completion_order(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tamaraw_unread_http_completion_does_not_rewrite_100_to_200_tail() {
+        assert_tamaraw_http_completion_order(false).await;
+    }
+
     fn queue_peer_connection_close(
         endpoint: &mut super::Endpoint,
         server: &mut neqo_http3::Http3Server,
@@ -34578,6 +36228,705 @@ mod tests {
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
+    fn cs_projected_advertisement_fixture(
+        defense: DefenseConfig,
+    ) -> (
+        QcsdController,
+        QcsdObservationClock,
+        Vec<TimestampedQcsdObservation>,
+        Instant,
+    ) {
+        let start = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(start);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense,
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([
+                    Packet::new(Duration::ZERO, Direction::Incoming, 100).expect("first packet"),
+                    Packet::new(Duration::from_millis(1), Direction::Incoming, 100)
+                        .expect("second packet"),
+                ]),
+                exact_incoming_window: true,
+            }),
+        )
+        .expect("controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(0),
+                origin: "https://example.com".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(0),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::from_millis(1));
+        let limit = controller
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit { absolute_limit, .. } => Some(absolute_limit),
+                _ => None,
+            })
+            .max()
+            .expect("scheduled receive credit");
+        let observations =
+            vec![
+                observation_clock.record(QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: QcsdEndpointId(0),
+                    stream: QcsdStreamId(0),
+                    absolute_limit: limit,
+                    slot: None,
+                }),
+            ];
+        (controller, observation_clock, observations, start)
+    }
+
+    fn cs_projection_test_defense() -> DefenseConfig {
+        DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "test-only-cs-incoming-deadline.json".into(),
+        })
+    }
+
+    fn cs_ordinary_control_output_fixture(
+        output: &Path,
+        started: Instant,
+        clock: &QcsdObservationClock,
+    ) -> (
+        Vec<super::Endpoint>,
+        neqo_http3::Http3Server,
+        QcsdController,
+        QcsdSlotId,
+        TraceFiles,
+        Instant,
+    ) {
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server(
+            output,
+            started,
+            clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        // Exercise the actual seven-byte MAX_STREAM_DATA encoding (two-byte
+        // stream ID and four-byte limit). The fixture server randomizes its
+        // connection-ID length, so the test joins the actual datagram extent.
+        // This test-only large credit selects wire varints; study parameters
+        // and production allocation rules are unchanged.
+        let mut stream = None;
+        for _ in 0..24 {
+            stream = Some(open_controlled_runner_stream(
+                &mut endpoint,
+                &mut server,
+                started,
+                4_433,
+                100_000,
+            ));
+        }
+        let stream = stream.expect("last connected application stream");
+        assert_eq!(stream.as_u64(), 92);
+        let incoming = Packet::new(Duration::ZERO, Direction::Incoming, 20_000)
+            .expect("test credit selects a four-byte receive limit");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: cs_projection_test_defense(),
+                control_interval_us: 5_000,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 50_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(RollingOutgoingSequence {
+                events: VecDeque::from([incoming]),
+                exact_incoming_window: true,
+            }),
+        )
+        .expect("CS controller with one exact incoming opportunity");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: QcsdEndpointId(0),
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(0),
+                stream: QcsdStreamId(stream.as_u64()),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(100_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let slot = actions
+            .iter()
+            .find_map(|action| action.receive_identity()?.slot())
+            .expect("exact incoming owner");
+        let defense_start = now();
+        let mut traces = TraceFiles::new(output, started).expect("phase trace");
+        endpoint.socket_handoff_policy = SocketHandoffPolicy::CandidateFidelityStrict;
+        endpoint.test_force_socket_handoff_success = true;
+        let mut endpoints = vec![endpoint];
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            defense_start,
+            Duration::ZERO,
+            actions,
+        )
+        .expect("stage exact receive control without an outgoing target");
+        assert!(endpoints[0].scheduled_outgoing.is_empty());
+        assert_eq!(endpoints[0].client.qcsd_pending_packet_targets(), 0);
+        (endpoints, server, controller, slot, traces, defense_start)
+    }
+
+    fn cs_phase_test_event_details(row: &str) -> serde_json::Value {
+        let raw = row.splitn(5, ',').nth(4).expect("event details column");
+        let closing = raw.rfind('"').expect("CSV closing details quote");
+        serde_json::from_str(&raw[1..closing].replace("\"\"", "\""))
+            .expect("actual phase event JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_incoming_ordinary_output_refuses_its_own_deadline_without_outer_deadline() {
+        let output = trace_output_dir("cs-ordinary-control-deadline");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, slot, mut traces, release) =
+            cs_ordinary_control_output_fixture(&output, started, &clock);
+        let deadline = release + Duration::from_millis(5);
+        let construction = release + Duration::from_millis(1);
+        let _api_clock = TestMonotonicNowOverride::fixed(construction);
+        let mut samples = VecDeque::from([construction, construction]);
+        let mut monotonic_clock = || samples.pop_front().unwrap_or(deadline);
+        let result = super::process_output_once_with_clock(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            &clock,
+            construction,
+            Some(release),
+            None,
+            None,
+            RunnerDefenseClock::Monotonic,
+            None,
+            &mut monotonic_clock,
+        )
+        .await;
+        assert!(matches!(result, Err(Error::AdapterDeadlinePreHandoff {
+            attempted_at, deadline: actual,
+        }) if attempted_at == deadline && actual == deadline));
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("phase evidence");
+        let phase = cs_phase_test_event_details(
+            events
+                .lines()
+                .find(|row| row.contains(",cs_exact_incoming_output_phase,handoff_refused,"))
+                .expect("ordinary output refused before its socket API"),
+        );
+        assert_eq!(phase["details"]["socket_api_attempts"], 0);
+        assert_eq!(phase["details"]["guarded_handoff_attempts"], 1);
+        assert_eq!(
+            phase["details"]["explicit_handoff_deadline_supplied"],
+            false
+        );
+        assert_eq!(
+            phase["details"]["advertisements"][0]["owners"][0]["slot"],
+            slot.0
+        );
+        assert_eq!(
+            phase["details"]["advertisements"][0]["owners"][0]["exclusive_deadline_monotonic_ns"],
+            duration_as_u64_nanos(deadline.saturating_duration_since(started))
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("packets.csv"))
+                .expect("no physical packet")
+                .lines()
+                .count(),
+            1
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove ordinary deadline fixture");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_incoming_ordinary_output_keeps_callback_and_none_pending_phase_evidence() {
+        for callback in [true, false] {
+            let output = trace_output_dir("cs-ordinary-control-no-output");
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let (mut endpoints, server, mut controller, slot, mut traces, release) =
+                cs_ordinary_control_output_fixture(&output, started, &clock);
+            let at = release + Duration::from_millis(1);
+            let _api_clock = TestMonotonicNowOverride::fixed(at);
+            if callback {
+                endpoints[0]
+                    .test_output_drives
+                    .push_back(TestOutputDrive::Callback(Duration::from_millis(2)));
+            } else {
+                endpoints[0].test_observation_on_next_output =
+                    Some(clock.record_at(QcsdObservation::EgressBacklog { pending: false }, at));
+            }
+            let mut monotonic_clock = || at;
+            let result = super::process_output_once_with_clock(
+                &mut endpoints[0],
+                &mut controller,
+                &mut traces,
+                &clock,
+                at,
+                Some(release),
+                None,
+                None,
+                RunnerDefenseClock::Monotonic,
+                None,
+                &mut monotonic_clock,
+            )
+            .await
+            .expect("transport no-output result remains unchanged");
+            assert!(matches!(
+                (callback, result),
+                (true, super::OutputDrive::Callback(_)) | (false, super::OutputDrive::None)
+            ));
+            assert!(!controller.incoming_slot_is_locally_realized(slot));
+            assert!(
+                !endpoints[0]
+                    .client
+                    .qcsd_pending_receive_action_identities()
+                    .is_empty()
+            );
+            drop(traces);
+            let events = fs::read_to_string(output.join("events.csv")).expect("phase evidence");
+            let marker = if callback {
+                ",cs_exact_incoming_output_phase,callback,"
+            } else {
+                ",cs_exact_incoming_output_phase,none,"
+            };
+            let phase = cs_phase_test_event_details(
+                events
+                    .lines()
+                    .find(|row| row.contains(marker))
+                    .expect("no-output phase preserves the pending accepted identity"),
+            );
+            assert_eq!(phase["pending_receive_actions"][0]["slot"], slot.0);
+            assert_eq!(
+                phase["details"]["phase_times"]["preparation_completed_monotonic_ns"],
+                duration_as_u64_nanos(at.saturating_duration_since(started))
+            );
+            assert_eq!(
+                fs::read_to_string(output.join("packets.csv"))
+                    .expect("no physical packet")
+                    .lines()
+                    .count(),
+                1
+            );
+            drop(endpoints);
+            drop(server);
+            fs::remove_dir_all(output).expect("remove no-output phase fixture");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the physical boundary oracle joins original production, API, packet and late-failure evidence"
+    )]
+    async fn cs_incoming_ordinary_output_keeps_successful_and_late_physical_phase_joins() {
+        for late in [false, true] {
+            let output = trace_output_dir("cs-ordinary-control-physical");
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let (mut endpoints, server, mut controller, slot, mut traces, release) =
+                cs_ordinary_control_output_fixture(&output, started, &clock);
+            let before = release + Duration::from_millis(1);
+            let deadline = release + Duration::from_millis(5);
+            let physical = if late { deadline } else { before };
+            let _api_clock = TestMonotonicNowOverride::fixed(before);
+            // Preparation start/end, guard entry and pre-syscall admission use
+            // the injectable seam; the test-only successful socket fallback
+            // supplies the independently chosen physical return timestamp.
+            let mut samples = VecDeque::from([before, before, before, before]);
+            let mut monotonic_clock = || samples.pop_front().unwrap_or(physical);
+            let result = super::process_output_once_with_clock(
+                &mut endpoints[0],
+                &mut controller,
+                &mut traces,
+                &clock,
+                before,
+                Some(release),
+                None,
+                None,
+                RunnerDefenseClock::Monotonic,
+                None,
+                &mut monotonic_clock,
+            )
+            .await;
+            if late {
+                assert!(
+                    matches!(result, Err(Error::AdapterDeadlineLateHandoff {
+                    sent_at, deadline: actual,
+                }) if sent_at == deadline && actual == deadline),
+                    "a successful late syscall retains the typed physical deadline refusal"
+                );
+                assert!(!controller.incoming_slot_is_locally_realized(slot));
+            } else {
+                assert!(matches!(result, Ok(super::OutputDrive::Datagram)));
+                assert!(controller.incoming_slot_is_locally_realized(slot));
+            }
+            drop(traces);
+            let events = fs::read_to_string(output.join("events.csv")).expect("physical evidence");
+            let phase = cs_phase_test_event_details(
+                events
+                    .lines()
+                    .find(|row| {
+                        row.contains(",cs_exact_incoming_output_phase,successful_socket_handoff,")
+                    })
+                    .expect("even a late successful syscall retains its physical phase"),
+            );
+            let details = &phase["details"];
+            assert_eq!(details["socket_api_attempts"], 1);
+            assert_eq!(details["socket_handoff_succeeded"], true);
+            assert_eq!(details["late_handoff"], late);
+            assert_eq!(details["explicit_handoff_deadline_supplied"], false);
+            assert_eq!(
+                details["last_socket_api_entry_monotonic_ns"],
+                duration_as_u64_nanos(before.saturating_duration_since(started))
+            );
+            assert_eq!(
+                details["successful_socket_handoff_monotonic_ns"],
+                duration_as_u64_nanos(physical.saturating_duration_since(started))
+            );
+            let advertisement = &details["advertisements"][0];
+            assert_eq!(advertisement["owners"][0]["slot"], slot.0);
+            let original = events
+                .lines()
+                .filter(|row| row.contains(",observation,recorded,"))
+                .map(cs_phase_test_event_details)
+                .find(|observation| {
+                    observation["production_sequence"] == advertisement["production_sequence"]
+                })
+                .expect("original immutable advertisement production record");
+            assert_eq!(
+                original["production_monotonic_ns"],
+                advertisement["production_monotonic_ns"]
+            );
+            assert_eq!(
+                original["endpoint"],
+                advertisement["observation"]["endpoint"]
+            );
+            assert_eq!(original["stream"], advertisement["observation"]["stream"]);
+            assert_eq!(
+                original["absolute_limit"],
+                advertisement["observation"]["absolute_limit"]
+            );
+            let packets = fs::read_to_string(output.join("packets.csv")).expect("physical packet");
+            let header: Vec<_> = packets
+                .lines()
+                .next()
+                .expect("packet header")
+                .split(',')
+                .collect();
+            let rows: Vec<_> = packets.lines().skip(1).collect();
+            assert_eq!(rows.len(), 1, "one ordinary control-only physical datagram");
+            let row: Vec<_> = rows[0].split(',').collect();
+            let field = |name| {
+                row[header
+                    .iter()
+                    .position(|column| *column == name)
+                    .expect("named packet column")]
+            };
+            let observations: Vec<_> = events
+                .lines()
+                .filter(|row| row.contains(",observation,recorded,"))
+                .map(|row| {
+                    let record = cs_phase_test_event_details(row);
+                    let observation: QcsdObservation = serde_json::from_value(record.clone())
+                        .expect("typed original transport observation");
+                    (record, observation)
+                })
+                .collect();
+            let classified: Vec<_> = observations
+                .iter()
+                .filter_map(|(record, observation)| match observation {
+                    QcsdObservation::ClassifiedDatagram {
+                        endpoint,
+                        direction: Direction::Outgoing,
+                        length,
+                        composition: Some(composition),
+                        ..
+                    } => Some((record, *endpoint, *length, *composition)),
+                    _ => None,
+                })
+                .collect();
+            let raw: Vec<_> = observations
+                .iter()
+                .filter_map(|(record, observation)| match observation {
+                    QcsdObservation::Datagram {
+                        endpoint,
+                        direction: Direction::Outgoing,
+                        length,
+                        timestamp_us,
+                    } => Some((record, *endpoint, *length, *timestamp_us)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                classified.len(),
+                1,
+                "one original outgoing packet-build extent"
+            );
+            assert_eq!(raw.len(), 1, "one physical outgoing datagram observation");
+            let (built_record, built_endpoint, built_length, composition) = classified[0];
+            let (raw_record, raw_endpoint, raw_length, raw_timestamp_us) = raw[0];
+            assert_eq!(built_endpoint, raw_endpoint);
+            assert_eq!(advertisement["observation"]["endpoint"], built_endpoint.0);
+            assert_eq!(
+                field("connection").parse::<u64>().expect("packet endpoint"),
+                built_endpoint.0
+            );
+            assert!(built_length > 0, "the physical datagram is nonempty");
+            assert_eq!(raw_length, built_length);
+            assert_eq!(composition.observed_udp_bytes, built_length);
+            assert!(
+                super::qcsd_composition_exact_wire_accounting(
+                    &composition,
+                    usize::from(built_length)
+                ),
+                "exact raw packet-build accounting"
+            );
+            assert_eq!(
+                field("observed_udp_length")
+                    .parse::<u16>()
+                    .expect("packet extent"),
+                built_length
+            );
+            assert_eq!(composition.application_stream_bytes, 0);
+            assert_eq!(composition.chaff_stream_bytes, 0);
+            assert_eq!(composition.defense_control_bytes, 7);
+            assert!(
+                built_record["production_sequence"]
+                    .as_u64()
+                    .expect("build sequence")
+                    < raw_record["production_sequence"]
+                        .as_u64()
+                        .expect("physical sequence")
+            );
+            assert_eq!(
+                raw_record["production_monotonic_ns"],
+                duration_as_u64_nanos(physical.saturating_duration_since(started))
+            );
+            assert_eq!(
+                raw_timestamp_us,
+                duration_as_trace_micros(physical.saturating_duration_since(release))
+            );
+            assert_eq!(field("slot_id"), "", "there is no scheduled outgoing owner");
+            assert_eq!(field("application_stream_bytes"), "0");
+            assert_eq!(field("chaff_stream_bytes"), "0");
+            assert_eq!(field("defense_control_bytes"), "7");
+            assert_eq!(
+                field("monotonic_us")
+                    .parse::<u64>()
+                    .expect("physical packet time"),
+                duration_as_trace_micros(physical.saturating_duration_since(started))
+            );
+            drop(endpoints);
+            drop(server);
+            fs::remove_dir_all(output).expect("remove physical phase fixture");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_incoming_ordinary_output_refuses_backpressure_without_retry_or_physical_credit() {
+        let output = trace_output_dir("cs-ordinary-control-would-block");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoints, server, mut controller, slot, mut traces, release) =
+            cs_ordinary_control_output_fixture(&output, started, &clock);
+        let at = release + Duration::from_millis(1);
+        let _api_clock = TestMonotonicNowOverride::fixed(at);
+        endpoints[0].test_force_socket_handoff_success = false;
+        endpoints[0].test_strict_socket_handoff_error = Some(libc::EWOULDBLOCK);
+        let mut monotonic_clock = || at;
+        let result = super::process_output_once_with_clock(
+            &mut endpoints[0],
+            &mut controller,
+            &mut traces,
+            &clock,
+            at,
+            Some(release),
+            None,
+            None,
+            RunnerDefenseClock::Monotonic,
+            None,
+            &mut monotonic_clock,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::SlotInvariant(message)) if message.contains("backpressure"))
+        );
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).expect("refusal evidence");
+        let phase = cs_phase_test_event_details(
+            events
+                .lines()
+                .find(|row| row.contains(",cs_exact_incoming_output_phase,handoff_refused,"))
+                .expect("bounded ordinary send refuses a late retry"),
+        );
+        assert_eq!(phase["details"]["socket_api_attempts"], 1);
+        assert_eq!(phase["details"]["socket_handoff_succeeded"], false);
+        assert_eq!(
+            fs::read_to_string(output.join("packets.csv"))
+                .expect("no physical packet")
+                .lines()
+                .count(),
+            1
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove backpressure fixture");
+    }
+
+    #[test]
+    fn cs_incoming_ordinary_projection_keeps_earliest_original_owner_deadline() {
+        let (controller, _clock, observations, start) =
+            cs_projected_advertisement_fixture(cs_projection_test_defense());
+        let ads = super::cs_exact_incoming_advertisement_handoffs(
+            &controller,
+            &observations,
+            Some(start),
+        )
+        .expect("project encoded advertisement");
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].owners.len(), 2, "slotless frame keeps both owners");
+        let deadlines: Vec<_> = ads
+            .iter()
+            .flat_map(|ad| ad.owners.iter().map(|owner| owner.deadline))
+            .collect();
+        assert_eq!(
+            deadlines.iter().min(),
+            Some(&(start + Duration::from_millis(5)))
+        );
+        let mut socket_calls = 0;
+        let result = attempt_socket_handoff_timestamped(
+            &deadlines,
+            None,
+            || {
+                socket_calls += 1;
+                Ok(Some(start + Duration::from_millis(5)))
+            },
+            || start + Duration::from_millis(5),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::AdapterDeadlinePreHandoff { .. })
+        ));
+        assert_eq!(
+            socket_calls, 0,
+            "ordinary credit cannot enter send at its deadline"
+        );
+    }
+
+    #[test]
+    fn cs_incoming_ordinary_projection_refuses_socket_backpressure_retry() {
+        let (controller, _clock, observations, start) =
+            cs_projected_advertisement_fixture(cs_projection_test_defense());
+        let ads = super::cs_exact_incoming_advertisement_handoffs(
+            &controller,
+            &observations,
+            Some(start),
+        )
+        .expect("project credit");
+        let deadlines: Vec<_> = ads
+            .iter()
+            .flat_map(|ad| ad.owners.iter().map(|owner| owner.deadline))
+            .collect();
+        assert!(
+            matches!(attempt_socket_handoff_timestamped(&deadlines, None,
+            || Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            || start + Duration::from_millis(1)),
+            Err(Error::SlotInvariant(message)) if message.contains("backpressure"))
+        );
+        assert!(matches!(
+            attempt_socket_handoff_timestamped(
+                &deadlines,
+                None,
+                || Ok(Some(start + Duration::from_millis(1))),
+                || start + Duration::from_millis(1)
+            ),
+            Ok(SocketHandoff::Sent(_))
+        ));
+    }
+
+    #[test]
+    fn cs_incoming_ordinary_projection_keeps_post_syscall_late_failure() {
+        let (controller, _clock, observations, start) =
+            cs_projected_advertisement_fixture(cs_projection_test_defense());
+        let ads = super::cs_exact_incoming_advertisement_handoffs(
+            &controller,
+            &observations,
+            Some(start),
+        )
+        .expect("project credit");
+        let deadlines: Vec<_> = ads
+            .iter()
+            .flat_map(|ad| ad.owners.iter().map(|owner| owner.deadline))
+            .collect();
+        assert!(matches!(
+            attempt_socket_handoff_timestamped(
+                &deadlines,
+                None,
+                || Ok(Some(start + Duration::from_millis(5))),
+                || start + Duration::from_millis(1)
+            ),
+            Ok(SocketHandoff::SentLate {
+                boundary: SocketHandoffBoundary::AdapterDeadline,
+                ..
+            })
+        ));
+        assert!(
+            super::cs_exact_incoming_advertisement_handoffs(&controller, &observations, None,)
+                .is_err(),
+            "owned advertisement requires original defense clock"
+        );
+    }
+
+    #[test]
+    fn cs_incoming_projection_preserves_other_defense_output_contracts() {
+        let (controller, _clock, observations, start) =
+            cs_projected_advertisement_fixture(DefenseConfig::None);
+        assert!(
+            super::cs_exact_incoming_advertisement_handoffs(
+                &controller,
+                &observations,
+                Some(start),
+            )
+            .expect("other mode unchanged")
+            .is_empty()
+        );
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -36430,10 +38779,12 @@ mod tests {
         assert!(bounds_active_ordinary_work(&DefenseConfig::Buflo(
             neqo_csdef::BufloConfig::default()
         )));
+        assert!(bounds_active_ordinary_work(&DefenseConfig::Tamaraw(
+            TamarawConfig::default()
+        )));
         for defense in [
             DefenseConfig::None,
             DefenseConfig::Front(FrontConfig::default()),
-            DefenseConfig::Tamaraw(TamarawConfig::default()),
         ] {
             assert!(!bounds_active_ordinary_work(&defense));
         }

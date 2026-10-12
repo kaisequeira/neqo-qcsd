@@ -654,6 +654,7 @@ impl TraceFiles {
                 }
             }
             let slots = self.advertised_credit_slots(*endpoint, *stream, *absolute_limit, *slot);
+            let mut newly_frozen_slots = Vec::new();
             for slot in &slots {
                 let pending = self.pending_slots.get_mut(slot).ok_or_else(|| {
                     Error::SlotInvariant(format!(
@@ -674,6 +675,7 @@ impl TraceFiles {
                             if controller.incoming_slot_is_locally_realized(*slot) {
                                 pending.credit_advertised_at_us =
                                     pending.credit_advertisement_candidate_at_us;
+                                newly_frozen_slots.push(*slot);
                             }
                         }
                     }
@@ -694,11 +696,19 @@ impl TraceFiles {
             }
             // An explicitly attributed scheduled release retains honest
             // scalar event provenance even when the same physical frame also
-            // covers preceding parser-owned capacity. A slotless parser-lease
-            // advertisement has scalar provenance only when it covers exactly
-            // one logical owner. Every covered schedule row always retains
-            // its own independently frozen boundary.
-            let scalar_slot = (*slot).or(match slots.as_slice() {
+            // covers preceding parser-owned capacity. For a slotless runtime
+            // advertisement, only a newly frozen whole-slot boundary can own
+            // the scalar receipt. Already-realized but unconsumed owners must
+            // retain their earlier timestamps without making that new receipt
+            // ambiguous. Multiple new owners remain unrepresented by a scalar.
+            // Controller-less historical callers retain their prior coverage
+            // rule. Every covered schedule row keeps its own frozen boundary.
+            let scalar_candidates = if controller.is_some() {
+                &newly_frozen_slots
+            } else {
+                &slots
+            };
+            let scalar_slot = (*slot).or(match scalar_candidates.as_slice() {
                 [only] => Some(*only),
                 _ => None,
             });
@@ -1081,7 +1091,8 @@ mod incoming_realization_tests {
     };
 
     use neqo_csdef::{
-        QcsdAction, QcsdConfig, QcsdObservationClock, QcsdRequestRole, StaticSchedule, Trace,
+        QcsdAction, QcsdConfig, QcsdObservationClock, QcsdRequestRole, QcsdStreamFinish, Resource,
+        ResourceManifest, StaticSchedule, Trace,
     };
 
     use super::*;
@@ -1441,5 +1452,645 @@ mod incoming_realization_tests {
                 None
             );
         }
+    }
+
+    /// Mechanism fixture, not a successful workload or a replacement FRONT
+    /// acceptance oracle. The fixed event list preserves FRONT's ChaffOnly
+    /// allocation and non-exact incoming lifecycle without random sampling.
+    struct FrontFixture {
+        controller: QcsdController,
+        traces: TraceFiles,
+        clock: QcsdObservationClock,
+        start: Instant,
+        output: PathBuf,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        packet: Packet,
+        first_action_us: u64,
+    }
+
+    impl FrontFixture {
+        fn new(body_bytes: u64, packets: usize) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let output = std::env::temp_dir().join(format!(
+                "qcsd-front-continuation-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&output).expect("fresh FRONT trace directory");
+            let start = Instant::now();
+            let endpoint = QcsdEndpointId(1);
+            let stream = QcsdStreamId(80);
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("cell");
+            let resource = |id, bytes| Resource {
+                id,
+                url: format!("https://example.com/chaff-{id}"),
+                kind: "Image".into(),
+                content_length: Some(bytes),
+                data_length: bytes,
+                chaff_priority: false,
+                known_valid: true,
+                depends_on: Vec::new(),
+                headers: Vec::new(),
+            };
+            // A future event keeps this a middle-of-flight opportunity, as
+            // in the retained slot855 case; it is never polled by these tests.
+            let sentinel = Packet::new(Duration::from_secs(10), Direction::Incoming, 1_200)
+                .expect("future event");
+            let schedule = Trace::new(std::iter::repeat_n(packet, packets).chain([sentinel]));
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: 16,
+                    max_stream_data_excess: 1_000,
+                    ..QcsdConfig::front_v5_light_configuration()
+                },
+                Some(ResourceManifest {
+                    resources: vec![resource(1, body_bytes), resource(2, 5_000)],
+                }),
+                Box::new(StaticSchedule::new(schedule, true)),
+            )
+            .expect("FRONT ChaffOnly controller");
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: "https://example.com".into(),
+                    max_udp_payload_size: 1_200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Chaff {
+                        resource_id: 1,
+                        request_id: None,
+                    },
+                    expected_response_length: Some(body_bytes),
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::ZERO);
+            Self {
+                controller,
+                traces: TraceFiles::new(&output, start).expect("FRONT traces"),
+                clock: QcsdObservationClock::new(start),
+                start,
+                output,
+                endpoint,
+                stream,
+                packet,
+                first_action_us: 1,
+            }
+        }
+
+        fn receive_actions(&mut self, at_us: u64) -> Vec<(QcsdSlotId, u64)> {
+            let actions: Vec<_> = self.controller.drain_actions().collect();
+            actions
+                .into_iter()
+                .filter_map(|action| {
+                    let QcsdAction::IncreaseReceiveLimit {
+                        endpoint,
+                        stream,
+                        absolute_limit,
+                        packet,
+                        slot,
+                    } = action
+                    else {
+                        return None;
+                    };
+                    assert_eq!(packet, self.packet, "continuation retains original target");
+                    assert_eq!(endpoint, self.endpoint);
+                    assert_eq!(stream, self.stream);
+                    self.traces
+                        .register_incoming_action(
+                            self.start + Duration::from_micros(at_us),
+                            endpoint,
+                            stream,
+                            absolute_limit,
+                            packet,
+                            slot,
+                        )
+                        .expect("actual controller action owns the trace target");
+                    Some((slot, absolute_limit))
+                })
+                .collect()
+        }
+
+        fn observe(&mut self, observation: QcsdObservation, at_us: u64) {
+            let record = self
+                .clock
+                .record_at(observation, self.start + Duration::from_micros(at_us));
+            self.controller
+                .observe(record.observation().clone(), Duration::from_micros(at_us));
+            self.traces
+                .observation_after_controller(Some(self.endpoint), &record, &self.controller, None)
+                .expect("actual non-advertisement observation");
+        }
+
+        fn advertise(&mut self, slot: QcsdSlotId, limit: u64, produced_us: u64, handoff_us: u64) {
+            let record = self.clock.record_at(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: self.endpoint,
+                    stream: self.stream,
+                    absolute_limit: limit,
+                    slot: Some(slot),
+                },
+                self.start + Duration::from_micros(produced_us),
+            );
+            self.controller.observe(
+                record.observation().clone(),
+                Duration::from_micros(handoff_us),
+            );
+            self.traces
+                .observation_after_controller(
+                    Some(self.endpoint),
+                    &record,
+                    &self.controller,
+                    Some(self.start + Duration::from_micros(handoff_us)),
+                )
+                .expect("original production plus successful physical boundary");
+        }
+
+        fn read(&mut self, bytes: u64, at_us: u64) {
+            self.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: self.endpoint,
+                    stream: self.stream,
+                    bytes,
+                },
+                at_us,
+            );
+        }
+
+        fn assert_original_action(&self, slot: QcsdSlotId) {
+            let pending = &self.traces.pending_slots[&slot];
+            assert_eq!(pending.packet, self.packet);
+            assert_eq!(pending.action_time_us, self.first_action_us);
+        }
+    }
+
+    impl Drop for FrontFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.output);
+        }
+    }
+
+    #[test]
+    fn front_partial_1200_byte_owner_retains_first_action_through_late_headers_and_fin() {
+        let mut f = FrontFixture::new(600, 1);
+        let actions = f.receive_actions(1);
+        assert_eq!(actions.len(), 1);
+        let (slot, limit) = actions[0];
+        assert_eq!(limit, 600, "584 controlled bytes plus16 initial bytes");
+        f.advertise(slot, limit, 2, 3);
+        f.read(600, 4);
+        assert!(!f.controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(f.traces.pending_slots[&slot].credit_advertised_at_us, None);
+
+        f.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint: f.endpoint,
+                stream: f.stream,
+                status: Some(200),
+                content_length: Some(600),
+                frame_bytes: 251,
+            },
+            1_000_000,
+        );
+        let headers = f.receive_actions(1_000_001);
+        assert_eq!(
+            headers,
+            [(slot, 851)],
+            "new framing continues the same owner"
+        );
+        f.advertise(slot, 851, 1_000_002, 1_000_003);
+        f.read(251, 1_000_004);
+        f.assert_original_action(slot);
+        assert!(!f.controller.incoming_slot_is_locally_realized(slot));
+
+        f.observe(
+            QcsdObservation::StreamFinished {
+                endpoint: f.endpoint,
+                stream: f.stream,
+                finish: QcsdStreamFinish::Fin,
+            },
+            1_100_000,
+        );
+        f.stream = QcsdStreamId(84);
+        f.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: f.endpoint,
+                stream: f.stream,
+                role: QcsdRequestRole::Chaff {
+                    resource_id: 2,
+                    request_id: None,
+                },
+                expected_response_length: Some(5_000),
+            },
+            1_100_001,
+        );
+        f.controller.poll(Duration::from_micros(1_100_002));
+        let continued = f.receive_actions(1_100_003);
+        assert_eq!(
+            continued,
+            [(slot, 381)],
+            "FIN returns only365 remaining owner bytes"
+        );
+        f.advertise(slot, 381, 1_400_000, 1_400_001);
+        f.assert_original_action(slot);
+        assert!(f.controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(
+            f.traces.pending_slots[&slot].credit_advertised_at_us,
+            Some(1_400_001)
+        );
+        assert_eq!(
+            f.controller
+                .defense_diagnostics()
+                .scheduled_incoming_requested_bytes,
+            1_200
+        );
+        assert_eq!(
+            f.controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            1_200
+        );
+        f.read(381, 1_400_002);
+        assert!(f.controller.drain_actions().any(|action| matches!(action,
+            QcsdAction::SlotSatisfied { slot: actual, .. } if actual == slot)));
+        f.traces
+            .schedule(&ScheduleTraceRow {
+                action_time_us: 1_400_003,
+                endpoint: Some(f.endpoint),
+                packet: f.packet,
+                satisfaction: "satisfied",
+                observed: Some(1_200),
+                miss_reason: "",
+                slot,
+                qcsd: QcsdTraceColumns::exact(1_200, Some(1_200)),
+                terminal_defense_elapsed_us: 1_400_002,
+            })
+            .expect("legacy complete terminal row retains its late whole-slot boundary");
+        f.traces.schedule.flush().expect("schedule fixture bytes");
+        let csv = fs::read_to_string(f.output.join("schedule.csv")).expect("schedule fixture");
+        let row: Vec<_> = csv
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
+        assert_eq!(
+            row[21], "1400001",
+            "neither first carrier nor production substitutes for physical whole-slot time"
+        );
+        assert_eq!(
+            row[22], "1400000",
+            "legacy scalar delay retains the first1us action"
+        );
+        assert_eq!(row[0], "0", "nominal scheduled target remains zero");
+    }
+
+    #[test]
+    fn front_two_original_owners_can_share_one_late_physical_carrier_without_renumbering() {
+        let mut f = FrontFixture::new(5_000, 2);
+        let actions = f.receive_actions(1);
+        assert_eq!(actions.len(), 2);
+        assert_ne!(actions[0].0, actions[1].0);
+        assert_eq!((actions[0].1, actions[1].1), (1_216, 2_416));
+        for (index, (slot, _)) in actions.iter().enumerate() {
+            // Transport coalescing may encode the highest absolute frontier
+            // while retaining one production record per accepted owner.
+            f.advertise(
+                *slot,
+                2_416,
+                70_000 + u64::try_from(index).expect("small index"),
+                70_100,
+            );
+            f.assert_original_action(*slot);
+            assert!(f.controller.incoming_slot_is_locally_realized(*slot));
+            assert_eq!(
+                f.traces.pending_slots[slot].credit_advertised_at_us,
+                Some(70_100)
+            );
+        }
+        let diagnostics = f.controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 2_400);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 2_400);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 0);
+    }
+
+    impl FrontFixture {
+        /// Exercise the shared trace producer with one original transport
+        /// observation and a separately supplied successful physical boundary.
+        /// This is a trace mechanism fixture, not a CS-BuFLO workload oracle.
+        fn advertise_with_identity(
+            &mut self,
+            slot: Option<QcsdSlotId>,
+            limit: u64,
+            produced_us: u64,
+            handoff_us: Option<u64>,
+        ) -> Result<TimestampedQcsdObservation, Error> {
+            let record = self.clock.record_at(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: self.endpoint,
+                    stream: self.stream,
+                    absolute_limit: limit,
+                    slot,
+                },
+                self.start + Duration::from_micros(produced_us),
+            );
+            self.controller.observe(
+                record.observation().clone(),
+                Duration::from_micros(handoff_us.unwrap_or(produced_us)),
+            );
+            self.traces.observation_after_controller(
+                Some(self.endpoint),
+                &record,
+                &self.controller,
+                handoff_us.map(|at| self.start + Duration::from_micros(at)),
+            )?;
+            Ok(record)
+        }
+    }
+
+    #[test]
+    fn incoming_scalar_receipt_uses_unique_newly_frozen_owner() {
+        let mut f = FrontFixture::new(5_000, 2);
+        let actions: Vec<_> = f
+            .controller
+            .drain_actions()
+            .filter_map(|action| {
+                let QcsdAction::IncreaseReceiveLimit {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    packet,
+                    slot,
+                } = action
+                else {
+                    return None;
+                };
+                Some((endpoint, stream, absolute_limit, packet, slot))
+            })
+            .collect();
+        assert_eq!(actions.len(), 2, "two genuine controller owners");
+        let (endpoint, stream, old_limit, old_packet, old_slot) = actions[0];
+        let (new_endpoint, new_stream, new_limit, new_packet, new_slot) = actions[1];
+        assert_ne!(old_slot, new_slot);
+        assert_eq!((new_endpoint, new_stream), (endpoint, stream));
+        f.traces
+            .register_incoming_action(
+                f.start + Duration::from_micros(76_708),
+                endpoint,
+                stream,
+                old_limit,
+                old_packet,
+                old_slot,
+            )
+            .expect("register first genuine action");
+        f.advertise(old_slot, old_limit, 76_726, 76_750);
+        assert!(f.controller.incoming_slot_is_locally_realized(old_slot));
+        assert!(
+            f.traces.is_slot_pending(old_slot),
+            "advertised is not consumed"
+        );
+
+        f.traces
+            .register_incoming_action(
+                f.start + Duration::from_micros(90_961),
+                new_endpoint,
+                new_stream,
+                new_limit,
+                new_packet,
+                new_slot,
+            )
+            .expect("register later genuine action");
+        assert_eq!(
+            f.traces
+                .advertised_credit_slots(endpoint, stream, new_limit, None),
+            vec![old_slot, new_slot],
+            "the new frame still reverse-covers both original owners",
+        );
+        let record = f
+            .advertise_with_identity(None, new_limit, 90_981, Some(91_004))
+            .expect("one actual slotless observation and successful handoff");
+        assert!(matches!(
+            record.observation(),
+            QcsdObservation::ReceiveLimitAdvertised { slot: None, .. }
+        ));
+        let rows: Vec<_> = f
+            .traces
+            .event_rows
+            .iter()
+            .filter(|row| row.production_sequence == Some(record.sequence()))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "never duplicate the original observation identity"
+        );
+        let row = rows[0];
+        assert_eq!(row.monotonic_ns, record.produced_monotonic_ns());
+        let detail: Value = serde_json::from_str(&row.details.replace("\"\"", "\""))
+            .expect("original observation JSON after CSV escaping");
+        assert_eq!(detail["slot"], Value::Null);
+        assert_eq!(detail["absolute_limit"], new_limit);
+        assert_eq!(detail["production_sequence"], record.sequence());
+        assert_eq!(
+            detail["production_monotonic_ns"],
+            record.produced_monotonic_ns()
+        );
+        assert_eq!(row.qcsd.schema_version, Some(2));
+        assert_eq!(row.qcsd.credit_advertised_at_us, Some(91_004));
+        assert_eq!(row.qcsd.credit_advertisement_delay_us, Some(43));
+        assert_eq!(
+            f.traces.pending_slots[&old_slot].credit_advertised_at_us,
+            Some(76_750)
+        );
+        assert_eq!(
+            f.traces.pending_slots[&new_slot].credit_advertised_at_us,
+            Some(91_004)
+        );
+        assert!(f.controller.incoming_slot_is_locally_realized(new_slot));
+        assert_eq!(f.traces.pending_slots[&old_slot].action_time_us, 76_708);
+        assert_eq!(f.traces.pending_slots[&new_slot].action_time_us, 90_961);
+        assert_eq!(
+            f.traces
+                .advertised_credit_slots(endpoint, stream, new_limit, None),
+            vec![old_slot, new_slot],
+            "scalar attribution must not remove reverse ownership"
+        );
+        assert_eq!(
+            f.controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            2_400
+        );
+        assert_eq!(
+            f.controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn incoming_scalar_receipt_preserves_explicit_owner_and_controllerless_compatibility() {
+        let mut f = FrontFixture::new(5_000, 2);
+        let actions = f.receive_actions(1);
+        let (old_slot, old_limit) = actions[0];
+        let (new_slot, new_limit) = actions[1];
+        f.advertise(old_slot, old_limit, 2, 3);
+        let record = f
+            .advertise_with_identity(Some(old_slot), new_limit, 4, Some(5))
+            .expect("explicit identity retains priority over reverse coverage");
+        let row = f
+            .traces
+            .event_rows
+            .iter()
+            .find(|row| row.production_sequence == Some(record.sequence()))
+            .expect("explicit event");
+        assert_eq!(row.qcsd.credit_advertised_at_us, Some(3));
+        assert_eq!(row.qcsd.credit_advertisement_delay_us, Some(2));
+        assert_eq!(
+            f.traces.pending_slots[&old_slot].credit_advertised_at_us,
+            Some(3)
+        );
+        assert_eq!(
+            f.traces.pending_slots[&new_slot].credit_advertised_at_us, None,
+            "an explicit earlier owner cannot realize an unresolved later owner"
+        );
+
+        let mut historical = FrontFixture::new(5_000, 1);
+        let (slot, limit) = historical.receive_actions(1)[0];
+        let original = historical.clock.record_at(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: historical.endpoint,
+                stream: historical.stream,
+                absolute_limit: limit,
+                slot: None,
+            },
+            historical.start + Duration::from_micros(2),
+        );
+        historical
+            .traces
+            .observation(Some(historical.endpoint), &original)
+            .expect("historical controller-less singleton attribution");
+        let row = historical
+            .traces
+            .event_rows
+            .last()
+            .expect("historical event");
+        assert_eq!(row.qcsd.schema_version, Some(2));
+        assert_eq!(row.qcsd.credit_advertised_at_us, Some(2));
+        assert_eq!(row.qcsd.credit_advertisement_delay_us, Some(1));
+        assert_eq!(
+            historical.traces.pending_slots[&slot].credit_advertised_at_us,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn incoming_scalar_receipt_refuses_multiple_new_owners_and_repeated_slotless_claims() {
+        let mut f = FrontFixture::new(5_000, 2);
+        let actions = f.receive_actions(1);
+        let record = f
+            .advertise_with_identity(None, actions[1].1, 2, Some(3))
+            .expect("physical coverage remains valid without an arbitrary scalar owner");
+        let row = f
+            .traces
+            .event_rows
+            .iter()
+            .find(|row| row.production_sequence == Some(record.sequence()))
+            .expect("shared event");
+        assert_eq!(row.qcsd.schema_version, None);
+        assert_eq!(row.qcsd.credit_advertised_at_us, None);
+        assert_eq!(row.qcsd.credit_advertisement_delay_us, None);
+        for (slot, _) in &actions {
+            assert!(f.controller.incoming_slot_is_locally_realized(*slot));
+            assert_eq!(
+                f.traces.pending_slots[slot].credit_advertised_at_us,
+                Some(3)
+            );
+        }
+        let repeated = f
+            .advertise_with_identity(None, actions[1].1, 4, Some(5))
+            .expect("repeat keeps original per-owner times");
+        let rows: Vec<_> = f
+            .traces
+            .event_rows
+            .iter()
+            .filter(|row| row.production_sequence == Some(repeated.sequence()))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].qcsd.schema_version, None);
+        assert_eq!(rows[0].qcsd.credit_advertised_at_us, None);
+        for (slot, _) in &actions {
+            assert_eq!(
+                f.traces.pending_slots[slot].credit_advertised_at_us,
+                Some(3)
+            );
+        }
+
+        let mut singleton = FrontFixture::new(5_000, 1);
+        let (slot, limit) = singleton.receive_actions(1)[0];
+        singleton
+            .advertise_with_identity(None, limit, 2, Some(3))
+            .expect("first singleton handoff freezes its boundary");
+        let repeat = singleton
+            .advertise_with_identity(None, limit, 4, Some(5))
+            .expect("repeating one old owner is not a new physical realization");
+        let row = singleton
+            .traces
+            .event_rows
+            .iter()
+            .find(|row| row.production_sequence == Some(repeat.sequence()))
+            .expect("one original repeated singleton event");
+        assert_eq!(row.qcsd.schema_version, None);
+        assert_eq!(row.qcsd.credit_advertised_at_us, None);
+        assert_eq!(
+            singleton.traces.pending_slots[&slot].credit_advertised_at_us,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn incoming_scalar_receipt_refuses_unresolved_fanout_and_missing_handoff() {
+        let mut partial = FrontFixture::new(600, 1);
+        let (slot, limit) = partial.receive_actions(1)[0];
+        let record = partial
+            .advertise_with_identity(None, limit, 2, Some(3))
+            .expect("partial physical coverage remains an incomplete candidate");
+        assert!(!partial.controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(
+            partial.traces.pending_slots[&slot].credit_advertised_at_us,
+            None
+        );
+        let row = partial
+            .traces
+            .event_rows
+            .iter()
+            .find(|row| row.production_sequence == Some(record.sequence()))
+            .expect("partial event");
+        assert_eq!(row.qcsd.schema_version, None);
+        assert_eq!(row.qcsd.credit_advertised_at_us, None);
+
+        let mut missing = FrontFixture::new(5_000, 1);
+        let (slot, limit) = missing.receive_actions(1)[0];
+        assert!(
+            matches!(missing.advertise_with_identity(None, limit, 2, None),
+            Err(Error::SlotInvariant(message)) if message.contains("lacked a successful socket-handoff"))
+        );
+        assert_eq!(
+            missing.traces.pending_slots[&slot].credit_advertised_at_us,
+            None
+        );
+        assert!(missing.traces.physical_receive_advertisements.is_empty());
+        assert!(
+            missing.traces.event_rows.is_empty(),
+            "missing handoff cannot publish an observation"
+        );
     }
 }
