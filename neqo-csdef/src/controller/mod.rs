@@ -5542,6 +5542,18 @@ impl QcsdController {
             .incoming_credit_ledger
             .values()
             .any(|ledger| !ledger.local_realization_emitted);
+        // An already advertised scheduled prefix can finish HEADERS or cross
+        // an unparsed DATA boundary and reveal another exact whole cell. Do
+        // not irreversibly stop before that discovery. Decoded DATA wholly
+        // containing the outstanding prefix retains its original RTT drain.
+        let unstable_scheduled_drain =
+            self.advertised_incoming_credit
+                .keys()
+                .any(|(endpoint, stream)| {
+                    !self
+                        .streams
+                        .scheduled_prefix_drain_is_stable(*endpoint, *stream)
+                });
         let terminal_parser_backlog = !self.parser_lease_ranges.is_empty()
             || self.streams.has_pending_application_parser_boundary();
         let prospective_action_pending = self.actions.iter().any(|action| {
@@ -5570,6 +5582,7 @@ impl QcsdController {
             || !self.control.claims.is_empty()
             || non_drain_continuation_pending
             || unadvertised_ledger_pending
+            || unstable_scheduled_drain
             || non_drain_slot_pending
             || terminal_parser_backlog
             || prospective_action_pending
@@ -18464,6 +18477,13 @@ mod tests {
     fn buflo_positive_rtt_credit_controller_with_activation(
         activate_request: bool,
     ) -> (QcsdController, QcsdEndpointId, QcsdStreamId, Vec<Packet>) {
+        buflo_positive_rtt_credit_controller_with_frontier(activate_request, true)
+    }
+
+    fn buflo_positive_rtt_credit_controller_with_frontier(
+        activate_request: bool,
+        decoded_frontier: bool,
+    ) -> (QcsdController, QcsdEndpointId, QcsdStreamId, Vec<Packet>) {
         let mut defense = resolved_buflo_terminal_defense(true);
         let mut delayed_incoming = Vec::new();
         for at in [40, 50] {
@@ -18508,8 +18528,32 @@ mod tests {
             true,
             16,
             1_000,
-            3_071,
+            if decoded_frontier { 3_063 } else { 3_071 },
         );
+        if decoded_frontier {
+            // Positive RTT drain is safe within an already decoded DATA
+            // extent. Body 3063 + HEADERS 5 + DATA header 3 preserves the
+            // fixture's original exact raw frontier 3071 and capacity 655.
+            controller.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint,
+                    stream,
+                    frame_bytes: 5,
+                    status: Some(200),
+                    content_length: Some(3_063),
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::DataFrame {
+                    endpoint,
+                    stream,
+                    frame_header_bytes: 3,
+                    data_bytes: 3_063,
+                },
+                Duration::ZERO,
+            );
+        }
         if activate_request {
             acknowledge_chaff_request(
                 &mut controller,
@@ -18581,8 +18625,14 @@ mod tests {
 
     fn advertised_buflo_positive_rtt_controller() -> (QcsdController, QcsdEndpointId, QcsdStreamId)
     {
+        advertised_buflo_positive_rtt_controller_with_frontier(true)
+    }
+
+    fn advertised_buflo_positive_rtt_controller_with_frontier(
+        decoded_frontier: bool,
+    ) -> (QcsdController, QcsdEndpointId, QcsdStreamId) {
         let (mut controller, endpoint, stream, delayed_incoming) =
-            buflo_positive_rtt_credit_controller();
+            buflo_positive_rtt_credit_controller_with_frontier(true, decoded_frontier);
         for packet in delayed_incoming {
             let (slot, absolute_limit) = materialize_buflo_incoming_credit(&mut controller, packet);
             acknowledge_buflo_incoming_credit(
@@ -18854,6 +18904,216 @@ mod tests {
             action,
             QcsdAction::CancelChaff { .. } | QcsdAction::SlotMissed { .. }
         )));
+    }
+
+    #[test]
+    fn buflo_late_response_framing_during_advertised_drain_preserves_exact_schedule() {
+        for late_at in [53, 71] {
+            let (mut controller, endpoint, stream) =
+                advertised_buflo_positive_rtt_controller_with_frontier(false);
+            controller.consume_advertised_credit(
+                endpoint,
+                stream,
+                16,
+                1_216,
+                Duration::from_micros(51),
+            );
+            controller.flush_defense_observations();
+            controller.drain_actions().for_each(drop);
+            open_additional_terminal_chaff(&mut controller, 8, 365);
+            assert_eq!(
+                controller.streams.aggregate_capacity().chaff_incoming,
+                1_004
+            );
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .buflo_incoming_unresolved_cells,
+                1
+            );
+
+            controller.observe(
+                QcsdObservation::EgressStreamBacklog { pending: false },
+                Duration::from_micros(52),
+            );
+            controller.observe(
+                QcsdObservation::EgressBacklog { pending: false },
+                Duration::from_micros(52),
+            );
+            controller.poll(Duration::from_micros(52));
+            controller.drain_actions().for_each(drop);
+
+            // The last already-advertised cell exposes exact response framing
+            // after the apparent 1004-byte exhaustion boundary. This fixture
+            // keeps its existing 3071-byte body hint and reproduces the actual
+            // 662-byte HEADERS plus three-byte DATA-header capacity growth.
+            let at = Duration::from_micros(late_at);
+            controller.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint,
+                    stream,
+                    frame_bytes: 662,
+                    status: Some(200),
+                    content_length: Some(3_071),
+                },
+                at,
+            );
+            controller.observe(
+                QcsdObservation::DataFrame {
+                    endpoint,
+                    stream,
+                    frame_header_bytes: 3,
+                    data_bytes: 3_071,
+                },
+                at,
+            );
+            assert_eq!(
+                controller.streams.aggregate_capacity().chaff_incoming,
+                1_669
+            );
+            controller.consume_advertised_credit(endpoint, stream, 1_216, 2_416, at);
+            controller.observe(QcsdObservation::EgressBacklog { pending: false }, at);
+            controller.poll(at);
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+            assert!(!diagnostics.buflo_terminal_subcell_latched);
+            assert!(!controller.actions.iter().any(|action| matches!(
+                action,
+                QcsdAction::CancelChaff { .. } | QcsdAction::DefenseComplete
+            )));
+
+            if late_at == 53 {
+                assert!(
+                    !diagnostics.buflo_schedule_stop_latched,
+                    "an advertised cell can still reveal another exact whole cell"
+                );
+                assert!(controller.defense.terminal_failure().is_none());
+                controller.poll(Duration::from_micros(60));
+                let next: Vec<_> = controller.drain_actions().collect();
+                assert_eq!(
+                    next.iter()
+                        .filter(|action| matches!(
+                            action,
+                            QcsdAction::SendPacket { .. } | QcsdAction::CommitPrearmedPacket { .. }
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(next.iter().filter(|action| matches!(action,
+                    QcsdAction::IncreaseReceiveLimit { packet, .. } if packet.length() == 1_200
+                )).count(), 1);
+                assert!(!next.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::SlotMissed { .. } | QcsdAction::CancelChaff { .. }
+                )));
+            } else {
+                // Waiting beyond the next cadence boundary must still fail;
+                // no pause, shifted tick, catch-up, or artificial tail passes.
+                assert!(
+                    controller.defense.terminal_failure().is_some(),
+                    "late discovery cannot suspend the original exact schedule"
+                );
+                assert!(!controller.is_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn buflo_last_incoming_feedback_after_schedule_stop_reduces_before_terminal_latch() {
+        let (mut controller, endpoint, stream) = advertised_buflo_positive_rtt_controller();
+        controller.consume_advertised_credit(
+            endpoint,
+            stream,
+            16,
+            1_216,
+            Duration::from_micros(51),
+        );
+        controller.flush_defense_observations();
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .buflo_incoming_unresolved_cells,
+            1
+        );
+        controller.drain_actions().for_each(drop);
+
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: true },
+            Duration::from_micros(52),
+        );
+        controller.observe(
+            QcsdObservation::EgressStreamBacklog { pending: false },
+            Duration::from_micros(52),
+        );
+        controller.flush_defense_observations();
+        let stopped = controller.defense_diagnostics();
+        assert!(stopped.buflo_schedule_stop_latched);
+        assert_eq!(stopped.buflo_schedule_stop_scheduled_incoming_cells, 6);
+        assert_eq!(stopped.buflo_schedule_stop_terminal_incoming_cells, 5);
+        assert_eq!(stopped.buflo_incoming_unresolved_cells, 1);
+        assert!(!stopped.buflo_terminal_subcell_latched);
+        controller.drain_actions().for_each(drop);
+
+        // The final advertised cell resolves after schedule stop. The frozen
+        // stop snapshot stays five, while current terminal accounting reaches
+        // six. A fresh actual empty adapter snapshot must reach the defense.
+        controller.consume_advertised_credit(
+            endpoint,
+            stream,
+            1_216,
+            2_416,
+            Duration::from_micros(53),
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(53),
+        );
+        controller.poll(Duration::from_micros(53));
+        let drained = controller.defense_diagnostics();
+        assert_eq!(drained.buflo_schedule_stop_terminal_incoming_cells, 5);
+        assert_eq!(drained.buflo_incoming_unresolved_cells, 0);
+        assert_eq!(drained.buflo_outgoing_unresolved_cells, 0);
+        assert_eq!(drained.scheduled_incoming_consumed_bytes, 2_400);
+        assert_eq!(drained.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(drained.scheduled_incoming_unresolved_bytes, 0);
+        assert_eq!(drained.buflo_missed_incoming_cells, 0);
+        assert!(drained.buflo_terminal_subcell_latched);
+        assert!(!controller.is_complete());
+        let terminal: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(
+            terminal
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::CancelChaff {
+                        reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!terminal.iter().any(|action| matches!(
+            action,
+            QcsdAction::SendPacket { .. }
+                | QcsdAction::CommitPrearmedPacket { .. }
+                | QcsdAction::IncreaseReceiveLimit { .. }
+                | QcsdAction::SlotMissed { .. }
+        )));
+
+        // Crossing the cancellation action boundary still needs the original
+        // second empty snapshot; resolving the last cell does not waive it.
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(54),
+        );
+        controller.poll(Duration::from_micros(54));
+        assert!(controller.is_complete());
+        assert!(
+            controller
+                .drain_actions()
+                .any(|action| matches!(action, QcsdAction::DefenseComplete))
+        );
     }
 
     #[test]

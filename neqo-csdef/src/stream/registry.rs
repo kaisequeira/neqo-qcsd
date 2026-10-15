@@ -334,6 +334,16 @@ impl StreamRegistry {
             })
     }
 
+    pub(crate) fn scheduled_prefix_drain_is_stable(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            state.receive_actions_available && state.receive.scheduled_prefix_drain_is_stable()
+        })
+    }
+
     pub fn aggregate_capacity(&self) -> Capacity {
         self.streams
             .values()
@@ -1935,6 +1945,33 @@ mod tests {
                 .is_empty(),
             "previously advertised credit is not an untouched initial prefix"
         );
+    }
+
+    #[test]
+    fn scheduled_prefix_stability_requires_exact_live_stream_identity() {
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(4);
+        for role in [
+            QcsdRequestRole::Application,
+            QcsdRequestRole::Chaff {
+                resource_id: 7,
+                request_id: None,
+            },
+        ] {
+            let mut registry = StreamRegistry::default();
+            registry.open(endpoint, stream, role, true, 16, 1_000, 1_798);
+            assert!(!registry.scheduled_prefix_drain_is_stable(endpoint, stream));
+            let state = registry
+                .get_mut(endpoint, stream)
+                .expect("live exact stream");
+            state.receive.response_headers(662, Some(1_798));
+            state.receive.data_frame(3, 1_798);
+            assert!(registry.scheduled_prefix_drain_is_stable(endpoint, stream));
+            assert!(!registry.scheduled_prefix_drain_is_stable(QcsdEndpointId(2), stream));
+            assert!(!registry.scheduled_prefix_drain_is_stable(endpoint, QcsdStreamId(8)));
+            assert!(registry.mark_receive_unavailable(endpoint, stream));
+            assert!(!registry.scheduled_prefix_drain_is_stable(endpoint, stream));
+        }
     }
 
     #[test]

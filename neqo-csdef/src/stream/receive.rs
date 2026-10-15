@@ -182,6 +182,39 @@ impl ReceiveState {
         true
     }
 
+    /// Whether an outstanding scheduled prefix stays within decoded framing.
+    /// A prepared body estimate is not decoded framing proof.
+    pub(crate) const fn scheduled_prefix_drain_is_stable(&self) -> bool {
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                consumed,
+                ..
+            } => {
+                *consumed <= *advertised_limit
+                    && *requested_limit == *advertised_limit
+                    && *consumed == *advertised_limit
+            }
+            Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                consumed,
+                framing_bytes,
+                data_length,
+                ..
+            } => {
+                let Some(decoded_end) = framing_bytes.checked_add(*data_length) else {
+                    return false;
+                };
+                *consumed <= *advertised_limit
+                    && *requested_limit == *advertised_limit
+                    && (*consumed == *advertised_limit || *advertised_limit <= decoded_end)
+            }
+            Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => false,
+        }
+    }
+
     pub const fn available(&self) -> u64 {
         match self {
             Self::ReceivingHeaders {
@@ -1318,6 +1351,76 @@ const MIN_HTTP3_DATA_OPPORTUNITY_BYTES: u64 = 3;
 #[cfg(test)]
 mod tests {
     use super::{MAX_HTTP3_FRAME_HEADER_BYTES, ReceiveState};
+
+    #[test]
+    fn scheduled_prefix_stability_requires_decoded_data_extent() {
+        let mut state = ReceiveState::controlled(16, 1_000, 1_798);
+        assert_eq!(state.release(778), Some((794, 778)));
+        state.advertised(794);
+        assert!(!state.scheduled_prefix_drain_is_stable());
+        state.response_headers(662, Some(1_798));
+        assert!(!state.scheduled_prefix_drain_is_stable());
+        let mut drained_headers = state.clone();
+        drained_headers.bytes_read(794);
+        assert!(drained_headers.scheduled_prefix_drain_is_stable());
+        state.data_frame(3, 1_798);
+        let before = state.clone();
+        assert!(state.scheduled_prefix_drain_is_stable());
+        assert_eq!(state, before, "stability proof must be read-only");
+    }
+
+    #[test]
+    fn scheduled_prefix_stability_refuses_pending_unknown_and_overflow_frontiers() {
+        let mut state = ReceiveState::controlled(16, 1_000, 5_000);
+        state.response_headers(5, Some(5_000));
+        state.data_frame(3, 600);
+        assert_eq!(state.release(592), Some((608, 592)));
+        state.advertised(608);
+        assert!(state.scheduled_prefix_drain_is_stable());
+        assert_eq!(state.release(1), Some((609, 1)));
+        assert!(
+            !state.scheduled_prefix_drain_is_stable(),
+            "unencoded growth is not a stable prefix"
+        );
+        state.advertised(609);
+        assert!(
+            !state.scheduled_prefix_drain_is_stable(),
+            "body hints do not prove the next frame"
+        );
+        if let ReceiveState::ReceivingData { consumed, .. } = &mut state {
+            *consumed = 610;
+        }
+        assert!(!state.scheduled_prefix_drain_is_stable());
+        if let ReceiveState::ReceivingData {
+            consumed,
+            framing_bytes,
+            data_length,
+            ..
+        } = &mut state
+        {
+            *consumed = 0;
+            *framing_bytes = u64::MAX;
+            *data_length = 1;
+        }
+        let before = state.clone();
+        assert!(!state.scheduled_prefix_drain_is_stable());
+        assert_eq!(state, before);
+        assert!(!ReceiveState::created(true, 16, 1_000, 1_798).scheduled_prefix_drain_is_stable());
+        assert!(
+            !ReceiveState::Automatic {
+                consumed: 0,
+                data_length: 0
+            }
+            .scheduled_prefix_drain_is_stable()
+        );
+        assert!(
+            !ReceiveState::Closed {
+                data_length: 0,
+                unadvertised: 0
+            }
+            .scheduled_prefix_drain_is_stable()
+        );
+    }
 
     fn recorded_primary_parser_tail() -> ReceiveState {
         let mut state = ReceiveState::controlled(16, 1_000, 1);
