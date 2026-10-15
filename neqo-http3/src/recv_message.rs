@@ -703,7 +703,10 @@ mod local_abandon_tests {
     use neqo_transport::StreamType;
 
     use super::*;
-    use crate::client_events::{Http3ClientEvent, Http3ClientEvents};
+    use crate::{
+        RecvStreamEvents as _,
+        client_events::{Http3ClientEvent, Http3ClientEvents},
+    };
 
     // Parser-only component fixture. The real connected HTTP/3 regression is
     // in the runner tests; no transport eligibility is asserted here.

@@ -31654,8 +31654,8 @@ mod tests {
         (endpoint, server, stream)
     }
 
-    #[test]
-    fn qcsd_local_abandon_real_http3_queues_no_wire_or_qpack_control() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn qcsd_local_abandon_real_http3_queues_no_wire_or_qpack_control() {
         let output = trace_output_dir("local-abandon-real-http3");
         let (mut endpoint, mut server, stream) = local_abandon_real_http3_fixture(&output);
         let role = QcsdRequestRole::Chaff {
@@ -31708,8 +31708,8 @@ mod tests {
         fs::remove_dir_all(output).unwrap();
     }
 
-    #[test]
-    fn qcsd_local_abandon_real_http3_rejects_wrong_identity_and_pending_credit_atomically() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn qcsd_local_abandon_real_http3_rejects_wrong_identity_and_pending_credit_atomically() {
         let output = trace_output_dir("local-abandon-real-http3-refusals");
         let (mut endpoint, server, stream) = local_abandon_real_http3_fixture(&output);
         let role = QcsdRequestRole::Chaff {
