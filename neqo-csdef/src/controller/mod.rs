@@ -1772,10 +1772,7 @@ impl QcsdController {
             } => {
                 self.streams.clear_pre_header_blocked(endpoint, stream);
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
-                    if status.is_some() {
-                        state.status = status;
-                    }
-                    state.receive.response_headers(frame_bytes, content_length);
+                    state.response_headers(frame_bytes, status, content_length);
                 }
                 self.release_exact_claims(endpoint, stream);
             }
@@ -22057,6 +22054,14 @@ mod tests {
     fn owned_primary_replay_controller(
         size: u16,
     ) -> (QcsdController, QcsdEndpointId, QcsdStreamId) {
+        owned_primary_replay_controller_with_tail(size, 1, Some(1_016))
+    }
+
+    fn owned_primary_replay_controller_with_tail(
+        size: u16,
+        tail: u64,
+        peer_blocked: Option<u64>,
+    ) -> (QcsdController, QcsdEndpointId, QcsdStreamId) {
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, size).expect("cell");
         let (mut defense, _) = ExactIncomingOneShot::new(packet);
         defense.event = None;
@@ -22181,7 +22186,7 @@ mod tests {
                 endpoint,
                 stream,
                 frame_header_bytes: 2,
-                data_bytes: 13,
+                data_bytes: 14 - tail,
             },
             Duration::ZERO,
         );
@@ -22189,7 +22194,7 @@ mod tests {
             QcsdObservation::BytesRead {
                 endpoint,
                 stream,
-                bytes: 15,
+                bytes: 16 - tail,
             },
             Duration::ZERO,
         );
@@ -22202,16 +22207,166 @@ mod tests {
             },
             Duration::ZERO,
         );
-        controller.observe(
-            QcsdObservation::StreamDataBlocked {
-                endpoint,
-                stream,
-                blocked_at: 1_016,
-            },
-            Duration::ZERO,
-        );
+        if let Some(blocked_at) = peer_blocked {
+            controller.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint,
+                    stream,
+                    blocked_at,
+                },
+                Duration::ZERO,
+            );
+        }
         controller.drain_actions().for_each(drop);
         (controller, endpoint, stream)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the CL-less bound-primary reproduction must join two original due owners with real encoded and consumed observations"
+    )]
+    fn owned_zero_tail_primary_continues_without_peer_blocked_and_preserves_full_accounting() {
+        for blocked_at in [None, Some(1_000)] {
+            let (mut controller, endpoint, stream) =
+                owned_primary_replay_controller_with_tail(600, 0, blocked_at);
+            assert_eq!(controller.streams.consumed(endpoint, stream), Some(1_016));
+            assert_eq!(
+                controller.streams.receive_limits(endpoint, stream),
+                Some((1_016, 1_016))
+            );
+            for index in 0..2 {
+                let (slot, packet, elapsed) =
+                    install_exact_parser_cell(&mut controller, index, 600);
+                let absolute = 1_016 + (index + 1) * 600;
+                let actions: Vec<_> = controller.drain_actions().collect();
+                assert_eq!(actions.iter().filter(|action| matches!(action,
+                    QcsdAction::LeaseParserReceive {
+                        absolute_limit, increase: 600, owner: Some(owner), ..
+                    } if *absolute_limit == absolute && owner.slot == slot && owner.packet == packet
+                )).count(), 1);
+                assert!(!actions.iter().any(|action| matches!(
+                    action,
+                    QcsdAction::LeaseParserReceive { owner: None, .. }
+                        | QcsdAction::SlotSatisfied { .. }
+                )));
+                controller.retry_pending_parser_leases();
+                assert!(
+                    controller.next_action().is_none(),
+                    "no repeated boundary grant"
+                );
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint,
+                        stream,
+                        absolute_limit: absolute,
+                        slot: None,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream,
+                        bytes: 3,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::DataFrame {
+                        endpoint,
+                        stream,
+                        frame_header_bytes: 3,
+                        data_bytes: 597,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream,
+                        bytes: 597,
+                    },
+                    elapsed,
+                );
+                assert!(controller.drain_actions().any(|action| matches!(action,
+                    QcsdAction::SlotSatisfied { slot: actual, .. } if actual == slot)));
+                controller.observe(
+                    QcsdObservation::HeaderProgress {
+                        endpoint,
+                        stream,
+                        min_remaining: 1,
+                        awaiting_data_frame: true,
+                    },
+                    elapsed,
+                );
+                assert!(
+                    controller.next_action().is_none(),
+                    "only another actual due cell may continue"
+                );
+                assert_eq!(
+                    controller.streams.consumed(endpoint, stream),
+                    Some(absolute)
+                );
+            }
+            let diagnostics = controller.defense_diagnostics();
+            assert_eq!(
+                (
+                    diagnostics.scheduled_incoming_requested_bytes,
+                    diagnostics.scheduled_incoming_advertised_bytes,
+                    diagnostics.scheduled_incoming_consumed_bytes
+                ),
+                (1_200, 1_200, 1_200)
+            );
+            assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn owned_zero_tail_fin_without_new_cell_consumption_gets_no_partial_exception() {
+        let (mut controller, endpoint, stream) =
+            owned_primary_replay_controller_with_tail(600, 0, None);
+        let (slot, _, elapsed) = install_exact_parser_cell(&mut controller, 0, 600);
+        assert!(controller.drain_actions().any(|action| matches!(action,
+            QcsdAction::LeaseParserReceive { increase: 600, owner: Some(owner), .. }
+                if owner.slot == slot)));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit: 1_616,
+                slot: None,
+            },
+            elapsed,
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream,
+                finish: QcsdStreamFinish::Fin,
+            },
+            elapsed,
+        );
+        assert!(controller.terminal_primary_partial_cell().is_none());
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(actions.iter().any(|action| matches!(action,
+            QcsdAction::SlotMissed {
+                slot: actual, reason: MissedSlotReason::ReceiveCreditRetired, ..
+            } if *actual == slot)));
+        assert!(!actions.iter().any(|action| matches!(action,
+            QcsdAction::SlotSatisfied { slot: actual, .. } if *actual == slot)));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(
+            (
+                diagnostics.scheduled_incoming_requested_bytes,
+                diagnostics.scheduled_incoming_advertised_bytes,
+                diagnostics.scheduled_incoming_consumed_bytes,
+                diagnostics.scheduled_incoming_retired_bytes
+            ),
+            (600, 600, 0, 600)
+        );
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
     }
 
     #[test]
@@ -22507,6 +22662,386 @@ mod tests {
         controller.process_incoming(u64::try_from(elapsed.as_micros()).expect("time"), elapsed);
         controller.retry_pending_parser_leases();
         (slot, packet, elapsed)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the actual HEADERS and eight DATA frames reproduce a peer stall without synthesizing blocked proof"
+    )]
+    fn observed_length_short_tail_controller(
+        content_length: Option<u64>,
+        tail: u64,
+        retain_old_blocked: bool,
+    ) -> (QcsdController, QcsdEndpointId, QcsdStreamId, QcsdStreamId) {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 600).expect("cell");
+        let (mut defense, _) = ExactIncomingOneShot::new(packet);
+        defense.event = None;
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                initial_max_stream_data: 1_000,
+                max_stream_data_excess: 16,
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(defense),
+        )
+        .expect("exact controller");
+        let endpoint = QcsdEndpointId(1);
+        let primary = QcsdStreamId(0);
+        let auxiliary = QcsdStreamId(4);
+        ready(&mut controller, endpoint.0, "https://example.com");
+        for (stream, expected) in [(primary, 444), (auxiliary, 1_000_000)] {
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(expected),
+                },
+                Duration::ZERO,
+            );
+        }
+        // This synthetic allocator fixture supplies already-qualified cover
+        // capacity; it does not make a server/chaff qualification claim.
+        controller
+            .streams
+            .get_mut(endpoint, auxiliary)
+            .expect("auxiliary")
+            .role = QcsdRequestRole::Chaff {
+            resource_id: 7,
+            request_id: None,
+        };
+        controller.drain_actions().for_each(drop);
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: primary,
+                bytes: 553,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint,
+                stream: primary,
+                frame_bytes: 553,
+                status: Some(200),
+                content_length,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: primary,
+                bytes: 3,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream: primary,
+                frame_header_bytes: 3,
+                data_bytes: 344,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: primary,
+                bytes: 344,
+            },
+            Duration::ZERO,
+        );
+        if retain_old_blocked {
+            controller.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint,
+                    stream: primary,
+                    blocked_at: 1_000,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: primary,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            controller.next_action(),
+            Some(QcsdAction::LeaseParserReceive {
+                absolute_limit: 1_016,
+                increase: 16,
+                owner: None,
+                ..
+            })
+        ));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream: primary,
+                absolute_limit: 1_016,
+                slot: None,
+            },
+            Duration::ZERO,
+        );
+        for data in [12, 12, 12, 12, 12, 12, 12, 16 - tail] {
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: primary,
+                    bytes: 2,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::DataFrame {
+                    endpoint,
+                    stream: primary,
+                    frame_header_bytes: 2,
+                    data_bytes: data,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: primary,
+                    bytes: data,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream: primary,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::ZERO,
+            );
+        }
+        assert_eq!(
+            controller.streams.consumed(endpoint, primary),
+            Some(1_016 - tail)
+        );
+        assert_eq!(
+            controller.streams.receive_limits(endpoint, primary),
+            Some((1_016, 1_016))
+        );
+        assert!(
+            controller.next_action().is_none(),
+            "no unowned rescue is generated"
+        );
+        (controller, endpoint, primary, auxiliary)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a complete due cell must retain exact ownership, advertisement and consumed counters across primary and cover"
+    )]
+    fn exact_cell_bridges_observed_remaining_body_without_current_blocked_report() {
+        for tail in [1, 2] {
+            for old_blocked in [false, true] {
+                let (mut controller, endpoint, primary, auxiliary) =
+                    observed_length_short_tail_controller(Some(444), tail, old_blocked);
+                let (slot, packet, elapsed) = install_exact_parser_cell(&mut controller, 0, 600);
+                let required = 3 - tail;
+                let actions: Vec<_> = controller.drain_actions().collect();
+                let (absolute_limit, owner) = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        QcsdAction::LeaseParserReceive {
+                            stream,
+                            absolute_limit,
+                            increase,
+                            owner: Some(owner),
+                            ..
+                        } if *stream == primary && *increase == required => {
+                            Some((*absolute_limit, *owner))
+                        }
+                        _ => None,
+                    })
+                    .expect("one actual-body-proven scheduled parser continuation");
+                assert_eq!(absolute_limit, 1_016 + required);
+                assert_eq!((owner.slot, owner.packet), (slot, packet));
+                let cover = actions
+                    .iter()
+                    .find_map(|action| match action {
+                        QcsdAction::IncreaseReceiveLimit {
+                            stream,
+                            absolute_limit,
+                            slot: observed,
+                            ..
+                        } if *stream == auxiliary && *observed == slot => {
+                            Some(*absolute_limit - 1_000)
+                        }
+                        _ => None,
+                    })
+                    .expect("unchanged exact cover allocation");
+                assert_eq!(
+                    cover + required,
+                    600,
+                    "the rescue displaces equal cover credit"
+                );
+                controller.retry_pending_parser_leases();
+                assert!(
+                    controller.next_action().is_none(),
+                    "no repeat grant at this boundary"
+                );
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint,
+                        stream: primary,
+                        absolute_limit,
+                        slot: None,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream: primary,
+                        bytes: 2,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::DataFrame {
+                        endpoint,
+                        stream: primary,
+                        frame_header_bytes: 2,
+                        data_bytes: 1,
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream: primary,
+                        bytes: 1,
+                    },
+                    elapsed,
+                );
+                assert_eq!(
+                    controller
+                        .defense_diagnostics()
+                        .scheduled_incoming_consumed_bytes,
+                    required
+                );
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint,
+                        stream: auxiliary,
+                        absolute_limit: 1_000 + cover,
+                        slot: Some(slot),
+                    },
+                    elapsed,
+                );
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream: auxiliary,
+                        bytes: 1_000 + cover,
+                    },
+                    elapsed,
+                );
+                assert!(controller.drain_actions().any(|action| matches!(action,
+                    QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot)));
+                let diagnostics = controller.defense_diagnostics();
+                assert_eq!(
+                    (
+                        diagnostics.scheduled_incoming_requested_bytes,
+                        diagnostics.scheduled_incoming_advertised_bytes,
+                        diagnostics.scheduled_incoming_consumed_bytes
+                    ),
+                    (600, 600, 600)
+                );
+                assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+                assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_cell_actual_body_rescue_refuses_estimates_and_rolls_back_incomplete_cell() {
+        for content_length in [None, Some(0), Some(442)] {
+            let (mut controller, endpoint, primary, _) =
+                observed_length_short_tail_controller(content_length, 2, true);
+            install_exact_parser_cell(&mut controller, 0, 600);
+            assert!(
+                !controller.drain_actions().any(|action| matches!(action,
+                QcsdAction::LeaseParserReceive { stream, .. } if stream == primary)),
+                "prepared444 cannot authorize absent/zero/completed actual body"
+            );
+            assert_eq!(
+                controller.streams.receive_limits(endpoint, primary),
+                Some((1_016, 1_016))
+            );
+        }
+        let (mut controller, endpoint, primary, auxiliary) =
+            observed_length_short_tail_controller(Some(444), 2, false);
+        if let crate::stream::ReceiveState::ReceivingHeaders { known_limit, .. } = &mut controller
+            .streams
+            .get_mut(endpoint, auxiliary)
+            .expect("auxiliary")
+            .receive
+        {
+            *known_limit = 1_598;
+        }
+        let before = controller
+            .streams
+            .get_mut(endpoint, primary)
+            .expect("primary")
+            .receive
+            .clone();
+        let auxiliary_before = controller
+            .streams
+            .get_mut(endpoint, auxiliary)
+            .expect("auxiliary")
+            .receive
+            .clone();
+        let (slot, _, _) = install_exact_parser_cell(&mut controller, 0, 600);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::LeaseParserReceive { .. } | QcsdAction::IncreaseReceiveLimit { .. }
+        )));
+        assert!(actions.iter().any(|action| matches!(action,
+            QcsdAction::SlotMissed { slot: observed, .. } if *observed == slot)));
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, primary)
+                .expect("primary")
+                .receive,
+            before
+        );
+        assert_eq!(
+            controller
+                .streams
+                .get_mut(endpoint, auxiliary)
+                .expect("auxiliary")
+                .receive,
+            auxiliary_before
+        );
+        assert!(controller.control.claims.is_empty());
+        assert!(controller.control.credit.is_empty());
+        assert!(
+            !controller
+                .parser_lease_ranges
+                .get(&(endpoint, primary))
+                .is_some_and(|ranges| ranges.iter().any(|range| range.owner.is_some()))
+        );
     }
 
     #[test]

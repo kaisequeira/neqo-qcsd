@@ -723,7 +723,7 @@ impl ReceiverFlowControl<()> {
     pub fn add_retired(&mut self, count: u64) {
         debug_assert!(self.retired + count <= self.consumed);
         self.retired += count;
-        if self.should_send_update() {
+        if self.auto_updates_enabled() && self.should_send_update() {
             self.frame_pending = true;
         }
     }
@@ -796,7 +796,7 @@ impl ReceiverFlowControl<StreamId> {
     pub fn add_retired(&mut self, count: u64) {
         debug_assert!(self.retired + count <= self.consumed);
         self.retired += count;
-        if self.should_send_update() {
+        if self.auto_updates_enabled() && self.should_send_update() {
             self.frame_pending = true;
         }
     }
@@ -1182,6 +1182,118 @@ mod test {
 
     #[cfg(feature = "qcsd")]
     #[test]
+    fn qcsd_stream_add_retired_does_not_repeat_encoded_manual_limit() -> Res<()> {
+        let now = test_fixture::now();
+        let rtt = Duration::from_millis(40);
+        let mut fc = ReceiverFlowControl::new(StreamId::new(0), 16);
+        fc.set_manual_limit(128).expect("manual stream grant");
+        assert_eq!(write_frames(&mut fc, rtt, now), 1);
+        assert_eq!(fc.max_allowed, 128);
+
+        let consumed = fc.set_consumed(128)?;
+        // RecvStream retires read/reset bytes through add_retired, not retire.
+        fc.add_retired(consumed);
+        assert_eq!(fc.retired(), 128);
+        assert!(!fc.frame_needed());
+        assert_eq!(write_frames(&mut fc, rtt, now), 0);
+
+        fc.frame_lost(128);
+        fc.add_retired(0);
+        assert!(fc.frame_needed());
+        assert_eq!(write_frames(&mut fc, rtt, now), 1);
+        assert_eq!(fc.max_allowed, 128);
+        assert!(!fc.frame_needed());
+        Ok(())
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_connection_add_retired_does_not_repeat_encoded_manual_limit() -> Res<()> {
+        let now = test_fixture::now();
+        let rtt = Duration::from_millis(40);
+        let mut fc = ReceiverFlowControl::new((), 16);
+        fc.set_manual_limit(128).expect("manual connection grant");
+        assert_eq!(write_connection_frames(&mut fc, rtt, now), 1);
+        assert_eq!(fc.max_allowed, 128);
+
+        fc.consume(128)?;
+        fc.add_retired(128);
+        assert_eq!(fc.retired(), 128);
+        assert!(!fc.frame_needed());
+        assert_eq!(write_connection_frames(&mut fc, rtt, now), 0);
+
+        fc.frame_lost(128);
+        fc.add_retired(0);
+        assert!(fc.frame_needed());
+        assert_eq!(write_connection_frames(&mut fc, rtt, now), 1);
+        assert_eq!(fc.max_allowed, 128);
+        assert!(!fc.frame_needed());
+        Ok(())
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_stream_add_retired_preserves_pending_explicit_grant() -> Res<()> {
+        let now = test_fixture::now();
+        let rtt = Duration::from_millis(40);
+        let mut fc = ReceiverFlowControl::new(StreamId::new(0), 16);
+        fc.set_manual_limit(128).expect("first manual stream grant");
+        assert_eq!(write_frames(&mut fc, rtt, now), 1);
+        let consumed = fc.set_consumed(128)?;
+
+        fc.set_manual_limit(256).expect("pending stream grant");
+        fc.add_retired(consumed);
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 256);
+        assert_eq!(write_frames(&mut fc, rtt, now), 1);
+        assert_eq!(fc.max_allowed, 256);
+        assert!(!fc.frame_needed());
+        Ok(())
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_connection_add_retired_preserves_pending_explicit_grant() -> Res<()> {
+        let now = test_fixture::now();
+        let rtt = Duration::from_millis(40);
+        let mut fc = ReceiverFlowControl::new((), 16);
+        fc.set_manual_limit(128)
+            .expect("first manual connection grant");
+        assert_eq!(write_connection_frames(&mut fc, rtt, now), 1);
+        fc.consume(128)?;
+
+        fc.set_manual_limit(256).expect("pending connection grant");
+        fc.add_retired(128);
+        assert!(fc.frame_needed());
+        assert_eq!(fc.next_limit(), 256);
+        assert_eq!(write_connection_frames(&mut fc, rtt, now), 1);
+        assert_eq!(fc.max_allowed, 256);
+        assert!(!fc.frame_needed());
+        Ok(())
+    }
+
+    #[test]
+    fn add_retired_queues_automatic_stream_and_connection_updates() -> Res<()> {
+        let now = test_fixture::now();
+        let rtt = Duration::from_millis(40);
+        let mut stream = ReceiverFlowControl::new(StreamId::new(0), 16);
+        let consumed = stream.set_consumed(16)?;
+        stream.add_retired(consumed);
+        assert!(stream.frame_needed());
+        assert_eq!(stream.next_limit(), 32);
+        assert_eq!(write_frames(&mut stream, rtt, now), 1);
+
+        let mut connection = ReceiverFlowControl::new((), 16);
+        connection.consume(16)?;
+        connection.add_retired(16);
+        assert!(connection.frame_needed());
+        assert_eq!(connection.next_limit(), 32);
+        assert_eq!(write_connection_frames(&mut connection, rtt, now), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
     fn qcsd_manual_limit_never_revokes_credit() {
         let mut fc = ReceiverFlowControl::new((), 64);
         assert_eq!(
@@ -1491,6 +1603,24 @@ mod test {
     }
 
     fn write_frames(fc: &mut ReceiverFlowControl<StreamId>, rtt: Duration, now: Instant) -> usize {
+        let mut builder =
+            packet::Builder::short(Encoder::default(), false, None::<&[u8]>, packet::LIMIT);
+        let mut tokens = recovery::Tokens::new();
+        fc.write_frames(
+            &mut builder,
+            &mut tokens,
+            &mut FrameStats::default(),
+            now,
+            rtt,
+        );
+        tokens.len()
+    }
+
+    fn write_connection_frames(
+        fc: &mut ReceiverFlowControl<()>,
+        rtt: Duration,
+        now: Instant,
+    ) -> usize {
         let mut builder =
             packet::Builder::short(Encoder::default(), false, None::<&[u8]>, packet::LIMIT);
         let mut tokens = recovery::Tokens::new();

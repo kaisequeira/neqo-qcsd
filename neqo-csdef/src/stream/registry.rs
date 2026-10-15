@@ -8,6 +8,16 @@ use std::collections::HashMap;
 use super::ReceiveState;
 use crate::{Capacity, DefenseMode, QcsdEndpointId, QcsdRequestRole, QcsdStreamId};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedResponseLength {
+    Unobserved,
+    Final {
+        status: u16,
+        content_length: Option<u64>,
+    },
+    Conflicting,
+}
+
 #[derive(Clone, Debug)]
 #[expect(
     clippy::partial_pub_fields,
@@ -26,12 +36,58 @@ pub struct StreamState {
     /// Actual post-header peer demand at one exact advertised frontier. The
     /// receive state rechecks this frontier at allocation and lease grant.
     parser_blocked_at: Option<u64>,
+    /// Actual final HEADERS evidence, distinct from a prepared body estimate.
+    observed_response_length: ObservedResponseLength,
     request_acknowledged_ranges: Vec<(u64, u64)>,
     request_acknowledged_final_size: Option<u64>,
     request_acknowledgment_invalid: bool,
 }
 
 impl StreamState {
+    pub(crate) fn response_headers(
+        &mut self,
+        frame_bytes: u64,
+        status: Option<u16>,
+        content_length: Option<u64>,
+    ) {
+        if let Some(status) = status {
+            self.status = Some(status);
+            if status >= 200 {
+                let observed = ObservedResponseLength::Final {
+                    status,
+                    content_length,
+                };
+                self.observed_response_length = match self.observed_response_length {
+                    ObservedResponseLength::Unobserved => observed,
+                    previous if previous == observed => previous,
+                    _ => ObservedResponseLength::Conflicting,
+                };
+            } else if self.observed_response_length != ObservedResponseLength::Unobserved {
+                self.observed_response_length = ObservedResponseLength::Conflicting;
+            }
+        }
+        // A status-less trailer cannot establish or replace final HEADERS.
+        self.receive.response_headers(frame_bytes, content_length);
+    }
+
+    fn application_response_content_length(&self) -> Option<u64> {
+        if self.role != QcsdRequestRole::Application || !self.receive_actions_available {
+            return None;
+        }
+        match self.observed_response_length {
+            ObservedResponseLength::Final {
+                status,
+                content_length,
+            } if self.status == Some(status)
+                && (200..300).contains(&status)
+                && !matches!(status, 204 | 205) =>
+            {
+                content_length
+            }
+            _ => None,
+        }
+    }
+
     fn record_request_acknowledgment(&mut self, offset: u64, bytes: u64, fin: bool) -> u64 {
         let Some(end) = offset.checked_add(bytes) else {
             self.request_acknowledgment_invalid = true;
@@ -153,6 +209,7 @@ impl StreamRegistry {
                 receive_actions_available: true,
                 pre_header_blocked_at: None,
                 parser_blocked_at: None,
+                observed_response_length: ObservedResponseLength::Unobserved,
                 request_acknowledged_ranges: Vec::new(),
                 request_acknowledged_final_size: None,
                 request_acknowledgment_invalid: false,
@@ -752,11 +809,17 @@ impl StreamRegistry {
         if !state.receive_actions_available {
             return 0;
         }
-        match state.parser_blocked_at {
-            Some(blocked_at) => state
+        match (
+            state.parser_blocked_at,
+            state.application_response_content_length(),
+        ) {
+            (blocked_at, Some(content_length)) => state
+                .receive
+                .scheduled_parser_lease_capacity_with_evidence(blocked_at, Some(content_length)),
+            (Some(blocked_at), None) => state
                 .receive
                 .scheduled_parser_lease_capacity_with_blocked(Some(blocked_at)),
-            None => state.receive.scheduled_parser_lease_capacity(),
+            (None, None) => state.receive.scheduled_parser_lease_capacity(),
         }
     }
 
@@ -772,9 +835,17 @@ impl StreamRegistry {
         if !state.receive_actions_available {
             return 0;
         }
-        state
-            .receive
-            .claim_scheduled_parser_lease_with_blocked(amount, state.parser_blocked_at)
+        if let Some(content_length) = state.application_response_content_length() {
+            state.receive.claim_scheduled_parser_lease_with_evidence(
+                amount,
+                state.parser_blocked_at,
+                Some(content_length),
+            )
+        } else {
+            state
+                .receive
+                .claim_scheduled_parser_lease_with_blocked(amount, state.parser_blocked_at)
+        }
     }
 
     /// Lease the remaining prefix up to the stream's absolute framing ceiling
@@ -844,12 +915,23 @@ impl StreamRegistry {
         if !state.receive_actions_available {
             return None;
         }
-        let (absolute_limit, increase, scheduled) = state.receive.parser_lease_with_blocked(
-            pristine_data_boundary,
-            scheduled_backing,
-            terminal_advertised_tail,
-            state.parser_blocked_at,
-        )?;
+        let (absolute_limit, increase, scheduled) =
+            if let Some(content_length) = state.application_response_content_length() {
+                state.receive.parser_lease_with_evidence(
+                    pristine_data_boundary,
+                    scheduled_backing,
+                    terminal_advertised_tail,
+                    state.parser_blocked_at,
+                    Some(content_length),
+                )
+            } else {
+                state.receive.parser_lease_with_blocked(
+                    pristine_data_boundary,
+                    scheduled_backing,
+                    terminal_advertised_tail,
+                    state.parser_blocked_at,
+                )
+            }?;
         Some(ParserLease {
             endpoint,
             stream,
@@ -1014,6 +1096,121 @@ mod tests {
         receive.data_frame(2, 13);
         receive.bytes_read(13);
         registry.header_progress(endpoint, stream, 1, true);
+    }
+
+    #[test]
+    fn observed_response_length_is_final_consistent_application_evidence_only() {
+        for tail in [1, 2] {
+            let (mut registry, endpoint, stream) = recorded_primary_before_short_frame();
+            consume_recorded_short_frame(&mut registry, endpoint, stream);
+            let state = registry.get_mut(endpoint, stream).expect("primary");
+            if let ReceiveState::ReceivingData {
+                consumed,
+                data_length,
+                pending_parser_boundary,
+                ..
+            } = &mut state.receive
+            {
+                *consumed -= tail - 1;
+                *data_length -= tail - 1;
+                *pending_parser_boundary = Some(*consumed);
+            }
+            state.response_headers(0, Some(103), Some(458));
+            assert_eq!(state.application_response_content_length(), None);
+            state.response_headers(0, Some(200), Some(458));
+            assert_eq!(state.application_response_content_length(), Some(458));
+            assert_eq!(
+                registry.scheduled_parser_lease_capacity(endpoint, stream),
+                0,
+                "headers clear the old boundary; a fresh typed stall is required"
+            );
+            registry.header_progress(endpoint, stream, 1, true);
+            assert_eq!(
+                registry.scheduled_parser_lease_capacity(endpoint, stream),
+                3 - tail
+            );
+            registry
+                .get_mut(endpoint, stream)
+                .expect("primary")
+                .response_headers(0, Some(200), Some(458));
+            registry.header_progress(endpoint, stream, 1, true);
+            assert_eq!(
+                registry.scheduled_parser_lease_capacity(endpoint, stream),
+                3 - tail
+            );
+            registry
+                .get_mut(endpoint, stream)
+                .expect("primary")
+                .response_headers(0, None, Some(999));
+            assert_eq!(
+                registry
+                    .get_mut(endpoint, stream)
+                    .expect("primary")
+                    .application_response_content_length(),
+                Some(458),
+                "trailers cannot replace final response proof"
+            );
+        }
+        for invalid in 0..9 {
+            let (mut registry, endpoint, stream) = recorded_primary_before_short_frame();
+            consume_recorded_short_frame(&mut registry, endpoint, stream);
+            let state = registry.get_mut(endpoint, stream).expect("primary");
+            state.response_headers(0, Some(200), Some(458));
+            match invalid {
+                0 => state.response_headers(0, Some(200), Some(459)),
+                1 => state.response_headers(0, Some(206), Some(458)),
+                2 => state.response_headers(0, Some(200), None),
+                3 => state.response_headers(0, Some(103), Some(458)),
+                4 => {
+                    state.role = QcsdRequestRole::Chaff {
+                        resource_id: 1,
+                        request_id: Some(crate::QcsdChaffRequestId(1)),
+                    }
+                }
+                5 => state.receive_actions_available = false,
+                6 => state.response_headers(0, Some(204), Some(458)),
+                7 => state.response_headers(0, Some(205), Some(458)),
+                _ => state.response_headers(0, Some(404), Some(458)),
+            }
+            assert_eq!(state.application_response_content_length(), None);
+            state.response_headers(0, Some(200), Some(458));
+            registry.header_progress(endpoint, stream, 1, true);
+            assert_eq!(
+                registry.scheduled_parser_lease_capacity(endpoint, stream),
+                0
+            );
+            assert_eq!(
+                registry.parser_lease_with_blocked(endpoint, stream, true, 2, None),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn observed_response_length_never_uses_prepared_hint_or_completed_variable_body() {
+        for length in [None, Some(0), Some(457)] {
+            let (mut registry, endpoint, stream) = recorded_primary_before_short_frame();
+            consume_recorded_short_frame(&mut registry, endpoint, stream);
+            let state = registry.get_mut(endpoint, stream).expect("primary");
+            state.response_headers(0, Some(200), length);
+            if let ReceiveState::ReceivingData { payload_floor, .. } = &mut state.receive {
+                *payload_floor = 458;
+            }
+            state.receive.framing(0);
+            registry.header_progress(endpoint, stream, 1, true);
+            assert_eq!(
+                registry.scheduled_parser_lease_capacity(endpoint, stream),
+                0
+            );
+        }
+        let (mut registry, endpoint, stream) = recorded_primary_before_short_frame();
+        let state = registry.get_mut(endpoint, stream).expect("primary");
+        state.response_headers(0, None, Some(1_000_000));
+        assert_eq!(
+            state.application_response_content_length(),
+            None,
+            "status-less observations cannot originate final-header proof"
+        );
     }
 
     #[test]

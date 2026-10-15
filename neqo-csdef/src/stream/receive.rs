@@ -692,6 +692,25 @@ impl ReceiveState {
         terminal_advertised_tail: Option<u64>,
         blocked_at: Option<u64>,
     ) -> Option<(u64, u64, bool)> {
+        self.parser_lease_with_evidence(
+            pristine_data_boundary,
+            scheduled_backing,
+            terminal_advertised_tail,
+            blocked_at,
+            None,
+        )
+    }
+
+    /// The actual final response length can also prove a pending nonempty
+    /// DATA frame when the peer cannot use its one- or two-byte raw tail.
+    pub(crate) fn parser_lease_with_evidence(
+        &mut self,
+        pristine_data_boundary: bool,
+        scheduled_backing: u64,
+        terminal_advertised_tail: Option<u64>,
+        blocked_at: Option<u64>,
+        response_content_length: Option<u64>,
+    ) -> Option<(u64, u64, bool)> {
         let positive_scheduled_tail = scheduled_backing > 0
             && matches!(
                 self,
@@ -710,7 +729,8 @@ impl ReceiveState {
         let backing = if positive_scheduled_tail {
             // Reservation was already debited when the complete slot staged
             // this claim. Recheck the frontier, not the now-reduced allowance.
-            let ceiling = self.scheduled_parser_lease_ceiling_with_blocked(blocked_at);
+            let ceiling = self
+                .scheduled_parser_lease_ceiling_with_evidence(blocked_at, response_content_length);
             if ceiling == 0 || scheduled_backing < ceiling {
                 return None;
             }
@@ -746,7 +766,7 @@ impl ReceiveState {
                 && *requested_limit == *advertised_limit
                 && *known_limit <= *requested_limit
                 && *consumed <= *requested_limit
-                && blocked_at == Some(*requested_limit)
+                && (blocked_at == Some(*requested_limit) || *consumed == *requested_limit)
                 && *pending_parser_boundary == Some(*consumed)
                 && *last_parser_lease_boundary != Some(*consumed)
                 && requested_limit.checked_add(due_quantum).is_some() =>
@@ -806,7 +826,16 @@ impl ReceiveState {
         &self,
         blocked_at: Option<u64>,
     ) -> u64 {
-        let ceiling = self.scheduled_parser_lease_ceiling_with_blocked(blocked_at);
+        self.scheduled_parser_lease_capacity_with_evidence(blocked_at, None)
+    }
+
+    pub(crate) fn scheduled_parser_lease_capacity_with_evidence(
+        &self,
+        blocked_at: Option<u64>,
+        response_content_length: Option<u64>,
+    ) -> u64 {
+        let ceiling =
+            self.scheduled_parser_lease_ceiling_with_evidence(blocked_at, response_content_length);
         match self {
             Self::ReceivingHeaders {
                 reservation_available,
@@ -833,10 +862,24 @@ impl ReceiveState {
         amount: u64,
         blocked_at: Option<u64>,
     ) -> u64 {
-        let capacity = self.scheduled_parser_lease_capacity_with_blocked(blocked_at);
+        self.claim_scheduled_parser_lease_with_evidence(amount, blocked_at, None)
+    }
+
+    pub(crate) fn claim_scheduled_parser_lease_with_evidence(
+        &mut self,
+        amount: u64,
+        blocked_at: Option<u64>,
+        response_content_length: Option<u64>,
+    ) -> u64 {
+        let capacity =
+            self.scheduled_parser_lease_capacity_with_evidence(blocked_at, response_content_length);
         let amount = amount.min(capacity);
         if self.has_positive_parser_tail()
-            && amount < self.scheduled_parser_lease_ceiling_with_blocked(blocked_at)
+            && amount
+                < self.scheduled_parser_lease_ceiling_with_evidence(
+                    blocked_at,
+                    response_content_length,
+                )
         {
             return 0;
         }
@@ -858,8 +901,19 @@ impl ReceiveState {
         )
     }
 
-    fn scheduled_parser_lease_ceiling_with_blocked(&self, blocked_at: Option<u64>) -> u64 {
+    fn scheduled_parser_lease_ceiling_with_evidence(
+        &self,
+        blocked_at: Option<u64>,
+        response_content_length: Option<u64>,
+    ) -> u64 {
         const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
+        // This must be an observed final response header, never the prepared
+        // payload floor. A variable primary may finish below that estimate.
+        let response_body_pending = matches!(
+            self,
+            Self::ReceivingData { data_length, .. }
+                if response_content_length.is_some_and(|length| length > *data_length)
+        );
         match self {
             Self::ReceivingHeaders {
                 advertised_limit,
@@ -892,7 +946,8 @@ impl ReceiveState {
                 } else if matches!(self, Self::ReceivingData { .. })
                     && raw_tail > 0
                     && raw_tail < MAX_HTTP3_FRAME_HEADER_BYTES
-                    && blocked_at == Some(*requested_limit)
+                    && (blocked_at == Some(*requested_limit)
+                        || (raw_tail < MIN_HTTP3_DATA_OPPORTUNITY_BYTES && response_body_pending))
                 {
                     MIN_HTTP3_DATA_OPPORTUNITY_BYTES
                         .saturating_sub(raw_tail)
@@ -1289,6 +1344,158 @@ mod tests {
     }
 
     #[test]
+    fn observed_body_short_tail_requires_complete_owned_minimum_and_can_roll_back() {
+        for tail in [1, 2] {
+            for blocked_at in [None, Some(1_014), Some(1_015)] {
+                let mut state = recorded_primary_parser_tail();
+                if let ReceiveState::ReceivingData {
+                    consumed,
+                    data_length,
+                    pending_parser_boundary,
+                    ..
+                } = &mut state
+                {
+                    *consumed -= tail - 1;
+                    *data_length -= tail - 1;
+                    *pending_parser_boundary = Some(*consumed);
+                }
+                let required = 3 - tail;
+                let before = state.clone();
+                assert_eq!(
+                    state.scheduled_parser_lease_capacity_with_evidence(blocked_at, Some(458)),
+                    required
+                );
+                assert_eq!(
+                    state.claim_scheduled_parser_lease_with_evidence(
+                        required - 1,
+                        blocked_at,
+                        Some(458)
+                    ),
+                    0
+                );
+                assert_eq!(
+                    state, before,
+                    "an undersized claim must not mutate receive state"
+                );
+                assert_eq!(
+                    state.parser_lease_with_evidence(true, 0, None, blocked_at, Some(458)),
+                    None,
+                    "actual Content-Length alone grants no unowned bytes"
+                );
+                assert_eq!(
+                    state.claim_scheduled_parser_lease_with_evidence(
+                        required,
+                        blocked_at,
+                        Some(458)
+                    ),
+                    required
+                );
+                assert_eq!(
+                    state.parser_lease_with_evidence(true, required, None, blocked_at, Some(458)),
+                    Some((1_016 + required, required, true))
+                );
+                assert_eq!(
+                    state.parser_lease_with_evidence(true, required, None, blocked_at, Some(458)),
+                    None,
+                    "one exact parser boundary cannot grant twice"
+                );
+                assert!(state.cancel_parser_lease(1_016 + required, required, false));
+                state.restore_claim(required);
+                assert_eq!(state.limits(), before.limits());
+                assert_eq!(state.claimable(), before.claimable());
+                assert_eq!(
+                    state.scheduled_parser_lease_capacity_with_evidence(blocked_at, Some(458)),
+                    required,
+                    "an unadvertised canceled lease can be reallocated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observed_body_short_tail_refuses_unproved_or_usable_tail() {
+        for tail in [1, 2, 3, 4, 15] {
+            let mut state = recorded_primary_parser_tail();
+            let mut announced = 0;
+            if let ReceiveState::ReceivingData {
+                consumed,
+                data_length,
+                pending_parser_boundary,
+                ..
+            } = &mut state
+            {
+                *consumed -= tail - 1;
+                *data_length -= tail - 1;
+                *pending_parser_boundary = Some(*consumed);
+                announced = *data_length;
+            }
+            for length in [None, Some(0), Some(announced)] {
+                assert_eq!(
+                    state.scheduled_parser_lease_capacity_with_evidence(None, length),
+                    0
+                );
+                assert_eq!(
+                    state.parser_lease_with_evidence(true, 16, None, None, length),
+                    None
+                );
+            }
+            if tail >= 3 {
+                assert_eq!(
+                    state.scheduled_parser_lease_capacity_with_evidence(None, Some(458)),
+                    0
+                );
+                assert_eq!(
+                    state.scheduled_parser_lease_capacity_with_evidence(Some(1_016), Some(458)),
+                    1,
+                    "the existing exact-current-blocked route remains available"
+                );
+            }
+        }
+        let mut state = recorded_primary_parser_tail();
+        if let ReceiveState::ReceivingData {
+            reservation_available,
+            ..
+        } = &mut state
+        {
+            *reservation_available = 1;
+        }
+        assert_eq!(
+            state.scheduled_parser_lease_capacity_with_evidence(None, Some(458)),
+            0
+        );
+        assert_eq!(
+            state.claim_scheduled_parser_lease_with_evidence(2, None, Some(458)),
+            0
+        );
+    }
+
+    #[test]
+    fn observed_body_short_tail_does_not_authorize_unparsed_headers() {
+        let mut state = ReceiveState::controlled(16, 16, 2);
+        if let ReceiveState::ReceivingHeaders {
+            consumed,
+            parser_lease_used,
+            parser_lease_exhausted,
+            pending_parser_boundary,
+            ..
+        } = &mut state
+        {
+            *consumed = 14;
+            *parser_lease_used = 16;
+            *parser_lease_exhausted = true;
+            *pending_parser_boundary = Some(14);
+        }
+        assert_eq!(
+            state.scheduled_parser_lease_capacity_with_evidence(None, Some(2)),
+            0
+        );
+        assert_eq!(
+            state.parser_lease_with_evidence(true, 1, None, None, Some(2)),
+            None
+        );
+    }
+
+    #[test]
     fn parser_blocked_short_tail_owns_a_complete_nonempty_data_opportunity() {
         let mut state = recorded_primary_parser_tail();
         assert_eq!(state.scheduled_parser_lease_capacity(), 0);
@@ -1356,6 +1563,82 @@ mod tests {
             state.scheduled_parser_lease_capacity_with_blocked(Some(1_016)),
             0
         );
+    }
+
+    #[test]
+    fn owned_zero_tail_uses_local_exhaustion_without_a_fresh_peer_blocked_report() {
+        for blocked_at in [None, Some(1_000), Some(1_015)] {
+            let mut state = recorded_primary_parser_tail();
+            state.bytes_read(1);
+            state.header_progress(1, true);
+            assert_eq!(state.limits(), Some((1_016, 1_016)));
+            assert_eq!(state.consumed(), 1_016);
+            assert_eq!(
+                state.parser_lease(true, 0, None),
+                None,
+                "local exhaustion creates no unowned receive allowance"
+            );
+            assert_eq!(state.owned_data_continuation_capacity(blocked_at, 600), 600);
+            assert_eq!(
+                state.owned_data_continuation(blocked_at, 600),
+                Some((1_616, 600, true))
+            );
+            assert_eq!(
+                state.owned_data_continuation(blocked_at, 600),
+                None,
+                "a pending boundary owns only one complete due quantum"
+            );
+            assert!(state.cancel_parser_lease(1_616, 600, false));
+            assert_eq!(state.limits(), Some((1_016, 1_016)));
+            assert_eq!(
+                state.owned_data_continuation_capacity(blocked_at, 600),
+                600,
+                "an unadvertised canceled quantum can be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_zero_tail_preserves_frontier_boundary_and_positive_tail_guards() {
+        let mut zero = recorded_primary_parser_tail();
+        zero.bytes_read(1);
+        zero.header_progress(1, true);
+        for invalid in 0..5 {
+            let mut state = zero.clone();
+            if let ReceiveState::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_exhausted,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } = &mut state
+            {
+                match invalid {
+                    0 => *pending_parser_boundary = None,
+                    1 => *advertised_limit -= 1,
+                    2 => *last_parser_lease_boundary = Some(*consumed),
+                    3 => *known_limit = *requested_limit + 1,
+                    _ => *parser_lease_exhausted = false,
+                }
+            }
+            assert_eq!(state.owned_data_continuation_capacity(None, 600), 0);
+            assert_eq!(state.owned_data_continuation(None, 600), None);
+        }
+        let positive = recorded_primary_parser_tail();
+        for blocked_at in [None, Some(1_000), Some(1_015)] {
+            assert_eq!(
+                positive.owned_data_continuation_capacity(blocked_at, 600),
+                0
+            );
+        }
+        assert_eq!(
+            positive.owned_data_continuation_capacity(Some(1_016), 600),
+            600
+        );
+        assert_eq!(zero.owned_data_continuation_capacity(None, 0), 0);
     }
 
     #[test]
