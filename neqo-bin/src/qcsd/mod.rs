@@ -31552,6 +31552,7 @@ mod tests {
             4_433,
             QcsdConfig {
                 initial_max_stream_data: 16,
+                defense: DefenseConfig::Buflo(neqo_csdef::BufloConfig::default()),
                 ..QcsdConfig::default()
             },
         );
