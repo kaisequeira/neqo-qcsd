@@ -19372,6 +19372,18 @@ fn apply_action(
     let terminal_us = terminal_slot
         .map(|slot| controller_terminal_resolution_us(controller, slot))
         .transpose()?;
+    let (terminal_trace_at, terminal_trace_us) = match &action {
+        QcsdAction::SlotMissed { packet, .. } | QcsdAction::SlotSatisfied { packet, .. }
+            if packet.direction() == Direction::Incoming =>
+        {
+            // The supplied Instant can precede the independent TAI sample
+            // used for controller reduction. Timestamp incoming terminal
+            // serialization after that resolution, without backdating it.
+            let recorded_at = self::now();
+            (recorded_at, traces.elapsed_us(recorded_at))
+        }
+        _ => (now, action_time_us),
+    };
     let terminal_semantics = match &action {
         QcsdAction::SlotMissed {
             reason: MissedSlotReason::EndpointClosed,
@@ -19381,8 +19393,8 @@ fn apply_action(
     };
     if record_terminal_action(
         traces,
-        now,
-        action_time_us,
+        terminal_trace_at,
+        terminal_trace_us,
         terminal_us,
         "recorded",
         terminal_semantics,
@@ -29566,6 +29578,242 @@ mod tests {
         assert!(schedule.contains("credit_advertised_at_us"));
         assert!(schedule.contains("credit_consumed_at_us"));
         assert!(row.ends_with(",3,3,7,7,7"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the regression binds real incoming credit consumption, controller resolution and persisted action clocks"
+    )]
+    fn incoming_terminal_action_serialization_follows_controller_resolution() {
+        let output = trace_output_dir("incoming-terminal-serialization-clock");
+        let started = now();
+        let defense_start_ns = 110_401_103_u64;
+        let target = Duration::from_micros(14_528_000);
+        let terminal_at = Duration::from_micros(14_530_120);
+        let supplied_at = started + Duration::from_micros(14_640_520);
+        let serialized_at = started + Duration::from_nanos(14_640_522_500);
+        let defense_start = started + Duration::from_nanos(defense_start_ns);
+        assert!(supplied_at < defense_start + terminal_at);
+        assert!(serialized_at > defense_start + terminal_at);
+
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        let packet = Packet::new(target, Direction::Incoming, 1_200).expect("incoming cell");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                // Keep this non-windowed test schedule's release on the
+                // exact target instead of the default 5ms watermark.
+                control_interval_us: 1,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint,
+                origin: "https://example.com".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::ZERO,
+        );
+        controller.poll(target);
+        let credit = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+            .expect("actual scheduled incoming credit");
+        let QcsdAction::IncreaseReceiveLimit {
+            absolute_limit,
+            slot,
+            ..
+        } = credit
+        else {
+            unreachable!("filtered incoming action");
+        };
+        assert_eq!(absolute_limit, 1_216);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        register_action_batch(
+            &mut traces,
+            defense_start + target,
+            std::slice::from_ref(&credit),
+        )
+        .expect("register actual scheduled incoming range");
+
+        let clock = QcsdObservationClock::new(started);
+        let advertised_at = defense_start + target + Duration::from_micros(1);
+        let advertisement = clock.record_at(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint,
+                stream,
+                absolute_limit,
+                slot: Some(slot),
+            },
+            advertised_at,
+        );
+        controller.observe(advertisement.observation().clone(), target + Duration::from_micros(1));
+        traces
+            .observation_after_controller(
+                Some(endpoint),
+                &advertisement,
+                &controller,
+                Some(advertised_at),
+            )
+            .expect("record the actual advertised incoming range");
+        assert!(controller.incoming_slot_is_locally_realized(slot));
+        let consumed = clock.record_at(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: absolute_limit,
+            },
+            started + Duration::from_micros(14_640_519),
+        );
+        controller.observe(consumed.observation().clone(), terminal_at);
+        traces
+            .observation_after_controller(Some(endpoint), &consumed, &controller, None)
+            .expect("record unchanged byte-read production identity");
+        let terminal = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::SlotSatisfied { slot: actual, .. } if *actual == slot))
+            .expect("the controller terminalizes the fully consumed cell");
+        assert_eq!(controller.terminal_slot_resolution_at(slot), Some(terminal_at));
+        let before = serde_json::to_value(controller.defense_diagnostics()).expect("diagnostics");
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+
+        // Production takes the terminal fast path before endpoint lookup.
+        // Only the existing clock seam supplies the later serialization
+        // instant; the incoming action and its resolution are genuine.
+        let current_clock = TestMonotonicNowOverride::fixed(serialized_at);
+        super::apply_action(
+            &mut [],
+            &mut controller,
+            None,
+            &mut traces,
+            supplied_at,
+            terminal_at,
+            terminal,
+            false,
+            None,
+        )
+        .expect("serialize the controller-generated terminal action");
+        drop(current_clock);
+        assert_eq!(controller.terminal_slot_resolution_at(slot), Some(terminal_at));
+        assert_eq!(serde_json::to_value(controller.defense_diagnostics()).expect("diagnostics"), before);
+        assert_eq!(consumed.produced_monotonic_ns(), 14_640_519_000);
+        assert_eq!(consumed.sequence(), 1);
+        drop(traces);
+
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        assert_eq!(schedule.lines().count(), 2);
+        let fields: Vec<_> = schedule.lines().nth(1).expect("terminal row").split(',').collect();
+        assert_eq!(fields[0], "14528000");
+        assert_eq!(fields[1], "incoming");
+        assert_eq!(fields[2], "1200");
+        assert_eq!(fields[3], "1");
+        assert_eq!(fields[4], "14638401");
+        assert_eq!(fields[5], "satisfied");
+        assert_eq!(fields[8], slot.0.to_string());
+        assert_eq!(fields[9], "3");
+        assert_eq!(fields[21], "14638402");
+        assert_eq!(fields[25], "14530120");
+        let consumed_us: u64 = fields[23].parse().expect("credit-consumption timestamp");
+        let terminal_us: u64 = fields[25].parse().expect("controller terminal timestamp");
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        let terminal_event = events.lines().find(|line| line.contains(",action,recorded,")).expect("terminal action event");
+        assert!(terminal_event.starts_with(&format!("{consumed_us},1,action,recorded,")));
+        assert!(events.contains("14640519,1,observation,recorded,"));
+        fs::remove_dir_all(output).expect("remove trace test directory");
+
+        // Exact unchanged retained-reader interval arithmetic: a process
+        // microsecond bucket has at most two defense-microsecond floors.
+        // No extra tolerance may cover the stale supplied timestamp.
+        let translated_upper = consumed_us - defense_start_ns / 1_000;
+        let translated_lower = translated_upper - u64::from(defense_start_ns % 1_000 != 0);
+        assert!(
+            terminal_us <= translated_upper && translated_upper - terminal_us <= 10_000,
+            "incoming terminal serialization must satisfy the unchanged retained-reader bound: terminal={terminal_us}, translated=[{translated_lower},{translated_upper}]"
+        );
+        assert_eq!(consumed_us, 14_640_522, "serialize at the actual current Instant");
+    }
+
+    #[test]
+    fn outgoing_terminal_action_keeps_supplied_timestamp() {
+        let output = trace_output_dir("outgoing-terminal-supplied-clock");
+        let started = now();
+        let target = Duration::from_micros(100);
+        let terminal_at = Duration::from_micros(120);
+        let supplied_at = started + terminal_at;
+        let endpoint = QcsdEndpointId(1);
+        let packet = Packet::new(target, Direction::Outgoing, 1_200).expect("outgoing cell");
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+        )
+        .expect("controller");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint,
+                origin: "https://example.com".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(target);
+        let outgoing = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::SendPacket { .. }))
+            .expect("actual outgoing target");
+        let (_, actual_packet, slot) = super::scheduled_action(&outgoing).expect("scheduled target");
+        assert_eq!(actual_packet, packet);
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        register_action_batch(&mut traces, started + target, std::slice::from_ref(&outgoing))
+            .expect("register outgoing target");
+        controller.abort_pending_slots(terminal_at, MissedSlotReason::RunAborted);
+        let terminal = controller
+            .drain_actions()
+            .find(|action| matches!(action, QcsdAction::SlotMissed { slot: actual, .. } if *actual == slot))
+            .expect("actual outgoing abort action");
+        assert_eq!(super::action_endpoint(&terminal), None);
+        assert_eq!(controller.terminal_slot_resolution_at(slot), Some(terminal_at));
+        let current_clock = TestMonotonicNowOverride::fixed(started + Duration::from_secs(1));
+        super::apply_action(
+            &mut [], &mut controller, None, &mut traces, supplied_at, terminal_at,
+            terminal, false, None,
+        )
+        .expect("serialize unchanged outgoing action");
+        drop(current_clock);
+        drop(traces);
+        let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
+        let fields: Vec<_> = schedule.lines().nth(1).expect("terminal row").split(',').collect();
+        assert_eq!(fields[1], "outgoing");
+        assert_eq!(fields[4], "100");
+        assert_eq!(fields[5], "missed");
+        assert_eq!(fields[7], "RunAborted");
+        assert_eq!(fields[8], slot.0.to_string());
+        assert_eq!(fields[23], "");
+        assert_eq!(fields[25], "120");
+        let events = fs::read_to_string(output.join("events.csv")).expect("events");
+        assert!(events.contains("120,,action,recorded,"));
+        assert!(!events.contains("1000000,,action,recorded,"));
         fs::remove_dir_all(output).expect("remove trace test directory");
     }
 
