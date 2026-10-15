@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use neqo_common::{Buffer, Role, qtrace, to_u64};
+use neqo_common::{Buffer, Role, qerror, qtrace, to_u64};
 #[cfg(feature = "qcsd")]
 use neqo_csdef::{QcsdReceiveLimitError, QcsdReceiveLimitOutcome};
 use smallvec::SmallVec;
@@ -780,7 +780,17 @@ impl RecvStream {
         let already_data_ready = self.data_ready();
         let new_end = offset + u64::try_from(data.len())?;
 
-        self.state.flow_control_consume_data(new_end, fin)?;
+        if let Err(error) = self.state.flow_control_consume_data(new_end, fin) {
+            if matches!(&error, Error::FlowControl) {
+                qerror!(
+                    "receive_flow_control_failure frame=STREAM stream={} offset={offset} \
+                     bytes={} fin={fin} end={new_end}",
+                    self.stream_id.as_u64(),
+                    data.len()
+                );
+            }
+            return Err(error);
+        }
 
         match &mut self.state {
             RecvStreamState::Recv {
@@ -879,7 +889,17 @@ impl RecvStream {
             return Err(Error::FrameEncoding);
         }
         // Catches a changed final size as FINAL_SIZE_ERROR.
-        self.state.flow_control_consume_data(final_size, true)?;
+        if let Err(error) = self.state.flow_control_consume_data(final_size, true) {
+            if matches!(&error, Error::FlowControl) {
+                qerror!(
+                    "receive_flow_control_failure frame=RESET stream={} \
+                     final_size={final_size} reliable_size={reliable_size} \
+                     application_error_code={application_error_code}",
+                    self.stream_id.as_u64()
+                );
+            }
+            return Err(error);
+        }
 
         match &mut self.state {
             RecvStreamState::Recv {

@@ -24,7 +24,7 @@ use std::{
 };
 
 use enum_map::EnumMap;
-use neqo_common::{Buffer, MAX_VARINT, Role, qdebug, qtrace, to_u64};
+use neqo_common::{Buffer, MAX_VARINT, Role, qdebug, qerror, qtrace, to_u64};
 #[cfg(feature = "qcsd")]
 use neqo_csdef::{QcsdReceiveLimitError, QcsdReceiveLimitFatal, QcsdReceiveLimitOutcome};
 
@@ -735,6 +735,12 @@ impl ReceiverFlowControl<()> {
                 self.consumed,
                 self.max_allowed
             );
+            // Fixed-size state retains the encoded ceiling and pending manual
+            // credit without logging any stream payload.
+            qerror!(
+                "receive_flow_control_failure scope=connection additional_bytes={count} \
+                 flow_control={self:?}"
+            );
             return Err(Error::FlowControl);
         }
         self.consumed += count;
@@ -808,6 +814,10 @@ impl ReceiverFlowControl<StreamId> {
 
         if consumed > self.max_allowed {
             qtrace!("Stream RX window exceeded: {consumed}");
+            qerror!(
+                "receive_flow_control_failure scope=stream attempted_end={consumed} \
+                 flow_control={self:?}"
+            );
             return Err(Error::FlowControl);
         }
         let new_consumed = consumed - self.consumed;
