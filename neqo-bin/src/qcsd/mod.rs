@@ -1675,6 +1675,8 @@ const BUFLO_KERNEL_CADENCE64_TX_SEMANTICS: &str = "client_only_buflo_kernel_time
 const BUFLO_KERNEL_CADENCE64_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; nominal_selection=release_minus_5ms; rolling_preparation_deadline=release_plus_4ms; tick_zero_preparation_deadline=release; completed_and_confirmed_before_recorded_preparation_deadline=true; preparation_reserve_ns=1000000; physical_deadline_unchanged_release_plus_5ms=true; exact_read_counts_and_failure_evidence=true; no_omissions_or_catch_up=true; cadence_ns=64000000_bound_to_exact_prospective_parameters";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema22_retains_schema21_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema13=true";
+const BUFLO_KERNEL_LAYERED_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v14; historical_schema13_unchanged=true; layered_tx_feedback=bounded_complete_inventory_v1; required_first_TX_SCHED_and_TX_SOFTWARE_pair_unchanged=true; unknown_reused_wrapped_ids_and_timestamp_reversals_fatal=true; shutdown_socket_schema2_required=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=64000000; packet_bytes=1200; incoming_window=bound_half_period_32000000ns; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
+const BUFLO_KERNEL_LAYERED_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema22_retains_schema21_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema14_with_socket_schema2=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RESERVE_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v12; historical_schema11_default_unchanged=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=20000000; packet_bytes=1200; incoming_window=unchanged_bound_preparation; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
 #[cfg(target_os = "linux")]
@@ -3844,7 +3846,15 @@ fn buflo_kernel_helper_evidence_complete_with_policy(
         && shutdown.remaining_post_main_datagrams == Some(0)
         && shutdown.lifecycle.as_ref() == Some(lifecycle)
         && shutdown.errors.is_empty()
-        && socket.schema_version == 1
+        && match socket.schema_version {
+            1 => socket.timestamp_inventories.is_empty(),
+            2 => buflo_kernel_timestamp_inventories_complete(
+                socket,
+                endpoint_tuples,
+                job_count + immediate_datagram_count,
+            ),
+            _ => false,
+        }
         && socket.socket_count == endpoint_count
         && socket.active_job_id.is_none()
         && socket.pending_socket_count == 0
@@ -3852,6 +3862,81 @@ fn buflo_kernel_helper_evidence_complete_with_policy(
         && socket.nonzero_priority_socket_count == 0
         && socket.inspection_errors.is_empty()
         && socket.clean
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_timestamp_inventories_complete(
+    socket: &timed_egress::HelperSocketShutdownReceipt,
+    endpoint_tuples: &[(SocketAddr, SocketAddr)],
+    transmission_count: usize,
+) -> bool {
+    socket.timestamp_inventories.len() == endpoint_tuples.len()
+        && socket
+            .timestamp_inventories
+            .iter()
+            .enumerate()
+            .all(|(index, inventory)| {
+                let scheduled: BTreeSet<_> = inventory
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.required_first_of_kind
+                            && event.kind == timed_egress::TimestampKind::Scheduled
+                    })
+                    .map(|event| event.kernel_timestamp_id)
+                    .collect();
+                let software: BTreeSet<_> = inventory
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        event.required_first_of_kind
+                            && event.kind == timed_egress::TimestampKind::Software
+                    })
+                    .map(|event| event.kernel_timestamp_id)
+                    .collect();
+                inventory.schema_version == 1
+                    && inventory.socket_index == index
+                    && inventory.local_address == endpoint_tuples[index].0
+                    && inventory.completed_history_limit
+                        == timed_egress::COMPLETED_TIMESTAMP_HISTORY_LIMIT
+                    && inventory.events_per_transmission_limit
+                        == timed_egress::TIMESTAMP_EVENTS_PER_TRANSMISSION_LIMIT
+                    && inventory.event_inventory_limit
+                        == timed_egress::TIMESTAMP_EVENT_INVENTORY_LIMIT
+                    && inventory.observed_timestamp_events == inventory.events.len()
+                    && inventory.events.len() <= inventory.event_inventory_limit
+                    && inventory.completed_transmissions == scheduled.len()
+                    && scheduled == software
+                    && inventory.highest_completed_id == scheduled.last().copied()
+                    && inventory.evicted_completed_ids
+                        == inventory
+                            .completed_transmissions
+                            .saturating_sub(inventory.completed_history_limit)
+                    && inventory
+                        .events
+                        .iter()
+                        .enumerate()
+                        .all(|(sequence, event)| {
+                            event.sequence == sequence
+                                && scheduled.contains(&event.kernel_timestamp_id)
+                                && (!event.required_first_of_kind
+                                    || (!event.already_completed
+                                        && event.phase
+                                            == timed_egress::TimestampFeedbackPhase::Pending))
+                        })
+                    && inventory
+                        .events
+                        .iter()
+                        .filter(|event| event.required_first_of_kind)
+                        .count()
+                        == inventory.completed_transmissions * 2
+            })
+        && socket
+            .timestamp_inventories
+            .iter()
+            .map(|inventory| inventory.completed_transmissions)
+            .sum::<usize>()
+            == transmission_count
 }
 
 #[cfg(target_os = "linux")]
@@ -5484,9 +5569,17 @@ impl BufloKernelTxRuntime {
         let active = prepared
             .into_iter()
             .map(|socket| {
-                socket
+                let mut active = socket
                     .activate_after_privilege_drop()
-                    .map_err(|error| buflo_kernel_timed_error("socket activation", error))
+                    .map_err(|error| buflo_kernel_timed_error("socket activation", error))?;
+                if incoming_policy.period_us() == 64_000 {
+                    active
+                        .enable_layered_timestamp_feedback()
+                        .map_err(|error| {
+                            buflo_kernel_timed_error("layered timestamp contract", error)
+                        })?;
+                }
+                Ok::<_, Error>(active)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let socket_count = active.len();
@@ -7514,14 +7607,14 @@ impl BufloKernelTxRuntime {
         let terminal_outcome = aggregate.terminal_outcome.to_string();
         BufloKernelTxReceipt {
             schema_version: if self.cadence == Duration::from_micros(64_000) {
-                13
+                14
             } else if self.preparation_reserve {
                 12
             } else {
                 BUFLO_KERNEL_TX_RECEIPT_SCHEMA_VERSION
             },
             semantics: if self.cadence == Duration::from_micros(64_000) {
-                BUFLO_KERNEL_CADENCE64_TX_SEMANTICS
+                BUFLO_KERNEL_LAYERED_TX_SEMANTICS
             } else if self.preparation_reserve {
                 BUFLO_KERNEL_RESERVE_TX_SEMANTICS
             } else {
@@ -8541,7 +8634,8 @@ impl RunnerWakeupMetrics {
         let schema = receipt
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
-        let cadence64 = schema == Some(13);
+        let layered_feedback = schema == Some(14);
+        let cadence64 = schema == Some(13) || layered_feedback;
         let preparation_reserve = schema == Some(12) || cadence64;
         self.buflo_kernel_tx = Some(receipt);
         self.schema_version = if cadence64 {
@@ -8551,14 +8645,18 @@ impl RunnerWakeupMetrics {
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         };
-        let retention_semantics = if cadence64 {
+        let retention_semantics = if layered_feedback {
+            BUFLO_KERNEL_LAYERED_RUNNER_RETENTION_SEMANTICS
+        } else if cadence64 {
             BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS
         } else if preparation_reserve {
             BUFLO_KERNEL_RESERVE_RUNNER_RETENTION_SEMANTICS
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS
         };
-        let kernel_semantics = if cadence64 {
+        let kernel_semantics = if layered_feedback {
+            BUFLO_KERNEL_LAYERED_TX_SEMANTICS
+        } else if cadence64 {
             BUFLO_KERNEL_CADENCE64_TX_SEMANTICS
         } else if preparation_reserve {
             BUFLO_KERNEL_RESERVE_TX_SEMANTICS
@@ -50999,6 +51097,7 @@ mod tests {
             stale_error_queue_socket_count: 0,
             nonzero_priority_socket_count: 0,
             inspection_errors: Vec::new(),
+            timestamp_inventories: Vec::new(),
             clean: true,
         };
         let priority_method = super::timed_egress::TimedPriorityMethod::SerializedSocketSoPriority;
