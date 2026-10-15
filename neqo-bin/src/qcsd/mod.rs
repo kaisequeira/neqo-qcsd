@@ -11674,6 +11674,7 @@ struct Endpoint {
     /// shaping stays enabled; neither candidate may finish before the original
     /// bytes or cancellation RESET is peer-confirmed.
     chaff_send_streams: BTreeSet<StreamId>,
+    terminal_local_abandonments: Vec<serde_json::Value>,
     completed: Vec<StreamRecord>,
     connected: bool,
     retired_applications: Vec<(u32, ResourceRunState)>,
@@ -16453,6 +16454,7 @@ fn create_endpoint_inventory(
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
                 chaff_send_streams: BTreeSet::new(),
+                terminal_local_abandonments: Vec::new(),
                 completed: Vec::new(),
                 connected: false,
                 retired_applications: Vec::new(),
@@ -19268,6 +19270,77 @@ fn prepare_chaff_cancellation(
     Ok(Some((stream_id, *reason)))
 }
 
+/// The BuFLO tail may abandon only its local, fully drained HTTP response.
+/// This is deliberately distinct from the unchanged CS-BuFLO wire-cancel path.
+fn abandon_buflo_terminal_chaff(
+    endpoint: &mut Endpoint,
+    controller: &QcsdController,
+    stream: StreamId,
+) -> Result<serde_json::Value, Error> {
+    let diagnostics = controller.defense_diagnostics();
+    if !matches!(controller.config().defense, DefenseConfig::Buflo(_))
+        || !diagnostics.buflo_application_complete
+        || !diagnostics.buflo_terminal_subcell_latched
+        || diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch != 0
+        || diagnostics.buflo_terminal_subcell_pending_application_parser_boundaries_at_latch != 0
+        || diagnostics.buflo_terminal_subcell_pending_request_cancellations != 0
+        || diagnostics.scheduled_incoming_unresolved_bytes != 0
+        || !endpoint.pending_chaff_requests.is_empty()
+    {
+        return Err(Error::SlotInvariant(
+            "BuFLO local abandonment lacks the original drained terminal latch".into(),
+        ));
+    }
+    let record = endpoint.streams.get(&stream).ok_or_else(|| {
+        Error::SlotInvariant("BuFLO local abandonment targeted unknown chaff".into())
+    })?;
+    let QcsdRequestRole::Chaff {
+        resource_id,
+        request_id: Some(request_id),
+    } = record.role
+    else {
+        return Err(Error::SlotInvariant(
+            "BuFLO local abandonment targeted an unqualified non-chaff identity".into(),
+        ));
+    };
+    if record.complete
+        || record.outcome != "in_flight"
+        || endpoint
+            .terminal_local_abandonments
+            .iter()
+            .any(|proof| proof["stream"].as_u64() == Some(stream.as_u64()))
+    {
+        return Err(Error::SlotInvariant(
+            "BuFLO local abandonment targeted a completed or repeated response".into(),
+        ));
+    }
+    let role = record.role;
+    let proof = endpoint
+        .client
+        .qcsd_abandon_buflo_terminal_chaff(stream, role)?;
+    Ok(json!({
+        "endpoint": endpoint.id.0,
+        "stream": stream.as_u64(),
+        "resource_id": resource_id,
+        "request_id": request_id.0,
+        "encoded_receive_limit": proof.receive.encoded_receive_limit,
+        "manual_receive_limit": proof.receive.manual_receive_limit,
+        "consumed": proof.receive.consumed,
+        "retired": proof.receive.retired,
+        "buffered_bytes": proof.receive.buffered_bytes,
+        "pending_receive_actions": 0,
+        "http3_response_headers_decoded": true,
+        "http3_receive_state": proof.http3_receive_state,
+        "qpack_blocked": false,
+        "qpack_decoder_pending": false,
+        "request_send_peer_confirmed": true,
+        "stop_sending_queued": false,
+        "reset_stream_queued": false,
+        "receive_credit_increase": 0,
+        "unshaped_data_bytes": 0,
+    }))
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -19616,7 +19689,24 @@ fn apply_action(
     } else {
         None
     };
-    match endpoint.client.apply_qcsd_action(transport_at, action) {
+    let adapter_result =
+        if let Some((stream, QcsdChaffCancellationReason::BufloTerminalSubcellTail)) =
+            canceled_chaff
+        {
+            let proof = abandon_buflo_terminal_chaff(endpoint, controller, stream)?;
+            traces.event(
+                now,
+                endpoint_id,
+                "chaff_local_abandonment",
+                "applied",
+                &proof,
+            )?;
+            endpoint.terminal_local_abandonments.push(proof);
+            Ok(None)
+        } else {
+            endpoint.client.apply_qcsd_action(transport_at, action)
+        };
+    match adapter_result {
         Ok(chaff_stream) => {
             if let QcsdAction::PrearmPacket {
                 packet,
@@ -25396,6 +25486,27 @@ fn buflo_run_summary(
     })
 }
 
+fn buflo_local_abandon_run_summary(
+    defense: &DefenseConfig,
+    diagnostics: Option<&DefenseDiagnostics>,
+    endpoints: &[Endpoint],
+) -> Option<serde_json::Value> {
+    let mut summary = buflo_run_summary(defense, diagnostics)?;
+    summary["schema_version"] = json!(5);
+    summary["terminal_subcell_policy"] =
+        json!("drain_whole_cells_then_guarded_local_abandon_unallocatable_reviewed_chaff_tail_v1");
+    summary["terminal_subcell_observer_effect"] = json!(
+        "local_http3_abandonment_without_stop_sending_reset_stream_receive_credit_or_qpack_cancellation"
+    );
+    summary["terminal_local_abandonments"] = json!(
+        endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.terminal_local_abandonments.iter())
+            .collect::<Vec<_>>()
+    );
+    Some(summary)
+}
+
 fn cs_buflo_run_summary(
     defense: &DefenseConfig,
     diagnostics: Option<&DefenseDiagnostics>,
@@ -25439,9 +25550,10 @@ fn render_run_json(
     started_unix_ns: u128,
     completion: &RunCompletion<'_>,
 ) -> Vec<u8> {
-    let buflo_summary = buflo_run_summary(
+    let buflo_summary = buflo_local_abandon_run_summary(
         &spec.config.defense,
         completion.defense_diagnostics.as_ref(),
+        endpoints,
     );
     let cs_buflo_summary = cs_buflo_run_summary(
         &spec.config.defense,
@@ -31421,6 +31533,282 @@ mod tests {
             release,
             tick_actions,
         }
+    }
+
+    fn local_abandon_real_http3_fixture(
+        output: &Path,
+    ) -> (
+        super::Endpoint,
+        neqo_http3::Http3Server,
+        neqo_transport::StreamId,
+    ) {
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server_config(
+            output,
+            started,
+            &clock,
+            QcsdEndpointId(0),
+            4_433,
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                ..QcsdConfig::default()
+            },
+        );
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let stream = endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::RequestChaff {
+                    endpoint: endpoint.id,
+                    resource: Resource {
+                        id: 0,
+                        url: "https://127.0.0.1:4433/chaff".into(),
+                        kind: "Other".into(),
+                        content_length: Some(3_000),
+                        data_length: 3_000,
+                        chaff_priority: true,
+                        known_valid: true,
+                        depends_on: Vec::new(),
+                        headers: Vec::new(),
+                    },
+                    request_id: QcsdChaffRequestId(7),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        endpoint.client.stream_close_send(stream, started).unwrap();
+        endpoint.chaff_send_streams.insert(stream);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 0,
+            request_id: Some(QcsdChaffRequestId(7)),
+        };
+        assert!(
+            !endpoint
+                .client
+                .qcsd_chaff_send_stream_peer_confirmed(stream)
+        );
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_buflo_terminal_chaff(stream, role)
+                .is_err(),
+            "unconfirmed request FIN cannot be locally abandoned"
+        );
+        endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint: endpoint.id,
+                    stream: QcsdStreamId(stream.as_u64()),
+                    initial_limit: 1_763,
+                },
+            )
+            .unwrap();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let request = server
+            .events()
+            .find_map(|event| match event {
+                neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                    assert!(fin);
+                    Some(stream)
+                }
+                _ => None,
+            })
+            .expect("real server received complete chaff request");
+        request
+            .send_headers(&[
+                neqo_common::Header::new(":status", "200"),
+                neqo_common::Header::new("content-length", "3000"),
+            ])
+            .unwrap();
+        let written = request.send_data(&[b'x'; 3_000], started).unwrap();
+        assert!(written > 0 && written < 3_000);
+        // Intentionally leave the response open; transport must stop at the
+        // actually encoded 1763-byte window, including HTTP/3 framing.
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let mut body_bytes = 0;
+        loop {
+            let (read, fin) = endpoint
+                .client
+                .read_data(started, stream, &mut [0; 4_096])
+                .unwrap();
+            assert!(!fin);
+            body_bytes += read;
+            if read == 0 {
+                break;
+            }
+        }
+        assert_eq!(body_bytes, written);
+        endpoint.client.qcsd_prepare_stream_output(started);
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert!(
+            endpoint
+                .client
+                .qcsd_chaff_send_stream_peer_confirmed(stream)
+        );
+        assert!(!endpoint.client.qcsd_qpack_decoder_handler_pending());
+        assert!(!endpoint.client.qcsd_qpack_decoder_transport_pending());
+        (endpoint, server, stream)
+    }
+
+    #[test]
+    fn qcsd_local_abandon_real_http3_queues_no_wire_or_qpack_control() {
+        let output = trace_output_dir("local-abandon-real-http3");
+        let (mut endpoint, mut server, stream) = local_abandon_real_http3_fixture(&output);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 0,
+            request_id: Some(QcsdChaffRequestId(7)),
+        };
+        let before = endpoint.client.transport_stats().frame_tx;
+        let proof = endpoint
+            .client
+            .qcsd_abandon_buflo_terminal_chaff(stream, role)
+            .unwrap();
+        assert_eq!(proof.receive.encoded_receive_limit, 1_763);
+        assert_eq!(proof.receive.manual_receive_limit, 1_763);
+        assert_eq!(
+            (
+                proof.receive.consumed,
+                proof.receive.retired,
+                proof.receive.buffered_bytes
+            ),
+            (1_763, 1_763, 0)
+        );
+        assert_eq!(
+            proof.http3_receive_state,
+            "waiting-for-data-at-frame-boundary"
+        );
+        assert!(!endpoint.client.qcsd_has_pending_defense_control());
+        assert!(!endpoint.client.qcsd_qpack_decoder_handler_pending());
+        assert!(!endpoint.client.qcsd_qpack_decoder_transport_pending());
+        assert!(chaff_send_halves_peer_confirmed(&endpoint));
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let after = endpoint.client.transport_stats().frame_tx;
+        assert_eq!(after.stop_sending, before.stop_sending);
+        assert_eq!(after.reset_stream, before.reset_stream);
+        assert_eq!(after.max_stream_data, before.max_stream_data);
+        assert_eq!(
+            after.stream, before.stream,
+            "local cleanup created no QPACK or request STREAM bytes"
+        );
+        assert!(endpoint_send_terminal(&mut endpoint, true));
+        assert_eq!(endpoint.client.state(), neqo_http3::Http3State::Connected);
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_buflo_terminal_chaff(stream, role)
+                .is_err(),
+            "local abandonment is not repeatable"
+        );
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn qcsd_local_abandon_real_http3_rejects_wrong_identity_and_pending_credit_atomically() {
+        let output = trace_output_dir("local-abandon-real-http3-refusals");
+        let (mut endpoint, server, stream) = local_abandon_real_http3_fixture(&output);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 0,
+            request_id: Some(QcsdChaffRequestId(7)),
+        };
+        for bad_role in [
+            QcsdRequestRole::Application,
+            QcsdRequestRole::Chaff {
+                resource_id: 1,
+                request_id: Some(QcsdChaffRequestId(7)),
+            },
+            QcsdRequestRole::Chaff {
+                resource_id: 0,
+                request_id: Some(QcsdChaffRequestId(8)),
+            },
+            QcsdRequestRole::Chaff {
+                resource_id: 0,
+                request_id: None,
+            },
+        ] {
+            assert!(
+                endpoint
+                    .client
+                    .qcsd_abandon_buflo_terminal_chaff(stream, bad_role)
+                    .is_err()
+            );
+        }
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_buflo_terminal_chaff(neqo_transport::StreamId::new(999), role)
+                .is_err()
+        );
+        assert_eq!(
+            endpoint
+                .client
+                .read_data(test_fixture::now(), stream, &mut [0; 1])
+                .unwrap(),
+            (0, false)
+        );
+        let action = QcsdAction::LeaseParserReceive {
+            endpoint: endpoint.id,
+            stream: QcsdStreamId(stream.as_u64()),
+            absolute_limit: 1_764,
+            increase: 1,
+            owner: None,
+        };
+        endpoint.client.apply_qcsd_receive_action(&action).unwrap();
+        let identities = endpoint.client.qcsd_pending_receive_action_identities();
+        assert_eq!(identities.len(), 1);
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_buflo_terminal_chaff(stream, role)
+                .is_err()
+        );
+        assert_eq!(
+            endpoint.client.qcsd_pending_receive_action_identities(),
+            identities
+        );
+        assert_eq!(
+            endpoint
+                .client
+                .read_data(test_fixture::now(), stream, &mut [0; 1])
+                .unwrap(),
+            (0, false)
+        );
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn qcsd_local_abandon_summary_five_preserves_legacy_summary_four() {
+        let defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: "buflo.json".into(),
+        });
+        let diagnostics = DefenseDiagnostics::default();
+        let legacy = buflo_run_summary(&defense, Some(&diagnostics)).unwrap();
+        let current =
+            super::buflo_local_abandon_run_summary(&defense, Some(&diagnostics), &[]).unwrap();
+        assert_eq!(legacy["schema_version"], 4);
+        assert!(legacy.get("terminal_local_abandonments").is_none());
+        assert_eq!(current["schema_version"], 5);
+        assert_eq!(current["terminal_local_abandonments"], json!([]));
+        assert_eq!(current["diagnostics"], legacy["diagnostics"]);
+        assert_eq!(
+            current["terminal_schedule_stop_policy"],
+            legacy["terminal_schedule_stop_policy"]
+        );
+        assert_eq!(
+            current["terminal_subcell_policy"],
+            "drain_whole_cells_then_guarded_local_abandon_unallocatable_reviewed_chaff_tail_v1"
+        );
+        assert_eq!(
+            current["terminal_subcell_observer_effect"],
+            "local_http3_abandonment_without_stop_sending_reset_stream_receive_credit_or_qpack_cancellation"
+        );
     }
 
     fn open_controlled_runner_stream(

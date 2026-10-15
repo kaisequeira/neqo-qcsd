@@ -20,6 +20,15 @@ use neqo_transport::StreamId;
 use super::Http3Client;
 use crate::{Error, Priority, Res, connection::RequestDescription};
 
+/// Actual terminal-only preflight facts, retained by the QCSD runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QcsdLocalChaffAbandonment {
+    /// Unchanged live transport receive-state proof.
+    pub receive: neqo_transport::recv_stream::QcsdDrainedReceive,
+    /// Exact decoded parser state before local handler cleanup.
+    pub http3_receive_state: &'static str,
+}
+
 impl Http3Client {
     /// Drive HTTP/3/QPACK send handlers into transport without constructing a
     /// QUIC datagram. The prefix qualifier uses this while send shaping is
@@ -148,6 +157,37 @@ impl Http3Client {
     #[must_use]
     pub fn qcsd_chaff_send_stream_peer_confirmed(&self, stream_id: StreamId) -> bool {
         self.conn.qcsd_chaff_send_stream_peer_confirmed(stream_id)
+    }
+
+    /// Abandon only the local HTTP response handler after strict, read-only
+    /// chaff/credit/parser/peer-confirmation checks. This sends no cancellation
+    /// frames, grants no credit, and leaves QUIC receive validation live.
+    ///
+    /// # Errors
+    /// Returns an error before mutation for any unproved precondition.
+    pub fn qcsd_abandon_buflo_terminal_chaff(
+        &mut self,
+        stream_id: StreamId,
+        role: QcsdRequestRole,
+    ) -> Res<QcsdLocalChaffAbandonment> {
+        let receive = self
+            .conn
+            .qcsd_preview_local_chaff_abandonment(stream_id, role)
+            .ok_or(Error::InvalidInput)?;
+        if self.qcsd_qpack_decoder_handler_pending()
+            || self.qcsd_qpack_decoder_transport_pending()
+            || self.qcsd_has_pending_stream_send()
+            || self.qcsd_has_pending_defense_control()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let http3_receive_state = self
+            .base_handler
+            .qcsd_abandon_drained_response(stream_id, &mut self.conn)?;
+        Ok(QcsdLocalChaffAbandonment {
+            receive,
+            http3_receive_state,
+        })
     }
 
     /// Open a same-origin nonblocking-QPACK request for qualification without

@@ -660,6 +660,23 @@ pub struct Stats {
     pub bytes_read: u64,
 }
 
+/// Read-only proof of an exhausted live manual receive window. This is not a
+/// FIN, RESET, receive-credit grant, or transport stream-state transition.
+#[cfg(feature = "qcsd")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QcsdDrainedReceive {
+    /// Greatest stream offset actually advertised on the wire.
+    pub encoded_receive_limit: u64,
+    /// Current manual limit, equal to the encoded limit at this boundary.
+    pub manual_receive_limit: u64,
+    /// Transport receive high-water mark.
+    pub consumed: u64,
+    /// Bytes retired by actual application/parser reads.
+    pub retired: u64,
+    /// Bytes still buffered by the transport receive orderer.
+    pub buffered_bytes: u64,
+}
+
 impl Stats {
     #[must_use]
     pub const fn new(bytes_received: u64, bytes_read: u64) -> Self {
@@ -1144,6 +1161,30 @@ impl RecvStream {
             | RecvStreamState::WaitForReset { fc, .. } => fc.manual_limit(),
             RecvStreamState::DataRead { .. } | RecvStreamState::ResetRecvd { .. } => None,
         }
+    }
+
+    /// Observe a fully consumed, read, and encoded manual window without
+    /// ending or abandoning its QUIC receive half.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_drained_manual_receive(&self) -> Option<QcsdDrainedReceive> {
+        let RecvStreamState::Recv { fc, recv_buf, .. } = &self.state else {
+            return None;
+        };
+        let proof = QcsdDrainedReceive {
+            encoded_receive_limit: fc.qcsd_encoded_limit(),
+            manual_receive_limit: fc.manual_limit()?,
+            consumed: fc.consumed(),
+            retired: fc.retired(),
+            buffered_bytes: recv_buf.buffered(),
+        };
+        (proof.encoded_receive_limit > 0
+            && proof.encoded_receive_limit == proof.manual_receive_limit
+            && proof.encoded_receive_limit == proof.consumed
+            && proof.encoded_receive_limit == proof.retired
+            && proof.buffered_bytes == 0
+            && !fc.manual_frame_pending())
+        .then_some(proof)
     }
 
     #[cfg(feature = "qcsd")]
@@ -2246,6 +2287,103 @@ mod tests {
             ),
             session_fc,
         )
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn local_abandon_encoded_stream() -> RecvStream {
+        let session = Rc::new(RefCell::new(ReceiverFlowControl::new((), 65_536)));
+        let mut stream =
+            RecvStream::new(StreamId::new(348), 16, session, ConnectionEvents::default());
+        assert!(stream.qcsd_set_manual_limit(1_763));
+        let mut builder =
+            packet::Builder::short(Encoder::default(), false, None::<&[u8]>, packet::LIMIT);
+        let mut tokens = recovery::Tokens::new();
+        let mut stats = FrameStats::default();
+        stream.write_frame(
+            &mut builder,
+            &mut tokens,
+            &mut stats,
+            now(),
+            Duration::from_millis(100),
+        );
+        assert_eq!(stats.max_stream_data, 1);
+        assert_eq!(stream.fc().unwrap().qcsd_encoded_limit(), 1_763);
+        stream
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn local_abandon_drained_stream() -> RecvStream {
+        let mut stream = local_abandon_encoded_stream();
+        stream.inbound_stream_frame(false, 0, &[0; 1_763]).unwrap();
+        assert_eq!(stream.read(&mut [0; 1_763]).unwrap(), (1_763, false));
+        assert!(stream.qcsd_drained_manual_receive().is_some());
+        stream
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_local_abandon_reset_over_encoded_limit_stays_flow_control() {
+        let mut stream = local_abandon_drained_stream();
+        let before = stream.qcsd_drained_manual_receive().unwrap();
+        assert_eq!(before.encoded_receive_limit, 1_763);
+        assert_eq!(before.manual_receive_limit, before.consumed);
+        assert_eq!(before.consumed, before.retired);
+        assert!(!stream.stop_sending(268));
+        assert_eq!(stream.reset(268, 1_983, 0), Err(Error::FlowControl));
+        let fc = stream.fc().unwrap();
+        assert_eq!(fc.qcsd_encoded_limit(), 1_763);
+        assert_eq!(fc.manual_limit(), Some(1_763));
+        assert_eq!((fc.consumed(), fc.retired()), (1_763, 1_763));
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_local_abandon_legal_reset_at_encoded_limit_succeeds() {
+        let mut stream = local_abandon_drained_stream();
+        assert!(!stream.stop_sending(268));
+        assert_eq!(stream.reset(268, 1_763, 0), Ok(true));
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_local_abandon_pending_unencoded_limit_does_not_authorize_reset() {
+        let mut stream = local_abandon_drained_stream();
+        assert!(stream.qcsd_set_manual_limit(1_983));
+        assert!(stream.qcsd_drained_manual_receive().is_none());
+        assert_eq!(stream.reset(268, 1_983, 0), Err(Error::FlowControl));
+        assert_eq!(stream.fc().unwrap().qcsd_encoded_limit(), 1_763);
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_local_abandon_live_receive_remains_strict_after_readonly_preview() {
+        let mut stream = local_abandon_drained_stream();
+        let before = stream.qcsd_drained_manual_receive().unwrap();
+        assert_eq!(stream.qcsd_drained_manual_receive(), Some(before));
+        assert!(matches!(stream.state, RecvStreamState::Recv { .. }));
+        assert_eq!(
+            stream.inbound_stream_frame(false, 1_763, &[0]),
+            Err(Error::FlowControl)
+        );
+        assert_eq!(stream.reset(268, 1_983, 0), Err(Error::FlowControl));
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_local_abandon_refuses_unread_gap_partial_and_final_receive_states() {
+        let mut unread = local_abandon_encoded_stream();
+        unread.inbound_stream_frame(false, 0, &[0; 1_763]).unwrap();
+        assert!(unread.qcsd_drained_manual_receive().is_none());
+        unread.read(&mut [0; 1_762]).unwrap();
+        assert!(unread.qcsd_drained_manual_receive().is_none());
+
+        let mut gap = local_abandon_encoded_stream();
+        gap.inbound_stream_frame(false, 1_600, &[0; 163]).unwrap();
+        assert!(gap.qcsd_drained_manual_receive().is_none());
+
+        let mut final_known = local_abandon_drained_stream();
+        final_known.inbound_stream_frame(true, 1_763, &[]).unwrap();
+        assert!(final_known.qcsd_drained_manual_receive().is_none());
     }
 
     #[test]

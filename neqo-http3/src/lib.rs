@@ -171,6 +171,8 @@ pub use client_events::{ConnectUdpEvent, Http3ClientEvent, WebTransportEvent};
 pub use conn_params::Http3Parameters;
 pub use connection::{Http3State, SessionAcceptAction};
 pub use connection_client::Http3Client;
+#[cfg(feature = "qcsd")]
+pub use connection_client::QcsdLocalChaffAbandonment;
 use frames::HFrame;
 pub use neqo_common::Header;
 use neqo_common::MessageType;
@@ -507,6 +509,16 @@ trait RecvStream: Stream {
 }
 
 trait HttpRecvStream: RecvStream {
+    /// Locally abandon an already-decoded ordinary response without creating
+    /// QUIC or QPACK cancellation work. Every other receive handler refuses.
+    ///
+    /// # Errors
+    /// Returns an error unless the implementation proves its parser quiescent.
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_drained_response(&mut self) -> Res<&'static str> {
+        Err(Error::InvalidInput)
+    }
+
     /// This function is similar to the receive function and has the same output, i.e.
     /// a `ReceiveOutput` enum and bool. The bool is true if the stream is completely done
     /// and can be forgotten, i.e. removed from all records.

@@ -1908,6 +1908,11 @@ pub struct SendStreams {
     #[cfg(feature = "qcsd")]
     qcsd_peer_confirmed: FxHashSet<StreamId>,
 
+    /// FIN-only confirmation for local-abandon preflight; RESET acknowledgment
+    /// remains valid for the existing general terminal predicate, not this one.
+    #[cfg(feature = "qcsd")]
+    qcsd_fin_confirmed: FxHashSet<StreamId>,
+
     // What we really want is a Priority Queue that we can do arbitrary
     // removes from (so we can reprioritize). BinaryHeap doesn't work,
     // because there's no remove().  BTreeMap doesn't work, since you can't
@@ -1958,6 +1963,15 @@ impl SendStreams {
     pub(crate) fn qcsd_peer_confirmed(&self, stream_id: StreamId) -> bool {
         self.qcsd_peer_confirmed.contains(&stream_id)
             || self.map.get(&stream_id).is_some_and(SendStream::is_ended)
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_fin_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        self.qcsd_fin_confirmed.contains(&stream_id)
+            || self
+                .map
+                .get(&stream_id)
+                .is_some_and(|stream| matches!(stream.state, State::DataRecvd { .. }))
     }
 
     #[cfg(feature = "qcsd")]
@@ -2279,6 +2293,8 @@ impl SendStreams {
         self.map.clear();
         #[cfg(feature = "qcsd")]
         self.qcsd_peer_confirmed.clear();
+        #[cfg(feature = "qcsd")]
+        self.qcsd_fin_confirmed.clear();
         self.has_ended = false;
         self.per_group.clear();
         self.per_group_next = 0;
@@ -2297,6 +2313,10 @@ impl SendStreams {
             removed = true;
             #[cfg(feature = "qcsd")]
             self.qcsd_peer_confirmed.insert(stream_id);
+            #[cfg(feature = "qcsd")]
+            if matches!(stream.state, State::DataRecvd { .. }) {
+                self.qcsd_fin_confirmed.insert(stream_id);
+            }
             if stream.is_fair() {
                 let group_id = stream.send_group().unwrap_or(NULL_GROUP_ID);
                 if let Some(grp_queues) = self.per_group.get_mut(&group_id) {
@@ -2599,6 +2619,39 @@ mod tests {
 
     fn connection_fc(limit: u64) -> Rc<RefCell<SenderFlowControl<()>>> {
         Rc::new(RefCell::new(SenderFlowControl::new((), limit)))
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_local_abandon_fin_confirmation_excludes_reset_before_and_after_cleanup() {
+        // State-classification component fixture; the paired HTTP/3 test
+        // obtains DataRecvd through real peer ACKs.
+        let mut streams = SendStreams::default();
+        for id in [StreamId::new(0), StreamId::new(4)] {
+            streams.insert(
+                id,
+                SendStream::new(id, 100, connection_fc(100), ConnectionEvents::default()),
+            );
+        }
+        streams.get_mut(StreamId::new(0)).unwrap().state = State::DataRecvd {
+            retired: 10,
+            written: 10,
+        };
+        streams.get_mut(StreamId::new(4)).unwrap().state = State::ResetRecvd {
+            final_retired: 10,
+            final_written: 10,
+        };
+        assert!(streams.qcsd_peer_confirmed(StreamId::new(0)));
+        assert!(streams.qcsd_peer_confirmed(StreamId::new(4)));
+        assert!(streams.qcsd_fin_peer_confirmed(StreamId::new(0)));
+        assert!(!streams.qcsd_fin_peer_confirmed(StreamId::new(4)));
+        streams.has_ended = true;
+        assert!(streams.remove_ended());
+        assert!(streams.qcsd_fin_peer_confirmed(StreamId::new(0)));
+        assert!(!streams.qcsd_fin_peer_confirmed(StreamId::new(4)));
+        assert!(streams.qcsd_peer_confirmed(StreamId::new(4)));
+        streams.clear();
+        assert!(!streams.qcsd_fin_peer_confirmed(StreamId::new(0)));
     }
 
     /// A send group only applies to fair streams: assigning one to a non-fair stream

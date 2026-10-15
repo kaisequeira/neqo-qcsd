@@ -612,6 +612,41 @@ impl RecvStream for RecvMessage {
 }
 
 impl HttpRecvStream for RecvMessage {
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_drained_response(&mut self) -> Res<&'static str> {
+        if self.stream_type != Http3StreamType::Http
+            || self.message_type != MessageType::Response
+            || !self.blocked_push_promise.is_empty()
+            || self
+                .qpack_decoder
+                .borrow()
+                .is_stream_blocked(self.stream_id)
+            || self.qpack_decoder.borrow().has_pending_send()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let receive_state = match &self.state {
+            RecvMessageState::ReadingData { remaining_data_len } if *remaining_data_len > 0 => {
+                "reading-data"
+            }
+            RecvMessageState::WaitingForData { frame_reader }
+                if frame_reader.qcsd_at_frame_boundary() =>
+            {
+                "waiting-for-data-at-frame-boundary"
+            }
+            _ => return Err(Error::InvalidInput),
+        };
+        // Calling reset() here would create a QPACK StreamCancellation. A
+        // local error notification purges queued application events without
+        // inventing a peer FIN/RESET or changing transport receive state.
+        self.state = RecvMessageState::Closed;
+        self.conn_events.recv_closed(
+            &self.stream_info,
+            CloseType::LocalError(Error::HttpRequestCancelled.code()),
+        );
+        Ok(receive_state)
+    }
+
     fn header_unblocked(
         &mut self,
         conn: &mut Connection,
@@ -659,5 +694,185 @@ impl HttpRecvStream for RecvMessage {
 
     fn extended_connect_wait_for_response(&self) -> bool {
         matches!(self.state, RecvMessageState::ExtendedConnect)
+    }
+}
+
+#[cfg(all(test, feature = "qcsd"))]
+mod local_abandon_tests {
+    use neqo_common::event::Provider as _;
+    use neqo_transport::StreamType;
+
+    use super::*;
+    use crate::client_events::{Http3ClientEvent, Http3ClientEvents};
+
+    // Parser-only component fixture. The real connected HTTP/3 regression is
+    // in the runner tests; no transport eligibility is asserted here.
+    fn response() -> (RecvMessage, Http3ClientEvents) {
+        let (mut connection, _peer) = test_fixture::connect();
+        let mut decoder = qpack::Decoder::new(&qpack::Settings::default());
+        let decoder_stream = connection.stream_create(StreamType::UniDi).unwrap();
+        decoder.add_send_stream(decoder_stream);
+        decoder.send(&mut connection).unwrap();
+        assert!(!decoder.has_pending_send());
+        let events = Http3ClientEvents::default();
+        let mut response = RecvMessage::new(
+            &RecvMessageInfo {
+                message_type: MessageType::Response,
+                stream_type: Http3StreamType::Http,
+                stream_id: StreamId::new(348),
+                first_frame_type: None,
+            },
+            Rc::new(RefCell::new(decoder)),
+            Box::new(events.clone()),
+            None,
+            PriorityHandler::new(false, Priority::default()),
+        );
+        response.state = RecvMessageState::ReadingData {
+            remaining_data_len: 69,
+        };
+        (response, events)
+    }
+
+    #[test]
+    fn qcsd_local_abandon_parser_notifies_only_local_error_without_qpack() {
+        let (mut response, mut events) = response();
+        events.data_readable(&response.stream_info);
+        assert_eq!(response.qcsd_abandon_drained_response(), Ok("reading-data"));
+        assert!(matches!(response.state, RecvMessageState::Closed));
+        assert!(!response.qpack_decoder.borrow().has_pending_send());
+        assert!(matches!(events.next_event(), Some(Http3ClientEvent::Reset {
+            stream_id, error: 268, local: true,
+        }) if stream_id == StreamId::new(348)));
+        assert!(
+            events.next_event().is_none(),
+            "queued readable event was purged"
+        );
+    }
+
+    #[test]
+    fn qcsd_local_abandon_parser_accepts_exact_waiting_data_boundary() {
+        let (mut response, _events) = response();
+        response.state = RecvMessageState::WaitingForData {
+            frame_reader: FrameReader::new(),
+        };
+        assert_eq!(
+            response.qcsd_abandon_drained_response(),
+            Ok("waiting-for-data-at-frame-boundary")
+        );
+    }
+
+    #[test]
+    fn qcsd_local_abandon_parser_refuses_headers_partial_frame_trailers_and_terminal_states() {
+        let states = [
+            RecvMessageState::WaitingForResponseHeaders {
+                frame_reader: FrameReader::new(),
+            },
+            RecvMessageState::DecodingHeaders {
+                header_block: vec![0],
+                fin: false,
+            },
+            RecvMessageState::WaitingForData {
+                frame_reader: FrameReader::new_with_type(HFrameType(0)),
+            },
+            RecvMessageState::WaitingForFinAfterTrailers {
+                frame_reader: FrameReader::new(),
+            },
+            RecvMessageState::ReadingData {
+                remaining_data_len: 0,
+            },
+            RecvMessageState::ClosePending,
+            RecvMessageState::Closed,
+            RecvMessageState::ExtendedConnect,
+        ];
+        for state in states {
+            let (mut response, mut events) = response();
+            response.state = state;
+            let before = format!("{:?}", response.state);
+            assert_eq!(
+                response.qcsd_abandon_drained_response(),
+                Err(Error::InvalidInput)
+            );
+            assert_eq!(format!("{:?}", response.state), before);
+            assert!(events.next_event().is_none());
+            assert!(!response.qpack_decoder.borrow().has_pending_send());
+        }
+    }
+
+    #[test]
+    fn qcsd_local_abandon_parser_refuses_request_and_extended_connect_types() {
+        let (mut request, _events) = response();
+        request.message_type = MessageType::Request;
+        assert_eq!(
+            request.qcsd_abandon_drained_response(),
+            Err(Error::InvalidInput)
+        );
+        let (mut extended, _events) = response();
+        extended.stream_type = Http3StreamType::ExtendedConnect;
+        assert_eq!(
+            extended.qcsd_abandon_drained_response(),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn qcsd_local_abandon_parser_refuses_blocked_push_promise_without_mutation() {
+        let (mut response, mut events) = response();
+        response.blocked_push_promise.push_back(PushInfo {
+            push_id: PushId::new(1),
+            header_block: vec![0x02, 0x80, 0x10],
+        });
+        assert_eq!(
+            response.qcsd_abandon_drained_response(),
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(response.blocked_push_promise.len(), 1);
+        assert!(matches!(
+            response.state,
+            RecvMessageState::ReadingData { .. }
+        ));
+        assert!(events.next_event().is_none());
+        assert!(!response.qpack_decoder.borrow().has_pending_send());
+    }
+
+    #[test]
+    fn qcsd_local_abandon_parser_refuses_pending_and_blocked_qpack() {
+        let (mut pending, mut events) = response();
+        pending.qpack_decoder = Rc::new(RefCell::new(qpack::Decoder::new(
+            &qpack::Settings::default(),
+        )));
+        assert_eq!(
+            pending.qcsd_abandon_drained_response(),
+            Err(Error::InvalidInput)
+        );
+        assert!(matches!(
+            pending.state,
+            RecvMessageState::ReadingData { .. }
+        ));
+        assert!(events.next_event().is_none());
+
+        let (mut blocked, mut events) = response();
+        assert!(
+            blocked
+                .qpack_decoder
+                .borrow_mut()
+                .decode_header_block(&[0x02, 0x80, 0x10], blocked.stream_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            blocked
+                .qpack_decoder
+                .borrow()
+                .is_stream_blocked(blocked.stream_id)
+        );
+        assert_eq!(
+            blocked.qcsd_abandon_drained_response(),
+            Err(Error::InvalidInput)
+        );
+        assert!(matches!(
+            blocked.state,
+            RecvMessageState::ReadingData { .. }
+        ));
+        assert!(events.next_event().is_none());
     }
 }

@@ -262,6 +262,12 @@ impl Decoder {
         !self.send_buf.is_empty()
     }
 
+    /// Whether this stream still depends on unavailable encoder instructions.
+    #[must_use]
+    pub fn is_stream_blocked(&self, stream_id: StreamId) -> bool {
+        self.blocked_streams.iter().any(|(id, _)| *id == stream_id)
+    }
+
     #[must_use]
     pub fn stats(&self) -> Stats {
         self.stats.clone()

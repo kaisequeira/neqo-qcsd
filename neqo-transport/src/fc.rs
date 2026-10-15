@@ -576,6 +576,12 @@ where
         self.consumed
     }
 
+    /// Last receive limit actually encoded, excluding pending manual credit.
+    #[cfg(feature = "qcsd")]
+    pub const fn qcsd_encoded_limit(&self) -> u64 {
+        self.max_allowed
+    }
+
     #[cfg(feature = "qcsd")]
     pub const fn manual_limit(&self) -> Option<u64> {
         self.manual_limit

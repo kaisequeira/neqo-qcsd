@@ -100,6 +100,11 @@ impl Streams {
     }
 
     #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_send_stream_fin_peer_confirmed(&self, stream_id: StreamId) -> bool {
+        self.send.qcsd_fin_peer_confirmed(stream_id)
+    }
+
+    #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_has_pending_send_data(&mut self) -> bool {
         self.send.qcsd_has_pending_data()
     }
