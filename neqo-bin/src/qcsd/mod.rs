@@ -15188,6 +15188,16 @@ async fn execute_run_inner(
                 .is_some_and(|source| source.6.acknowledged_start()));
     let deadline = process_start + Duration::from_secs(spec.timeout_seconds);
     let bound_ordinary_work = bounds_active_ordinary_work(&spec.config.defense);
+    // Only the already authenticated 64-ms preparation-reserve kernel path
+    // can finish an admitted ordinary transaction through its nominal release.
+    // Fresh work still stops at the unchanged ten-millisecond admission guard.
+    #[cfg(target_os = "linux")]
+    let admitted_tail_run_deadline = (buflo_kernel_tx.is_some()
+        && incoming_policy
+            == BufloIncomingCreditReleasePolicy::RapidV7Cadence64msAckStartPreparationReserve)
+        .then_some((deadline, spec.timeout_seconds));
+    #[cfg(not(target_os = "linux"))]
+    let admitted_tail_run_deadline = None;
 
     let mut loop_result: Result<(), Error> = async {
         macro_rules! defense_elapsed_at {
@@ -15606,7 +15616,7 @@ async fn execute_run_inner(
                         )?,
                     );
                     let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
-                    if let Some(wakeup) = drive_endpoint_output_until(
+                    if let Some(wakeup) = drive_endpoint_output_until_with_admitted_tail(
                         endpoint_index,
                         &mut endpoints,
                         &mut controller,
@@ -15623,6 +15633,7 @@ async fn execute_run_inner(
                         } else {
                             OutputDriveCardinality::DrainAvailable
                         },
+                        admitted_tail_run_deadline,
                     )
                     .await?
                         && wakeup < next_wakeup
@@ -15770,7 +15781,7 @@ async fn execute_run_inner(
                     )?,
                 );
                 let unshaped_handoff_interrupt = output_guard.map(|guard| guard.release);
-                if let Some(wakeup) = drive_endpoint_output_until(
+                if let Some(wakeup) = drive_endpoint_output_until_with_admitted_tail(
                     endpoint_index,
                     &mut endpoints,
                     &mut controller,
@@ -15787,6 +15798,7 @@ async fn execute_run_inner(
                     } else {
                         OutputDriveCardinality::DrainAvailable
                     },
+                    admitted_tail_run_deadline,
                 )
                 .await?
                     && wakeup < next_wakeup
@@ -23404,6 +23416,9 @@ fn datagram_observation(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputDrive {
     Datagram,
+    /// One admitted ordinary transaction was sent and finalised; service its
+    /// interrupted exact boundary before any further ordinary work.
+    DatagramYield,
     Callback(Instant),
     None,
 }
@@ -23424,6 +23439,82 @@ struct PreparedDatagramAttribution {
     observed: usize,
     satisfied: Option<SatisfiedDatagram>,
     composition: QcsdSlotComposition,
+}
+
+/// A finite handoff allowance derived from the original rolling identity.
+/// It never owns a slot, changes an exact deadline, or retains output between
+/// calls. Original prepared bytes and observations remain in the local caller.
+#[derive(Clone, Copy, Debug)]
+struct BufloAdmittedOrdinaryTail {
+    endpoint: QcsdEndpointId,
+    source: SocketAddr,
+    destination: SocketAddr,
+    nominal_release: Duration,
+    hard_deadline: Duration,
+    run_deadline: Instant,
+    timeout_seconds: u64,
+}
+
+fn buflo_admitted_ordinary_prepared_is_eligible(
+    endpoint: &Endpoint,
+    prepared: &PreparedOutputMicrostep,
+) -> bool {
+    !prepared.attributed_datagrams.is_empty()
+        && prepared.batch.num_datagrams() == prepared.attributed_datagrams.len()
+        && prepared.batch.source() == endpoint.local_addr
+        && prepared.batch.destination() == endpoint.remote_addr
+        && prepared
+            .attributed_datagrams
+            .iter()
+            .all(|item| item.satisfied.is_none())
+        && prepared
+            .observations
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.observation(),
+                    QcsdObservation::ClassifiedDatagram {
+                        direction: Direction::Outgoing,
+                        ..
+                    }
+                )
+            })
+            .count()
+            == prepared.attributed_datagrams.len()
+        && prepared
+            .observations
+            .iter()
+            .all(|record| match record.observation() {
+                QcsdObservation::ClassifiedDatagram {
+                    endpoint: owner,
+                    direction: Direction::Outgoing,
+                    composition: Some(_),
+                    ..
+                }
+                | QcsdObservation::StreamDataTransmitted {
+                    endpoint: owner,
+                    slot: None,
+                    ..
+                } => *owner == endpoint.id,
+                // A slotless receive advertisement may cover scheduled or parser
+                // ownership. No receive, terminal, unknown, or foreign observation
+                // is permission to complete this ordinary transaction late.
+                _ => false,
+            })
+}
+
+fn buflo_admitted_ordinary_tail_deadline(
+    controller: &QcsdController,
+    guard: &BufloExactReleaseGuard,
+) -> Result<Option<Duration>, Error> {
+    if guard.phase != BufloExactReleasePhase::Prearmed {
+        return Ok(None);
+    }
+    Ok(controller.buflo_admitted_ordinary_handoff_deadline(
+        guard.endpoint,
+        guard.packet,
+        guard.slot,
+    )?)
 }
 
 enum PreparedOutputDrive {
@@ -24250,6 +24341,9 @@ async fn drive_buflo_exact_incoming_output_with_clock(
     {
         OutputDrive::Callback(wakeup) => Ok(Some(wakeup)),
         OutputDrive::Datagram | OutputDrive::None => Ok(None),
+        OutputDrive::DatagramYield => Err(Error::SlotInvariant(
+            "exact incoming output cannot use an ordinary admitted-tail allowance".into(),
+        )),
     }
 }
 
@@ -24289,6 +24383,48 @@ async fn drive_endpoint_output_until(
         true,
         cardinality,
         PostOutputRollingBarrier::Apply,
+        &mut monotonic_clock,
+    )
+    .await
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "the ordinary caller carries its authenticated policy and original run deadline"
+)]
+async fn drive_endpoint_output_until_with_admitted_tail(
+    endpoint_index: usize,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Option<Instant>,
+    work_boundary: Option<OutputWorkBoundary>,
+    unshaped_handoff_interrupt: Option<Instant>,
+    absolute_handoff_deadline: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
+    cardinality: OutputDriveCardinality,
+    admitted_tail_run_deadline: Option<(Instant, u64)>,
+) -> Result<Option<Instant>, Error> {
+    let mut monotonic_clock = now;
+    drive_endpoint_output_with_clock_until_with_admitted_tail(
+        endpoint_index,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        defense_start,
+        work_boundary,
+        unshaped_handoff_interrupt,
+        absolute_handoff_deadline,
+        defense_clock,
+        true,
+        cardinality,
+        PostOutputRollingBarrier::Apply,
+        admitted_tail_run_deadline,
         &mut monotonic_clock,
     )
     .await
@@ -24346,7 +24482,7 @@ async fn drive_endpoint_output_with_clock(
     clippy::too_many_lines,
     reason = "one output-drive loop preserves the exact reduce-prearm-process causality boundary"
 )]
-async fn drive_endpoint_output_with_clock_until(
+async fn drive_endpoint_output_with_clock_until_with_admitted_tail(
     endpoint_index: usize,
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
@@ -24361,6 +24497,7 @@ async fn drive_endpoint_output_with_clock_until(
     interrupt_new_buflo_guards: bool,
     cardinality: OutputDriveCardinality,
     post_output_rolling_barrier: PostOutputRollingBarrier,
+    admitted_tail_run_deadline: Option<(Instant, u64)>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<Option<Instant>, Error> {
     let mut work_boundary = work_boundary;
@@ -24580,7 +24717,52 @@ async fn drive_endpoint_output_with_clock_until(
             .into_iter()
             .chain(unshaped_handoff_interrupt)
             .min();
-        let output = process_output_once_with_clock(
+        let admitted_tail = if admitted_tail_run_deadline.is_some()
+            && interrupt_new_buflo_guards
+            && defense_clock.uses_kernel_tai()
+            && absolute_handoff_deadline.is_none()
+            && post_output_rolling_barrier == PostOutputRollingBarrier::Apply
+        {
+            match (
+                admitted_tail_run_deadline,
+                sampled_drive_elapsed,
+                next_buflo_exact_release_guard(
+                    &controller.config().defense,
+                    controller,
+                    endpoints,
+                )?,
+            ) {
+                (Some((run_deadline, timeout_seconds)), Some(admitted_at), Some(guard))
+                    if kernel_rolling_interrupt == Some(guard.packet.timestamp())
+                        && kernel_controller_interrupt
+                            .is_none_or(|at| at == guard.packet.timestamp())
+                        && guard
+                            .packet
+                            .timestamp()
+                            .checked_sub(Duration::from_millis(10))
+                            .is_some_and(|admission| admitted_at < admission) =>
+                {
+                    buflo_admitted_ordinary_tail_deadline(controller, &guard)?.map(
+                        |hard_deadline| {
+                            let endpoint = &endpoints[output_endpoint_index];
+                            BufloAdmittedOrdinaryTail {
+                                endpoint: endpoint.id,
+                                source: endpoint.local_addr,
+                                destination: endpoint.remote_addr,
+                                nominal_release: guard.packet.timestamp(),
+                                hard_deadline,
+                                run_deadline,
+                                timeout_seconds,
+                            }
+                        },
+                    )
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let output = process_output_once_with_clock_with_admitted_tail(
             &mut endpoints[output_endpoint_index],
             controller,
             traces,
@@ -24591,6 +24773,7 @@ async fn drive_endpoint_output_with_clock_until(
             absolute_handoff_deadline,
             defense_clock,
             kernel_semantic_handoff_interrupt,
+            admitted_tail,
             monotonic_clock,
         )
         .await;
@@ -24628,6 +24811,13 @@ async fn drive_endpoint_output_with_clock_until(
             );
         }
         let output = output?;
+        if output == OutputDrive::DatagramYield {
+            // The physical ordinary transaction is complete. Do not poll,
+            // reconcile, prepare, or drive an exact target in this ordinary
+            // loop: its production caller immediately enters the unchanged
+            // owner-bound kernel dispatcher before the next unit of work.
+            return Ok(Some(monotonic_clock()));
+        }
         let exact_due_slots_are_terminal = !due_rolling_slots_before_output.is_empty()
             && due_rolling_slots_before_output.iter().all(|slot| {
                 controller.terminal_slot_resolution_at(*slot).is_some()
@@ -24675,10 +24865,56 @@ async fn drive_endpoint_output_with_clock_until(
                 return Ok(None);
             }
             OutputDrive::Datagram => {}
+            OutputDrive::DatagramYield => {
+                unreachable!("sent tail returned at its service boundary")
+            }
             OutputDrive::Callback(wakeup) => return Ok(Some(wakeup)),
             OutputDrive::None => return Ok(None),
         }
     }
+}
+
+#[expect(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    reason = "historical callers retain the original strict interruption ABI"
+)]
+async fn drive_endpoint_output_with_clock_until(
+    endpoint_index: usize,
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    defense_start: Option<Instant>,
+    work_boundary: Option<OutputWorkBoundary>,
+    unshaped_handoff_interrupt: Option<Instant>,
+    absolute_handoff_deadline: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
+    interrupt_new_buflo_guards: bool,
+    cardinality: OutputDriveCardinality,
+    post_output_rolling_barrier: PostOutputRollingBarrier,
+    monotonic_clock: &mut impl FnMut() -> Instant,
+) -> Result<Option<Instant>, Error> {
+    drive_endpoint_output_with_clock_until_with_admitted_tail(
+        endpoint_index,
+        endpoints,
+        controller,
+        chaff_manifest,
+        traces,
+        observation_clock,
+        defense_start,
+        work_boundary,
+        unshaped_handoff_interrupt,
+        absolute_handoff_deadline,
+        defense_clock,
+        interrupt_new_buflo_guards,
+        cardinality,
+        post_output_rolling_barrier,
+        None,
+        monotonic_clock,
+    )
+    .await
 }
 
 fn rolling_output_lifecycle_active(controller: &QcsdController, endpoints: &[Endpoint]) -> bool {
@@ -25132,7 +25368,7 @@ fn finalize_prepared_output_with_elapsed(
     clippy::too_many_lines,
     reason = "the deterministic handoff clock is an explicit output-causality seam"
 )]
-async fn process_output_once_with_clock(
+async fn process_output_once_with_clock_with_admitted_tail(
     endpoint: &mut Endpoint,
     controller: &mut QcsdController,
     traces: &mut TraceFiles,
@@ -25143,6 +25379,7 @@ async fn process_output_once_with_clock(
     absolute_handoff_deadline: Option<Instant>,
     defense_clock: RunnerDefenseClock,
     semantic_handoff_interrupt: Option<Duration>,
+    admitted_tail: Option<BufloAdmittedOrdinaryTail>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
     let supplied_drive_now = drive_now;
@@ -25230,6 +25467,21 @@ async fn process_output_once_with_clock(
         }
         Ok(PreparedOutputDrive::Datagram(prepared)) => prepared,
     };
+    let admitted_tail = admitted_tail.filter(|tail| {
+        defense_clock.uses_kernel_tai()
+            && matches!(controller.config().defense, DefenseConfig::Buflo(_))
+            && defense_start.is_some()
+            && absolute_handoff_deadline.is_none()
+            && semantic_handoff_interrupt == Some(tail.nominal_release)
+            && tail.hard_deadline > tail.nominal_release
+            && tail.endpoint == endpoint.id
+            && tail.source == endpoint.local_addr
+            && tail.destination == endpoint.remote_addr
+            && buflo_admitted_ordinary_prepared_is_eligible(endpoint, &prepared)
+    });
+    let handoff_semantic_interrupt = admitted_tail
+        .map(|tail| tail.hard_deadline)
+        .or(semantic_handoff_interrupt);
     let incoming_advertisements = cs_exact_incoming_advertisement_handoffs(
         controller,
         &prepared.observations,
@@ -25253,11 +25505,20 @@ async fn process_output_once_with_clock(
     let mut last_socket_api_entry = None;
     let (sent_at, late_handoff, semantic_wire_elapsed, semantic_interrupt_crossed) = loop {
         if let (Some(started), Some(interrupt_elapsed)) =
-            (defense_start, semantic_handoff_interrupt)
+            (defense_start, handoff_semantic_interrupt)
         {
             let guard_observed_at = monotonic_clock();
             let (sampled_elapsed, reached) =
                 defense_clock.sample_boundary(started, guard_observed_at, interrupt_elapsed)?;
+            if let Some(tail) = admitted_tail
+                && guard_observed_at >= tail.run_deadline
+            {
+                return Err(deadline_error(
+                    &controller.config().defense,
+                    controller.is_complete(),
+                    tail.timeout_seconds,
+                ));
+            }
             if reached {
                 // This is a diagnostic shape census, never permission to defer.
                 // A slotless physical receive-limit frame can still cover an
@@ -25405,6 +25666,10 @@ async fn process_output_once_with_clock(
                         "guard_monotonic_ns": duration_as_u64_nanos(
                             guard_observed_at.saturating_duration_since(endpoint.receive_loop.origin)),
                         "interrupt_elapsed_ns": duration_as_u64_nanos(interrupt_elapsed),
+                        "admitted_tail_nominal_release_elapsed_ns": admitted_tail
+                            .map(|tail| duration_as_u64_nanos(tail.nominal_release)),
+                        "admitted_tail_hard_deadline_elapsed_ns": admitted_tail
+                            .map(|tail| duration_as_u64_nanos(tail.hard_deadline)),
                         "sampled_elapsed_ns": duration_as_u64_nanos(sampled_elapsed),
                         "clock": clock,
                         "prepared_output_finalized": false,
@@ -25591,7 +25856,7 @@ async fn process_output_once_with_clock(
         match handoff {
             SocketHandoff::Sent(sent_at) => {
                 let (elapsed, crossed) = match defense_start {
-                    Some(started) => match semantic_handoff_interrupt {
+                    Some(started) => match handoff_semantic_interrupt {
                         Some(interrupt_elapsed) => {
                             let (elapsed, crossed) = defense_clock.sample_boundary(
                                 started,
@@ -25612,7 +25877,7 @@ async fn process_output_once_with_clock(
                 boundary,
             } => {
                 let (elapsed, crossed) = match defense_start {
-                    Some(started) => match semantic_handoff_interrupt {
+                    Some(started) => match handoff_semantic_interrupt {
                         Some(interrupt_elapsed) => {
                             let (elapsed, crossed) = defense_clock.sample_boundary(
                                 started,
@@ -25629,7 +25894,7 @@ async fn process_output_once_with_clock(
             }
             SocketHandoff::RetryUnshaped => {
                 if let (Some(started), Some(interrupt_elapsed)) =
-                    (defense_start, semantic_handoff_interrupt)
+                    (defense_start, handoff_semantic_interrupt)
                 {
                     let hint_base = monotonic_clock();
                     let wake_hint = defense_clock.project_elapsed_hint(
@@ -25637,6 +25902,8 @@ async fn process_output_once_with_clock(
                         interrupt_elapsed,
                         hint_base,
                     )?;
+                    let wake_hint =
+                        admitted_tail.map_or(wake_hint, |tail| wake_hint.min(tail.run_deadline));
                     await_unshaped_socket_retry_hint(endpoint.socket.writable(), wake_hint).await?;
                 } else {
                     await_unshaped_socket_retry(
@@ -25699,7 +25966,71 @@ async fn process_output_once_with_clock(
         // Only then reject the run for the fidelity violation.
         return Err(late_socket_handoff_error(sent_at, deadline, boundary));
     }
+    if let Some(tail) = admitted_tail {
+        if sent_at >= tail.run_deadline {
+            return Err(deadline_error(
+                &controller.config().defense,
+                controller.is_complete(),
+                tail.timeout_seconds,
+            ));
+        }
+        if let Some(wire_elapsed) = semantic_wire_elapsed
+            && wire_elapsed >= tail.nominal_release
+        {
+            traces.event(
+                sent_at,
+                Some(endpoint.id),
+                "buflo_admitted_ordinary_tail",
+                "sent_then_yield",
+                &json!({
+                    "schema_version": 1,
+                    "source": "native105-admitted-prepared-ordinary-tail-v1",
+                    "nominal_release_elapsed_ns": duration_as_u64_nanos(tail.nominal_release),
+                    "exclusive_hard_deadline_elapsed_ns": duration_as_u64_nanos(tail.hard_deadline),
+                    "actual_wire_elapsed_ns": duration_as_u64_nanos(wire_elapsed),
+                    "original_batch_datagrams": prepared.batch.num_datagrams(),
+                    "socket_handoff_succeeded": true,
+                    "controller_and_trace_finalized": true,
+                }),
+            )?;
+            return Ok(OutputDrive::DatagramYield);
+        }
+    }
     Ok(OutputDrive::Datagram)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "historical callers preserve the exact strict socket-handoff ABI"
+)]
+async fn process_output_once_with_clock(
+    endpoint: &mut Endpoint,
+    controller: &mut QcsdController,
+    traces: &mut TraceFiles,
+    observation_clock: &QcsdObservationClock,
+    drive_now: Instant,
+    defense_start: Option<Instant>,
+    unshaped_handoff_interrupt: Option<Instant>,
+    absolute_handoff_deadline: Option<Instant>,
+    defense_clock: RunnerDefenseClock,
+    semantic_handoff_interrupt: Option<Duration>,
+    monotonic_clock: &mut impl FnMut() -> Instant,
+) -> Result<OutputDrive, Error> {
+    process_output_once_with_clock_with_admitted_tail(
+        endpoint,
+        controller,
+        traces,
+        observation_clock,
+        drive_now,
+        defense_start,
+        unshaped_handoff_interrupt,
+        absolute_handoff_deadline,
+        defense_clock,
+        semantic_handoff_interrupt,
+        None,
+        monotonic_clock,
+    )
+    .await
 }
 
 fn process_input(

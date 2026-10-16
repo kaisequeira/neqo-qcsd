@@ -5998,6 +5998,118 @@ impl QcsdController {
         }
     }
 
+    /// A nominal rolling BuFLO release is distinct from every actual hard
+    /// controller deadline. This pure query permits only the exact live
+    /// outgoing preview to use its already-published preparation interval.
+    /// Incoming retry/advertisement expiry and completion remain hard minima;
+    /// immediate work, terminal state, or an unknown identity grants nothing.
+    ///
+    /// # Errors
+    /// Rejects overflow while deriving an original finite timing boundary.
+    pub fn buflo_admitted_ordinary_handoff_deadline(
+        &self,
+        endpoint: QcsdEndpointId,
+        packet: crate::Packet,
+        slot: QcsdSlotId,
+    ) -> Result<Option<Duration>> {
+        let window = Duration::from_millis(32);
+        let release = packet.timestamp();
+        if !matches!(self.config.defense, DefenseConfig::Buflo(_))
+            || self.config.control_interval_us != 5_000
+            || self.config.max_udp_payload_size != 1_200
+            || self.config.drop_unsatisfied_events
+            || self.buflo_incoming_half_period_window != Some(window)
+            || packet.direction() != Direction::Outgoing
+            || packet.length() != 1_200
+            || release.is_zero()
+            || slot.0 == 0
+            || self.rolling_outgoing_prearm_identity() != Some((endpoint, packet, slot))
+            || self.defense.next_outgoing_prearm() != Some(packet)
+            || self.defense.next_event_at() != Some(release)
+            || self.rolling_reconcile_due.is_some()
+            || self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || self.defense.diagnostics().buflo_schedule_stop_latched
+            || self.completion_emitted
+            || !self.observations.is_empty()
+            || !self.control.outgoing.is_empty()
+            || !self.actions.is_empty()
+        {
+            return Ok(None);
+        }
+        let mut deadline = release
+            .checked_add(Duration::from_millis(4))
+            .ok_or_else(|| {
+                crate::Error::ControllerInvariant(
+                    "BuFLO admitted ordinary preparation deadline overflow".into(),
+                )
+            })?;
+        // Keep the exact original next_deadline incoming-control candidate.
+        // Equality with the nominal release must not erase its hard meaning.
+        if !self.control.incoming.is_empty() {
+            let earliest = self
+                .control
+                .incoming
+                .iter()
+                .map(|pending| pending.packet.timestamp_us())
+                .min()
+                .unwrap_or(0);
+            let interval = self.config.control_interval_us;
+            let next = if earliest == 0 {
+                0
+            } else {
+                earliest.div_ceil(interval).saturating_mul(interval)
+            };
+            let next_unprocessed = self
+                .control
+                .last_incoming_boundary_us
+                .filter(|last| next <= *last)
+                .map_or(next, |last| last.saturating_add(interval));
+            deadline = deadline.min(Duration::from_micros(next_unprocessed));
+        }
+        // Include every pending incoming identity, even before a ledger was
+        // allocated. Local advertisement, not eventual RTT consumption,
+        // determines whether its existing window remains a hard deadline.
+        for (incoming_slot, incoming_packet) in &self.pending_slots {
+            if incoming_packet.direction() == Direction::Incoming
+                && !self.incoming_slot_is_locally_realized(*incoming_slot)
+            {
+                let incoming_deadline = incoming_packet
+                    .timestamp()
+                    .checked_add(window)
+                    .ok_or_else(|| {
+                        crate::Error::ControllerInvariant(
+                            "BuFLO admitted ordinary incoming deadline overflow".into(),
+                        )
+                    })?;
+                deadline = deadline.min(incoming_deadline);
+            }
+        }
+        // The original next_deadline inventory also includes live ledgers.
+        // Keep them independently, including an inconsistent orphan ledger.
+        for ledger in self
+            .incoming_credit_ledger
+            .values()
+            .filter(|ledger| !ledger.local_realization_emitted)
+        {
+            let incoming_deadline =
+                ledger
+                    .packet
+                    .timestamp()
+                    .checked_add(window)
+                    .ok_or_else(|| {
+                        crate::Error::ControllerInvariant(
+                            "BuFLO admitted ordinary ledger deadline overflow".into(),
+                        )
+                    })?;
+            deadline = deadline.min(incoming_deadline);
+        }
+        if let Some(due) = self.completion_due.filter(|_| !self.completion_emitted) {
+            deadline = deadline.min(due);
+        }
+        Ok((deadline > release).then_some(deadline))
+    }
+
     /// Earliest time at which [`Self::poll`] can produce another action.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Duration> {
