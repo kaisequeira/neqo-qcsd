@@ -11453,6 +11453,84 @@ struct StreamRecord {
     expected_chaff_response: Option<ExpectedChaffIdentity>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Http3FailureDiagnostic {
+    Reset {
+        schema_version: u8,
+        source: &'static str,
+        endpoint_id: u64,
+        stream_id: u64,
+        app_error_code: u64,
+        local: bool,
+        perspective: &'static str,
+        resource_id: Option<u32>,
+        request_id: Option<u64>,
+        role: Option<QcsdRequestRole>,
+        status: Option<u16>,
+        received_body_bytes: Option<u64>,
+        complete: Option<bool>,
+    },
+    GoawayReceived {
+        schema_version: u8,
+        source: &'static str,
+        endpoint_id: u64,
+        latest_going_away_cutoff_stream_id: Option<u64>,
+        cutoff_semantics: &'static str,
+        exact_per_frame_cutoff: bool,
+    },
+}
+
+// These observations describe delivered HTTP/3 events only. In particular,
+// local=false does not distinguish peer RESET_STREAM from GOAWAY rejection.
+fn http3_event_diagnostic(
+    endpoint_id: QcsdEndpointId,
+    event: &Http3ClientEvent,
+    record: Option<&StreamRecord>,
+    current_state: Option<&Http3State>,
+) -> Option<Http3FailureDiagnostic> {
+    match event {
+        Http3ClientEvent::Reset {
+            stream_id,
+            error,
+            local,
+        } => Some(Http3FailureDiagnostic::Reset {
+            schema_version: 1,
+            source: "http3-client-event-reset-v1",
+            endpoint_id: endpoint_id.0,
+            stream_id: stream_id.as_u64(),
+            app_error_code: *error,
+            local: *local,
+            perspective: if *local {
+                "local-receive-error"
+            } else {
+                "remote-close-or-goaway-rejection"
+            },
+            resource_id: record.map(|record| record.resource_id),
+            request_id: record.and_then(|record| match record.role {
+                QcsdRequestRole::Chaff { request_id, .. } => request_id.map(|id| id.0),
+                QcsdRequestRole::Application => None,
+            }),
+            role: record.map(|record| record.role),
+            status: record.and_then(|record| record.status),
+            received_body_bytes: record.map(|record| record.bytes),
+            complete: record.map(|record| record.complete),
+        }),
+        Http3ClientEvent::GoawayReceived => Some(Http3FailureDiagnostic::GoawayReceived {
+            schema_version: 1,
+            source: "http3-client-event-goaway-received-v1",
+            endpoint_id: endpoint_id.0,
+            latest_going_away_cutoff_stream_id: match current_state {
+                Some(Http3State::GoingAway(cutoff)) => Some(cutoff.as_u64()),
+                _ => None,
+            },
+            cutoff_semantics: "latest-http3-state-at-event-drain",
+            exact_per_frame_cutoff: false,
+        }),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ExpectedChaffIdentity {
     status: u16,
@@ -11675,6 +11753,7 @@ struct Endpoint {
     /// bytes or cancellation RESET is peer-confirmed.
     chaff_send_streams: BTreeSet<StreamId>,
     terminal_local_abandonments: Vec<serde_json::Value>,
+    http3_failure_diagnostics: Vec<Http3FailureDiagnostic>,
     completed: Vec<StreamRecord>,
     connected: bool,
     retired_applications: Vec<(u32, ResourceRunState)>,
@@ -16251,11 +16330,18 @@ fn application_response_length_hint(spec: &RunSpec, resource: &Resource) -> Opti
                 *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
             },
         );
-    if variable_primary {
-        // Prepared primary bodies may differ between visits under this explicit
-        // source-bound policy. A prepared length is not a lower bound on the
-        // next response. The policy requires a nonempty primary body, so its
-        // only prepared-independent body floor is one byte. Preserve the
+    let current_buflo_observed_extent =
+        matches!(spec.config.defense, DefenseConfig::Buflo(_))
+            && spec.application_workload_source.as_ref().is_some_and(
+                |(_, _, _, _, _, _, policy, _, _, _)| {
+                    *policy
+                        == BufloIncomingCreditReleasePolicy::RapidV7Cadence64msAckStartPreparationReserve
+                },
+            );
+    if variable_primary || current_buflo_observed_extent {
+        // A prepared body length is not a lower bound on a current response.
+        // The bound current BuFLO treatment uses the same positive minimal
+        // knowledge floor for every application resource. Preserve the
         // bounded, unadvertised framing reservation and parser continuations;
         // actual HEADERS and DATA frame extents establish every further byte.
         // Scheduled cells retain their full consumption requirement.
@@ -16455,6 +16541,7 @@ fn create_endpoint_inventory(
                 application_send_streams: BTreeSet::new(),
                 chaff_send_streams: BTreeSet::new(),
                 terminal_local_abandonments: Vec::new(),
+                http3_failure_diagnostics: Vec::new(),
                 completed: Vec::new(),
                 connected: false,
                 retired_applications: Vec::new(),
@@ -16934,6 +17021,32 @@ fn handle_http_events(
             break;
         };
         handled_events = handled_events.saturating_add(1);
+        let diagnostic = match &event {
+            Http3ClientEvent::Reset { stream_id, .. } => {
+                http3_event_diagnostic(endpoint.id, &event, endpoint.streams.get(stream_id), None)
+            }
+            Http3ClientEvent::GoawayReceived => {
+                http3_event_diagnostic(endpoint.id, &event, None, Some(&endpoint.client.state()))
+            }
+            _ => None,
+        };
+        if let Some(diagnostic) = diagnostic {
+            let (event_name, outcome) = match &diagnostic {
+                Http3FailureDiagnostic::Reset { local, .. } => {
+                    ("http3_reset", if *local { "local_error" } else { "reset" })
+                }
+                Http3FailureDiagnostic::GoawayReceived { .. } => ("http3_goaway", "observed"),
+            };
+            let index = endpoint.http3_failure_diagnostics.len();
+            endpoint.http3_failure_diagnostics.push(diagnostic);
+            traces.event(
+                now,
+                Some(endpoint.id),
+                event_name,
+                outcome,
+                &endpoint.http3_failure_diagnostics[index],
+            )?;
+        }
         match event {
             Http3ClientEvent::AuthenticationNeeded => {
                 endpoint
@@ -25650,6 +25763,22 @@ fn render_run_json(
         "responses": responses,
         "chaff_responses": chaff_responses,
     });
+    // A successful run's scientific DTO stays unchanged. These optional
+    // failure observations do not replace the original error or authorize it.
+    if completion_status != "complete" {
+        let diagnostics: Vec<_> = endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.http3_failure_diagnostics.iter())
+            .collect();
+        if !diagnostics.is_empty() {
+            run["http3_failure_diagnostics"] = json!({
+                "schema_version": 1,
+                "source": "runner-observed-http3-terminal-diagnostics-v1",
+                "observations_only": true,
+                "entries": diagnostics,
+            });
+        }
+    }
     if let Some(policy) = buflo_incoming_credit_release_receipt(spec) {
         run["buflo_incoming_credit_release_policy"] = policy;
     }
@@ -29664,7 +29793,10 @@ mod tests {
             },
             advertised_at,
         );
-        controller.observe(advertisement.observation().clone(), target + Duration::from_micros(1));
+        controller.observe(
+            advertisement.observation().clone(),
+            target + Duration::from_micros(1),
+        );
         traces
             .observation_after_controller(
                 Some(endpoint),
@@ -29690,7 +29822,10 @@ mod tests {
             .drain_actions()
             .find(|action| matches!(action, QcsdAction::SlotSatisfied { slot: actual, .. } if *actual == slot))
             .expect("the controller terminalizes the fully consumed cell");
-        assert_eq!(controller.terminal_slot_resolution_at(slot), Some(terminal_at));
+        assert_eq!(
+            controller.terminal_slot_resolution_at(slot),
+            Some(terminal_at)
+        );
         let before = serde_json::to_value(controller.defense_diagnostics()).expect("diagnostics");
         let diagnostics = controller.defense_diagnostics();
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
@@ -29715,15 +29850,26 @@ mod tests {
         )
         .expect("serialize the controller-generated terminal action");
         drop(current_clock);
-        assert_eq!(controller.terminal_slot_resolution_at(slot), Some(terminal_at));
-        assert_eq!(serde_json::to_value(controller.defense_diagnostics()).expect("diagnostics"), before);
+        assert_eq!(
+            controller.terminal_slot_resolution_at(slot),
+            Some(terminal_at)
+        );
+        assert_eq!(
+            serde_json::to_value(controller.defense_diagnostics()).expect("diagnostics"),
+            before
+        );
         assert_eq!(consumed.produced_monotonic_ns(), 14_640_519_000);
         assert_eq!(consumed.sequence(), 1);
         drop(traces);
 
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
         assert_eq!(schedule.lines().count(), 2);
-        let fields: Vec<_> = schedule.lines().nth(1).expect("terminal row").split(',').collect();
+        let fields: Vec<_> = schedule
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
         assert_eq!(fields[0], "14528000");
         assert_eq!(fields[1], "incoming");
         assert_eq!(fields[2], "1200");
@@ -29737,7 +29883,10 @@ mod tests {
         let consumed_us: u64 = fields[23].parse().expect("credit-consumption timestamp");
         let terminal_us: u64 = fields[25].parse().expect("controller terminal timestamp");
         let events = fs::read_to_string(output.join("events.csv")).expect("events");
-        let terminal_event = events.lines().find(|line| line.contains(",action,recorded,")).expect("terminal action event");
+        let terminal_event = events
+            .lines()
+            .find(|line| line.contains(",action,recorded,"))
+            .expect("terminal action event");
         assert!(terminal_event.starts_with(&format!("{consumed_us},1,action,recorded,")));
         assert!(events.contains("14640519,1,observation,recorded,"));
         fs::remove_dir_all(output).expect("remove trace test directory");
@@ -29751,7 +29900,10 @@ mod tests {
             terminal_us <= translated_upper && translated_upper - terminal_us <= 10_000,
             "incoming terminal serialization must satisfy the unchanged retained-reader bound: terminal={terminal_us}, translated=[{translated_lower},{translated_upper}]"
         );
-        assert_eq!(consumed_us, 14_640_522, "serialize at the actual current Instant");
+        assert_eq!(
+            consumed_us, 14_640_522,
+            "serialize at the actual current Instant"
+        );
     }
 
     #[test]
@@ -29782,28 +29934,48 @@ mod tests {
             .drain_actions()
             .find(|action| matches!(action, QcsdAction::SendPacket { .. }))
             .expect("actual outgoing target");
-        let (_, actual_packet, slot) = super::scheduled_action(&outgoing).expect("scheduled target");
+        let (_, actual_packet, slot) =
+            super::scheduled_action(&outgoing).expect("scheduled target");
         assert_eq!(actual_packet, packet);
         let mut traces = TraceFiles::new(&output, started).expect("trace files");
-        register_action_batch(&mut traces, started + target, std::slice::from_ref(&outgoing))
-            .expect("register outgoing target");
+        register_action_batch(
+            &mut traces,
+            started + target,
+            std::slice::from_ref(&outgoing),
+        )
+        .expect("register outgoing target");
         controller.abort_pending_slots(terminal_at, MissedSlotReason::RunAborted);
         let terminal = controller
             .drain_actions()
             .find(|action| matches!(action, QcsdAction::SlotMissed { slot: actual, .. } if *actual == slot))
             .expect("actual outgoing abort action");
         assert_eq!(super::action_endpoint(&terminal), None);
-        assert_eq!(controller.terminal_slot_resolution_at(slot), Some(terminal_at));
+        assert_eq!(
+            controller.terminal_slot_resolution_at(slot),
+            Some(terminal_at)
+        );
         let current_clock = TestMonotonicNowOverride::fixed(started + Duration::from_secs(1));
         super::apply_action(
-            &mut [], &mut controller, None, &mut traces, supplied_at, terminal_at,
-            terminal, false, None,
+            &mut [],
+            &mut controller,
+            None,
+            &mut traces,
+            supplied_at,
+            terminal_at,
+            terminal,
+            false,
+            None,
         )
         .expect("serialize unchanged outgoing action");
         drop(current_clock);
         drop(traces);
         let schedule = fs::read_to_string(output.join("schedule.csv")).expect("schedule");
-        let fields: Vec<_> = schedule.lines().nth(1).expect("terminal row").split(',').collect();
+        let fields: Vec<_> = schedule
+            .lines()
+            .nth(1)
+            .expect("terminal row")
+            .split(',')
+            .collect();
         assert_eq!(fields[1], "outgoing");
         assert_eq!(fields[4], "100");
         assert_eq!(fields[5], "missed");
@@ -42941,6 +43113,855 @@ mod tests {
         assert_eq!(
             super::application_response_length_hint(&spec, &spec.workload.resources[0]),
             Some(128)
+        );
+    }
+
+    #[test]
+    fn http3_failure_reset_diagnostic_preserves_error_local_and_request_identity() {
+        let mut record = application(None, false);
+        record.resource_id = 9;
+        record.role = QcsdRequestRole::Chaff {
+            resource_id: 9,
+            request_id: Some(QcsdChaffRequestId(4)),
+        };
+        let before = format!("{record:?}");
+        for (local, error, perspective) in [
+            (false, 0x10b, "remote-close-or-goaway-rejection"),
+            (true, 0x101, "local-receive-error"),
+        ] {
+            let event = neqo_http3::Http3ClientEvent::Reset {
+                stream_id: neqo_transport::StreamId::new(36),
+                error,
+                local,
+            };
+            let value = serde_json::to_value(
+                super::http3_event_diagnostic(QcsdEndpointId(7), &event, Some(&record), None)
+                    .expect("typed reset is observed"),
+            )
+            .expect("serialize diagnostic");
+            assert_eq!(value["kind"], "reset");
+            assert_eq!(value["source"], "http3-client-event-reset-v1");
+            assert_eq!(value["schema_version"], 1);
+            assert_eq!(value["endpoint_id"], 7);
+            assert_eq!(value["stream_id"], 36);
+            assert_eq!(value["app_error_code"], error);
+            assert_eq!(value["local"], local);
+            assert_eq!(value["perspective"], perspective);
+            assert_eq!(value["resource_id"], 9);
+            assert_eq!(value["request_id"], 4);
+            assert!(value["status"].is_null());
+            assert_eq!(value["received_body_bytes"], 0);
+            assert_eq!(value["complete"], false);
+            assert!(value.get("wire_reset_proven").is_none());
+            assert_eq!(format!("{record:?}"), before);
+        }
+        let event = neqo_http3::Http3ClientEvent::Reset {
+            stream_id: neqo_transport::StreamId::new(40),
+            error: 0x10b,
+            local: false,
+        };
+        let value = serde_json::to_value(
+            super::http3_event_diagnostic(QcsdEndpointId(7), &event, None, None)
+                .expect("unknown stream remains observable"),
+        )
+        .expect("serialize unknown stream");
+        for field in [
+            "resource_id",
+            "request_id",
+            "role",
+            "status",
+            "received_body_bytes",
+            "complete",
+        ] {
+            assert!(value[field].is_null(), "unknown identity field {field}");
+        }
+    }
+
+    #[test]
+    fn http3_failure_diagnostic_ignores_ordinary_fin_and_unrelated_events() {
+        let fin = neqo_http3::Http3ClientEvent::HeaderReady {
+            stream_id: neqo_transport::StreamId::new(0),
+            headers: vec![neqo_common::Header::new(":status", "200")],
+            interim: false,
+            fin: true,
+        };
+        for event in [fin, neqo_http3::Http3ClientEvent::RequestsCreatable] {
+            assert!(super::http3_event_diagnostic(QcsdEndpointId(0), &event, None, None).is_none());
+        }
+    }
+
+    #[test]
+    fn http3_failure_goaway_diagnostic_uses_only_the_supplied_latest_state() {
+        let event = neqo_http3::Http3ClientEvent::GoawayReceived;
+        for (state, expected) in [
+            (
+                neqo_http3::Http3State::GoingAway(neqo_transport::StreamId::new(8)),
+                Some(8_u64),
+            ),
+            (
+                neqo_http3::Http3State::GoingAway(neqo_transport::StreamId::new(4)),
+                Some(4_u64),
+            ),
+            (neqo_http3::Http3State::Connected, None),
+        ] {
+            let value = serde_json::to_value(
+                super::http3_event_diagnostic(QcsdEndpointId(0), &event, None, Some(&state))
+                    .expect("typed GOAWAY is observed"),
+            )
+            .expect("serialize GOAWAY");
+            assert_eq!(value["kind"], "goaway_received");
+            assert_eq!(value["latest_going_away_cutoff_stream_id"], json!(expected));
+            assert_eq!(
+                value["cutoff_semantics"],
+                "latest-http3-state-at-event-drain"
+            );
+            assert_eq!(value["exact_per_frame_cutoff"], false);
+            assert!(value.get("app_error_code").is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http3_failure_diagnostics_are_failure_only_and_preserve_primary_error() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("http3-failure-render-component");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoints =
+            create_endpoints(&spec, started, &clock).expect("actual endpoint objects");
+        let scheduler = super::process_scheduler_evidence().expect("actual scheduler metadata");
+        let completion = RunCompletion {
+            ended_unix_ns: Some(1),
+            status: "complete",
+            error: None,
+            error_class: None,
+            defense_start_monotonic_ns: None,
+            application_completion_monotonic_ns: None,
+            defense_diagnostics: None,
+            runner_wakeup_metrics: None,
+            terminal_primary_partial_cell: None,
+        };
+        let before =
+            super::render_run_json(&spec, &endpoints, &[], &[], &scheduler, &[], 0, &completion);
+        let event = neqo_http3::Http3ClientEvent::Reset {
+            stream_id: neqo_transport::StreamId::new(36),
+            error: 0x10b,
+            local: false,
+        };
+        endpoints[0].http3_failure_diagnostics.push(
+            super::http3_event_diagnostic(QcsdEndpointId(0), &event, None, None)
+                .expect("component DTO"),
+        );
+        let after =
+            super::render_run_json(&spec, &endpoints, &[], &[], &scheduler, &[], 0, &completion);
+        assert_eq!(after, before, "successful run JSON is byte-identical");
+        let failure = RunCompletion {
+            status: "error",
+            error: Some("original failure"),
+            error_class: Some("original-error-class"),
+            ..completion
+        };
+        let raw = super::render_run_json(&spec, &endpoints, &[], &[], &scheduler, &[], 0, &failure);
+        let value: serde_json::Value = serde_json::from_slice(&raw).expect("failure DTO");
+        assert_eq!(value["completion_status"], "error");
+        assert_eq!(value["error"], "original failure");
+        assert_eq!(value["error_class"], "original-error-class");
+        assert_eq!(
+            value["http3_failure_diagnostics"]["observations_only"],
+            true
+        );
+        assert_eq!(
+            value["http3_failure_diagnostics"]["entries"][0]["app_error_code"],
+            0x10b
+        );
+        assert_eq!(value["responses"], json!([]));
+        assert_eq!(value["chaff_responses"], json!([]));
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("remove component directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http3_failure_diagnostics_follow_real_peer_reset_and_fin_without_reclassification() {
+        for reset in [true, false] {
+            let output = trace_output_dir(if reset {
+                "http3-real-reset"
+            } else {
+                "http3-real-fin"
+            });
+            let started = test_fixture::now();
+            let clock = QcsdObservationClock::new(started);
+            let spec = application_stream_limit_spec(
+                output.clone(),
+                vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+            );
+            let (mut endpoint, mut server) = connected_runner_endpoint_with_server_config(
+                &output,
+                started,
+                &clock,
+                QcsdEndpointId(0),
+                4_433,
+                QcsdConfig::default(),
+            );
+            let stream =
+                open_controlled_runner_stream(&mut endpoint, &mut server, started, 4_433, 1);
+            let request = super::ApplicationRequest {
+                resource_id: 1,
+                url: "https://127.0.0.1:4433/controlled"
+                    .parse()
+                    .expect("actual requested URL"),
+                headers: Vec::new(),
+                expected_response_length: Some(1),
+            };
+            endpoint.streams.insert(
+                stream,
+                super::application_record(&request, QcsdRequestRole::Application, "in_flight"),
+            );
+            let response = server
+                .events()
+                .find_map(|event| match event {
+                    neqo_http3::Http3ServerEvent::Headers {
+                        stream: response, ..
+                    } if response.stream_id() == stream => Some(response),
+                    _ => None,
+                })
+                .expect("real server received the actual request");
+            if reset {
+                response
+                    .stream_reset_send(0x10b)
+                    .expect("real peer RESET_STREAM");
+            } else {
+                response
+                    .send_headers(&[
+                        neqo_common::Header::new(":status", "200"),
+                        neqo_common::Header::new("content-length", "1"),
+                    ])
+                    .expect("actual response headers");
+                assert_eq!(response.send_data(b"x", started).expect("actual body"), 1);
+                response.stream_close_send(started).expect("actual FIN");
+            }
+            test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+            let mut traces = TraceFiles::new(&output, started).expect("real trace writer");
+            handle_http_events(&mut endpoint, &spec, started, &mut traces, None)
+                .expect("original HTTP reducer");
+            assert_eq!(endpoint.completed.len(), 1);
+            let record = &endpoint.completed[0];
+            assert_eq!(record.complete, !reset);
+            assert_eq!(record.outcome, if reset { "reset" } else { "succeeded" });
+            assert_eq!(endpoint.http3_failure_diagnostics.len(), usize::from(reset));
+            assert!(endpoint.client.qcsd_timestamped_observations().iter().any(|observation| {
+                matches!(observation.observation(), QcsdObservation::StreamFinished { stream: observed, finish, .. }
+                    if observed.0 == stream.as_u64() && *finish == if reset { QcsdStreamFinish::Reset } else { QcsdStreamFinish::Fin })
+            }), "actual producer keeps RESET and FIN distinct");
+            if reset {
+                let value = serde_json::to_value(&endpoint.http3_failure_diagnostics[0])
+                    .expect("diagnostic");
+                assert_eq!(value["app_error_code"], 0x10b);
+                assert_eq!(value["local"], false);
+                assert_eq!(value["resource_id"], 1);
+                assert!(value["status"].is_null());
+                assert_eq!(value["received_body_bytes"], 0);
+            }
+            traces.flush_events().expect("flush original events");
+            drop(traces);
+            let events = fs::read_to_string(output.join("events.csv")).expect("actual trace bytes");
+            assert_eq!(events.contains(",http3_reset,reset,"), reset);
+            drop(response);
+            drop(endpoint);
+            drop(server);
+            fs::remove_dir_all(output).expect("remove protocol fixture directory");
+        }
+    }
+
+    // Component observations below model legal adapter inputs; no socket,
+    // live response qualification, raw-session acceptance or credit is claimed.
+    // The small raw frontier428 preserves Toiimg's exact412/788 allocation
+    // split without privately seeding the captured140929-byte prefix.
+    fn observed_application_extent_spec() -> RunSpec {
+        let mut spec = buflo_cadence64_bound_spec();
+        let mut source = variable_primary_document_source();
+        source["resources"][1]["known_valid"] = json!(true);
+        source["resources"][1]["depends_on"] = json!([]);
+        source["resources"][1]["content_length"] = json!(147_911);
+        source["resources"][1]["data_length"] = json!(147_911);
+        source["preparation"]["expected_responses"][1]["status"] = json!(200);
+        source["preparation"]["expected_responses"][1]["bytes"] = json!(147_911);
+        source["preparation"]["buflo_incoming_credit_release_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::CADENCE64_ACK_START_NAME);
+        source["preparation"]["buflo_kernel_preparation_policy"] =
+            json!(super::BufloIncomingCreditReleasePolicy::CADENCE64_PREPARATION_RESERVE_NAME);
+        source["preparation"]["qualified_chaff_origin_policy"] =
+            json!("prepared-approved-origins-v1");
+        source["preparation"]["approved_origins"] =
+            json!(["https://example.com", "https://api.example.com"]);
+        let output = trace_output_dir("observed-application-extent-source");
+        let path = output.join("prepared.json");
+        let raw = serde_json::to_vec(&source).expect("prepared source bytes");
+        fs::write(&path, &raw).expect("write exact prepared source");
+        let bound =
+            super::load_application_workload_source(&path).expect("actual typed source loader");
+        assert_eq!(bound.1, sha256(&raw).expect("exact source hash"));
+        spec.workload = bound.0.clone();
+        spec.application_workload_source = Some(bound);
+        spec.workload_hash =
+            sha256(&serde_json::to_vec(&spec.workload).expect("frozen workload bytes"))
+                .expect("workload hash");
+        super::validate_buflo_incoming_credit_release_policy(&spec)
+            .expect("genuine current source/parameter/policy binding");
+        fs::remove_dir_all(output).expect("parsed immutable source retained");
+        spec
+    }
+
+    fn observed_application_extent_outgoing(
+        controller: &mut QcsdController,
+        actions: &[QcsdAction],
+        at: Duration,
+    ) {
+        let mut count = 0;
+        for action in actions {
+            if let QcsdAction::SendPacket {
+                endpoint,
+                packet,
+                slot,
+                ..
+            }
+            | QcsdAction::CommitPrearmedPacket {
+                endpoint,
+                packet,
+                slot,
+                ..
+            } = action
+            {
+                assert_eq!(packet.direction(), Direction::Outgoing);
+                assert_eq!(packet.length(), 1_200);
+                assert_eq!(packet.timestamp(), at);
+                controller.observe(
+                    QcsdObservation::SlotSatisfied {
+                        endpoint: *endpoint,
+                        slot: *slot,
+                        observed_size: packet.length(),
+                    },
+                    at,
+                );
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "one actual controller-produced outgoing cell");
+        controller.flush_defense_observations();
+    }
+
+    fn observed_application_extent_controller(
+        content_length: bool,
+        acknowledged: bool,
+        headers_observed: bool,
+    ) -> (QcsdController, u64) {
+        let spec = observed_application_extent_spec();
+        let source = spec.application_workload_source.as_ref().expect("source");
+        let prepared_bytes = source.2[&1].bytes;
+        let source_hash = source.1.clone();
+        assert_eq!(prepared_bytes, 147_911);
+        let hint = super::application_response_length_hint(&spec, &spec.workload.resources[1]);
+        let parameters = spec
+            .defense_parameters
+            .as_ref()
+            .expect("parameters")
+            .buflo_parameters
+            .clone()
+            .expect("parsed fixed BuFLO parameters");
+        let config = QcsdConfig {
+            initial_max_stream_data: 16,
+            max_stream_data_excess: 1_000,
+            low_watermark: 24_000,
+            max_chaff_streams: 1,
+            ..spec.config.clone()
+        };
+        let resource = Resource {
+            id: 9,
+            url: "https://api.example.com/chaff".into(),
+            kind: "Other".into(),
+            content_length: Some(2_000),
+            data_length: 2_000,
+            chaff_priority: true,
+            known_valid: true,
+            depends_on: Vec::new(),
+            headers: Vec::new(),
+        };
+        let mut controller = QcsdController::with_defense(
+            config,
+            Some(ResourceManifest {
+                resources: vec![resource],
+            }),
+            Box::new(neqo_csdef::Buflo::from_parameters(parameters)),
+        )
+        .expect("real fixed-cadence controller");
+        controller
+            .enable_buflo_half_period_incoming_window_for_interval(64_000)
+            .expect("same strict32ms incoming window");
+        controller
+            .enable_buflo_acknowledged_incoming_startup()
+            .expect("actual original ACK startup");
+        let endpoint = QcsdEndpointId(1);
+        let application = QcsdStreamId(40);
+        let chaff = QcsdStreamId(44);
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint,
+                origin: "https://api.example.com".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: application,
+                role: QcsdRequestRole::Application,
+                expected_response_length: hint,
+            },
+            Duration::ZERO,
+        );
+        let prefix = if content_length { 11 } else { 8 };
+        controller.poll(Duration::ZERO);
+        let first: Vec<_> = controller.drain_actions().collect();
+        let request_id = first
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::RequestChaff { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .expect("actual controller-issued chaff request");
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 9,
+            request_id: Some(request_id),
+        };
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: chaff,
+                role,
+                expected_response_length: None,
+            },
+            Duration::ZERO,
+        );
+        let first_slot = first
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::SendPacket { slot, .. } => Some(*slot),
+                _ => None,
+            })
+            .expect("actual first outgoing owner");
+        for (stream, role) in [(application, QcsdRequestRole::Application), (chaff, role)] {
+            controller.observe(
+                QcsdObservation::StreamDataTransmitted {
+                    endpoint,
+                    stream,
+                    role,
+                    offset: 0,
+                    bytes: 100,
+                    fin: true,
+                    slot: Some(first_slot),
+                },
+                Duration::ZERO,
+            );
+        }
+        observed_application_extent_outgoing(&mut controller, &first, Duration::ZERO);
+        if headers_observed {
+            let headers = if content_length { 8 } else { 5 };
+            let body = 428 - prefix;
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: application,
+                    bytes: headers,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint,
+                    stream: application,
+                    frame_bytes: headers,
+                    status: Some(200),
+                    content_length: content_length.then_some(body),
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: application,
+                    bytes: 3,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::DataFrame {
+                    endpoint,
+                    stream: application,
+                    frame_header_bytes: 3,
+                    data_bytes: body,
+                },
+                Duration::ZERO,
+            );
+        }
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: chaff,
+                bytes: 5,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint,
+                stream: chaff,
+                frame_bytes: 5,
+                status: Some(200),
+                content_length: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: chaff,
+                bytes: 3,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream: chaff,
+                frame_header_bytes: 3,
+                data_bytes: 2_000,
+            },
+            Duration::ZERO,
+        );
+        if acknowledged {
+            controller.observe(
+                QcsdObservation::StreamDataAcknowledged {
+                    endpoint,
+                    stream: chaff,
+                    role,
+                    offset: 0,
+                    bytes: 100,
+                    fin: true,
+                },
+                Duration::from_micros(63_999),
+            );
+        }
+        controller.poll(Duration::from_micros(64_000));
+        let second: Vec<_> = controller.drain_actions().collect();
+        observed_application_extent_outgoing(
+            &mut controller,
+            &second,
+            Duration::from_micros(64_000),
+        );
+        assert_eq!(source.1, source_hash);
+        assert_eq!(source.2[&1].bytes, prepared_bytes);
+        assert_eq!(spec.workload.resources[1].effective_length(), 147_911);
+        (controller, if headers_observed { prefix } else { 0 })
+    }
+
+    fn observed_application_extent_cell(
+        controller: &mut QcsdController,
+    ) -> (Vec<QcsdAction>, QcsdSlotId, u64, u64) {
+        let at = Duration::from_micros(128_000);
+        controller.poll(at);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        observed_application_extent_outgoing(controller, &actions, at);
+        let mut slot = None;
+        let (mut app_limit, mut chaff_limit) = (16, 16);
+        for action in &actions {
+            if let QcsdAction::IncreaseReceiveLimit {
+                endpoint,
+                stream,
+                absolute_limit,
+                packet,
+                slot: actual_slot,
+            } = action
+            {
+                assert_eq!(*endpoint, QcsdEndpointId(1));
+                assert_eq!(packet.direction(), Direction::Incoming);
+                assert_eq!(packet.timestamp(), at);
+                assert_eq!(packet.length(), 1_200);
+                if let Some(previous) = slot {
+                    assert_eq!(previous, *actual_slot);
+                }
+                slot = Some(*actual_slot);
+                match stream.0 {
+                    40 => app_limit = *absolute_limit,
+                    44 => chaff_limit = *absolute_limit,
+                    _ => panic!("unexpected owner"),
+                }
+                controller.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: *endpoint,
+                        stream: *stream,
+                        absolute_limit: *absolute_limit,
+                        slot: Some(*actual_slot),
+                    },
+                    at + Duration::from_micros(1),
+                );
+            }
+        }
+        (
+            actions,
+            slot.expect("actual scheduled incoming cell"),
+            app_limit,
+            chaff_limit,
+        )
+    }
+
+    #[test]
+    fn buflo_current_shorter_nonprimary_fin_keeps_exact_cell_with_chaff() {
+        for content_length in [false, true] {
+            let (mut controller, prefix) =
+                observed_application_extent_controller(content_length, true, true);
+            let (_, slot, app_limit, chaff_limit) =
+                observed_application_extent_cell(&mut controller);
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(40),
+                    bytes: 428 - prefix,
+                },
+                Duration::from_micros(128_002),
+            );
+            controller.observe(
+                QcsdObservation::StreamFinished {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(40),
+                    finish: QcsdStreamFinish::Fin,
+                },
+                Duration::from_micros(128_002),
+            );
+            controller.flush_defense_observations();
+            let mut terminal: Vec<_> = controller.drain_actions().collect();
+            if chaff_limit > 16 {
+                assert!(!terminal.iter().any(|action| matches!(action,
+                    QcsdAction::SlotSatisfied { slot: candidate, .. } if *candidate == slot)));
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint: QcsdEndpointId(1),
+                        stream: QcsdStreamId(44),
+                        bytes: chaff_limit - 8,
+                    },
+                    Duration::from_micros(128_003),
+                );
+            }
+            controller.flush_defense_observations();
+            terminal.extend(controller.drain_actions());
+            let diagnostics = controller.defense_diagnostics();
+            // Intended original-production RED: old hint grants app1216 and
+            // normal FIN retires788, despite enough peer-ACKed chaff capacity.
+            assert_eq!(
+                diagnostics.scheduled_incoming_retired_bytes, 0,
+                "prepared body estimate must not overgrant a shorter current response"
+            );
+            assert_eq!((app_limit - 16, chaff_limit - 16), (412, 788));
+            assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 1_200);
+            assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 1_200);
+            assert_eq!(diagnostics.buflo_missed_incoming_cells, 0);
+            assert!(controller.terminal_failure().is_none());
+            assert!(controller.terminal_primary_partial_cell().is_none());
+            assert_eq!(
+                terminal
+                    .iter()
+                    .filter(|action| matches!(action,
+                QcsdAction::SlotSatisfied { slot: candidate, .. } if *candidate == slot))
+                    .count(),
+                1
+            );
+            assert!(!terminal.iter().any(|action| matches!(
+                action,
+                QcsdAction::SlotMissed { .. } | QcsdAction::CancelChaff { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn buflo_current_observed_extent_keeps_ack_start_and_atomic_capacity_guards() {
+        let (mut unacknowledged, _) = observed_application_extent_controller(false, false, true);
+        unacknowledged.poll(Duration::from_micros(128_000));
+        let actions: Vec<_> = unacknowledged.drain_actions().collect();
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::SlotMissed { .. }
+        )));
+        assert!(
+            !unacknowledged
+                .defense_diagnostics()
+                .buflo_incoming_startup
+                .expect("startup")
+                .armed
+        );
+
+        let (mut insufficient, _) = observed_application_extent_controller(false, true, true);
+        insufficient.observe(
+            QcsdObservation::StreamFinished {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(44),
+                finish: QcsdStreamFinish::Reset,
+            },
+            Duration::from_micros(64_001),
+        );
+        insufficient.poll(Duration::from_micros(128_000));
+        let actions: Vec<_> = insufficient.drain_actions().collect();
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::IncreaseReceiveLimit { .. }))
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(
+                    action,
+                    QcsdAction::SlotMissed {
+                        reason: MissedSlotReason::InsufficientIncomingCapacity,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(insufficient.terminal_failure().is_some());
+    }
+
+    #[test]
+    fn buflo_current_observed_extent_does_not_waive_postadvertisement_reset() {
+        let (mut controller, _) = observed_application_extent_controller(false, true, true);
+        let (_, slot, _, chaff_limit) = observed_application_extent_cell(&mut controller);
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(40),
+                finish: QcsdStreamFinish::Reset,
+            },
+            Duration::from_micros(128_002),
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(44),
+                bytes: chaff_limit - 8,
+            },
+            Duration::from_micros(128_003),
+        );
+        controller.flush_defense_observations();
+        let terminal: Vec<_> = controller.drain_actions().collect();
+        assert!(controller.terminal_failure().is_some());
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_retired_bytes,
+            412
+        );
+        assert_eq!(terminal.iter().filter(|action| matches!(action,
+            QcsdAction::SlotMissed { slot: candidate, reason: MissedSlotReason::ReceiveCreditRetired, .. }
+                if *candidate == slot)).count(), 1);
+        assert!(!terminal.iter().any(|action| matches!(action,
+            QcsdAction::SlotSatisfied { slot: candidate, .. } if *candidate == slot)));
+    }
+
+    #[test]
+    fn buflo_current_observed_extent_keeps_actual_bounded_preheader_bootstrap() {
+        let (mut controller, _) = observed_application_extent_controller(false, true, false);
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(40),
+                blocked_at: 16,
+            },
+            Duration::from_micros(64_001),
+        );
+        let leases: Vec<_> = controller
+            .drain_actions()
+            .filter(|action| {
+                matches!(action,
+            QcsdAction::LeaseParserReceive { stream, .. } if *stream == QcsdStreamId(40))
+            })
+            .collect();
+        assert_eq!(leases.len(), 1);
+        assert!(matches!(
+            leases[0],
+            QcsdAction::LeaseParserReceive {
+                absolute_limit: 1_000,
+                increase: 984,
+                owner: None,
+                ..
+            }
+        ));
+        controller.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(40),
+                absolute_limit: 1_000,
+                slot: None,
+            },
+            Duration::from_micros(64_002),
+        );
+        controller.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(40),
+                blocked_at: 1_000,
+            },
+            Duration::from_micros(64_003),
+        );
+        assert!(!controller.drain_actions().any(|action| matches!(action,
+            QcsdAction::LeaseParserReceive { stream, .. } if stream == QcsdStreamId(40))));
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_requested_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn buflo_current_observed_extent_hint_preserves_legacy_other_modes_and_zero_cap() {
+        let mut spec = observed_application_extent_spec();
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[0]),
+            Some(1)
+        );
+        for defense in [
+            DefenseConfig::None,
+            DefenseConfig::Front(FrontConfig::default()),
+            DefenseConfig::Tamaraw(TamarawConfig::default()),
+            DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+                parameters: "unused.json".into(),
+            }),
+        ] {
+            spec.config.defense = defense;
+            assert_eq!(
+                super::application_response_length_hint(&spec, &spec.workload.resources[1]),
+                Some(147_911)
+            );
+        }
+        spec = observed_application_extent_spec();
+        spec.application_workload_source.as_mut().expect("source").6 =
+            super::BufloIncomingCreditReleasePolicy::RapidV5HalfPeriodAckStartPreparationReserve;
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[1]),
+            Some(147_911)
+        );
+        spec.application_workload_source = None;
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[1]),
+            Some(147_911)
+        );
+        spec = observed_application_extent_spec();
+        spec.max_response_bytes = 0;
+        assert_eq!(
+            super::application_response_length_hint(&spec, &spec.workload.resources[1]),
+            None
         );
     }
 

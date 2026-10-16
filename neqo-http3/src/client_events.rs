@@ -598,6 +598,53 @@ mod tests {
 
     use super::{Http3ClientEvent, Http3ClientEvents};
 
+    // Real recv_closed producer semantics. This is not a malformed-wire proof;
+    // existing response_wo_status/response_w_101 tests supply that parser path.
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn http3_receive_close_diagnostic_source_keeps_fin_reset_and_local_error_distinct() {
+        use neqo_csdef::{QcsdEndpointId, QcsdObservation, QcsdObservationClock, QcsdStreamFinish};
+        use neqo_transport::StreamId;
+
+        use crate::{CloseType, Http3StreamInfo, Http3StreamType, RecvStreamEvents as _};
+        for (close, finish, public_reset) in [
+            (CloseType::Done, QcsdStreamFinish::Fin, None),
+            (
+                CloseType::ResetRemote(0x10b),
+                QcsdStreamFinish::Reset,
+                Some((false, 0x10b)),
+            ),
+            (
+                CloseType::LocalError(0x101),
+                QcsdStreamFinish::LocalError,
+                Some((true, 0x101)),
+            ),
+            (CloseType::ResetApp(0x10c), QcsdStreamFinish::Reset, None),
+        ] {
+            let mut events = Http3ClientEvents::default();
+            events.qcsd_enable(
+                QcsdEndpointId(3),
+                QcsdObservationClock::new(test_fixture::now()),
+            );
+            let stream = StreamId::new(0);
+            events.recv_closed(&Http3StreamInfo::new(stream, Http3StreamType::Http), close);
+            let observations = events.qcsd_timestamped_observations();
+            assert_eq!(observations.len(), 1);
+            assert!(
+                matches!(observations[0].observation(), QcsdObservation::StreamFinished { stream: observed, finish: actual, .. }
+                if observed.0 == stream.as_u64() && *actual == finish)
+            );
+            assert_eq!(
+                events.next_event(),
+                public_reset.map(|(local, error)| Http3ClientEvent::Reset {
+                    stream_id: stream,
+                    error,
+                    local
+                })
+            );
+        }
+    }
+
     #[test]
     fn has_events() {
         let events = Http3ClientEvents::default();
