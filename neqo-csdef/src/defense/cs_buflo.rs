@@ -1112,6 +1112,16 @@ impl Defense for CsBuflo {
         true
     }
 
+    fn accepts_new_chaff_requests(&self) -> bool {
+        // Both irreversible onLoad stop latches forbid future opportunities,
+        // even while already-advertised incoming cells are still draining.
+        // Pre-onLoad provisional stops retain the original replenisher.
+        !self.local_termination_latched
+            && !(self.application_complete()
+                && self.termination_stop_latched[OUTGOING]
+                && self.termination_stop_latched[INCOMING])
+    }
+
     fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
         Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
     }

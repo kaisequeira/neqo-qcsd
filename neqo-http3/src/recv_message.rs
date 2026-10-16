@@ -686,6 +686,32 @@ impl HttpRecvStream for RecvMessage {
         Ok(receive_state)
     }
 
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_cs_idle_initial_response(&mut self) -> Res<&'static str> {
+        if self.stream_type != Http3StreamType::Http
+            || self.message_type != MessageType::Response
+            || !self.blocked_push_promise.is_empty()
+            || self
+                .qpack_decoder
+                .borrow()
+                .is_stream_blocked(self.stream_id)
+            || self.qpack_decoder.borrow().has_pending_send()
+            || !matches!(&self.state,
+                RecvMessageState::WaitingForResponseHeaders { frame_reader }
+                    if frame_reader.qcsd_untouched_initial_frame())
+        {
+            return Err(Error::InvalidInput);
+        }
+        // No HEADERS/QPACK decoder has run. Do not read/discard buffered QUIC
+        // bytes and do not reset either protocol layer.
+        self.state = RecvMessageState::Closed;
+        self.conn_events.recv_closed(
+            &self.stream_info,
+            CloseType::LocalError(Error::HttpRequestCancelled.code()),
+        );
+        Ok("cs-untouched-initial-response")
+    }
+
     fn header_unblocked(
         &mut self,
         conn: &mut Connection,

@@ -221,6 +221,34 @@ impl Http3Client {
         })
     }
 
+    /// Separate complete-application CS policy for an untouched initial
+    /// response. All request-FIN/ACK, receive-owner and pending-output guards
+    /// remain strict. This returns unread/buffered facts, not a drained proof.
+    pub fn qcsd_abandon_cs_idle_initial_chaff(
+        &mut self,
+        stream_id: StreamId,
+        role: QcsdRequestRole,
+    ) -> Res<(
+        neqo_transport::recv_stream::QcsdIdleInitialReceive,
+        &'static str,
+    )> {
+        let receive = self
+            .conn
+            .qcsd_preview_cs_idle_initial_chaff_abandonment(stream_id, role)
+            .ok_or(Error::InvalidInput)?;
+        if self.qcsd_qpack_decoder_handler_pending()
+            || self.qcsd_qpack_decoder_transport_pending()
+            || self.qcsd_has_pending_stream_send()
+            || self.qcsd_has_pending_defense_control()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let state = self
+            .base_handler
+            .qcsd_abandon_cs_idle_initial_response(stream_id, &mut self.conn)?;
+        Ok((receive, state))
+    }
+
     /// Open a same-origin nonblocking-QPACK request for qualification without
     /// installing shaped transport stream roles.
     ///

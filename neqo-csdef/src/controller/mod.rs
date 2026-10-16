@@ -5020,13 +5020,31 @@ impl QcsdController {
             if mixed_service_eligible && self.buflo_chaff_service_turn == 5 {
                 // A service candidate must have consumed its exact advertised
                 // frontier and have no preceding unadvertised/owned work.
+                // A real peer may defer its initial response until the first
+                // scheduled credit. Require the existing strict pristine/ACK
+                // predicate rather than circularly requiring an initial read.
+                // All pending credit/claims/parser ownership checks below still
+                // apply, and the ordinary whole-cell staging owns the release.
+                let pristine_chaff: Vec<_> = self
+                    .scheduler
+                    .endpoints()
+                    .iter()
+                    .flat_map(|endpoint| {
+                        self.streams.pristine_terminal_chaff_opportunities(
+                            *endpoint,
+                            1_200,
+                            self.config.initial_max_stream_data,
+                        )
+                    })
+                    .map(|opportunity| (opportunity.endpoint, opportunity.stream))
+                    .collect();
                 let ready_chaff: Vec<_> = opportunities
                     .iter()
                     .filter(|o| {
                         let key = (o.endpoint, o.stream);
                         matches!(o.role, QcsdRequestRole::Chaff { .. })
                             && self.buflo_chaff_ack_observed_at.contains_key(&key)
-                            && self
+                            && (self
                                 .streams
                                 .receive_limits(o.endpoint, o.stream)
                                 .is_some_and(|(advertised, requested)| {
@@ -5034,6 +5052,7 @@ impl QcsdController {
                                         && self.streams.consumed(o.endpoint, o.stream)
                                             == Some(advertised)
                                 })
+                                || pristine_chaff.contains(&key))
                             && !self
                                 .control
                                 .credit

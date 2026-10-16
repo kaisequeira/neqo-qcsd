@@ -526,6 +526,13 @@ trait HttpRecvStream: RecvStream {
         Err(Error::InvalidInput)
     }
 
+    /// A separate CS terminal policy may drop only an untouched initial
+    /// ordinary response handler. Transport bytes and validation remain live.
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_cs_idle_initial_response(&mut self) -> Res<&'static str> {
+        Err(Error::InvalidInput)
+    }
+
     /// This function is similar to the receive function and has the same output, i.e.
     /// a `ReceiveOutput` enum and bool. The bool is true if the stream is completely done
     /// and can be forgotten, i.e. removed from all records.

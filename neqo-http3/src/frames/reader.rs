@@ -250,6 +250,17 @@ impl FrameReader {
                 if decoder.min_remaining() > 0)
     }
 
+    /// No byte of the initial frame has reached the HTTP/3 parser.
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn qcsd_untouched_initial_frame(&self) -> bool {
+        self.frame_type.0 == u64::MAX
+            && self.frame_len == 0
+            && self.qcsd_current_frame_bytes == 0
+            && self.qcsd_last_frame_bytes == 0
+            && self.qcsd_ignored_frame_bytes == 0
+            && !self.decoding_in_progress()
+    }
+
     #[cfg(feature = "qcsd")]
     pub(crate) const fn qcsd_last_frame_bytes(&self) -> u64 {
         self.qcsd_last_frame_bytes

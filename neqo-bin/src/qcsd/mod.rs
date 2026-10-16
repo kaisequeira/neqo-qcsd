@@ -19467,8 +19467,9 @@ fn abandon_buflo_terminal_chaff(
 }
 
 /// CS local ET retains its original stop/drain decision and application
-/// handoff. Only the fully drained exact chaff response is locally abandoned;
-/// no STOP/RESET/credit/QPACK output is introduced by this cleanup.
+/// handoff. Complete-application cleanup accepts either an exact drained
+/// response or the separately proved untouched initial sixteen-byte window;
+/// its unread QUIC bytes remain buffered. No STOP/RESET/credit/QPACK is queued.
 fn abandon_cs_buflo_terminal_chaff(
     endpoint: &mut Endpoint,
     controller: &QcsdController,
@@ -19511,9 +19512,45 @@ fn abandon_cs_buflo_terminal_chaff(
             "CS-BuFLO local abandonment targeted a completed or repeated response".into(),
         ));
     }
-    let proof = endpoint
+    let proof = match endpoint
         .client
-        .qcsd_abandon_cs_terminal_chaff(stream, record.role)?;
+        .qcsd_abandon_cs_terminal_chaff(stream, record.role)
+    {
+        Ok(proof) => proof,
+        Err(neqo_http3::Error::InvalidInput) => {
+            // This is a separate exact policy, not acceptance of an unchecked
+            // InvalidInput or a claim that an unread window was drained.
+            let (initial, state) = endpoint
+                .client
+                .qcsd_abandon_cs_idle_initial_chaff(stream, record.role)?;
+            return Ok(json!({
+                "policy": "cs_buflo_complete_app_idle_initial_response_local_abandon_v1",
+                "reason": "cs_buflo_local_early_termination",
+                "application_complete_at_local_abandonment": true,
+                "endpoint": endpoint.id.0, "stream": stream.as_u64(),
+                "resource_id": resource_id, "request_id": request_id.0,
+                "local_et_latched_at_us": diagnostics.cs_buflo_local_et_latched_at_us,
+                "before_application_complete": diagnostics.cs_buflo_local_et_before_application_complete,
+                "scheduled_incoming_unresolved_bytes": 0,
+                "encoded_receive_limit": initial.encoded_receive_limit,
+                "manual_receive_limit": initial.manual_receive_limit,
+                "consumed": initial.consumed, "retired": initial.retired,
+                "buffered_bytes": initial.buffered_bytes,
+                "contiguous_ready_bytes": initial.contiguous_ready_bytes,
+                "received_bytes": initial.received_bytes,
+                "initial_window_drained": false,
+                "transport_receive_bytes_retained": true,
+                "pending_receive_actions": 0,
+                "http3_response_headers_decoded": false,
+                "http3_receive_state": state,
+                "qpack_blocked": false, "qpack_decoder_pending": false,
+                "request_send_peer_confirmed": true,
+                "stop_sending_queued": false, "reset_stream_queued": false,
+                "receive_credit_increase": 0, "unshaped_data_bytes": 0,
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok(json!({
         "policy": "cs_buflo_stop_drain_then_guarded_local_http3_abandon_v1",
         "reason": "cs_buflo_local_early_termination",
@@ -26349,7 +26386,10 @@ fn cs_buflo_terminal_local_abandonment_proof(
     let diagnostics = diagnostics?;
     Some(json!({
         "schema_version": 1,
-        "policy": "cs_buflo_stop_drain_then_guarded_local_http3_abandon_v1",
+        "policy": if endpoints.iter().flat_map(|endpoint| endpoint.terminal_local_abandonments.iter())
+            .any(|entry| entry["policy"] == "cs_buflo_complete_app_idle_initial_response_local_abandon_v1") {
+                "cs_buflo_complete_app_drained_or_idle_initial_local_abandon_v2"
+            } else { "cs_buflo_stop_drain_then_guarded_local_http3_abandon_v1" },
         "reason": "cs_buflo_local_early_termination",
         "observer_effect": "local_http3_abandonment_without_stop_sending_reset_stream_receive_credit_or_qpack_cancellation",
         "local_et_latched_at_us": diagnostics.cs_buflo_local_et_latched_at_us,

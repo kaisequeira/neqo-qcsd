@@ -677,6 +677,21 @@ pub struct QcsdDrainedReceive {
     pub buffered_bytes: u64,
 }
 
+/// Separate read-only CS terminal fact: the initial sixteen-byte window has
+/// never been read by HTTP/3. Buffered/gapped bytes remain owned by QUIC; this
+/// is explicitly not a drained-window, FIN, RESET or receive-credit receipt.
+#[cfg(feature = "qcsd")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QcsdIdleInitialReceive {
+    pub encoded_receive_limit: u64,
+    pub manual_receive_limit: u64,
+    pub consumed: u64,
+    pub retired: u64,
+    pub buffered_bytes: u64,
+    pub contiguous_ready_bytes: u64,
+    pub received_bytes: u64,
+}
+
 impl Stats {
     #[must_use]
     pub const fn new(bytes_received: u64, bytes_read: u64) -> Self {
@@ -1183,6 +1198,35 @@ impl RecvStream {
             && proof.encoded_receive_limit == proof.consumed
             && proof.encoded_receive_limit == proof.retired
             && proof.buffered_bytes == 0
+            && !fc.manual_frame_pending())
+        .then_some(proof)
+    }
+
+    /// Retain the exact untouched initial window without consuming or freeing
+    /// any transport bytes. Only the terminal CS caller may use this proof.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_idle_initial_manual_receive(&self) -> Option<QcsdIdleInitialReceive> {
+        let RecvStreamState::Recv { fc, recv_buf, .. } = &self.state else {
+            return None;
+        };
+        let proof = QcsdIdleInitialReceive {
+            encoded_receive_limit: fc.qcsd_encoded_limit(),
+            manual_receive_limit: fc.manual_limit()?,
+            consumed: fc.consumed(),
+            retired: fc.retired(),
+            buffered_bytes: recv_buf.buffered(),
+            contiguous_ready_bytes: u64::try_from(recv_buf.bytes_ready()).ok()?,
+            received_bytes: recv_buf.received(),
+        };
+        (proof.encoded_receive_limit == 16
+            && proof.manual_receive_limit == 16
+            && proof.retired == 0
+            && recv_buf.retired() == 0
+            && proof.consumed <= 16
+            && proof.received_bytes <= proof.consumed
+            && proof.buffered_bytes <= proof.received_bytes
+            && proof.contiguous_ready_bytes <= proof.buffered_bytes
             && !fc.manual_frame_pending())
         .then_some(proof)
     }

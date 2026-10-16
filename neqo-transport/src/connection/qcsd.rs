@@ -392,6 +392,43 @@ impl Connection {
             .qcsd_drained_manual_receive()
     }
 
+    /// Preview a separate CS untouched initial response, preserving all QUIC bytes.
+    /// The live QUIC receive half and its encoded flow-control ceiling remain
+    /// unchanged, including validation of any later STREAM or RESET frame.
+    #[must_use]
+    pub fn qcsd_preview_cs_idle_initial_chaff_abandonment(
+        &self,
+        stream: StreamId,
+        role: QcsdRequestRole,
+    ) -> Option<crate::recv_stream::QcsdIdleInitialReceive> {
+        if !matches!(
+            role,
+            QcsdRequestRole::Chaff {
+                request_id: Some(_),
+                ..
+            }
+        ) || self.qcsd_stream_roles.get(&stream) != Some(&role)
+            || !self.streams.qcsd_send_stream_fin_peer_confirmed(stream)
+            || self
+                .qcsd_pending_receive_actions
+                .iter()
+                .any(|pending| pending.identity.stream().0 == stream.as_u64())
+            || self
+                .qcsd_pending_receive_credit
+                .iter()
+                .any(|credit| credit.stream == stream)
+            || self
+                .qcsd_unacked_defense_receive_limits
+                .contains_key(&stream)
+            || self.streams.qcsd_local_et_cancellation_controls(stream) != (false, false)
+        {
+            return None;
+        }
+        self.streams
+            .qcsd_get_recv_stream(stream)?
+            .qcsd_idle_initial_manual_receive()
+    }
+
     pub(super) fn qcsd_observe_stream_transmissions(&mut self, tokens: &recovery::Tokens) {
         let slot = self.qcsd_active_target.map(|target| target.slot);
         let transmissions: Vec<_> = tokens
