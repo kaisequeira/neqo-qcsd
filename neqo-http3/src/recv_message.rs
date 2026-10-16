@@ -712,6 +712,31 @@ impl HttpRecvStream for RecvMessage {
         Ok("cs-untouched-initial-response")
     }
 
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_cs_parser_allowance_response(&mut self) -> Res<&'static str> {
+        if self.stream_type != Http3StreamType::Http
+            || self.message_type != MessageType::Response
+            || !self.blocked_push_promise.is_empty()
+            || self
+                .qpack_decoder
+                .borrow()
+                .is_stream_blocked(self.stream_id)
+            || self.qpack_decoder.borrow().has_pending_send()
+            || !matches!(&self.state, RecvMessageState::WaitingForData { frame_reader }
+                if frame_reader.qcsd_at_frame_boundary())
+        {
+            return Err(Error::InvalidInput);
+        }
+        // No parser read, cancellation or transport mutation. The controller
+        // suffix and fresh QUIC offsets were checked by the distinct caller.
+        self.state = RecvMessageState::Closed;
+        self.conn_events.recv_closed(
+            &self.stream_info,
+            CloseType::LocalError(Error::HttpRequestCancelled.code()),
+        );
+        Ok("cs-unused-parser-allowance-at-frame-boundary")
+    }
+
     fn header_unblocked(
         &mut self,
         conn: &mut Connection,

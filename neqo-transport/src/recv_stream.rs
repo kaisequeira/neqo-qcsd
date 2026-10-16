@@ -677,6 +677,27 @@ pub struct QcsdDrainedReceive {
     pub buffered_bytes: u64,
 }
 
+/// Read-only CS terminal proof of an unused, controller-witnessed parser
+/// suffix. No unused byte is retired, read, granted or removed from QUIC.
+#[cfg(feature = "qcsd")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QcsdUnusedParserReceive {
+    /// Greatest offset physically advertised to the peer.
+    pub encoded_receive_limit: u64,
+    /// Current manual limit, unchanged and equal to the encoded ceiling.
+    pub manual_receive_limit: u64,
+    /// Current transport receive high-water mark.
+    pub consumed: u64,
+    /// Actual HTTP/3 read offset; excludes the unused suffix.
+    pub retired: u64,
+    /// Actual remaining transport buffer, required empty.
+    pub buffered_bytes: u64,
+    /// First unused byte, witnessed by the controller before closure.
+    pub unused_parser_start: u64,
+    /// Exclusive end of the same originally advertised parser lease.
+    pub unused_parser_end: u64,
+}
+
 /// Separate read-only CS terminal fact: the initial sixteen-byte window has
 /// never been read by HTTP/3. Buffered/gapped bytes remain owned by QUIC; this
 /// is explicitly not a drained-window, FIN, RESET or receive-credit receipt.
@@ -1198,6 +1219,43 @@ impl RecvStream {
             && proof.encoded_receive_limit == proof.consumed
             && proof.encoded_receive_limit == proof.retired
             && proof.buffered_bytes == 0
+            && !fc.manual_frame_pending())
+        .then_some(proof)
+    }
+
+    /// Match fresh receive state against an opaque, already recorded CS
+    /// parser suffix without mutating the live transport receive half.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_unused_parser_manual_receive(
+        &self,
+        witness: &neqo_csdef::CsBufloTerminalParserAllowance,
+    ) -> Option<QcsdUnusedParserReceive> {
+        let RecvStreamState::Recv { fc, recv_buf, .. } = &self.state else {
+            return None;
+        };
+        let proof = QcsdUnusedParserReceive {
+            encoded_receive_limit: fc.qcsd_encoded_limit(),
+            manual_receive_limit: fc.manual_limit()?,
+            consumed: fc.consumed(),
+            retired: fc.retired(),
+            buffered_bytes: recv_buf.buffered(),
+            unused_parser_start: witness.range_start(),
+            unused_parser_end: witness.range_end(),
+        };
+        let unused = proof
+            .unused_parser_end
+            .checked_sub(proof.unused_parser_start)?;
+        (unused > 0
+            && unused <= 16
+            && witness.consumed() == proof.unused_parser_start
+            && proof.encoded_receive_limit == proof.unused_parser_end
+            && proof.manual_receive_limit == proof.encoded_receive_limit
+            && proof.consumed == witness.consumed()
+            && proof.retired == proof.consumed
+            && recv_buf.retired() == proof.retired
+            && proof.buffered_bytes == 0
+            && recv_buf.bytes_ready() == 0
             && !fc.manual_frame_pending())
         .then_some(proof)
     }
@@ -2362,6 +2420,90 @@ mod tests {
         assert_eq!(stream.read(&mut [0; 1_763]).unwrap(), (1_763, false));
         assert!(stream.qcsd_drained_manual_receive().is_some());
         stream
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_cs_idle_initial_receive_keeps_unread_gap_and_encoded_ceiling() {
+        let make = || {
+            let session = Rc::new(RefCell::new(ReceiverFlowControl::new((), 65_536)));
+            let mut stream =
+                RecvStream::new(StreamId::new(348), 16, session, ConnectionEvents::default());
+            assert!(stream.qcsd_set_manual_limit(16));
+            stream
+        };
+        let empty = make();
+        let proof = empty.qcsd_idle_initial_manual_receive().unwrap();
+        assert_eq!(
+            (
+                proof.encoded_receive_limit,
+                proof.manual_receive_limit,
+                proof.consumed,
+                proof.retired,
+                proof.buffered_bytes
+            ),
+            (16, 16, 0, 0, 0)
+        );
+        assert!(empty.qcsd_drained_manual_receive().is_none());
+
+        let mut unread = make();
+        unread.inbound_stream_frame(false, 0, &[7; 16]).unwrap();
+        let proof = unread.qcsd_idle_initial_manual_receive().unwrap();
+        assert_eq!(
+            (
+                proof.consumed,
+                proof.retired,
+                proof.buffered_bytes,
+                proof.contiguous_ready_bytes,
+                proof.received_bytes
+            ),
+            (16, 0, 16, 16, 16)
+        );
+        assert_eq!(unread.qcsd_idle_initial_manual_receive(), Some(proof));
+        assert!(unread.qcsd_drained_manual_receive().is_none());
+        assert_eq!(unread.read(&mut [0; 1]).unwrap(), (1, false));
+        assert!(
+            unread.qcsd_idle_initial_manual_receive().is_none(),
+            "one actual read excludes idle policy"
+        );
+
+        let mut gap = make();
+        gap.inbound_stream_frame(false, 8, &[8; 8]).unwrap();
+        let proof = gap.qcsd_idle_initial_manual_receive().unwrap();
+        assert_eq!(
+            (
+                proof.consumed,
+                proof.retired,
+                proof.buffered_bytes,
+                proof.contiguous_ready_bytes,
+                proof.received_bytes
+            ),
+            (16, 0, 8, 0, 8)
+        );
+        assert_eq!(
+            gap.qcsd_idle_initial_manual_receive(),
+            Some(proof),
+            "preview cannot discard gapped bytes"
+        );
+        assert_eq!(
+            gap.inbound_stream_frame(false, 16, &[0]),
+            Err(Error::FlowControl)
+        );
+        assert_eq!(gap.reset(268, 17, 0), Err(Error::FlowControl));
+        assert_eq!(gap.qcsd_idle_initial_manual_receive(), Some(proof));
+        assert_eq!(
+            gap.reset(268, 16, 0),
+            Ok(true),
+            "legal final size still follows original validator"
+        );
+
+        let mut unadvertised = make();
+        assert!(unadvertised.qcsd_set_manual_limit(32));
+        assert!(unadvertised.qcsd_idle_initial_manual_receive().is_none());
+        assert_eq!(unadvertised.reset(268, 32, 0), Err(Error::FlowControl));
+        let mut final_known = make();
+        final_known.inbound_stream_frame(true, 0, &[0; 16]).unwrap();
+        assert!(final_known.qcsd_idle_initial_manual_receive().is_none());
     }
 
     #[cfg(feature = "qcsd")]

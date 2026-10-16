@@ -1956,6 +1956,28 @@ impl Http3Connection {
         Ok(receive_state)
     }
 
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_abandon_cs_parser_allowance_response(
+        &mut self,
+        stream_id: StreamId,
+        conn: &mut Connection,
+    ) -> Res<&'static str> {
+        if self.qpack_encoder.borrow().has_pending_send()
+            || self.qpack_decoder.borrow().has_pending_send()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let receive_state = self
+            .recv_streams
+            .get_mut(&stream_id)
+            .ok_or(Error::InvalidStreamId)?
+            .http_stream()
+            .ok_or(Error::InvalidInput)?
+            .qcsd_abandon_cs_parser_allowance_response()?;
+        drop(self.remove_recv_stream(stream_id, conn));
+        Ok(receive_state)
+    }
+
     fn remove_extended_connect(
         &mut self,
         wt: &Rc<RefCell<extended_connect::session::Session>>,

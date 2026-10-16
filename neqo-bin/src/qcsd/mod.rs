@@ -19518,6 +19518,42 @@ fn abandon_cs_buflo_terminal_chaff(
     {
         Ok(proof) => proof,
         Err(neqo_http3::Error::InvalidInput) => {
+            if let Some(witness) = controller.cs_buflo_terminal_parser_allowance(
+                endpoint.id,
+                neqo_csdef::QcsdStreamId(stream.as_u64()),
+            ) {
+                let (receive, state) = endpoint.client.qcsd_abandon_cs_parser_allowance_chaff(
+                    stream,
+                    record.role,
+                    &witness,
+                )?;
+                return Ok(json!({
+                    "policy": "cs_buflo_complete_app_witnessed_unused_parser_allowance_local_abandon_v1",
+                    "reason": "cs_buflo_local_early_termination",
+                    "application_complete_at_local_abandonment": true,
+                    "endpoint": endpoint.id.0, "stream": stream.as_u64(),
+                    "resource_id": resource_id, "request_id": request_id.0,
+                    "local_et_latched_at_us": diagnostics.cs_buflo_local_et_latched_at_us,
+                    "before_application_complete": diagnostics.cs_buflo_local_et_before_application_complete,
+                    "scheduled_incoming_unresolved_bytes": 0,
+                    "controller_consumed_at_close": witness.consumed(),
+                    "parser_allowance_range_start": witness.range_start(),
+                    "parser_allowance_range_end": witness.range_end(),
+                    "unused_parser_allowance_bytes": receive.unused_parser_end - receive.unused_parser_start,
+                    "encoded_receive_limit": receive.encoded_receive_limit,
+                    "manual_receive_limit": receive.manual_receive_limit,
+                    "consumed": receive.consumed, "retired": receive.retired,
+                    "buffered_bytes": receive.buffered_bytes,
+                    "transport_receive_bytes_retained": true,
+                    "pending_receive_actions": 0,
+                    "http3_response_headers_decoded": true,
+                    "http3_receive_state": state,
+                    "qpack_blocked": false, "qpack_decoder_pending": false,
+                    "request_send_peer_confirmed": true,
+                    "stop_sending_queued": false, "reset_stream_queued": false,
+                    "receive_credit_increase": 0, "unshaped_data_bytes": 0,
+                }));
+            }
             // This is a separate exact policy, not acceptance of an unchecked
             // InvalidInput or a claim that an unread window was drained.
             let (initial, state) = endpoint
@@ -26387,6 +26423,9 @@ fn cs_buflo_terminal_local_abandonment_proof(
     Some(json!({
         "schema_version": 1,
         "policy": if endpoints.iter().flat_map(|endpoint| endpoint.terminal_local_abandonments.iter())
+            .any(|entry| entry["policy"] == "cs_buflo_complete_app_witnessed_unused_parser_allowance_local_abandon_v1") {
+                "cs_buflo_complete_app_drained_idle_or_witnessed_parser_allowance_local_abandon_v3"
+            } else if endpoints.iter().flat_map(|endpoint| endpoint.terminal_local_abandonments.iter())
             .any(|entry| entry["policy"] == "cs_buflo_complete_app_idle_initial_response_local_abandon_v1") {
                 "cs_buflo_complete_app_drained_or_idle_initial_local_abandon_v2"
             } else { "cs_buflo_stop_drain_then_guarded_local_http3_abandon_v1" },
@@ -32698,6 +32737,1379 @@ mod tests {
             incoming_slot,
             release,
             tick_actions,
+        }
+    }
+
+    // Connected cleanup component, not a full20 or physical timing receipt.
+    // Every receive advertisement/byte/frame/ACK below comes from the real in-process
+    // H3 peer. Only the public ApplicationComplete premise is synthetic.
+    #[derive(Debug, Default)]
+    struct CsUnusedParserObserved {
+        raw: u64,
+        headers: Option<(u64, Option<u16>)>,
+        data: Vec<(u64, u64, u64)>,
+        advertisements: Vec<(u64, Option<QcsdSlotId>)>,
+        progress: Vec<(u64, u64, bool)>,
+    }
+
+    fn cs_unused_parser_parameters() -> neqo_csdef::CsBufloParameters {
+        neqo_csdef::CsBufloParameters {
+            schema_version: 1,
+            packet_size: 600,
+            initial_interval_us: 8_192,
+            minimum_interval_us: 4_096,
+            maximum_interval_us: 32_768,
+            initial_adaptation_boundary_bytes: 16_384,
+            quiet_time_us: 2_000_000,
+            outgoing_padding_mode: neqo_csdef::CsBufloPaddingMode::Payload,
+            incoming_padding_mode: neqo_csdef::CsBufloPaddingMode::Payload,
+            timing_sample_limit: 1_000,
+            jitter_denominator: 100,
+            jitter_max_numerator: 200,
+            early_termination: neqo_csdef::CsBufloEarlyTermination::Local,
+            max_events: 1_000,
+            implementation_scope: neqo_csdef::QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        }
+    }
+
+    fn cs_unused_parser_reduce_actual(
+        endpoint: &mut super::Endpoint,
+        controller: &mut QcsdController,
+        stream: neqo_transport::StreamId,
+        elapsed: Duration,
+        observed: &mut CsUnusedParserObserved,
+    ) {
+        for record in endpoint.client.qcsd_timestamped_observations() {
+            let observation = record.into_observation();
+            match &observation {
+                QcsdObservation::BytesRead {
+                    stream: s, bytes, ..
+                } if s.0 == stream.as_u64() => observed.raw += *bytes,
+                QcsdObservation::ResponseHeaders {
+                    stream: s,
+                    frame_bytes,
+                    status,
+                    ..
+                } if s.0 == stream.as_u64() => observed.headers = Some((*frame_bytes, *status)),
+                QcsdObservation::DataFrame {
+                    stream: s,
+                    frame_header_bytes,
+                    data_bytes,
+                    ..
+                } if s.0 == stream.as_u64() => {
+                    observed
+                        .data
+                        .push((observed.raw, *frame_header_bytes, *data_bytes));
+                }
+                QcsdObservation::ReceiveLimitAdvertised {
+                    stream: s,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if s.0 == stream.as_u64() => {
+                    observed.advertisements.push((*absolute_limit, *slot));
+                }
+                QcsdObservation::HeaderProgress {
+                    stream: s,
+                    min_remaining,
+                    awaiting_data_frame,
+                    ..
+                } if s.0 == stream.as_u64() => {
+                    observed
+                        .progress
+                        .push((observed.raw, *min_remaining, *awaiting_data_frame));
+                }
+                _ => {}
+            }
+            controller.observe(observation, elapsed);
+        }
+    }
+
+    fn cs_unused_parser_drain_http(
+        endpoint: &mut super::Endpoint,
+        spec: &RunSpec,
+        started: Instant,
+        traces: &mut TraceFiles,
+    ) {
+        // CS bounds each production HTTP turn. A small finite number of real
+        // turns also drains handshake/priority notifications in this fixture.
+        for _ in 0..8 {
+            handle_http_events(endpoint, spec, started, traces, None).unwrap();
+        }
+    }
+
+    struct CsUnusedParserConnected {
+        endpoint: super::Endpoint,
+        server: neqo_http3::Http3Server,
+        controller: QcsdController,
+        stream: neqo_transport::StreamId,
+        cancel: QcsdAction,
+        traces: TraceFiles,
+        elapsed: Duration,
+        observed: CsUnusedParserObserved,
+        slot: QcsdSlotId,
+        response: neqo_http3::Http3OrWebTransportStream,
+    }
+
+    fn cs_unused_parser_connected_fixture(
+        output: &Path,
+        tracked_parser: bool,
+        inspect_owned_tail: impl FnOnce(&QcsdController, QcsdEndpointId, QcsdStreamId),
+    ) -> CsUnusedParserConnected {
+        test_fixture::fixture_init();
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let config = QcsdConfig {
+            defense: cs_projection_test_defense(),
+            max_udp_payload_size: 1_200,
+            initial_max_stream_data: 16,
+            tail_wait_us: 0,
+            ..QcsdConfig::default()
+        };
+        let spec = RunSpec {
+            method: "GET",
+            workload: ResourceManifest {
+                resources: vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+            },
+            workload_hash: "connected-CS-unused-parser-cleanup-component".into(),
+            application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::default(),
+            config: config.clone(),
+            defense_parameters: None,
+            chaff_manifest: None,
+            chaff_manifest_hash: None,
+            request_policy: RequestPolicyArg::AsDefined,
+            seed: 7,
+            output_dir: output.to_path_buf(),
+            max_response_bytes: 3_000,
+            timeout_seconds: 60,
+        };
+        let mut endpoint = create_endpoints(&spec, started, &clock).unwrap().remove(0);
+        let mut server = test_fixture::http3_server_with_params(
+            neqo_http3::Http3Parameters::default()
+                .max_table_size_encoder(0)
+                .max_table_size_decoder(100)
+                .max_blocked_streams(100)
+                .max_concurrent_push_streams(10),
+        );
+        let trailing = test_fixture::connect_peers(&mut endpoint.client, &mut server);
+        let server_output = server.process(trailing, test_fixture::now()).dgram();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, server_output);
+        endpoint.connected = true;
+        endpoint.pending.clear();
+        endpoint.client.qcsd_enable_send_shaping(false);
+
+        let parameters = cs_unused_parser_parameters();
+        let mut probe = neqo_csdef::CsBuflo::from_parameters(parameters.clone(), 7);
+        let tick = probe.next_event_at().expect("real seed7 first deadline");
+        let first = probe.next_event(tick).expect("real first CS opportunity");
+        assert_eq!(first.direction(), Direction::Incoming);
+        assert_eq!(first.length(), 600);
+        assert!(
+            probe.next_event(tick).is_none(),
+            "no invented outgoing outcome is needed"
+        );
+        let mut controller = QcsdController::with_defense(
+            config,
+            None,
+            Box::new(neqo_csdef::CsBuflo::from_parameters(parameters, 7)),
+        )
+        .unwrap();
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoint.id,
+                origin: endpoint.origin.to_string(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.drain_actions().for_each(drop);
+        let stream = endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::RequestChaff {
+                    endpoint: endpoint.id,
+                    resource: Resource {
+                        id: 0,
+                        url: "https://127.0.0.1:4433/chaff".into(),
+                        kind: "Other".into(),
+                        content_length: Some(3_000),
+                        data_length: 3_000,
+                        chaff_priority: true,
+                        known_valid: true,
+                        depends_on: Vec::new(),
+                        headers: Vec::new(),
+                    },
+                    request_id: QcsdChaffRequestId(7),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let request_bytes = endpoint.client.qcsd_request_stream_bytes(stream).unwrap();
+        endpoint.client.stream_close_send(stream, started).unwrap();
+        endpoint.chaff_send_streams.insert(stream);
+        let mut record = chaff(&[b'x'; 3_000], false);
+        record.url = "https://127.0.0.1:4433/chaff".into();
+        record.body.clear();
+        record.bytes = 0;
+        record.status = None;
+        record.content_length = None;
+        record.response_headers.clear();
+        record.request_headers.clear();
+        record.request_stream_bytes = request_bytes;
+        let mut qualified = request(0, "https://127.0.0.1:4433/chaff", Vec::new());
+        qualified.url = record.url.clone();
+        let measured =
+            measured_nonblocking_chaff_request_bytes(&qualified, "https://127.0.0.1:4433");
+        assert_eq!(request_bytes, measured);
+        record.expected_request_stream_bytes = Some(measured);
+        endpoint.streams.insert(stream, record);
+        let mut observed = CsUnusedParserObserved::default();
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            Duration::ZERO,
+            &mut observed,
+        );
+        let configured: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(configured.len(), 1);
+        assert!(
+            matches!(&configured[0], QcsdAction::ConfigureManualReceive {
+            stream: s, initial_limit: 16, .. } if s.0 == stream.as_u64())
+        );
+        endpoint
+            .client
+            .apply_qcsd_action(started, configured.into_iter().next().unwrap())
+            .unwrap();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let response = server
+            .events()
+            .find_map(|event| match event {
+                neqo_http3::Http3ServerEvent::Headers {
+                    stream: response,
+                    fin,
+                    ..
+                } => {
+                    assert!(fin);
+                    Some(response)
+                }
+                _ => None,
+            })
+            .expect("real peer received the complete chaff request and FIN");
+        assert_eq!(response.stream_id(), stream);
+        response
+            .send_headers(&[
+                neqo_common::Header::new(":status", "200"),
+                neqo_common::Header::new("content-length", "3000"),
+            ])
+            .unwrap();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let mut traces = TraceFiles::new(output, started).unwrap();
+        cs_unused_parser_drain_http(&mut endpoint, &spec, started, &mut traces);
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            Duration::ZERO,
+            &mut observed,
+        );
+        let (headers, status) = observed.headers.expect("real response HEADERS decoded");
+        assert_eq!(status, Some(200));
+        assert!(
+            headers <= 13,
+            "reference-free HEADERS leave a complete initial DATA frame"
+        );
+        let initial_payload = usize::try_from(16 - headers - 2).unwrap();
+        assert_eq!(
+            response
+                .send_data(&vec![b'x'; initial_payload], started)
+                .unwrap(),
+            initial_payload
+        );
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        cs_unused_parser_drain_http(&mut endpoint, &spec, started, &mut traces);
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            Duration::ZERO,
+            &mut observed,
+        );
+        assert_eq!(observed.raw, 16);
+        assert!(controller.drain_actions().next().is_none());
+
+        controller.poll(tick);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let credit = actions
+            .iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    QcsdAction::IncreaseReceiveLimit {
+                        absolute_limit: 616,
+                        ..
+                    }
+                )
+            })
+            .expect("genuine public CS600 allocation")
+            .clone();
+        assert_eq!(
+            actions.len(),
+            1,
+            "only the real first incoming opportunity is due"
+        );
+        let QcsdAction::IncreaseReceiveLimit { slot, packet, .. } = credit.clone() else {
+            unreachable!()
+        };
+        assert_eq!(packet, first);
+        endpoint.client.apply_qcsd_action(started, credit).unwrap();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            tick + Duration::from_micros(1),
+            &mut observed,
+        );
+        assert!(observed.advertisements.contains(&(616, Some(slot))));
+        assert!(controller.incoming_slot_is_locally_realized(slot));
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_advertised_bytes,
+            600
+        );
+        if tracked_parser {
+            controller.observe(
+                QcsdObservation::ApplicationComplete,
+                tick + Duration::from_micros(2),
+            );
+            controller.flush_defense_observations();
+            let stops = controller.defense_diagnostics();
+            assert!(stops.cs_buflo_application_complete);
+            assert!(stops.cs_buflo_incoming_termination_stop_latched);
+            assert!(stops.cs_buflo_outgoing_termination_stop_latched);
+            assert!(!stops.cs_buflo_local_termination_latched);
+        }
+
+        assert_eq!(response.send_data(&[b'x'; 595], started).unwrap(), 595);
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        cs_unused_parser_drain_http(&mut endpoint, &spec, started, &mut traces);
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            tick + Duration::from_micros(3),
+            &mut observed,
+        );
+        assert_eq!(observed.raw, 614);
+        assert_eq!(observed.data.last().copied(), Some((19, 3, 595)));
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            598
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_unresolved_bytes,
+            2
+        );
+        inspect_owned_tail(&controller, endpoint.id, QcsdStreamId(stream.as_u64()));
+        let bridge_actions: Vec<_> = controller.drain_actions().collect();
+        let bridge = if tracked_parser {
+            assert_eq!(bridge_actions.len(), 1);
+            bridge_actions.into_iter().next().unwrap()
+        } else {
+            // Negative-only path: a real transport grant without a controller
+            // parser lease produces the same numeric gap, not its provenance.
+            // No observation, ACK, consumed byte or scheduled outcome is faked.
+            assert!(bridge_actions.is_empty());
+            QcsdAction::LeaseParserReceive {
+                endpoint: endpoint.id,
+                stream: QcsdStreamId(stream.as_u64()),
+                absolute_limit: 632,
+                increase: 16,
+                owner: None,
+            }
+        };
+        assert!(
+            matches!(&bridge, QcsdAction::LeaseParserReceive {
+            stream: s, absolute_limit: 632, increase: 16, owner: None, .. }
+            if s.0 == stream.as_u64()),
+            "only the actual controller-issued unowned bridge"
+        );
+        assert!(
+            controller
+                .exact_incoming_advertisement_targets(
+                    endpoint.id,
+                    QcsdStreamId(stream.as_u64()),
+                    632,
+                    None
+                )
+                .unwrap()
+                .is_empty()
+        );
+        endpoint.client.apply_qcsd_action(started, bridge).unwrap();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            tick + Duration::from_micros(4),
+            &mut observed,
+        );
+        assert!(observed.advertisements.contains(&(632, None)));
+
+        assert_eq!(response.send_data(&[b'x'; 13], started).unwrap(), 13);
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        cs_unused_parser_drain_http(&mut endpoint, &spec, started, &mut traces);
+        cs_unused_parser_reduce_actual(
+            &mut endpoint,
+            &mut controller,
+            stream,
+            tick + Duration::from_micros(5),
+            &mut observed,
+        );
+        assert_eq!(observed.data.last().copied(), Some((616, 2, 13)));
+        assert_eq!(observed.raw, 629);
+        assert_eq!(observed.progress.last().copied(), Some((629, 1, true)));
+        let diagnostics = controller.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 600);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 600);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action,
+            QcsdAction::SlotSatisfied { slot: actual, .. } if *actual == slot))
+                .count(),
+            1
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::SlotMissed { .. }))
+        );
+        assert!(controller.pending_slots().is_empty());
+        if !tracked_parser {
+            controller.observe(
+                QcsdObservation::ApplicationComplete,
+                tick + Duration::from_micros(6),
+            );
+        }
+        controller.flush_defense_observations();
+        let elapsed = tick + Duration::from_micros(6);
+        controller.poll(elapsed);
+        let terminal = controller.defense_diagnostics();
+        assert!(terminal.cs_buflo_application_complete);
+        assert!(terminal.cs_buflo_incoming_termination_stop_latched);
+        assert!(terminal.cs_buflo_outgoing_termination_stop_latched);
+        assert!(terminal.cs_buflo_local_termination_latched);
+        assert!(controller.terminal_failure().is_none());
+        let mut cancels = controller.drain_actions().filter(|action| {
+            matches!(action,
+            QcsdAction::CancelChaff { stream: s,
+                reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination, .. }
+                if s.0 == stream.as_u64())
+        });
+        let cancel = cancels.next().expect("real CS terminal cleanup action");
+        assert!(cancels.next().is_none());
+        drop(cancels);
+        endpoint.client.qcsd_prepare_stream_output(started);
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert!(
+            endpoint
+                .client
+                .qcsd_chaff_send_stream_peer_confirmed(stream)
+        );
+        assert!(
+            endpoint
+                .client
+                .qcsd_pending_receive_action_identities()
+                .is_empty()
+        );
+        assert!(
+            !endpoint
+                .client
+                .qcsd_has_unadvertised_scheduled_receive_credit()
+        );
+        assert!(
+            !endpoint.client.qcsd_has_pending_defense_control(),
+            "real MAX receive-credit ACK"
+        );
+        assert!(!endpoint.client.qcsd_has_pending_stream_send());
+        assert!(!endpoint.client.qcsd_qpack_decoder_handler_pending());
+        assert!(!endpoint.client.qcsd_qpack_decoder_transport_pending());
+        let role = endpoint.streams[&stream].role;
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_cs_terminal_chaff(stream, role)
+                .is_err()
+        );
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_cs_idle_initial_chaff(stream, role)
+                .is_err()
+        );
+        assert_eq!(endpoint.streams[&stream].status, Some(200));
+        assert_eq!(endpoint.streams[&stream].content_length, Some(3_000));
+        assert!(!endpoint.streams[&stream].complete);
+        CsUnusedParserConnected {
+            endpoint,
+            server,
+            controller,
+            stream,
+            cancel,
+            traces,
+            elapsed,
+            observed,
+            slot,
+            response,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_complete_app_unused_parser_suffix_closes_after_real_scheduled_cell_drain() {
+        let output = trace_output_dir("cs-unused-parser-suffix-real-H3");
+        let CsUnusedParserConnected {
+            endpoint,
+            mut server,
+            mut controller,
+            stream,
+            cancel,
+            mut traces,
+            elapsed,
+            observed,
+            slot,
+            response,
+        } = cs_unused_parser_connected_fixture(&output, true, |_, _, _| {});
+        let before = endpoint.client.transport_stats().frame_tx;
+        let started = endpoint.receive_loop.origin;
+        let mut endpoints = vec![endpoint];
+        super::apply_action(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            elapsed,
+            cancel,
+            false,
+            None,
+        )
+        .expect("CS cleanup must preserve the real three-byte unowned parser suffix");
+        assert_eq!(observed.raw, 629);
+        assert!(controller.terminal_slot_resolution_at(slot).is_some());
+        let proof = &endpoints[0].terminal_local_abandonments[0];
+        assert_eq!(proof["stream"], stream.as_u64());
+        assert_eq!(
+            proof["policy"],
+            "cs_buflo_complete_app_witnessed_unused_parser_allowance_local_abandon_v1"
+        );
+        assert_eq!(proof["encoded_receive_limit"], 632);
+        assert_eq!(proof["manual_receive_limit"], 632);
+        assert_eq!(proof["consumed"], 629);
+        assert_eq!(proof["retired"], 629);
+        assert_eq!(proof["buffered_bytes"], 0);
+        assert_eq!(proof["parser_allowance_range_start"], 629);
+        assert_eq!(proof["parser_allowance_range_end"], 632);
+        assert_eq!(proof["unused_parser_allowance_bytes"], 3);
+        assert_eq!(
+            proof["http3_receive_state"],
+            "cs-unused-parser-allowance-at-frame-boundary"
+        );
+        assert_eq!(proof["request_send_peer_confirmed"], true);
+        assert!(endpoints[0].streams.is_empty());
+        assert_eq!(
+            endpoints[0].completed[0].outcome,
+            "local_early_termination_cancelled"
+        );
+        assert!(!endpoints[0].completed[0].complete);
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+        let after = endpoints[0].client.transport_stats().frame_tx;
+        for (before, after) in [
+            (before.stop_sending, after.stop_sending),
+            (before.reset_stream, after.reset_stream),
+            (before.max_stream_data, after.max_stream_data),
+            (before.max_data, after.max_data),
+            (before.stream, after.stream),
+        ] {
+            assert_eq!(
+                after, before,
+                "local cleanup queues no STOP/RESET/MAX/STREAM/QPACK"
+            );
+        }
+        assert_eq!(
+            endpoints[0].client.state(),
+            neqo_http3::Http3State::Connected
+        );
+        assert!(controller.terminal_failure().is_none());
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_retired_bytes,
+            0
+        );
+        drop(response);
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_unused_parser_cleanup_refuses_owned_tail_and_unproved_numeric_gap() {
+        let output = trace_output_dir("cs-unused-parser-no-provenance");
+        let CsUnusedParserConnected {
+            endpoint,
+            mut controller,
+            stream,
+            cancel,
+            mut traces,
+            elapsed,
+            observed,
+            server,
+            response,
+            ..
+        } = cs_unused_parser_connected_fixture(&output, false, |controller, endpoint, stream| {
+            assert_eq!(
+                controller
+                    .defense_diagnostics()
+                    .scheduled_incoming_unresolved_bytes,
+                2
+            );
+            assert!(
+                controller
+                    .cs_buflo_terminal_parser_allowance(endpoint, stream)
+                    .is_none(),
+                "two remaining owned bytes cannot become an unused-parser witness"
+            );
+        });
+        assert_eq!(observed.raw, 629);
+        assert!(observed.advertisements.contains(&(632, None)));
+        assert!(
+            controller
+                .cs_buflo_terminal_parser_allowance(endpoint.id, QcsdStreamId(stream.as_u64()))
+                .is_none(),
+            "the same three-byte gap without a controller-issued parser range is insufficient"
+        );
+        let before = endpoint.client.transport_stats().frame_tx;
+        let started = endpoint.receive_loop.origin;
+        let mut endpoints = vec![endpoint];
+        assert!(matches!(
+            super::apply_action(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                started,
+                elapsed,
+                cancel,
+                false,
+                None
+            ),
+            Err(super::Error::Http3(neqo_http3::Error::InvalidInput))
+        ));
+        assert!(endpoints[0].terminal_local_abandonments.is_empty());
+        assert!(endpoints[0].streams.contains_key(&stream));
+        let after = endpoints[0].client.transport_stats().frame_tx;
+        assert_eq!(before.stop_sending, after.stop_sending);
+        assert_eq!(before.reset_stream, after.reset_stream);
+        assert_eq!(before.max_stream_data, after.max_stream_data);
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_retired_bytes,
+            0
+        );
+        drop(response);
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_unused_parser_cleanup_refuses_wrong_role_and_new_pending_receive_control() {
+        let output = trace_output_dir("cs-unused-parser-fresh-guards");
+        let mut fixture =
+            cs_unused_parser_connected_fixture(&output, true, |controller, endpoint, stream| {
+                assert_eq!(
+                    controller
+                        .defense_diagnostics()
+                        .scheduled_incoming_unresolved_bytes,
+                    2
+                );
+                assert!(
+                    controller
+                        .cs_buflo_terminal_parser_allowance(endpoint, stream)
+                        .is_none()
+                );
+            });
+        let stream = fixture.stream;
+        let role = fixture.endpoint.streams[&stream].role;
+        let witness = fixture
+            .controller
+            .cs_buflo_terminal_parser_allowance(fixture.endpoint.id, QcsdStreamId(stream.as_u64()))
+            .expect("real controller retains only the advertised unowned suffix before closure");
+        assert_eq!(witness.endpoint(), fixture.endpoint.id);
+        assert_eq!(witness.stream(), QcsdStreamId(stream.as_u64()));
+        assert_eq!(witness.role(), role);
+        assert_eq!(
+            (
+                witness.consumed(),
+                witness.range_start(),
+                witness.range_end()
+            ),
+            (629, 629, 632)
+        );
+        let before = fixture.endpoint.client.transport_stats().frame_tx;
+        assert!(matches!(
+            fixture
+                .endpoint
+                .client
+                .qcsd_abandon_cs_parser_allowance_chaff(
+                    stream,
+                    QcsdRequestRole::Application,
+                    &witness
+                ),
+            Err(neqo_http3::Error::InvalidInput)
+        ));
+        assert!(fixture.endpoint.streams.contains_key(&stream));
+        assert!(!fixture.endpoint.client.qcsd_has_pending_defense_control());
+        assert_eq!(
+            fixture
+                .endpoint
+                .client
+                .read_data(fixture.endpoint.receive_loop.origin, stream, &mut [0; 16])
+                .unwrap(),
+            (0, false)
+        );
+        assert!(
+            fixture
+                .endpoint
+                .client
+                .qcsd_pending_receive_action_identities()
+                .is_empty()
+        );
+        let fresh_lease = QcsdAction::LeaseParserReceive {
+            endpoint: fixture.endpoint.id,
+            stream: QcsdStreamId(stream.as_u64()),
+            absolute_limit: 633,
+            increase: 1,
+            owner: None,
+        };
+        let fresh_identity = QcsdReceiveActionIdentity::ParserLease {
+            endpoint: fixture.endpoint.id,
+            stream: QcsdStreamId(stream.as_u64()),
+            absolute_limit: 633,
+            increase: 1,
+            owner: None,
+        };
+        assert_eq!(fresh_lease.receive_identity(), Some(fresh_identity));
+        assert_eq!(
+            fixture
+                .endpoint
+                .client
+                .preview_qcsd_receive_action(&fresh_lease, None)
+                .unwrap(),
+            Some(QcsdReceiveLimitOutcome::Applied)
+        );
+        assert_eq!(
+            fixture
+                .endpoint
+                .client
+                .apply_qcsd_receive_action(&fresh_lease)
+                .unwrap(),
+            Some(QcsdReceiveLimitOutcome::Applied)
+        );
+        assert_eq!(
+            fixture
+                .endpoint
+                .client
+                .qcsd_pending_receive_action_identities(),
+            vec![fresh_identity]
+        );
+        assert!(fixture.endpoint.client.qcsd_has_pending_defense_control());
+        assert!(
+            matches!(
+                fixture
+                    .endpoint
+                    .client
+                    .qcsd_abandon_cs_parser_allowance_chaff(stream, role, &witness),
+                Err(neqo_http3::Error::InvalidInput)
+            ),
+            "an old witness cannot authorize a fresh unencoded MAX/control suffix"
+        );
+        assert_eq!(
+            fixture
+                .endpoint
+                .client
+                .qcsd_pending_receive_action_identities(),
+            vec![fresh_identity],
+            "refusal must preserve the exact unencoded lease identity"
+        );
+        assert_eq!(
+            fixture
+                .endpoint
+                .client
+                .read_data(fixture.endpoint.receive_loop.origin, stream, &mut [0; 16])
+                .unwrap(),
+            (0, false)
+        );
+        let after = fixture.endpoint.client.transport_stats().frame_tx;
+        assert_eq!(before.stop_sending, after.stop_sending);
+        assert_eq!(before.reset_stream, after.reset_stream);
+        assert_eq!(before.max_stream_data, after.max_stream_data);
+        assert_eq!(before.stream, after.stream);
+        drop(fixture);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_unused_parser_cleanup_refuses_a_genuine_later_peer_fin() {
+        let output = trace_output_dir("cs-unused-parser-later-FIN");
+        let mut fixture = cs_unused_parser_connected_fixture(&output, true, |_, _, _| {});
+        let stream = fixture.stream;
+        let role = fixture.endpoint.streams[&stream].role;
+        let witness = fixture
+            .controller
+            .cs_buflo_terminal_parser_allowance(fixture.endpoint.id, QcsdStreamId(stream.as_u64()))
+            .unwrap();
+        fixture
+            .response
+            .stream_close_send(test_fixture::now())
+            .unwrap();
+        test_fixture::exchange_packets(
+            &mut fixture.endpoint.client,
+            &mut fixture.server,
+            false,
+            None,
+        );
+        let before = fixture.endpoint.client.transport_stats().frame_tx;
+        assert!(
+            fixture
+                .endpoint
+                .client
+                .qcsd_abandon_cs_parser_allowance_chaff(stream, role, &witness)
+                .is_err(),
+            "a later real FIN/final-size transition invalidates the pre-close receive witness"
+        );
+        assert!(fixture.endpoint.terminal_local_abandonments.is_empty());
+        let after = fixture.endpoint.client.transport_stats().frame_tx;
+        assert_eq!(before.stop_sending, after.stop_sending);
+        assert_eq!(before.reset_stream, after.reset_stream);
+        assert_eq!(before.max_stream_data, after.max_stream_data);
+        drop(fixture);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    // Connected incoming/cleanup component, not a full20 or physical CS
+    // schedule claim. ApplicationComplete is an explicit public premise; real
+    // H3 request bytes/FIN/ACK and zero received response bytes are independent.
+    fn cs_idle_component_parameters() -> neqo_csdef::CsBufloParameters {
+        neqo_csdef::CsBufloParameters {
+            schema_version: 1,
+            packet_size: 1_200,
+            initial_interval_us: 8_192,
+            minimum_interval_us: 4_096,
+            maximum_interval_us: 32_768,
+            initial_adaptation_boundary_bytes: 16_384,
+            quiet_time_us: 2_000_000,
+            outgoing_padding_mode: neqo_csdef::CsBufloPaddingMode::Payload,
+            incoming_padding_mode: neqo_csdef::CsBufloPaddingMode::Payload,
+            timing_sample_limit: 1_000,
+            jitter_denominator: 100,
+            jitter_max_numerator: 200,
+            early_termination: neqo_csdef::CsBufloEarlyTermination::Local,
+            max_events: 1_000,
+            implementation_scope: neqo_csdef::QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+        }
+    }
+
+    fn cs_idle_initial_real_http3_fixture(
+        output: &Path,
+        exchange_request: bool,
+        partial_headers: bool,
+    ) -> (
+        super::Endpoint,
+        neqo_http3::Http3Server,
+        neqo_transport::StreamId,
+    ) {
+        test_fixture::fixture_init();
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let config = QcsdConfig {
+            defense: cs_projection_test_defense(),
+            max_udp_payload_size: 1_200,
+            initial_max_stream_data: 16,
+            tail_wait_us: 0,
+            ..QcsdConfig::default()
+        };
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server_config(
+            output,
+            started,
+            &clock,
+            QcsdEndpointId(0),
+            4_433,
+            config,
+        );
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let stream = endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::RequestChaff {
+                    endpoint: endpoint.id,
+                    resource: Resource {
+                        id: 0,
+                        url: "https://127.0.0.1:4433/chaff".into(),
+                        kind: "Other".into(),
+                        content_length: Some(3_000),
+                        data_length: 3_000,
+                        chaff_priority: true,
+                        known_valid: true,
+                        depends_on: Vec::new(),
+                        headers: Vec::new(),
+                    },
+                    request_id: QcsdChaffRequestId(7),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream).unwrap();
+        endpoint.client.stream_close_send(stream, started).unwrap();
+        endpoint.chaff_send_streams.insert(stream);
+        endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint: endpoint.id,
+                    stream: QcsdStreamId(stream.as_u64()),
+                    initial_limit: 16,
+                },
+            )
+            .unwrap();
+        if exchange_request {
+            test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+            let request = server
+                .events()
+                .find_map(|event| match event {
+                    neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                        assert!(fin);
+                        Some(stream)
+                    }
+                    _ => None,
+                })
+                .expect("real peer receives the complete request/FIN");
+            assert_eq!(request.stream_id(), stream);
+            if partial_headers {
+                request
+                    .send_headers(&[
+                        neqo_common::Header::new(":status", "200"),
+                        neqo_common::Header::new("content-length", "3000"),
+                        neqo_common::Header::new("x-component-pad", "z".repeat(3_000)),
+                    ])
+                    .unwrap();
+                test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+            }
+            // Otherwise deliberately leave the real peer response unopened. Normal H3
+            // processing cannot manufacture response bytes within manual16.
+            endpoint.client.qcsd_prepare_stream_output(started);
+            test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+            assert!(
+                endpoint
+                    .client
+                    .qcsd_chaff_send_stream_peer_confirmed(stream)
+            );
+        } else {
+            assert!(
+                !endpoint
+                    .client
+                    .qcsd_chaff_send_stream_peer_confirmed(stream)
+            );
+        }
+        assert_eq!(
+            endpoint
+                .client
+                .read_data(started, stream, &mut [0; 16])
+                .unwrap(),
+            (0, false)
+        );
+        let mut record = chaff(&[b'x'; 3_000], false);
+        record.url = "https://127.0.0.1:4433/chaff".into();
+        record.body.clear();
+        record.bytes = 0;
+        record.status = None;
+        record.content_length = None;
+        record.response_headers.clear();
+        record.request_headers.clear();
+        record.request_stream_bytes = request_stream_bytes;
+        let mut qualified = request(0, "https://127.0.0.1:4433/chaff", Vec::new());
+        qualified.url = record.url.clone();
+        let measured =
+            measured_nonblocking_chaff_request_bytes(&qualified, "https://127.0.0.1:4433");
+        assert_eq!(
+            record.request_stream_bytes, measured,
+            "independent actual request encoder measurement"
+        );
+        record.expected_request_stream_bytes = Some(measured);
+        endpoint.streams.insert(stream, record);
+        (endpoint, server, stream)
+    }
+
+    fn cs_idle_terminal_controller(
+        endpoint: &mut super::Endpoint,
+        stream: neqo_transport::StreamId,
+    ) -> (QcsdController, QcsdAction) {
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: cs_projection_test_defense(),
+                max_udp_payload_size: 1_200,
+                initial_max_stream_data: 16,
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(neqo_csdef::CsBuflo::from_parameters(
+                cs_idle_component_parameters(),
+                7,
+            )),
+        )
+        .unwrap();
+        let actual = endpoint.client.qcsd_timestamped_observations();
+        assert!(actual.iter().any(|record| matches!(record.observation(),
+            QcsdObservation::StreamOpened { stream: s, role: QcsdRequestRole::Chaff { .. }, .. }
+                if s.0 == stream.as_u64())));
+        assert_eq!(
+            actual
+                .iter()
+                .filter_map(|record| match record.observation() {
+                    QcsdObservation::BytesRead {
+                        stream: s, bytes, ..
+                    } if s.0 == stream.as_u64() => Some(*bytes),
+                    _ => None,
+                })
+                .sum::<u64>(),
+            0,
+            "normal H3 processing has read no response byte"
+        );
+        for record in actual {
+            controller.observe(record.into_observation(), Duration::ZERO);
+        }
+        let configured: Vec<_> = controller.drain_actions().collect();
+        assert!(configured.iter().any(|action| matches!(action,
+            QcsdAction::ConfigureManualReceive { stream: s, initial_limit: 16, .. }
+                if s.0 == stream.as_u64())));
+        assert!(configured.iter().all(|action| matches!(
+            action,
+            QcsdAction::ConfigureManualReceive {
+                initial_limit: 16,
+                ..
+            }
+        )));
+        // The exact manual16 configuration was already applied before request
+        // transmission. Only this disclosed onLoad premise is synthetic.
+        controller.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(1),
+        );
+        controller.flush_defense_observations();
+        controller.poll(Duration::from_micros(1));
+        let diagnostics = controller.defense_diagnostics();
+        assert!(diagnostics.cs_buflo_application_complete);
+        assert!(diagnostics.cs_buflo_local_termination_latched);
+        assert!(diagnostics.cs_buflo_outgoing_termination_stop_latched);
+        assert!(diagnostics.cs_buflo_incoming_termination_stop_latched);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert!(controller.terminal_failure().is_none());
+        let mut cancels = controller.drain_actions().filter(|action| {
+            matches!(action,
+            QcsdAction::CancelChaff { endpoint: e, stream: s,
+                reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination }
+                if *e == endpoint.id && s.0 == stream.as_u64())
+        });
+        let cancel = cancels.next().expect("genuine CS terminal cancellation");
+        assert!(cancels.next().is_none());
+        drop(cancels);
+        (controller, cancel)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_complete_app_idle_initial_chaff_closes_locally_without_invented_drain_or_wire() {
+        // The same real H3 fixture first proves that unACKed request FIN stays
+        // a hard refusal; the positive case differs only by actual exchange.
+        for exchange_request in [false, true] {
+            let output = trace_output_dir("cs-idle-initial-terminal");
+            let (mut endpoint, mut server, stream) =
+                cs_idle_initial_real_http3_fixture(&output, exchange_request, false);
+            let role = QcsdRequestRole::Chaff {
+                resource_id: 0,
+                request_id: Some(QcsdChaffRequestId(7)),
+            };
+            assert!(
+                endpoint
+                    .client
+                    .qcsd_abandon_buflo_terminal_chaff(stream, role)
+                    .is_err(),
+                "the old BuFLO drained policy remains strict"
+            );
+            assert!(
+                endpoint
+                    .client
+                    .qcsd_abandon_cs_terminal_chaff(stream, role)
+                    .is_err(),
+                "the old CS fully-drained policy remains strict"
+            );
+            let (mut controller, cancel) = cs_idle_terminal_controller(&mut endpoint, stream);
+            let before = endpoint.client.transport_stats().frame_tx;
+            let started = test_fixture::now();
+            let mut traces = TraceFiles::new(&output, started).unwrap();
+            let mut endpoints = vec![endpoint];
+            let result = super::apply_action(
+                &mut endpoints,
+                &mut controller,
+                None,
+                &mut traces,
+                started,
+                Duration::from_micros(1),
+                cancel,
+                false,
+                None,
+            );
+            if !exchange_request {
+                assert!(matches!(
+                    result,
+                    Err(super::Error::Http3(neqo_http3::Error::InvalidInput))
+                ));
+                assert!(endpoints[0].terminal_local_abandonments.is_empty());
+                assert!(endpoints[0].streams.contains_key(&stream));
+            } else {
+                result.expect("CS terminal idle initial response must locally close without synthetic drain or wire cancellation");
+                let proof = &endpoints[0].terminal_local_abandonments[0];
+                assert_eq!(
+                    proof["policy"],
+                    "cs_buflo_complete_app_idle_initial_response_local_abandon_v1"
+                );
+                assert_eq!(proof["initial_window_drained"], false);
+                assert_eq!(proof["transport_receive_bytes_retained"], true);
+                assert_eq!(proof["encoded_receive_limit"], 16);
+                assert_eq!(proof["manual_receive_limit"], 16);
+                for field in [
+                    "consumed",
+                    "retired",
+                    "buffered_bytes",
+                    "contiguous_ready_bytes",
+                    "received_bytes",
+                ] {
+                    assert_eq!(
+                        proof[field], 0,
+                        "exact initial receive facts must not be fabricated"
+                    );
+                }
+                assert_eq!(proof["request_send_peer_confirmed"], true);
+                assert_eq!(
+                    proof["http3_receive_state"],
+                    "cs-untouched-initial-response"
+                );
+                assert!(endpoints[0].streams.is_empty());
+                assert_eq!(
+                    endpoints[0].completed[0].outcome,
+                    "local_early_termination_cancelled"
+                );
+                assert!(!endpoints[0].completed[0].complete);
+                test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+                assert_eq!(
+                    endpoints[0].client.state(),
+                    neqo_http3::Http3State::Connected
+                );
+                assert!(!endpoints[0].client.qcsd_has_pending_defense_control());
+                assert!(!endpoints[0].client.qcsd_has_pending_stream_send());
+                assert!(!endpoints[0].client.qcsd_qpack_decoder_handler_pending());
+                assert!(!endpoints[0].client.qcsd_qpack_decoder_transport_pending());
+            }
+            let after = endpoints[0].client.transport_stats().frame_tx;
+            assert_eq!(after.stop_sending, before.stop_sending, "no STOP_SENDING");
+            assert_eq!(after.reset_stream, before.reset_stream, "no RESET_STREAM");
+            assert_eq!(
+                after.max_stream_data, before.max_stream_data,
+                "no new stream credit"
+            );
+            assert_eq!(after.max_data, before.max_data, "no new connection credit");
+            assert_eq!(
+                after.stream, before.stream,
+                "no QPACK/request STREAM output"
+            );
+            drop(traces);
+            drop(endpoints);
+            drop(server);
+            fs::remove_dir_all(output).unwrap();
+        }
+    }
+
+    #[test]
+    fn cs_onload_both_stop_latches_close_replenishment_before_advertised_credit_drains() {
+        // Pure published Defense lifecycle: exact incoming advertisement and
+        // outcome signals are component premises, not a forged wire receipt.
+        let parameters = cs_idle_component_parameters();
+        // Preserve real seed7 ctor jitter. One delayed public handling turn
+        // after the declared maximum initial jitter makes both opportunities
+        // due; CS stamps each packet at this actual handling time, so its
+        // following advertisement/outcome signals have no late-cell premise.
+        let at = Duration::from_micros(
+            parameters
+                .initial_interval_us
+                .checked_mul(parameters.jitter_max_numerator)
+                .unwrap()
+                .checked_div(parameters.jitter_denominator)
+                .unwrap()
+                .checked_add(1)
+                .unwrap(),
+        );
+        let mut defense = neqo_csdef::CsBuflo::from_parameters(parameters, 7);
+        assert!(defense.next_event_at().unwrap() < at);
+        let first = defense.next_event(at).expect("first due real opportunity");
+        let second = defense.next_event(at).expect("other due real opportunity");
+        assert_ne!(first.direction(), second.direction());
+        assert_eq!(first.timestamp(), at);
+        assert_eq!(second.timestamp(), at);
+        let (outgoing, incoming) = if first.direction() == Direction::Outgoing {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let slot = QcsdSlotId(1);
+        defense.observe(DefenseSignal {
+            at,
+            kind: SignalKind::IncomingCreditScheduled {
+                slot,
+                packet: incoming,
+            },
+        });
+        defense.observe(DefenseSignal {
+            at,
+            kind: SignalKind::IncomingCreditAdvertised {
+                slot,
+                packet: incoming,
+            },
+        });
+        defense.observe(DefenseSignal {
+            at,
+            kind: SignalKind::Resolved {
+                packet: outgoing,
+                outcome: neqo_csdef::EventOutcome::Satisfied { observed: 1_200 },
+            },
+        });
+        assert!(
+            defense.accepts_new_chaff_requests(),
+            "active CS retains original replenishment"
+        );
+        defense.observe(DefenseSignal {
+            at: at + Duration::from_micros(1),
+            kind: SignalKind::ApplicationComplete,
+        });
+        let d = defense.diagnostics();
+        assert!(d.cs_buflo_outgoing_termination_stop_latched);
+        assert!(d.cs_buflo_incoming_termination_stop_latched);
+        assert!(
+            !d.cs_buflo_local_termination_latched,
+            "one advertised incoming cell still needs its outcome"
+        );
+        assert!(!defense.is_complete());
+        assert!(
+            !defense.accepts_new_chaff_requests(),
+            "full onLoad both-stop phase must not open a replacement while advertised cells drain"
+        );
+        defense.observe(DefenseSignal {
+            at: at + Duration::from_micros(2),
+            kind: SignalKind::IncomingCreditResolved {
+                slot,
+                packet: incoming,
+                outcome: neqo_csdef::EventOutcome::Satisfied { observed: 1_200 },
+            },
+        });
+        assert!(defense.is_complete());
+        assert!(defense.diagnostics().cs_buflo_local_termination_latched);
+        assert_eq!(defense.terminal_failure(), None);
+        assert!(!defense.accepts_new_chaff_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cs_idle_initial_policy_rejects_read_headers_and_foreign_role_without_mutation() {
+        for partial_headers in [false, true] {
+            let output = trace_output_dir("cs-idle-initial-H3-refusal");
+            let (mut endpoint, mut server, stream) =
+                cs_idle_initial_real_http3_fixture(&output, true, partial_headers);
+            let role = QcsdRequestRole::Chaff {
+                resource_id: 0,
+                request_id: Some(QcsdChaffRequestId(7)),
+            };
+            let before = endpoint.client.transport_stats().frame_tx;
+            assert_eq!(
+                endpoint
+                    .client
+                    .qcsd_abandon_cs_idle_initial_chaff(stream, QcsdRequestRole::Application),
+                Err(neqo_http3::Error::InvalidInput)
+            );
+            if partial_headers {
+                let actual = endpoint.client.qcsd_timestamped_observations();
+                assert_eq!(
+                    actual
+                        .iter()
+                        .filter_map(|record| match record.observation() {
+                            QcsdObservation::BytesRead {
+                                stream: s, bytes, ..
+                            } if s.0 == stream.as_u64() => Some(*bytes),
+                            _ => None,
+                        })
+                        .sum::<u64>(),
+                    16,
+                    "real initial HEADERS consumed its existing sixteen bytes"
+                );
+                assert_eq!(
+                    endpoint
+                        .client
+                        .qcsd_abandon_cs_idle_initial_chaff(stream, role),
+                    Err(neqo_http3::Error::InvalidInput)
+                );
+                // Refusal did not remove/mutate the response: the original
+                // fully-drained CS HEADERS policy still accepts the same state.
+                let proof = endpoint
+                    .client
+                    .qcsd_abandon_cs_terminal_chaff(stream, role)
+                    .unwrap();
+                assert_eq!(proof.http3_receive_state, "cs-reading-initial-headers");
+                assert_eq!(proof.receive.retired, 16);
+            } else {
+                let (proof, state) = endpoint
+                    .client
+                    .qcsd_abandon_cs_idle_initial_chaff(stream, role)
+                    .unwrap();
+                assert_eq!(proof.retired, 0);
+                assert_eq!(proof.buffered_bytes, 0);
+                assert_eq!(state, "cs-untouched-initial-response");
+            }
+            test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+            let after = endpoint.client.transport_stats().frame_tx;
+            assert_eq!(after.stop_sending, before.stop_sending);
+            assert_eq!(after.reset_stream, before.reset_stream);
+            assert_eq!(after.max_stream_data, before.max_stream_data);
+            assert_eq!(after.max_data, before.max_data);
+            assert_eq!(after.stream, before.stream);
+            drop(endpoint);
+            drop(server);
+            fs::remove_dir_all(output).unwrap();
         }
     }
 

@@ -183,6 +183,57 @@ struct AdvertisedIncomingCredit {
     end: u64,
 }
 
+/// Opaque controller evidence retained before terminal CS stream closure.
+/// This describes only an advertised, unowned parser suffix; it grants no
+/// credit and does not attest to transport ACKs or the current HTTP/3 state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsBufloTerminalParserAllowance {
+    endpoint: QcsdEndpointId,
+    stream: QcsdStreamId,
+    role: QcsdRequestRole,
+    consumed: u64,
+    range_start: u64,
+    range_end: u64,
+}
+
+impl CsBufloTerminalParserAllowance {
+    /// Exact endpoint that owned the parser lease.
+    #[must_use]
+    pub const fn endpoint(&self) -> QcsdEndpointId {
+        self.endpoint
+    }
+
+    /// Exact request stream that owned the parser lease.
+    #[must_use]
+    pub const fn stream(&self) -> QcsdStreamId {
+        self.stream
+    }
+
+    /// Registered qualified chaff identity at terminal closure.
+    #[must_use]
+    pub const fn role(&self) -> QcsdRequestRole {
+        self.role
+    }
+
+    /// Raw HTTP/3 consumption offset at terminal closure.
+    #[must_use]
+    pub const fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// First unused byte of the advertised unowned parser range.
+    #[must_use]
+    pub const fn range_start(&self) -> u64 {
+        self.range_start
+    }
+
+    /// Exclusive encoded end of that exact parser range.
+    #[must_use]
+    pub const fn range_end(&self) -> u64 {
+        self.range_end
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParserLeaseRange {
     start: u64,
@@ -462,6 +513,9 @@ pub struct QcsdController {
     /// consumed overlap can realize that owner. Merely granting or advertising
     /// a lease never satisfies scheduled work.
     parser_lease_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<ParserLeaseRange>>,
+    /// Exact CS terminal parser suffixes survive controller stream retirement.
+    cs_buflo_terminal_parser_allowances:
+        HashMap<(QcsdEndpointId, QcsdStreamId), CsBufloTerminalParserAllowance>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
     /// Metadata only: actual consumed offsets survive a later legacy parser
     /// ownership transfer and terminal ledger removal.
@@ -699,6 +753,7 @@ impl QcsdController {
             chaff_stream_ranges: HashMap::new(),
             advertised_incoming_credit: HashMap::new(),
             parser_lease_ranges: HashMap::new(),
+            cs_buflo_terminal_parser_allowances: HashMap::new(),
             incoming_credit_ledger: HashMap::new(),
             incoming_consumed_ranges: HashMap::new(),
             incoming_realization_witnesses: HashMap::new(),
@@ -750,6 +805,19 @@ impl QcsdController {
     #[must_use]
     pub const fn config(&self) -> &QcsdConfig {
         &self.config
+    }
+
+    /// Read the original CS parser ownership fact captured before closure.
+    /// A caller must independently recheck fresh HTTP/3 and transport state.
+    #[must_use]
+    pub fn cs_buflo_terminal_parser_allowance(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<CsBufloTerminalParserAllowance> {
+        self.cs_buflo_terminal_parser_allowances
+            .get(&(endpoint, stream))
+            .copied()
     }
 
     /// Enable the prospectively bound fixed Tamaraw collection policy.
@@ -5817,6 +5885,98 @@ impl QcsdController {
         }
     }
 
+    fn retain_cs_buflo_terminal_parser_allowance(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) {
+        let diagnostics = self.defense_diagnostics();
+        if !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || !self.application_complete_delivered_to_defense
+            || !self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || !diagnostics.cs_buflo_application_complete
+            || !diagnostics.cs_buflo_local_termination_latched
+            || !diagnostics.cs_buflo_outgoing_termination_stop_latched
+            || !diagnostics.cs_buflo_incoming_termination_stop_latched
+            || diagnostics.scheduled_incoming_unresolved_bytes != 0
+            || !self.streams.has_pending_parser_boundary(endpoint, stream)
+            || self
+                .control
+                .credit
+                .iter()
+                .any(|credit| credit.endpoint == endpoint && credit.stream == stream)
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|claim| claim.endpoint == endpoint && claim.stream == stream)
+            || self
+                .advertised_incoming_credit
+                .get(&(endpoint, stream))
+                .is_some_and(|ranges| !ranges.is_empty())
+            || self.actions.iter().any(|action| {
+                matches!(action,
+                QcsdAction::IncreaseReceiveLimit { endpoint: e, stream: s, .. }
+                | QcsdAction::LeaseParserReceive { endpoint: e, stream: s, .. }
+                if *e == endpoint && *s == stream)
+            })
+        {
+            return;
+        }
+        let Some(state) = self.streams.get_mut(endpoint, stream) else {
+            return;
+        };
+        let role = state.role;
+        let consumed = state.receive.consumed();
+        let Some((advertised, requested)) = state.receive.limits() else {
+            return;
+        };
+        if !matches!(
+            role,
+            QcsdRequestRole::Chaff {
+                request_id: Some(_),
+                ..
+            }
+        ) || !state.chaff_request_activated()
+        {
+            return;
+        }
+        let Some(ranges) = self.parser_lease_ranges.get(&(endpoint, stream)) else {
+            return;
+        };
+        let [range] = ranges.as_slice() else {
+            return;
+        };
+        // All scheduled offsets have already resolved. The only remaining
+        // range is the physically advertised suffix of a real parser lease.
+        // Sixteen is the existing maximum HTTP/3 frame-header lease quantum.
+        if range.owner.is_some()
+            || !range.unowned
+            || !range.advertised
+            || range.reservation_debited
+            || range.start != consumed
+            || consumed <= self.config.effective_initial_max_stream_data()
+            || range.end != requested
+            || advertised != requested
+            || range.bytes() == 0
+            || range.bytes() > 16
+        {
+            return;
+        }
+        self.cs_buflo_terminal_parser_allowances.insert(
+            (endpoint, stream),
+            CsBufloTerminalParserAllowance {
+                endpoint,
+                stream,
+                role,
+                consumed,
+                range_start: range.start,
+                range_end: range.end,
+            },
+        );
+    }
+
     fn terminalize_local_chaff(&mut self, at: Duration) {
         if !self.defense.is_complete() || self.defense.terminal_failure().is_some() {
             return;
@@ -5883,6 +6043,9 @@ impl QcsdController {
             self.terminal_chaff_cancellation_empty_snapshot_observed = false;
         }
         for (endpoint, stream) in open_chaff_streams {
+            if reason == QcsdChaffCancellationReason::CsBufloLocalEarlyTermination {
+                self.retain_cs_buflo_terminal_parser_allowance(endpoint, stream);
+            }
             self.actions.push_back(QcsdAction::CancelChaff {
                 endpoint,
                 stream,

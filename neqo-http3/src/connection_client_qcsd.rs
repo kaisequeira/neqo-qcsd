@@ -249,6 +249,39 @@ impl Http3Client {
         Ok((receive, state))
     }
 
+    /// Separate CS terminal policy for a witnessed unused parser allowance.
+    /// The caller supplies original controller provenance; fresh protocol
+    /// checks must still succeed before removing only the local HTTP handler.
+    ///
+    /// # Errors
+    /// Refuses before mutation for stale, foreign, owned, buffered, unacknowledged,
+    /// terminal, QPACK-blocked or non-boundary state. Grants no receive credit.
+    pub fn qcsd_abandon_cs_parser_allowance_chaff(
+        &mut self,
+        stream_id: StreamId,
+        role: QcsdRequestRole,
+        witness: &neqo_csdef::CsBufloTerminalParserAllowance,
+    ) -> Res<(
+        neqo_transport::recv_stream::QcsdUnusedParserReceive,
+        &'static str,
+    )> {
+        let receive = self
+            .conn
+            .qcsd_preview_cs_parser_allowance_chaff_abandonment(stream_id, role, witness)
+            .ok_or(Error::InvalidInput)?;
+        if self.qcsd_qpack_decoder_handler_pending()
+            || self.qcsd_qpack_decoder_transport_pending()
+            || self.qcsd_has_pending_stream_send()
+            || self.qcsd_has_pending_defense_control()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let state = self
+            .base_handler
+            .qcsd_abandon_cs_parser_allowance_response(stream_id, &mut self.conn)?;
+        Ok((receive, state))
+    }
+
     /// Open a same-origin nonblocking-QPACK request for qualification without
     /// installing shaped transport stream roles.
     ///

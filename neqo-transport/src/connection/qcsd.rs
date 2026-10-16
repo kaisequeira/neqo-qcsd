@@ -429,6 +429,48 @@ impl Connection {
             .qcsd_idle_initial_manual_receive()
     }
 
+    /// Preview only an exact CS controller-witnessed unowned parser suffix.
+    /// All original identity, request-FIN/ACK, receive-action and wire-control
+    /// checks remain mandatory; the live QUIC receive state stays unchanged.
+    #[must_use]
+    pub fn qcsd_preview_cs_parser_allowance_chaff_abandonment(
+        &self,
+        stream: StreamId,
+        role: QcsdRequestRole,
+        witness: &neqo_csdef::CsBufloTerminalParserAllowance,
+    ) -> Option<crate::recv_stream::QcsdUnusedParserReceive> {
+        if self.qcsd_endpoint != Some(witness.endpoint())
+            || witness.stream().0 != stream.as_u64()
+            || witness.role() != role
+            || !matches!(
+                role,
+                QcsdRequestRole::Chaff {
+                    request_id: Some(_),
+                    ..
+                }
+            )
+            || self.qcsd_stream_roles.get(&stream) != Some(&role)
+            || !self.streams.qcsd_send_stream_fin_peer_confirmed(stream)
+            || self
+                .qcsd_pending_receive_actions
+                .iter()
+                .any(|pending| pending.identity.stream().0 == stream.as_u64())
+            || self
+                .qcsd_pending_receive_credit
+                .iter()
+                .any(|credit| credit.stream == stream)
+            || self
+                .qcsd_unacked_defense_receive_limits
+                .contains_key(&stream)
+            || self.streams.qcsd_local_et_cancellation_controls(stream) != (false, false)
+        {
+            return None;
+        }
+        self.streams
+            .qcsd_get_recv_stream(stream)?
+            .qcsd_unused_parser_manual_receive(witness)
+    }
+
     pub(super) fn qcsd_observe_stream_transmissions(&mut self, tokens: &recovery::Tokens) {
         let slot = self.qcsd_active_target.map(|target| target.slot);
         let transmissions: Vec<_> = tokens
