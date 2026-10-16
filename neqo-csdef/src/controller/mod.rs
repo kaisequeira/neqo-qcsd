@@ -430,6 +430,10 @@ pub struct QcsdController {
     /// Only an independently validated prepared BuFLO policy may widen the
     /// incoming advertisement window; outgoing deadlines stay unchanged.
     buflo_incoming_half_period_window: Option<Duration>,
+    /// Last committed ordinary receive allocation within each endpoint and
+    /// role class. Only the authenticated 64 ms BuFLO path advances these
+    /// cursors; registry eligibility and application priority stay unchanged.
+    buflo_incoming_stream_cursor: HashMap<(QcsdEndpointId, bool), QcsdStreamId>,
     /// Prospective source-bound Tamaraw receive ownership and outgoing window.
     /// Incoming releases can still complete across real transport callbacks;
     /// slotless parser bootstrap never becomes scheduled ownership afterward.
@@ -673,6 +677,7 @@ impl QcsdController {
             buflo_chaff_ack_observed_at: HashMap::new(),
             buflo_startup_requested_chaff: HashMap::new(),
             buflo_incoming_half_period_window: None,
+            buflo_incoming_stream_cursor: HashMap::new(),
             tamaraw_rapid_capture_policy: false,
             front_padding_outgoing_window: false,
             terminal_primary_partial_cell_policy: false,
@@ -1723,6 +1728,8 @@ impl QcsdController {
                 self.return_endpoint_credit(endpoint, at);
                 self.scheduler.remove_endpoint(endpoint);
                 self.endpoint_origins.remove(&endpoint);
+                self.buflo_incoming_stream_cursor
+                    .retain(|(candidate, _), _| *candidate != endpoint);
                 self.streams.remove_endpoint(endpoint);
                 self.application_stream_ranges
                     .retain(|(candidate, _), _| *candidate != endpoint);
@@ -4914,8 +4921,11 @@ impl QcsdController {
                 });
                 continue;
             }
+            let fair_stream_turns =
+                self.buflo_incoming_half_period_window == Some(Duration::from_micros(32_000));
             let mut staged_credit = Vec::new();
             let mut staged_claims: Vec<PendingClaim> = Vec::new();
+            let mut staged_stream_turns = HashMap::new();
             let mut opportunities = Vec::new();
             for endpoint in endpoint_order {
                 let mut endpoint_opportunities = self.streams.allocation_opportunities_excluding(
@@ -4943,6 +4953,16 @@ impl QcsdController {
                     )
                 {
                     endpoint_opportunities.push(opportunity);
+                }
+                if fair_stream_turns {
+                    endpoint_opportunities.sort_by_key(|opportunity| {
+                        let chaff = matches!(opportunity.role, QcsdRequestRole::Chaff { .. });
+                        let wrapped = self
+                            .buflo_incoming_stream_cursor
+                            .get(&(endpoint, chaff))
+                            .is_some_and(|last| opportunity.stream <= *last);
+                        (chaff, wrapped, opportunity.stream)
+                    });
                 }
                 opportunities.extend(endpoint_opportunities);
             }
@@ -4973,6 +4993,7 @@ impl QcsdController {
                 if incoming.remaining == 0 {
                     break;
                 }
+                let remaining_before = incoming.remaining;
                 if opportunity.exact > 0 {
                     let release = self
                         .streams
@@ -5065,6 +5086,10 @@ impl QcsdController {
                         });
                     }
                 }
+                if fair_stream_turns && incoming.remaining < remaining_before {
+                    let chaff = matches!(opportunity.role, QcsdRequestRole::Chaff { .. });
+                    staged_stream_turns.insert((opportunity.endpoint, chaff), opportunity.stream);
+                }
             }
 
             if incoming.remaining == 0 || (!exact_window && !self.config.drop_unsatisfied_events) {
@@ -5087,6 +5112,10 @@ impl QcsdController {
                     }
                     self.control.claims.push(claim);
                 }
+                // A failed exact-cell staging pass rolls back every release
+                // and claim below, and must not consume a fairness turn.
+                self.buflo_incoming_stream_cursor
+                    .extend(staged_stream_turns);
             } else {
                 for credit in staged_credit.into_iter().rev() {
                     assert!(self.streams.cancel_release(
@@ -26448,6 +26477,458 @@ mod tests {
                 assert_eq!(metrics.scheduled_incoming_unresolved_bytes, 0);
             }
         }
+    }
+
+    // These are controller-allocation component controls. Real decoded extents,
+    // local receive advertisements and raw reads drive the public controller;
+    // outgoing SlotSatisfied observations are explicit adapter premises, not a
+    // claim about packet construction or independent wire qualification.
+    fn native102_fairness_controller(
+        interval_us: u64,
+        opted_in: bool,
+        excess: u64,
+    ) -> QcsdController {
+        let parameters = BufloParameters {
+            schema_version: 1,
+            interval_us,
+            minimum_duration_us: 10_000_000,
+            packet_size: 1_200,
+            max_events: 10_000,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+            duration_budget_policy: Some(if interval_us == 64_000 {
+                crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds
+            } else {
+                crate::BufloDurationBudgetPolicy::RapidV6Fixed200Seconds
+            }),
+        };
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: DefenseConfig::Buflo(crate::BufloConfig {
+                    parameters: "component-bound-buflo.json".into(),
+                }),
+                initial_max_stream_data: 16,
+                max_stream_data_excess: excess,
+                max_udp_payload_size: 1_200,
+                control_interval_us: 5_000,
+                tail_wait_us: 0,
+                ..QcsdConfig::default()
+            },
+            None,
+            Box::new(Buflo::from_parameters(parameters)),
+        )
+        .expect("real fixed-cell BuFLO controller");
+        if opted_in {
+            controller
+                .enable_buflo_half_period_incoming_window_for_interval(interval_us)
+                .expect("independently bound cadence policy");
+        }
+        controller
+    }
+
+    fn native102_open_decoded(
+        controller: &mut QcsdController,
+        limits: &mut std::collections::HashMap<(QcsdEndpointId, QcsdStreamId), u64>,
+        endpoint: u64,
+        stream: u64,
+        role: QcsdRequestRole,
+        body: u64,
+    ) {
+        let endpoint = QcsdEndpointId(endpoint);
+        let stream = QcsdStreamId(stream);
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role,
+                expected_response_length: Some(1),
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint,
+                stream,
+                frame_bytes: 5,
+                status: Some(200),
+                content_length: None,
+            },
+            Duration::ZERO,
+        );
+        let frame_header_bytes = 1 + if body < 64 {
+            1
+        } else if body < 16_384 {
+            2
+        } else if body < (1_u64 << 30) {
+            4
+        } else {
+            8
+        };
+        let prefix_bytes = 5 + frame_header_bytes;
+        // Consume the exact HEADERS plus DATA varint prefix before publishing
+        // the DATA extent; use the rest of the actual initial16 for payload.
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: prefix_bytes,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream,
+                frame_header_bytes,
+                data_bytes: body,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes: 16 - prefix_bytes,
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(limits.insert((endpoint, stream), 16), None);
+    }
+
+    fn native102_realize_cell(
+        controller: &mut QcsdController,
+        limits: &mut std::collections::HashMap<(QcsdEndpointId, QcsdStreamId), u64>,
+        target_us: u64,
+    ) -> Vec<(QcsdEndpointId, QcsdStreamId, u64)> {
+        let at = Duration::from_micros(target_us);
+        controller.poll(at);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            QcsdAction::SlotMissed { .. } | QcsdAction::LeaseParserReceive { .. }
+        )));
+        let mut credit = Vec::new();
+        let mut incoming = None;
+        let mut outgoing = 0;
+        for action in actions {
+            match action {
+                QcsdAction::SendPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    ..
+                }
+                | QcsdAction::CommitPrearmedPacket {
+                    endpoint,
+                    packet,
+                    slot,
+                    ..
+                } => {
+                    assert_eq!(packet, outgoing_packet(at));
+                    outgoing += 1;
+                    // This is the same public adapter-outcome seam as the
+                    // inherited fixed-cadence controller controls.
+                    controller.observe(
+                        QcsdObservation::SlotSatisfied {
+                            endpoint,
+                            slot,
+                            observed_size: 1_200,
+                        },
+                        at,
+                    );
+                }
+                QcsdAction::IncreaseReceiveLimit {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    packet,
+                    slot,
+                } => {
+                    assert_eq!(packet, incoming_packet(at));
+                    assert!(incoming.is_none_or(|old| old == slot));
+                    incoming = Some(slot);
+                    let previous = limits.get_mut(&(endpoint, stream)).expect("opened stream");
+                    let increase = absolute_limit
+                        .checked_sub(*previous)
+                        .expect("strict advance");
+                    assert!(increase > 0);
+                    *previous = absolute_limit;
+                    credit.push((endpoint, stream, increase, absolute_limit));
+                }
+                QcsdAction::PrearmPacket { .. } => {}
+                other => panic!("unexpected action in decoded fixed-cell fixture: {other:?}"),
+            }
+        }
+        assert_eq!(outgoing, 1);
+        let slot = incoming.expect("one actual incoming cell");
+        assert_eq!(credit.iter().map(|entry| entry.2).sum::<u64>(), 1_200);
+        assert!(!controller.incoming_slot_is_locally_realized(slot));
+        for &(endpoint, stream, _, absolute_limit) in &credit {
+            controller.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                at + Duration::from_micros(1),
+            );
+        }
+        assert!(controller.incoming_slot_is_locally_realized(slot));
+        assert!(
+            controller
+                .pending_slots()
+                .iter()
+                .any(|(pending, _)| *pending == slot)
+        );
+        for &(endpoint, stream, increase, _) in &credit {
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: increase,
+                },
+                at + Duration::from_micros(2),
+            );
+        }
+        let terminals: Vec<_> = controller.drain_actions().collect();
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(terminals[0], QcsdAction::SlotSatisfied {
+            slot: observed, packet, ..
+        } if observed == slot && packet == incoming_packet(at)));
+        assert!(
+            controller
+                .pending_slots()
+                .iter()
+                .all(|(pending, _)| *pending != slot)
+        );
+        assert_eq!(
+            controller.terminal_slot_resolution_at(slot),
+            Some(at + Duration::from_micros(2))
+        );
+        assert_eq!(controller.terminal_failure(), None);
+        credit
+            .into_iter()
+            .map(|(endpoint, stream, increase, _)| (endpoint, stream, increase))
+            .collect()
+    }
+
+    #[test]
+    fn buflo_cadence64_later_application_gets_credit_before_large_prior_streams_finish() {
+        let mut controller = native102_fairness_controller(64_000, true, 1_000);
+        let mut limits = std::collections::HashMap::new();
+        ready(&mut controller, 1, "https://example.com");
+        for (stream, body) in [(0, 391_179), (4, 528_710), (8, 543_091), (12, 2_400)] {
+            native102_open_decoded(
+                &mut controller,
+                &mut limits,
+                1,
+                stream,
+                QcsdRequestRole::Application,
+                body,
+            );
+        }
+        controller.drain_actions().for_each(drop);
+        let mut selected = Vec::new();
+        for tick in 0..5 {
+            let credit = native102_realize_cell(&mut controller, &mut limits, tick * 64_000);
+            assert_eq!(credit.len(), 1);
+            selected.push(credit[0].1.0);
+        }
+        assert_eq!(
+            selected,
+            [0, 4, 8, 12, 0],
+            "a later ordinary application must receive a turn while every earlier large body is still live"
+        );
+        for (stream, body) in [(0, 391_179), (4, 528_710), (8, 543_091)] {
+            assert!(limits[&(QcsdEndpointId(1), QcsdStreamId(stream))] < body);
+        }
+        let d = controller.defense_diagnostics();
+        assert_eq!(d.scheduled_incoming_requested_bytes, 6_000);
+        assert_eq!(d.scheduled_incoming_advertised_bytes, 6_000);
+        assert_eq!(d.scheduled_incoming_consumed_bytes, 6_000);
+        assert_eq!(d.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(d.scheduled_incoming_unresolved_bytes, 0);
+        assert_eq!(d.buflo_missed_incoming_cells, 0);
+        assert_eq!(d.buflo_missed_outgoing_cells, 0);
+    }
+
+    #[test]
+    fn buflo_stream_fairness_preserves_unopted_and_twenty_ms_order() {
+        for (interval, opted_in) in [(64_000, false), (20_000, true)] {
+            let mut controller = native102_fairness_controller(interval, opted_in, 1_000);
+            let mut limits = std::collections::HashMap::new();
+            ready(&mut controller, 1, "https://example.com");
+            for stream in [0, 4] {
+                native102_open_decoded(
+                    &mut controller,
+                    &mut limits,
+                    1,
+                    stream,
+                    QcsdRequestRole::Application,
+                    100_000,
+                );
+            }
+            controller.drain_actions().for_each(drop);
+            for tick in 0..3 {
+                let credit = native102_realize_cell(&mut controller, &mut limits, tick * interval);
+                assert_eq!(credit, [(QcsdEndpointId(1), QcsdStreamId(0), 1_200)]);
+            }
+        }
+    }
+
+    #[test]
+    fn buflo_cadence64_stream_turns_preserve_endpoint_round_robin() {
+        let mut controller = native102_fairness_controller(64_000, true, 1_000);
+        let mut limits = std::collections::HashMap::new();
+        for endpoint in [1, 2] {
+            ready(
+                &mut controller,
+                endpoint,
+                &format!("https://{endpoint}.example.com"),
+            );
+            for stream in [0, 4] {
+                native102_open_decoded(
+                    &mut controller,
+                    &mut limits,
+                    endpoint,
+                    stream,
+                    QcsdRequestRole::Application,
+                    100_000,
+                );
+            }
+        }
+        controller.drain_actions().for_each(drop);
+        let mut selected = Vec::new();
+        for tick in 0..4 {
+            let credit = native102_realize_cell(&mut controller, &mut limits, tick * 64_000);
+            assert_eq!(credit.len(), 1);
+            selected.push((credit[0].0.0, credit[0].1.0));
+        }
+        assert_eq!(selected, [(1, 0), (2, 0), (1, 4), (2, 4)]);
+    }
+
+    #[test]
+    fn buflo_cadence64_stream_turns_keep_application_priority_and_chaff_ack_guard() {
+        let mut controller = native102_fairness_controller(64_000, true, 1_000);
+        let mut limits = std::collections::HashMap::new();
+        ready(&mut controller, 1, "https://example.com");
+        for stream in [4, 8, 12] {
+            let role = QcsdRequestRole::Chaff {
+                resource_id: u32::try_from(stream).expect("component resource ID"),
+                request_id: None,
+            };
+            native102_open_decoded(&mut controller, &mut limits, 1, stream, role, 100_000);
+            controller.observe(
+                QcsdObservation::StreamDataTransmitted {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(stream),
+                    role,
+                    offset: 0,
+                    bytes: 100,
+                    fin: true,
+                    slot: None,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamDataAcknowledged {
+                    endpoint: QcsdEndpointId(1),
+                    stream: QcsdStreamId(stream),
+                    role,
+                    offset: 0,
+                    bytes: if stream == 4 { 99 } else { 100 },
+                    fin: stream != 4,
+                },
+                Duration::ZERO,
+            );
+        }
+        for stream in [20, 24] {
+            native102_open_decoded(
+                &mut controller,
+                &mut limits,
+                1,
+                stream,
+                QcsdRequestRole::Application,
+                1_208,
+            );
+        }
+        controller.drain_actions().for_each(drop);
+        let mut selected = Vec::new();
+        for tick in 0..5 {
+            let credit = native102_realize_cell(&mut controller, &mut limits, tick * 64_000);
+            assert_eq!(credit.len(), 1);
+            let stream = credit[0].1;
+            selected.push(stream.0);
+            if stream.0 >= 20 {
+                controller.observe(
+                    QcsdObservation::StreamFinished {
+                        endpoint: QcsdEndpointId(1),
+                        stream,
+                        finish: QcsdStreamFinish::Fin,
+                    },
+                    Duration::from_micros(tick * 64_000 + 3),
+                );
+                assert!(
+                    controller
+                        .drain_actions()
+                        .all(|action| !matches!(action, QcsdAction::SlotMissed { .. }))
+                );
+            }
+        }
+        assert_eq!(selected, [20, 24, 8, 12, 8]);
+        assert_eq!(
+            limits[&(QcsdEndpointId(1), QcsdStreamId(4))],
+            16,
+            "incomplete ACK coverage must never become eligible chaff"
+        );
+    }
+
+    #[test]
+    fn buflo_cadence64_fanout_advances_after_last_committed_stream() {
+        let mut controller = native102_fairness_controller(64_000, true, 0);
+        let mut limits = std::collections::HashMap::new();
+        ready(&mut controller, 1, "https://example.com");
+        for (stream, body) in [(0, 1_808), (4, 608), (8, 100_000)] {
+            native102_open_decoded(
+                &mut controller,
+                &mut limits,
+                1,
+                stream,
+                QcsdRequestRole::Application,
+                body,
+            );
+        }
+        controller.drain_actions().for_each(drop);
+        for (tick, expected) in [
+            vec![(QcsdEndpointId(1), QcsdStreamId(0), 1_200)],
+            vec![
+                (QcsdEndpointId(1), QcsdStreamId(4), 600),
+                (QcsdEndpointId(1), QcsdStreamId(8), 600),
+            ],
+            vec![
+                (QcsdEndpointId(1), QcsdStreamId(0), 600),
+                (QcsdEndpointId(1), QcsdStreamId(8), 600),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                native102_realize_cell(
+                    &mut controller,
+                    &mut limits,
+                    u64::try_from(tick).expect("tick") * 64_000
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            3_600
+        );
     }
 
     fn startup_cadence64_controller(known_valid: bool) -> QcsdController {
