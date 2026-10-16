@@ -24546,27 +24546,36 @@ async fn drive_endpoint_output_with_clock_until(
         } else {
             None
         };
-        let kernel_semantic_handoff_interrupt = if defense_clock.uses_kernel_tai() {
-            controller
-                .next_deadline()
-                .into_iter()
-                .chain(endpoints.iter().flat_map(|endpoint| {
-                    endpoint
-                        .prearmed_outgoing
+        // Keep the two already-consumed boundary sources for refusal-only
+        // attribution. Their minimum and the successful output path are unchanged.
+        let (kernel_controller_interrupt, kernel_rolling_interrupt) =
+            if defense_clock.uses_kernel_tai() {
+                (
+                    controller.next_deadline(),
+                    endpoints
                         .iter()
-                        .map(|prearm| prearm.packet.timestamp())
-                        .chain(
+                        .flat_map(|endpoint| {
                             endpoint
-                                .scheduled_outgoing
+                                .prearmed_outgoing
                                 .iter()
-                                .filter(|scheduled| scheduled.rolling_prearmed)
-                                .map(|scheduled| scheduled.packet.timestamp()),
-                        )
-                }))
-                .min()
-        } else {
-            None
-        };
+                                .map(|prearm| prearm.packet.timestamp())
+                                .chain(
+                                    endpoint
+                                        .scheduled_outgoing
+                                        .iter()
+                                        .filter(|scheduled| scheduled.rolling_prearmed)
+                                        .map(|scheduled| scheduled.packet.timestamp()),
+                                )
+                        })
+                        .min(),
+                )
+            } else {
+                (None, None)
+            };
+        let kernel_semantic_handoff_interrupt = kernel_controller_interrupt
+            .into_iter()
+            .chain(kernel_rolling_interrupt)
+            .min();
         let effective_unshaped_handoff_interrupt = rolling_handoff_interrupt
             .into_iter()
             .chain(unshaped_handoff_interrupt)
@@ -24584,7 +24593,41 @@ async fn drive_endpoint_output_with_clock_until(
             kernel_semantic_handoff_interrupt,
             monotonic_clock,
         )
-        .await?;
+        .await;
+        if matches!(&output, Err(Error::DefenseExecution(message))
+            if message == "BuFLO ordinary socket handoff reached its CLOCK_TAI semantic interrupt before send")
+        {
+            let winner = match (kernel_controller_interrupt, kernel_rolling_interrupt) {
+                (Some(controller), Some(rolling)) if controller == rolling => "both",
+                (Some(controller), Some(rolling)) if controller < rolling => "controller",
+                (Some(_), Some(_)) | (None, Some(_)) => "rolling",
+                (Some(_), None) => "controller",
+                (None, None) => "none",
+            };
+            // Diagnostics cannot replace the original hard failure, including
+            // when the trace sink itself cannot retain the diagnostic event.
+            let _ = traces.event(
+                drive_now,
+                Some(endpoints[output_endpoint_index].id),
+                "buflo_ordinary_handoff_refusal",
+                "boundary_origin",
+                &json!({
+                    "schema_version": 1,
+                    "policy": "buflo-ordinary-presend-refusal-diagnostic-v1",
+                    "supplied_drive_monotonic_ns": duration_as_u64_nanos(
+                        drive_now.saturating_duration_since(
+                            endpoints[output_endpoint_index].receive_loop.origin)),
+                    "interrupt_elapsed_ns": kernel_semantic_handoff_interrupt
+                        .map(duration_as_u64_nanos),
+                    "controller_interrupt_elapsed_ns": kernel_controller_interrupt
+                        .map(duration_as_u64_nanos),
+                    "rolling_interrupt_elapsed_ns": kernel_rolling_interrupt
+                        .map(duration_as_u64_nanos),
+                    "winning_boundary_source": winner,
+                }),
+            );
+        }
+        let output = output?;
         let exact_due_slots_are_terminal = !due_rolling_slots_before_output.is_empty()
             && due_rolling_slots_before_output.iter().all(|slot| {
                 controller.terminal_slot_resolution_at(*slot).is_some()
@@ -25102,6 +25145,7 @@ async fn process_output_once_with_clock(
     semantic_handoff_interrupt: Option<Duration>,
     monotonic_clock: &mut impl FnMut() -> Instant,
 ) -> Result<OutputDrive, Error> {
+    let supplied_drive_now = drive_now;
     // V4 admission uses a fresh physical clock after all prior reduction and
     // action work. A stale loop timestamp must not reopen the reserved final
     // millisecond. Other policies retain their established clock seam.
@@ -25210,14 +25254,209 @@ async fn process_output_once_with_clock(
     let (sent_at, late_handoff, semantic_wire_elapsed, semantic_interrupt_crossed) = loop {
         if let (Some(started), Some(interrupt_elapsed)) =
             (defense_start, semantic_handoff_interrupt)
-            && defense_clock
-                .sample_boundary(started, monotonic_clock(), interrupt_elapsed)?
-                .1
         {
-            return Err(Error::DefenseExecution(
-                "BuFLO ordinary socket handoff reached its CLOCK_TAI semantic interrupt before send"
-                    .into(),
-            ));
+            let guard_observed_at = monotonic_clock();
+            let (sampled_elapsed, reached) =
+                defense_clock.sample_boundary(started, guard_observed_at, interrupt_elapsed)?;
+            if reached {
+                // This is a diagnostic shape census, never permission to defer.
+                // A slotless physical receive-limit frame can still cover an
+                // owned scheduled/parser range, so every such frame is excluded.
+                let mut observation_kind_counts =
+                    std::collections::BTreeMap::<&'static str, u64>::new();
+                let mut non_allowlisted_kind_counts =
+                    std::collections::BTreeMap::<&'static str, u64>::new();
+                let mut terminal_slot_records = Vec::new();
+                let mut slot_owned_transmission_records = Vec::new();
+                let observation_records = prepared
+                    .observations
+                    .iter()
+                    .map(|record| {
+                        let observation = record.observation();
+                        let kind = match observation {
+                            QcsdObservation::EndpointReady { .. } => "endpoint_ready",
+                            QcsdObservation::EndpointClosed { .. } => "endpoint_closed",
+                            QcsdObservation::StreamOpened { .. } => "stream_opened",
+                            QcsdObservation::HeaderProgress { .. } => "header_progress",
+                            QcsdObservation::ResponseHeaders { .. } => "response_headers",
+                            QcsdObservation::DataFrame { .. } => "data_frame",
+                            QcsdObservation::PushPromiseFrame { .. } => "push_promise_frame",
+                            QcsdObservation::IgnoredRequestStreamFrame { .. } => {
+                                "ignored_request_stream_frame"
+                            }
+                            QcsdObservation::BytesRead { .. } => "bytes_read",
+                            QcsdObservation::StreamDataBlocked { .. } => "stream_data_blocked",
+                            QcsdObservation::ReceiveLimitAdvertised { .. } => {
+                                "receive_limit_advertised"
+                            }
+                            QcsdObservation::StreamFinished { .. } => "stream_finished",
+                            QcsdObservation::ChaffRequestFailed { .. } => "chaff_request_failed",
+                            QcsdObservation::ResourceCompleted { .. } => "resource_completed",
+                            QcsdObservation::ApplicationBatchStarted => "application_batch_started",
+                            QcsdObservation::ApplicationBatchCompleted => {
+                                "application_batch_completed"
+                            }
+                            QcsdObservation::ApplicationComplete => "application_complete",
+                            QcsdObservation::EgressBacklog { .. } => "egress_backlog",
+                            QcsdObservation::EgressStreamBacklog { .. } => "egress_stream_backlog",
+                            QcsdObservation::Datagram { .. } => "datagram",
+                            QcsdObservation::ClassifiedDatagram { .. } => "classified_datagram",
+                            QcsdObservation::TrafficMorphingEgress { .. } => {
+                                "traffic_morphing_egress"
+                            }
+                            QcsdObservation::StreamDataTransmitted { .. } => {
+                                "stream_data_transmitted"
+                            }
+                            QcsdObservation::StreamDataAcknowledged { .. } => {
+                                "stream_data_acknowledged"
+                            }
+                            QcsdObservation::SlotSatisfied { .. } => "slot_satisfied",
+                            QcsdObservation::SlotMissed { .. } => "slot_missed",
+                            QcsdObservation::SlotResolved { .. } => "slot_resolved",
+                        };
+                        let allowlisted = matches!(observation,
+                        QcsdObservation::ClassifiedDatagram {
+                            endpoint: observed_endpoint,
+                            direction: Direction::Outgoing,
+                            composition: Some(_), ..
+                        } if *observed_endpoint == endpoint.id)
+                            || matches!(observation,
+                            QcsdObservation::StreamDataTransmitted {
+                                endpoint: observed_endpoint, slot: None, ..
+                            } if *observed_endpoint == endpoint.id);
+                        let count = observation_kind_counts.entry(kind).or_default();
+                        *count = count.saturating_add(1);
+                        if !allowlisted {
+                            let count = non_allowlisted_kind_counts.entry(kind).or_default();
+                            *count = count.saturating_add(1);
+                        }
+                        if let Some(slot) = terminal_observation_slot(observation) {
+                            terminal_slot_records.push(json!({
+                                "slot": slot.0,
+                                "production_sequence": record.sequence(),
+                                "production_monotonic_ns": record.produced_monotonic_ns(),
+                                "observation": observation,
+                            }));
+                        }
+                        if matches!(
+                            observation,
+                            QcsdObservation::StreamDataTransmitted { slot: Some(_), .. }
+                        ) {
+                            slot_owned_transmission_records.push(json!({
+                                "production_sequence": record.sequence(),
+                                "production_monotonic_ns": record.produced_monotonic_ns(),
+                                "observation": observation,
+                            }));
+                        }
+                        // These variants contain typed numeric/enum fields only.
+                        // Other kinds retain their exact kind and production stamp,
+                        // which suffices to exclude them without copying an origin.
+                        let numeric_observation = match observation {
+                            QcsdObservation::ClassifiedDatagram { .. }
+                            | QcsdObservation::StreamDataTransmitted { .. }
+                            | QcsdObservation::ReceiveLimitAdvertised { .. }
+                            | QcsdObservation::SlotSatisfied { .. }
+                            | QcsdObservation::SlotMissed { .. }
+                            | QcsdObservation::SlotResolved { .. } => Some(json!(observation)),
+                            _ => None,
+                        };
+                        json!({
+                            "production_sequence": record.sequence(),
+                            "production_monotonic_ns": record.produced_monotonic_ns(),
+                            "kind": kind,
+                            "conservative_shape_allowlisted": allowlisted,
+                            "numeric_observation": numeric_observation,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let all_datagram_attributions_targetless = prepared
+                    .attributed_datagrams
+                    .iter()
+                    .all(|attribution| attribution.satisfied.is_none());
+                let conservative_targetless_shape_candidate =
+                    all_datagram_attributions_targetless && non_allowlisted_kind_counts.is_empty();
+                let clock = match defense_clock {
+                    RunnerDefenseClock::Monotonic => json!({"source": "monotonic"}),
+                    #[cfg(target_os = "linux")]
+                    RunnerDefenseClock::KernelTai { start_tai_ns, .. } => json!({
+                        "source": "CLOCK_TAI",
+                        "epoch_tai_ns": start_tai_ns,
+                        // A reached nonnegative boundary proves the saturating
+                        // subtraction in sample_boundary did not saturate. This
+                        // reconstructs its SAME sample; it never resamples TAI.
+                        "sampled_tai_ns": start_tai_ns
+                            .checked_add(duration_as_u64_nanos(sampled_elapsed)),
+                        "boundary_tai_ns": start_tai_ns
+                            .checked_add(duration_as_u64_nanos(interrupt_elapsed)),
+                    }),
+                };
+                let _ = traces.event(
+                    guard_observed_at,
+                    Some(endpoint.id),
+                    "buflo_ordinary_handoff_refusal",
+                    "clock_sample",
+                    &json!({
+                        "schema_version": 1,
+                        "policy": "buflo-ordinary-presend-refusal-diagnostic-v1",
+                        "supplied_drive_monotonic_ns": duration_as_u64_nanos(
+                            supplied_drive_now.saturating_duration_since(endpoint.receive_loop.origin)),
+                        "transport_drive_monotonic_ns": duration_as_u64_nanos(
+                            drive_now.saturating_duration_since(endpoint.receive_loop.origin)),
+                        "guard_monotonic_ns": duration_as_u64_nanos(
+                            guard_observed_at.saturating_duration_since(endpoint.receive_loop.origin)),
+                        "interrupt_elapsed_ns": duration_as_u64_nanos(interrupt_elapsed),
+                        "sampled_elapsed_ns": duration_as_u64_nanos(sampled_elapsed),
+                        "clock": clock,
+                        "prepared_output_finalized": false,
+                        "successful_socket_handoff": false,
+                        "prior_socket_would_block_returns": socket_would_block_returns,
+                        "prepared_datagram_lengths": prepared.batch.iter()
+                            .map(|datagram| datagram.len()).collect::<Vec<_>>(),
+                        "drained_observation_count": prepared.observations.len(),
+                        "drained_observation_kind_counts": observation_kind_counts,
+                        "non_allowlisted_observation_kind_counts": non_allowlisted_kind_counts,
+                        "drained_observation_records": observation_records,
+                        "drained_terminal_slot_records": terminal_slot_records,
+                        "drained_slot_owned_stream_transmission_records": slot_owned_transmission_records,
+                        "all_prepared_datagram_attributions_targetless": all_datagram_attributions_targetless,
+                        "conservative_targetless_shape_candidate": conservative_targetless_shape_candidate,
+                        "shape_allowlist": "same-endpoint outgoing ClassifiedDatagram with composition; same-endpoint StreamDataTransmitted with slot None",
+                        "shape_candidate_does_not_authorize_deferral": true,
+                        "retention_conservation_or_lifecycle_validated": false,
+                        "prepared_datagram_compositions": prepared.attributed_datagrams.iter()
+                            .map(|attribution| attribution.composition).collect::<Vec<_>>(),
+                        "ordinary_datagram_count": prepared.attributed_datagrams.iter()
+                            .filter(|attribution| attribution.satisfied.is_none()).count(),
+                        "slot_owned_datagrams": prepared.attributed_datagrams.iter()
+                            .filter_map(|attribution| attribution.satisfied.map(|target| json!({
+                                "slot": target.slot.0,
+                                "observed_bytes": attribution.observed,
+                                "scheduled_bytes": target.observed_size,
+                                "satisfaction": target.status,
+                                "exclusive_deadline_monotonic_ns": duration_as_u64_nanos(
+                                    target.deadline.saturating_duration_since(endpoint.receive_loop.origin)),
+                            }))).collect::<Vec<_>>(),
+                        "drained_receive_advertisements": prepared.observations.iter()
+                            .filter_map(|record| {
+                                let QcsdObservation::ReceiveLimitAdvertised {
+                                    endpoint, stream, absolute_limit, slot,
+                                } = record.observation() else { return None; };
+                                Some(json!({
+                                    "production_sequence": record.sequence(),
+                                    "production_monotonic_ns": record.produced_monotonic_ns(),
+                                    "endpoint": endpoint.0,
+                                    "stream": stream.0,
+                                    "absolute_limit": absolute_limit,
+                                    "slot": slot.map(|slot| slot.0),
+                                }))
+                            }).collect::<Vec<_>>(),
+                    }),
+                );
+                return Err(Error::DefenseExecution(
+                    "BuFLO ordinary socket handoff reached its CLOCK_TAI semantic interrupt before send"
+                        .into(),
+                ));
+            }
         }
         #[cfg(test)]
         let force_socket_handoff_success = endpoint.test_force_socket_handoff_success;
