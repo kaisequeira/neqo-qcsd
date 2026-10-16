@@ -239,6 +239,17 @@ impl FrameReader {
         !self.decoding_in_progress()
     }
 
+    /// Only a known, unfinished initial HEADERS payload may be discarded by
+    /// the separate CS terminal local-abandonment path. No decoder ran yet.
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_partial_initial_headers(&self) -> bool {
+        self.frame_type == HFrameType::HEADERS
+            && self.frame_len > 0
+            && self.qcsd_current_frame_bytes > 0
+            && matches!(&self.state, FrameReaderState::GetData { decoder }
+                if decoder.min_remaining() > 0)
+    }
+
     #[cfg(feature = "qcsd")]
     pub(crate) const fn qcsd_last_frame_bytes(&self) -> u64 {
         self.qcsd_last_frame_bytes

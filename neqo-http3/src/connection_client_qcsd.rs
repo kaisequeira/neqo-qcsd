@@ -190,6 +190,37 @@ impl Http3Client {
         })
     }
 
+    /// Separate CS terminal cleanup. The runner must prove the original CS
+    /// stop/drain latch before calling; all transport/identity/ACK checks are
+    /// identical to the existing strict local-abandonment preview.
+    ///
+    /// # Errors
+    /// Refuses before mutation for any unproved transport, HTTP or QPACK state.
+    pub fn qcsd_abandon_cs_terminal_chaff(
+        &mut self,
+        stream_id: StreamId,
+        role: QcsdRequestRole,
+    ) -> Res<QcsdLocalChaffAbandonment> {
+        let receive = self
+            .conn
+            .qcsd_preview_local_chaff_abandonment(stream_id, role)
+            .ok_or(Error::InvalidInput)?;
+        if self.qcsd_qpack_decoder_handler_pending()
+            || self.qcsd_qpack_decoder_transport_pending()
+            || self.qcsd_has_pending_stream_send()
+            || self.qcsd_has_pending_defense_control()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let http3_receive_state = self
+            .base_handler
+            .qcsd_abandon_cs_drained_response(stream_id, &mut self.conn)?;
+        Ok(QcsdLocalChaffAbandonment {
+            receive,
+            http3_receive_state,
+        })
+    }
+
     /// Open a same-origin nonblocking-QPACK request for qualification without
     /// installing shaped transport stream roles.
     ///

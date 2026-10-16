@@ -19466,6 +19466,83 @@ fn abandon_buflo_terminal_chaff(
     }))
 }
 
+/// CS local ET retains its original stop/drain decision and application
+/// handoff. Only the fully drained exact chaff response is locally abandoned;
+/// no STOP/RESET/credit/QPACK output is introduced by this cleanup.
+fn abandon_cs_buflo_terminal_chaff(
+    endpoint: &mut Endpoint,
+    controller: &QcsdController,
+    stream: StreamId,
+) -> Result<serde_json::Value, Error> {
+    let diagnostics = controller.defense_diagnostics();
+    if !matches!(controller.config().defense, DefenseConfig::CsBuflo(_))
+        || !diagnostics.cs_buflo_application_complete
+        || !diagnostics.cs_buflo_local_termination_latched
+        || !diagnostics.cs_buflo_outgoing_termination_stop_latched
+        || !diagnostics.cs_buflo_incoming_termination_stop_latched
+        || diagnostics.scheduled_incoming_unresolved_bytes != 0
+        || controller.terminal_failure().is_some()
+        || !endpoint.pending_chaff_requests.is_empty()
+    {
+        return Err(Error::SlotInvariant(
+            "CS-BuFLO local abandonment lacks the original drained terminal latch".into(),
+        ));
+    }
+    let record = endpoint.streams.get(&stream).ok_or_else(|| {
+        Error::SlotInvariant("CS-BuFLO local abandonment targeted unknown chaff".into())
+    })?;
+    let QcsdRequestRole::Chaff {
+        resource_id,
+        request_id: Some(request_id),
+    } = record.role
+    else {
+        return Err(Error::SlotInvariant(
+            "CS-BuFLO local abandonment targeted an unqualified non-chaff identity".into(),
+        ));
+    };
+    if record.complete
+        || record.outcome != "in_flight"
+        || endpoint
+            .terminal_local_abandonments
+            .iter()
+            .any(|proof| proof["stream"].as_u64() == Some(stream.as_u64()))
+    {
+        return Err(Error::SlotInvariant(
+            "CS-BuFLO local abandonment targeted a completed or repeated response".into(),
+        ));
+    }
+    let proof = endpoint
+        .client
+        .qcsd_abandon_cs_terminal_chaff(stream, record.role)?;
+    Ok(json!({
+        "policy": "cs_buflo_stop_drain_then_guarded_local_http3_abandon_v1",
+        "reason": "cs_buflo_local_early_termination",
+        "application_complete_at_local_abandonment": diagnostics.cs_buflo_application_complete,
+        "endpoint": endpoint.id.0,
+        "stream": stream.as_u64(),
+        "resource_id": resource_id,
+        "request_id": request_id.0,
+        "local_et_latched_at_us": diagnostics.cs_buflo_local_et_latched_at_us,
+        "before_application_complete": diagnostics.cs_buflo_local_et_before_application_complete,
+        "scheduled_incoming_unresolved_bytes": 0,
+        "encoded_receive_limit": proof.receive.encoded_receive_limit,
+        "manual_receive_limit": proof.receive.manual_receive_limit,
+        "consumed": proof.receive.consumed,
+        "retired": proof.receive.retired,
+        "buffered_bytes": proof.receive.buffered_bytes,
+        "pending_receive_actions": 0,
+        "http3_response_headers_decoded": proof.http3_receive_state != "cs-reading-initial-headers",
+        "http3_receive_state": proof.http3_receive_state,
+        "qpack_blocked": false,
+        "qpack_decoder_pending": false,
+        "request_send_peer_confirmed": true,
+        "stop_sending_queued": false,
+        "reset_stream_queued": false,
+        "receive_credit_increase": 0,
+        "unshaped_data_bytes": 0,
+    }))
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -19840,6 +19917,25 @@ fn apply_action(
                 applied_action_trace_at,
                 endpoint_id,
                 "chaff_local_abandonment",
+                "applied",
+                &proof,
+            )?;
+            endpoint.terminal_local_abandonments.push(proof);
+            Ok(None)
+        } else if let Some((stream, QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)) =
+            canceled_chaff.filter(|_| {
+                let diagnostics = controller.defense_diagnostics();
+                matches!(controller.config().defense, DefenseConfig::CsBuflo(_))
+                    && diagnostics.cs_buflo_application_complete
+                    && diagnostics.cs_buflo_local_termination_latched
+            })
+        {
+            let proof = abandon_cs_buflo_terminal_chaff(endpoint, controller, stream)?;
+            applied_action_trace_at = self::now();
+            traces.event(
+                applied_action_trace_at,
+                endpoint_id,
+                "cs_chaff_local_abandonment",
                 "applied",
                 &proof,
             )?;
@@ -26242,6 +26338,26 @@ fn cs_buflo_run_summary(
     })
 }
 
+fn cs_buflo_terminal_local_abandonment_proof(
+    defense: &DefenseConfig,
+    diagnostics: Option<&DefenseDiagnostics>,
+    endpoints: &[Endpoint],
+) -> Option<serde_json::Value> {
+    if !matches!(defense, DefenseConfig::CsBuflo(_)) {
+        return None;
+    }
+    let diagnostics = diagnostics?;
+    Some(json!({
+        "schema_version": 1,
+        "policy": "cs_buflo_stop_drain_then_guarded_local_http3_abandon_v1",
+        "reason": "cs_buflo_local_early_termination",
+        "observer_effect": "local_http3_abandonment_without_stop_sending_reset_stream_receive_credit_or_qpack_cancellation",
+        "local_et_latched_at_us": diagnostics.cs_buflo_local_et_latched_at_us,
+        "entries": endpoints.iter().flat_map(|endpoint| endpoint.terminal_local_abandonments.iter())
+            .collect::<Vec<_>>(),
+    }))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the run-receipt renderer keeps each independently sourced evidence inventory explicit at the schema boundary"
@@ -26359,6 +26475,15 @@ fn render_run_json(
                 "entries": diagnostics,
             });
         }
+    }
+    // Additional top-level engineering provenance. The exact existing CS
+    // schema-4 summary/diagnostic keyset and scientific fields stay unchanged.
+    if let Some(proof) = cs_buflo_terminal_local_abandonment_proof(
+        &spec.config.defense,
+        completion.defense_diagnostics.as_ref(),
+        endpoints,
+    ) {
+        run["cs_buflo_terminal_local_abandonment"] = proof;
     }
     if let Some(policy) = buflo_incoming_credit_release_receipt(spec) {
         run["buflo_incoming_credit_release_policy"] = policy;

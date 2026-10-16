@@ -519,6 +519,13 @@ trait HttpRecvStream: RecvStream {
         Err(Error::InvalidInput)
     }
 
+    /// CS terminal cleanup may additionally drop an undecoded initial HEADERS
+    /// prefix. Every non-ordinary receive handler still refuses by default.
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_cs_drained_response(&mut self) -> Res<&'static str> {
+        Err(Error::InvalidInput)
+    }
+
     /// This function is similar to the receive function and has the same output, i.e.
     /// a `ReceiveOutput` enum and bool. The bool is true if the stream is completely done
     /// and can be forgotten, i.e. removed from all records.

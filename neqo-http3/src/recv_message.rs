@@ -647,6 +647,45 @@ impl HttpRecvStream for RecvMessage {
         Ok(receive_state)
     }
 
+    #[cfg(feature = "qcsd")]
+    fn qcsd_abandon_cs_drained_response(&mut self) -> Res<&'static str> {
+        if self.stream_type != Http3StreamType::Http
+            || self.message_type != MessageType::Response
+            || !self.blocked_push_promise.is_empty()
+            || self
+                .qpack_decoder
+                .borrow()
+                .is_stream_blocked(self.stream_id)
+            || self.qpack_decoder.borrow().has_pending_send()
+        {
+            return Err(Error::InvalidInput);
+        }
+        let receive_state = match &self.state {
+            RecvMessageState::WaitingForResponseHeaders { frame_reader }
+                if frame_reader.qcsd_partial_initial_headers() =>
+            {
+                "cs-reading-initial-headers"
+            }
+            RecvMessageState::ReadingData { remaining_data_len } if *remaining_data_len > 0 => {
+                "reading-data"
+            }
+            RecvMessageState::WaitingForData { frame_reader }
+                if frame_reader.qcsd_at_frame_boundary() =>
+            {
+                "waiting-for-data-at-frame-boundary"
+            }
+            _ => return Err(Error::InvalidInput),
+        };
+        // This is local application cleanup, not peer FIN/RESET or QPACK
+        // cancellation. The caller has independently proved transport drain.
+        self.state = RecvMessageState::Closed;
+        self.conn_events.recv_closed(
+            &self.stream_info,
+            CloseType::LocalError(Error::HttpRequestCancelled.code()),
+        );
+        Ok(receive_state)
+    }
+
     fn header_unblocked(
         &mut self,
         conn: &mut Connection,
