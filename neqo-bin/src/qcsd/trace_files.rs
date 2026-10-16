@@ -712,7 +712,13 @@ impl TraceFiles {
                 [only] => Some(*only),
                 _ => None,
             });
-            if let Some(scalar_slot) = scalar_slot {
+            // An unfinished explicit fan-out has no whole-slot scalar receipt.
+            // Preserve its observation with the nullable extension still empty.
+            if let Some(scalar_slot) = scalar_slot
+                && self.pending_slots[&scalar_slot]
+                    .credit_advertised_at_us
+                    .is_some()
+            {
                 let pending = &self.pending_slots[&scalar_slot];
                 qcsd.schema_version = Some(2);
                 qcsd.credit_advertised_at_us = pending.credit_advertised_at_us;
