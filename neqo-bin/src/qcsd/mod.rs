@@ -19814,13 +19814,18 @@ fn apply_action(
     } else {
         None
     };
+    let mut applied_action_trace_at = now;
     let adapter_result =
         if let Some((stream, QcsdChaffCancellationReason::BufloTerminalSubcellTail)) =
             canceled_chaff
         {
             let proof = abandon_buflo_terminal_chaff(endpoint, controller, stream)?;
+            // The supplied Instant can precede the independent TAI sample
+            // that latched terminal cancellation. Record the successful local
+            // cleanup and its paired typed action at one actual later Instant.
+            applied_action_trace_at = self::now();
             traces.event(
-                now,
+                applied_action_trace_at,
                 endpoint_id,
                 "chaff_local_abandonment",
                 "applied",
@@ -19985,7 +19990,13 @@ fn apply_action(
                     &window,
                 )?;
             }
-            traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
+            traces.event(
+                applied_action_trace_at,
+                endpoint_id,
+                "action",
+                "applied",
+                &trace_action,
+            )?;
         }
         Err(neqo_http3::Error::StreamLimit)
             if matches!(&trace_action, QcsdAction::RequestChaff { .. }) =>
@@ -32202,6 +32213,366 @@ mod tests {
         drop(endpoint);
         drop(server);
         fs::remove_dir_all(output).unwrap();
+    }
+
+    fn local_abandon_serialization_real_http3_fixture(
+        output: &Path,
+    ) -> (
+        super::Endpoint,
+        neqo_http3::Http3Server,
+        neqo_transport::StreamId,
+        TraceFiles,
+    ) {
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server_config(
+            output,
+            started,
+            &clock,
+            QcsdEndpointId(0),
+            4_433,
+            // Advertise 16 first, then advance monotonically to the actual
+            // 1763-byte manual window before any response arrives.
+            QcsdConfig {
+                initial_max_stream_data: 16,
+                defense: DefenseConfig::Buflo(neqo_csdef::BufloConfig::default()),
+                ..QcsdConfig::default()
+            },
+        );
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let stream = endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::RequestChaff {
+                    endpoint: endpoint.id,
+                    resource: Resource {
+                        id: 10,
+                        url: "https://127.0.0.1:4433/chaff".into(),
+                        kind: "Other".into(),
+                        content_length: Some(2_400),
+                        data_length: 2_400,
+                        chaff_priority: true,
+                        known_valid: true,
+                        depends_on: Vec::new(),
+                        headers: Vec::new(),
+                    },
+                    request_id: QcsdChaffRequestId(7),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        // Query the real request encoder while its send stream still exists,
+        // matching production apply_action's ordering before close_send.
+        let request_stream_bytes = endpoint.client.qcsd_request_stream_bytes(stream).unwrap();
+        endpoint.client.stream_close_send(stream, started).unwrap();
+        endpoint.chaff_send_streams.insert(stream);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 10,
+            request_id: Some(QcsdChaffRequestId(7)),
+        };
+        // This is a synthetic expected identity for a real, incomplete H3
+        // response; it is not a public qualification or a successful receipt.
+        let application_request = super::ApplicationRequest {
+            resource_id: 10,
+            url: "https://127.0.0.1:4433/chaff".parse().unwrap(),
+            headers: Vec::new(),
+            expected_response_length: Some(2_400),
+        };
+        let mut record = super::application_record(&application_request, role, "in_flight");
+        record.request_stream_bytes = request_stream_bytes;
+        record.expected_request_stream_bytes = Some(record.request_stream_bytes);
+        record.expected_chaff_response = Some(ExpectedChaffIdentity {
+            status: 200,
+            content_encoding: "identity".into(),
+            body_bytes: 2_400,
+            body_sha256: sha256(&[b'x'; 2_400]).unwrap(),
+        });
+        endpoint.streams.insert(stream, record);
+        let spec = application_stream_limit_spec(
+            output.to_path_buf(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut traces = TraceFiles::new(output, started).unwrap();
+        assert!(
+            !endpoint
+                .client
+                .qcsd_chaff_send_stream_peer_confirmed(stream)
+        );
+        assert!(
+            endpoint
+                .client
+                .qcsd_abandon_buflo_terminal_chaff(stream, role)
+                .is_err(),
+            "unconfirmed request FIN cannot be locally abandoned"
+        );
+        endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint: endpoint.id,
+                    stream: QcsdStreamId(stream.as_u64()),
+                    initial_limit: 1_763,
+                },
+            )
+            .unwrap();
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let request = server
+            .events()
+            .find_map(|event| match event {
+                neqo_http3::Http3ServerEvent::Headers { stream, fin, .. } => {
+                    assert!(fin);
+                    Some(stream)
+                }
+                _ => None,
+            })
+            .expect("real server received complete chaff request");
+        request
+            .send_headers(&[
+                neqo_common::Header::new(":status", "200"),
+                neqo_common::Header::new("content-length", "2400"),
+            ])
+            .unwrap();
+        let written = request.send_data(&[b'x'; 2_400], started).unwrap();
+        assert!(written > 0 && written < 2_400);
+        // Intentionally leave the response open; transport must stop at the
+        // actually encoded 1763-byte window, including HTTP/3 framing.
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        // The production HTTP reducer populates the native record from the
+        // actual peer's headers and DATA, leaving the response incomplete.
+        handle_http_events(&mut endpoint, &spec, started, &mut traces, None).unwrap();
+        let record = &endpoint.streams[&stream];
+        assert_eq!(record.bytes, u64::try_from(written).unwrap());
+        assert_eq!(record.status, Some(200));
+        assert_eq!(record.content_length, Some(2_400));
+        assert!(!record.complete);
+        assert_eq!(record.outcome, "in_flight");
+        endpoint.client.qcsd_prepare_stream_output(started);
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        assert!(
+            endpoint
+                .client
+                .qcsd_chaff_send_stream_peer_confirmed(stream)
+        );
+        assert!(!endpoint.client.qcsd_qpack_decoder_handler_pending());
+        assert!(!endpoint.client.qcsd_qpack_decoder_transport_pending());
+        (endpoint, server, stream, traces)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn buflo_local_abandonment_serialization_follows_real_terminal_latch() {
+        let output = trace_output_dir("local-abandon-serialization-clock");
+        let (endpoint, mut server, stream, mut traces) =
+            local_abandon_serialization_real_http3_fixture(&output);
+        let started = endpoint.receive_loop.origin;
+        let defense_start_ns = 114_897_041_u64;
+        let latch_us = 14_212_504_u64;
+        let supplied_process_ns = 14_327_400_000_u64;
+        let serialized_process_ns = 14_327_402_000_u64;
+        let defense_start = started + Duration::from_nanos(defense_start_ns);
+        let supplied_at = started + Duration::from_nanos(supplied_process_ns);
+
+        // Reuse the exact current64 parameter fixture. Public Defense signals
+        // establish an already-serviced component before the real controller
+        // terminal transition; no private ledger/latch/diagnostic is seeded.
+        // These preliminary outcomes are component premises, not wire proof.
+        let spec = buflo_cadence64_bound_spec();
+        let parameters = spec
+            .defense_parameters
+            .as_ref()
+            .unwrap()
+            .buflo_parameters
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(parameters.interval_us, 64_000);
+        let mut defense = neqo_csdef::Buflo::from_parameters(parameters);
+        let last_tick = (latch_us / 64_000) * 64_000;
+        let mut scheduled = Vec::new();
+        for tick in 0..=latch_us / 64_000 {
+            let at = Duration::from_micros(tick * 64_000);
+            while let Some(packet) = defense.next_event(at) {
+                scheduled.push(packet);
+            }
+        }
+        for packet in scheduled {
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(last_tick),
+                kind: SignalKind::Resolved {
+                    packet,
+                    outcome: neqo_csdef::EventOutcome::Satisfied { observed: 1_200 },
+                },
+            });
+        }
+        assert!(!defense.is_complete());
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: spec.config.defense.clone(),
+                initial_max_stream_data: 1_763,
+                tail_wait_us: 0,
+                ..spec.config.clone()
+            },
+            None,
+            Box::new(defense),
+        )
+        .unwrap();
+        let mut endpoints = vec![endpoint];
+        let observations = endpoints[0].client.qcsd_timestamped_observations();
+        assert!(
+            observations
+                .iter()
+                .any(|record| matches!(record.observation(),
+            QcsdObservation::StreamOpened { stream: actual, .. }
+                if actual.0 == stream.as_u64()))
+        );
+        for record in observations {
+            assert!(super::terminal_observation_slot(record.observation()).is_none());
+            controller.observe(record.observation().clone(), Duration::ZERO);
+            traces.observation(Some(endpoints[0].id), &record).unwrap();
+        }
+        // Transport already has this actual manual boundary. Discard only
+        // setup actions generated while replaying its genuine observations.
+        for action in controller.drain_actions() {
+            assert!(matches!(
+                action,
+                QcsdAction::ConfigureManualReceive {
+                    initial_limit: 1_763,
+                    ..
+                } | QcsdAction::LeaseParserReceive { owner: None, .. }
+            ));
+        }
+
+        let tai_start = 2_000_000_000_u64;
+        let decision_clock =
+            super::TestBufloDecisionTaiOverride::fixed(tai_start + latch_us * 1_000);
+        let runner_clock = super::RunnerDefenseClock::KernelTai {
+            start: defense_start,
+            start_tai_ns: tai_start,
+        };
+        let elapsed = runner_clock.sample(defense_start, supplied_at).unwrap();
+        drop(decision_clock);
+        assert_eq!(elapsed, Duration::from_micros(latch_us));
+        assert!(supplied_at < defense_start + elapsed);
+        assert_eq!(
+            supplied_process_ns + 999 + 42,
+            defense_start_ns + latch_us * 1_000
+        );
+        let actual_backlog = endpoint_candidate_egress_backlog(&mut endpoints[0], false);
+        assert_eq!(actual_backlog, (false, false));
+        controller.observe(QcsdObservation::ApplicationComplete, elapsed);
+        controller.observe(
+            QcsdObservation::EgressStreamBacklog {
+                pending: actual_backlog.0,
+            },
+            elapsed,
+        );
+        controller.observe(
+            QcsdObservation::EgressBacklog {
+                pending: actual_backlog.1,
+            },
+            elapsed,
+        );
+        controller.poll(elapsed);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let mut cancellations = actions.into_iter().filter(|action| {
+            matches!(action,
+            QcsdAction::CancelChaff { stream: actual,
+                reason: QcsdChaffCancellationReason::BufloTerminalSubcellTail, .. }
+                if actual.0 == stream.as_u64())
+        });
+        let cancellation = cancellations
+            .next()
+            .expect("real controller-issued cancellation");
+        assert!(cancellations.next().is_none());
+        let diagnostics = controller.defense_diagnostics();
+        assert!(diagnostics.buflo_terminal_subcell_latched);
+        assert_eq!(diagnostics.buflo_terminal_subcell_latched_at_us, latch_us);
+        assert_eq!(diagnostics.buflo_terminal_subcell_stream_cancellations, 1);
+        assert_eq!(
+            diagnostics.buflo_terminal_subcell_parser_lease_bytes_at_latch,
+            0
+        );
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        let before = serde_json::to_value(&diagnostics).unwrap();
+        let frame_tx = endpoints[0].client.transport_stats().frame_tx;
+        let serialization_clock =
+            TestMonotonicNowOverride::fixed(started + Duration::from_nanos(serialized_process_ns));
+        super::apply_action(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            supplied_at,
+            elapsed,
+            cancellation,
+            false,
+            None,
+        )
+        .unwrap();
+        drop(serialization_clock);
+        assert_eq!(
+            serde_json::to_value(controller.defense_diagnostics()).unwrap(),
+            before
+        );
+        let proof = &endpoints[0].terminal_local_abandonments[0];
+        assert_eq!(proof["stream"], stream.as_u64());
+        assert_eq!(proof["resource_id"], 10);
+        assert_eq!(proof["request_id"], 7);
+        assert_eq!(proof["encoded_receive_limit"], 1_763);
+        assert_eq!(proof["manual_receive_limit"], 1_763);
+        assert_eq!(proof["consumed"], 1_763);
+        assert_eq!(proof["retired"], 1_763);
+        assert_eq!(proof["buffered_bytes"], 0);
+        assert_eq!(proof["pending_receive_actions"], 0);
+        assert_eq!(proof["stop_sending_queued"], false);
+        assert_eq!(proof["reset_stream_queued"], false);
+        assert_eq!(proof["receive_credit_increase"], 0);
+        assert_eq!(proof["unshaped_data_bytes"], 0);
+        assert_eq!(
+            endpoints[0].completed[0].outcome,
+            "buflo_terminal_subcell_tail_cancelled"
+        );
+        assert!(!endpoints[0].completed[0].complete);
+        test_fixture::exchange_packets(&mut endpoints[0].client, &mut server, false, None);
+        let after = endpoints[0].client.transport_stats().frame_tx;
+        assert_eq!(after.stop_sending, frame_tx.stop_sending);
+        assert_eq!(after.reset_stream, frame_tx.reset_stream);
+        assert_eq!(after.max_stream_data, frame_tx.max_stream_data);
+        assert_eq!(after.stream, frame_tx.stream);
+        traces.flush_events().unwrap();
+        drop(traces);
+        let events = fs::read_to_string(output.join("events.csv")).unwrap();
+        let proof_rows: Vec<_> = events
+            .lines()
+            .filter(|line| line.contains(",chaff_local_abandonment,applied,"))
+            .collect();
+        let action_rows: Vec<_> = events
+            .lines()
+            .filter(|line| {
+                line.contains(",action,applied,") && line.contains("buflo_terminal_subcell_tail")
+            })
+            .collect();
+        assert_eq!(proof_rows.len(), 1);
+        assert_eq!(action_rows.len(), 1);
+        let proof_us: u64 = proof_rows[0].split(',').next().unwrap().parse().unwrap();
+        let action_us: u64 = action_rows[0].split(',').next().unwrap().parse().unwrap();
+        assert_eq!(
+            proof_us, action_us,
+            "proof and typed action retain one exact clock"
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).unwrap();
+        // Intended original RED: even the final ns in the stale CSV bucket
+        // is 42ns before the actual controller latch. This is the unchanged
+        // Source042 fidelity gate, with no epsilon or altered acceptance.
+        assert!(
+            action_us * 1_000 + 999 >= defense_start_ns + latch_us * 1_000,
+            "local-abandonment precedes its actual terminal latch: action={action_us}, latch={latch_us}, defense_start_ns={defense_start_ns}"
+        );
+        assert_eq!(action_us, serialized_process_ns / 1_000);
     }
 
     #[test]
