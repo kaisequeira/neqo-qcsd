@@ -434,6 +434,11 @@ pub struct QcsdController {
     /// role class. Only the authenticated 64 ms BuFLO path advances these
     /// cursors; registry eligibility and application priority stay unchanged.
     buflo_incoming_stream_cursor: HashMap<(QcsdEndpointId, bool), QcsdStreamId>,
+    /// Experimental mixed-pool service: one existing whole incoming cell per
+    /// six committed turns; no added credit or change to the cadence.
+    buflo_chaff_service_turn: u8,
+    /// Only actual positive raw reads advance a live chaff service timestamp.
+    buflo_chaff_last_read_at: HashMap<(QcsdEndpointId, QcsdStreamId), Duration>,
     /// Prospective source-bound Tamaraw receive ownership and outgoing window.
     /// Incoming releases can still complete across real transport callbacks;
     /// slotless parser bootstrap never becomes scheduled ownership afterward.
@@ -678,6 +683,8 @@ impl QcsdController {
             buflo_startup_requested_chaff: HashMap::new(),
             buflo_incoming_half_period_window: None,
             buflo_incoming_stream_cursor: HashMap::new(),
+            buflo_chaff_service_turn: 0,
+            buflo_chaff_last_read_at: HashMap::new(),
             tamaraw_rapid_capture_policy: false,
             front_padding_outgoing_window: false,
             terminal_primary_partial_cell_policy: false,
@@ -1730,6 +1737,8 @@ impl QcsdController {
                 self.endpoint_origins.remove(&endpoint);
                 self.buflo_incoming_stream_cursor
                     .retain(|(candidate, _), _| *candidate != endpoint);
+                self.buflo_chaff_last_read_at
+                    .retain(|(candidate, _), _| *candidate != endpoint);
                 self.streams.remove_endpoint(endpoint);
                 self.application_stream_ranges
                     .retain(|(candidate, _), _| *candidate != endpoint);
@@ -1828,6 +1837,16 @@ impl QcsdController {
                         (cover, consumed_start, state.receive.consumed())
                     })
                 {
+                    if cover
+                        && consumed_end > consumed_start
+                        && self.buflo_incoming_half_period_window
+                            == Some(Duration::from_micros(32_000))
+                    {
+                        self.buflo_chaff_last_read_at
+                            .entry((endpoint, stream))
+                            .and_modify(|last| *last = (*last).max(at))
+                            .or_insert(at);
+                    }
                     self.push_signal(
                         at,
                         SignalKind::PayloadBytes {
@@ -2240,6 +2259,7 @@ impl QcsdController {
             return;
         };
         self.retire_stream_advertised_credit(endpoint, stream, at);
+        self.buflo_chaff_last_read_at.remove(&(endpoint, stream));
         if let QcsdRequestRole::Chaff { resource_id, .. } = state.role {
             let success = finish == crate::QcsdStreamFinish::Fin
                 && state
@@ -4975,6 +4995,111 @@ impl QcsdController {
             opportunities.sort_by_key(|opportunity| {
                 matches!(opportunity.role, QcsdRequestRole::Chaff { .. })
             });
+            // SOURCE EXPERIMENT ONLY: both existing prepared-policy opt-ins
+            // are necessary. All special/partial/terminal allocations retain
+            // their original order. The cell is staged/rolled back below.
+            let mixed_service_eligible = fair_stream_turns
+                && self
+                    .defense
+                    .diagnostics()
+                    .buflo_incoming_startup
+                    .is_some_and(|startup| startup.armed)
+                && !self.application_complete
+                && !terminal_chaff_incoming
+                && tagged_disposition.is_none()
+                && reserve_disposition.is_none()
+                && incoming.packet.length() == 1_200
+                && incoming.remaining == 1_200
+                && self.incoming_slot_is_untouched(&incoming)
+                && opportunities
+                    .iter()
+                    .any(|o| o.role == QcsdRequestRole::Application)
+                && opportunities
+                    .iter()
+                    .any(|o| matches!(o.role, QcsdRequestRole::Chaff { .. }));
+            if mixed_service_eligible && self.buflo_chaff_service_turn == 5 {
+                // A service candidate must have consumed its exact advertised
+                // frontier and have no preceding unadvertised/owned work.
+                let ready_chaff: Vec<_> = opportunities
+                    .iter()
+                    .filter(|o| {
+                        let key = (o.endpoint, o.stream);
+                        matches!(o.role, QcsdRequestRole::Chaff { .. })
+                            && self.buflo_chaff_ack_observed_at.contains_key(&key)
+                            && self
+                                .streams
+                                .receive_limits(o.endpoint, o.stream)
+                                .is_some_and(|(advertised, requested)| {
+                                    advertised == requested
+                                        && self.streams.consumed(o.endpoint, o.stream)
+                                            == Some(advertised)
+                                })
+                            && !self
+                                .control
+                                .credit
+                                .iter()
+                                .any(|c| (c.endpoint, c.stream) == key)
+                            && !self
+                                .control
+                                .claims
+                                .iter()
+                                .any(|c| (c.endpoint, c.stream) == key)
+                            && self.parser_lease_ranges.get(&key).is_none_or(Vec::is_empty)
+                    })
+                    .copied()
+                    .collect();
+                // Drain every ready sub-cell tail in the original numeric
+                // order before rotating complete reservoirs. This retains the
+                // Native103 finite-tail/replacement invariant.
+                let drain_tails = ready_chaff.iter().any(|o| o.exact > 0 && o.exact < 1_200);
+                let leader = opportunities
+                    .iter()
+                    .find(|o| matches!(o.role, QcsdRequestRole::Chaff { .. }))
+                    .map(|o| (o.endpoint, o.stream));
+                let selected = if drain_tails {
+                    None
+                } else {
+                    ready_chaff
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| {
+                            o.exact
+                                >= if Some((o.endpoint, o.stream)) == leader {
+                                    1_200
+                                } else {
+                                    2_400
+                                }
+                        })
+                        .min_by_key(|(index, o)| {
+                            let key = (o.endpoint, o.stream);
+                            let activated = self.buflo_chaff_ack_observed_at[&key];
+                            (
+                                self.buflo_chaff_last_read_at
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or(activated)
+                                    .max(activated),
+                                *index,
+                            )
+                        })
+                        .map(|(_, o)| (o.endpoint, o.stream))
+                };
+                if drain_tails || selected.is_some() {
+                    opportunities.sort_by_key(|o| {
+                        let key = (o.endpoint, o.stream);
+                        if selected == Some(key)
+                            || (drain_tails
+                                && ready_chaff.iter().any(|r| (r.endpoint, r.stream) == key))
+                        {
+                            0
+                        } else if o.role == QcsdRequestRole::Application {
+                            1
+                        } else {
+                            2
+                        }
+                    });
+                }
+            }
             if self.defense.incoming_exact_capacity_precedes_claims() {
                 // FRONT must not park a due owner's remainder on one stream's
                 // non-advertised framing claim while another live chaff stream
@@ -5121,6 +5246,9 @@ impl QcsdController {
                 // and claim below, and must not consume a fairness turn.
                 self.buflo_incoming_stream_cursor
                     .extend(staged_stream_turns);
+                if mixed_service_eligible {
+                    self.buflo_chaff_service_turn = (self.buflo_chaff_service_turn + 1) % 6;
+                }
             } else {
                 for credit in staged_credit.into_iter().rev() {
                     assert!(self.streams.cancel_release(
