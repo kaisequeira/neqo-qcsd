@@ -2335,8 +2335,13 @@ fn validate_terminal_primary_partial_cell_policy(spec: &RunSpec) -> Result<(), E
                         && (source_policy_period == 20_000
                             || matches!(
                                 (parameters.max_events, parameters.duration_budget_policy),
-                                (10_000, Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
-                                    | (20_000, Some(BufloDurationBudgetPolicy::RapidV8Fixed64ms1280Seconds))
+                                (
+                                    10_000,
+                                    Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds)
+                                ) | (
+                                    20_000,
+                                    Some(BufloDurationBudgetPolicy::RapidV8Fixed64ms1280Seconds)
+                                )
                             ))
                 })
         }),
@@ -16059,6 +16064,13 @@ async fn execute_run_inner(
 
     if let Err(error) = loop_result {
         let mut cleanup_errors = Vec::new();
+        if let Err(cleanup_error) =
+            record_queued_final_read_observations_after_run_error(&mut endpoints, &mut traces)
+        {
+            cleanup_errors.push(format!(
+                "record queued final-read failure observations failed: {cleanup_error}"
+            ));
+        }
         if post_loop_finalization_error {
             cleanup_errors.push(format!(
                 "post-loop evidence finalisation failed after kernel receipt closure: {error}"
@@ -17540,6 +17552,33 @@ fn handle_all_qcsd_observations(
         }
     }
     Ok(())
+}
+
+/// Failure-only persistence of already-queued typed final-read/lifecycle data.
+/// Preserve every such payload, including unmatched FIN/RESET and inconsistent
+/// counters, without deriving a pair, success, final-size inference or authority.
+/// Other observation kinds are not reinterpreted after abort: in particular the
+/// controller-less MAX compatibility recorder can mutate pending trace clocks.
+/// This helper never reduces the controller, reads/sends transport data, grants
+/// credit, retires bytes, reconciles physical cells, or repairs the failed run.
+fn record_queued_final_read_observations_after_run_error(
+    endpoints: &mut [Endpoint],
+    traces: &mut TraceFiles,
+) -> Result<usize, Error> {
+    let mut recorded = 0;
+    for (endpoint_index, record) in take_all_qcsd_observations(endpoints) {
+        if matches!(
+            record.observation(),
+            QcsdObservation::PeerFinRead { .. } | QcsdObservation::StreamFinished { .. }
+        ) {
+            // The existing serializer retains the original payload, production
+            // sequence and time. No controller is supplied and these two kinds
+            // do not enter its MAX compatibility or physical-reconcile paths.
+            traces.observation(Some(endpoints[endpoint_index].id), &record)?;
+            recorded += 1;
+        }
+    }
+    Ok(recorded)
 }
 
 fn take_all_qcsd_observations(
@@ -58758,26 +58797,420 @@ mod tests {
         });
         spec.defense_parameters = super::defense_parameter_provenance(&spec.config)
             .expect("new exact receipt bound to actual parsed bytes");
-        super::validate_buflo_incoming_credit_release_policy(&spec).expect("same ACK/source policy");
-        super::validate_terminal_primary_partial_cell_policy(&spec).expect("same owned primary policy");
+        super::validate_buflo_incoming_credit_release_policy(&spec)
+            .expect("same ACK/source policy");
+        super::validate_terminal_primary_partial_cell_policy(&spec)
+            .expect("same owned primary policy");
         let run = buflo_incoming_credit_release_policy_run(&spec);
-        assert_eq!(run["defense_parameters"]["buflo_duration_budget"]["policy"],
-            "rapid-v8-fixed-64ms-1280s-duration-budget-v1");
-        assert_eq!(run["defense_parameters"]["buflo_duration_budget"]["max_events"], 20_000);
-        assert_eq!(run["defense_parameters"]["buflo_duration_budget"]["duration_budget_us"], 1_280_000_000u64);
-        assert_eq!(run["buflo_incoming_credit_release_policy"]["period_us"], 64_000);
-        assert_eq!(run["buflo_incoming_credit_release_policy"]["incoming_release_window_us"], 32_000);
-        assert_eq!(run["buflo_kernel_preparation_policy"]["outgoing_physical_window_us"], 5_000);
-        assert_eq!(run["buflo_kernel_preparation_policy"]["rolling_preparation_after_release_us"], 4_000);
+        assert_eq!(
+            run["defense_parameters"]["buflo_duration_budget"]["policy"],
+            "rapid-v8-fixed-64ms-1280s-duration-budget-v1"
+        );
+        assert_eq!(
+            run["defense_parameters"]["buflo_duration_budget"]["max_events"],
+            20_000
+        );
+        assert_eq!(
+            run["defense_parameters"]["buflo_duration_budget"]["duration_budget_us"],
+            1_280_000_000u64
+        );
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"]["period_us"],
+            64_000
+        );
+        assert_eq!(
+            run["buflo_incoming_credit_release_policy"]["incoming_release_window_us"],
+            32_000
+        );
+        assert_eq!(
+            run["buflo_kernel_preparation_policy"]["outgoing_physical_window_us"],
+            5_000
+        );
+        assert_eq!(
+            run["buflo_kernel_preparation_policy"]["rolling_preparation_after_release_us"],
+            4_000
+        );
         // A typed DTO with the new policy but the legacy count must not enter
         // either original ACK/release or terminal-primary policy path.
-        spec.defense_parameters.as_mut().expect("proof").buflo_parameters
-            .as_mut().expect("parsed parameters").max_events = 10_000;
+        spec.defense_parameters
+            .as_mut()
+            .expect("proof")
+            .buflo_parameters
+            .as_mut()
+            .expect("parsed parameters")
+            .max_events = 10_000;
         assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
         assert!(super::validate_terminal_primary_partial_cell_policy(&spec).is_err());
-        spec.defense_parameters.as_mut().expect("proof").buflo_parameters
-            .as_mut().expect("parsed parameters").max_events = 20_000;
+        spec.defense_parameters
+            .as_mut()
+            .expect("proof")
+            .buflo_parameters
+            .as_mut()
+            .expect("parsed parameters")
+            .max_events = 20_000;
         super::validate_buflo_incoming_credit_release_policy(&spec).expect("exact tuple restored");
         fs::remove_dir_all(output).expect("private parameter fixture removed");
+    }
+
+    // Native116 connected diagnostic regression. No synthetic observation is
+    // inserted into the live positive path: the real HTTP/3 final read mints it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_chaff_identity_preserves_all_real_queued_final_read_observations() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("failed-chaff-real-queued-peer-fin");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let mut spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        // Defended fixture setup makes the encoded transport-parameter ceiling
+        // exactly the manual ceiling before any real response byte arrives.
+        let config = QcsdConfig {
+            initial_max_stream_data: 65_536,
+            defense: DefenseConfig::Front(FrontConfig::default()),
+            ..QcsdConfig::default()
+        };
+        spec.config = config.clone();
+        let (mut endpoint, mut server) = connected_runner_endpoint_with_server_config(
+            &output,
+            started,
+            &clock,
+            QcsdEndpointId(0),
+            4_433,
+            config,
+        );
+        endpoint.client.qcsd_enable_send_shaping(false);
+        let url: http::Uri = "https://127.0.0.1:4433/controlled"
+            .parse()
+            .expect("actual URL");
+        let stream = endpoint
+            .client
+            .fetch(started, "GET", &url, &[], neqo_http3::Priority::default())
+            .expect("real request stream");
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 0,
+            request_id: Some(QcsdChaffRequestId(7)),
+        };
+        endpoint
+            .client
+            .register_qcsd_stream(stream, role, Some(2))
+            .expect("actual chaff role");
+        endpoint
+            .client
+            .apply_qcsd_action(
+                started,
+                QcsdAction::ConfigureManualReceive {
+                    endpoint: endpoint.id,
+                    stream: QcsdStreamId(stream.as_u64()),
+                    initial_limit: 65_536,
+                },
+            )
+            .expect("real manual receive scope, with the original encoded initial ceiling");
+        endpoint
+            .client
+            .stream_close_send(stream, started)
+            .expect("real GET FIN");
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        endpoint.client.qcsd_enable_send_shaping(true);
+        drop(endpoint.client.qcsd_timestamped_observations());
+        let mut record = chaff(b"", false);
+        record.url = url.to_string();
+        record.content_length = None;
+        record.expected_chaff_response = Some(ExpectedChaffIdentity {
+            status: 200,
+            content_encoding: "identity".into(),
+            body_bytes: 2,
+            body_sha256: sha256(b"xx").expect("distinct qualified identity"),
+        });
+        endpoint.streams.insert(stream, record);
+        let response = server
+            .events()
+            .find_map(|event| match event {
+                neqo_http3::Http3ServerEvent::Headers {
+                    stream: response, ..
+                } if response.stream_id() == stream => Some(response),
+                _ => None,
+            })
+            .expect("real server request");
+        // No Content-Length: identity failure occurs after genuine DATA+FIN,
+        // matching the missing-witness failure boundary, not an early header error.
+        response
+            .send_headers(&[neqo_common::Header::new(":status", "200")])
+            .expect("real HEADERS");
+        assert_eq!(
+            response.send_data(b"x", started).expect("real short body"),
+            1
+        );
+        response.stream_close_send(started).expect("real peer FIN");
+        test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+        let mut traces = TraceFiles::new(&output, started).expect("original trace writer");
+        let original = handle_http_events(&mut endpoint, &spec, started, &mut traces, None)
+            .expect_err("whole original identity guard must still refuse");
+        let original_message = original.to_string();
+        assert!(original_message.contains("did not match its qualified identity"));
+        assert_eq!(endpoint.completed.len(), 1);
+        assert_eq!(endpoint.completed[0].outcome, "identity_mismatch");
+        assert_eq!(endpoint.completed[0].body, b"x");
+        assert!(endpoint.completed[0].complete);
+        let scheduler = super::process_scheduler_evidence().expect("actual scheduler");
+        let complete = RunCompletion {
+            ended_unix_ns: Some(1),
+            status: "complete",
+            error: None,
+            error_class: None,
+            defense_start_monotonic_ns: None,
+            application_completion_monotonic_ns: None,
+            defense_diagnostics: None,
+            buflo_fin_permission: None,
+            runner_wakeup_metrics: None,
+            terminal_primary_partial_cell: None,
+        };
+        let before = super::render_run_json(
+            &spec,
+            std::slice::from_ref(&endpoint),
+            &[],
+            &[],
+            &scheduler,
+            &[],
+            0,
+            &complete,
+        );
+        assert_eq!(
+            super::record_queued_final_read_observations_after_run_error(
+                std::slice::from_mut(&mut endpoint),
+                &mut traces
+            )
+            .expect("same production failure-cleanup helper"),
+            2
+        );
+        assert!(endpoint.client.qcsd_timestamped_observations().is_empty());
+        assert_eq!(
+            super::record_queued_final_read_observations_after_run_error(
+                std::slice::from_mut(&mut endpoint),
+                &mut traces
+            )
+            .expect("second empty drain cannot duplicate evidence"),
+            0
+        );
+        assert_eq!(
+            super::render_run_json(
+                &spec,
+                std::slice::from_ref(&endpoint),
+                &[],
+                &[],
+                &scheduler,
+                &[],
+                0,
+                &complete
+            ),
+            before,
+            "successful scientific DTO unchanged"
+        );
+        let failure = RunCompletion {
+            status: "error",
+            error: Some(&original_message),
+            error_class: Some(super::run_error_class(&original)),
+            ..complete
+        };
+        let run: serde_json::Value = serde_json::from_slice(&super::render_run_json(
+            &spec,
+            std::slice::from_ref(&endpoint),
+            &[],
+            &[],
+            &scheduler,
+            &[],
+            0,
+            &failure,
+        ))
+        .expect("run JSON");
+        assert_eq!(run["completion_status"], "error");
+        assert_eq!(run["error"], original_message);
+        assert_eq!(endpoint.completed[0].outcome, "identity_mismatch");
+        traces
+            .flush_events()
+            .expect("same original terminal trace persistence");
+        drop(traces);
+        let csv =
+            fs::read_to_string(output.join("events.csv")).expect("saved failure observations");
+        let observations = failed_run_final_read_csv_observations(&csv);
+        let reads: Vec<_> = observations
+            .iter()
+            .filter(|v| v["type"] == "peer_fin_read")
+            .collect();
+        let fins: Vec<_> = observations
+            .iter()
+            .filter(|v| v["type"] == "stream_finished")
+            .collect();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(fins.len(), 1);
+        let read = reads[0];
+        let fin = fins[0];
+        assert_eq!(read["stream"], stream.as_u64());
+        assert_eq!(fin["stream"], stream.as_u64());
+        assert_eq!(read["endpoint"], 0);
+        assert_eq!(fin["endpoint"], 0);
+        assert!(
+            read["final_size"].as_u64().unwrap() > 1,
+            "raw final size includes actual H3 framing"
+        );
+        assert_eq!(read["final_size"], read["bytes_received"]);
+        assert_eq!(read["final_size"], read["bytes_read"]);
+        assert_eq!(read["buffered_bytes"], 0);
+        assert!(
+            read["production_sequence"].as_u64().unwrap()
+                < fin["production_sequence"].as_u64().unwrap()
+        );
+        assert!(
+            read["production_monotonic_ns"].as_u64().unwrap()
+                <= fin["production_monotonic_ns"].as_u64().unwrap()
+        );
+        drop(response);
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("close connected test artifacts");
+    }
+
+    fn failed_run_final_read_csv_observations(csv: &str) -> Vec<serde_json::Value> {
+        csv.lines()
+            .filter_map(|line| {
+                let (_, tail) = line.split_once(",observation,recorded,\"")?;
+                let (quoted, _) = tail.rsplit_once("\",")?;
+                Some(
+                    serde_json::from_str(&quoted.replace("\"\"", "\""))
+                        .expect("original observation CSV JSON"),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_run_final_read_diagnostics_preserve_unmatched_anomalous_payloads_verbatim() {
+        test_fixture::fixture_init();
+        let output = trace_output_dir("failed-run-verbatim-final-read-negative-attribution");
+        let started = test_fixture::now();
+        let clock = QcsdObservationClock::new(started);
+        let spec = application_stream_limit_spec(
+            output.clone(),
+            vec![request(1, "https://127.0.0.1:4433", Vec::new())],
+        );
+        let mut endpoints =
+            create_endpoints(&spec, started, &clock).expect("real endpoint container");
+        drop(endpoints[0].client.qcsd_timestamped_observations());
+        let endpoint = endpoints[0].id;
+        // Explicitly synthetic anomalous diagnostic inputs. They must remain
+        // visible as supplied, and must never become a success/pair certificate.
+        let records = vec![
+            clock.record_at(
+                QcsdObservation::StreamFinished {
+                    endpoint,
+                    stream: QcsdStreamId(84),
+                    finish: QcsdStreamFinish::Fin,
+                },
+                started + Duration::from_nanos(5),
+            ),
+            clock.record_at(
+                QcsdObservation::PeerFinRead {
+                    endpoint,
+                    stream: QcsdStreamId(84),
+                    final_size: 97,
+                    encoded_receive_limit: 128,
+                    manual_receive_limit: 127,
+                    bytes_received: 96,
+                    bytes_read: 95,
+                    buffered_bytes: 1,
+                },
+                started + Duration::from_nanos(4),
+            ),
+            clock.record_at(
+                QcsdObservation::StreamFinished {
+                    endpoint,
+                    stream: QcsdStreamId(88),
+                    finish: QcsdStreamFinish::Fin,
+                },
+                started + Duration::from_nanos(3),
+            ),
+            clock.record_at(
+                QcsdObservation::StreamFinished {
+                    endpoint,
+                    stream: QcsdStreamId(84),
+                    finish: QcsdStreamFinish::Reset,
+                },
+                started + Duration::from_nanos(6),
+            ),
+        ];
+        let expected: Vec<serde_json::Value> = records
+            .iter()
+            .map(|record| {
+                let mut payload =
+                    serde_json::to_value(record.observation()).expect("typed payload");
+                let fields = payload
+                    .as_object_mut()
+                    .expect("original typed observation object");
+                fields.insert("production_sequence".into(), json!(record.sequence()));
+                fields.insert(
+                    "production_monotonic_ns".into(),
+                    json!(record.produced_monotonic_ns()),
+                );
+                payload
+            })
+            .collect();
+        endpoints[0].test_output_observations.extend(records);
+        endpoints[0].test_output_observations.push(clock.record_at(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: QcsdStreamId(84),
+                bytes: 9,
+            },
+            started + Duration::from_nanos(7),
+        ));
+        let mut traces = TraceFiles::new(&output, started).expect("original trace writer");
+        assert_eq!(
+            super::record_queued_final_read_observations_after_run_error(
+                &mut endpoints,
+                &mut traces
+            )
+            .expect("verbatim diagnostic persistence"),
+            4
+        );
+        traces.flush_events().expect("original CSV flush");
+        drop(traces);
+        let csv = fs::read_to_string(output.join("events.csv")).expect("failure observations");
+        let observed = failed_run_final_read_csv_observations(&csv);
+        assert_eq!(observed.len(), expected.len());
+        for payload in expected {
+            let sequence = payload["production_sequence"].as_u64().unwrap();
+            let matching: Vec<_> = observed
+                .iter()
+                .filter(|row| row["production_sequence"] == sequence)
+                .collect();
+            assert_eq!(
+                matching,
+                vec![&payload],
+                "wrong-stream/unmatched FIN, original sequence/time and unequal final-size counters stay verbatim"
+            );
+        }
+        assert!(
+            observed.iter().all(|row| row["type"] != "bytes_read"),
+            "ordinary BytesRead is not replayed as late reduction"
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("schedule.csv"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "diagnostic persistence cannot terminalize or repair any schedule row"
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("packets.csv"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "diagnostic persistence cannot manufacture a physical packet"
+        );
+        drop(endpoints);
+        fs::remove_dir_all(output).expect("close diagnostic control artifacts");
     }
 }
