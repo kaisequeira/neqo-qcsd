@@ -660,6 +660,60 @@ pub struct Stats {
     pub bytes_read: u64,
 }
 
+/// Opaque evidence minted only by a genuine final transport read.
+/// No constructor is public. A local close, RESET, timeout or a terminal
+/// statistics snapshot cannot create this proof. It grants no receive credit.
+#[cfg(feature = "qcsd")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QcsdPeerFinRead {
+    stream_id: StreamId,
+    final_size: u64,
+    encoded_receive_limit: u64,
+    manual_receive_limit: u64,
+    bytes_received: u64,
+    bytes_read: u64,
+    buffered_bytes: u64,
+}
+
+#[cfg(feature = "qcsd")]
+impl QcsdPeerFinRead {
+    /// The request stream whose real final read minted this proof.
+    #[must_use]
+    pub const fn stream_id(self) -> StreamId {
+        self.stream_id
+    }
+    /// Immutable QUIC final offset, checked before the final read.
+    #[must_use]
+    pub const fn final_size(self) -> u64 {
+        self.final_size
+    }
+    /// Historical greatest receive offset encoded to the peer; never rewound.
+    #[must_use]
+    pub const fn encoded_receive_limit(self) -> u64 {
+        self.encoded_receive_limit
+    }
+    /// Actual manual limit at the final read, equal to its encoded ceiling.
+    #[must_use]
+    pub const fn manual_receive_limit(self) -> u64 {
+        self.manual_receive_limit
+    }
+    /// Genuine received raw bytes, equal to the final offset without gaps.
+    #[must_use]
+    pub const fn bytes_received(self) -> u64 {
+        self.bytes_received
+    }
+    /// Genuine parser/application raw reads, equal to the final offset.
+    #[must_use]
+    pub const fn bytes_read(self) -> u64 {
+        self.bytes_read
+    }
+    /// Remaining buffered raw bytes, required zero when minted.
+    #[must_use]
+    pub const fn buffered_bytes(self) -> u64 {
+        self.buffered_bytes
+    }
+}
+
 /// Read-only proof of an exhausted live manual receive window. This is not a
 /// FIN, RESET, receive-credit grant, or transport stream-state transition.
 #[cfg(feature = "qcsd")]
@@ -736,6 +790,8 @@ impl Stats {
 /// Implement a QUIC receive stream.
 #[derive(Debug)]
 pub struct RecvStream {
+    #[cfg(feature = "qcsd")]
+    qcsd_peer_fin_read: Option<QcsdPeerFinRead>,
     stream_id: StreamId,
     state: RecvStreamState,
     conn_events: ConnectionEvents,
@@ -750,6 +806,8 @@ impl RecvStream {
         conn_events: ConnectionEvents,
     ) -> Self {
         Self {
+            #[cfg(feature = "qcsd")]
+            qcsd_peer_fin_read: None,
             stream_id,
             state: RecvStreamState::new(max_stream_data, stream_id, session_fc),
             conn_events,
@@ -1199,6 +1257,13 @@ impl RecvStream {
         }
     }
 
+    /// Take the one genuine final-read proof, if it was minted. Terminal
+    /// state alone never synthesizes a witness, and taking it twice returns None.
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_take_peer_fin_read(&mut self) -> Option<QcsdPeerFinRead> {
+        self.qcsd_peer_fin_read.take()
+    }
+
     /// Observe a fully consumed, read, and encoded manual window without
     /// ending or abandoning its QUIC receive half.
     #[cfg(feature = "qcsd")]
@@ -1482,6 +1547,32 @@ impl RecvStream {
                     if recv_buf.buffered() == 0 {
                         let received = recv_buf.received();
                         let read = recv_buf.retired();
+                        // This exact DataRecvd -> genuine fin_read edge is the
+                        // sole mint. Preserve the live flow-control facts before
+                        // DataRead discards them. Local stop_sending also creates
+                        // DataRead, so neither that state nor Stats is authority.
+                        #[cfg(feature = "qcsd")]
+                        {
+                            let final_size = fc.consumed();
+                            let encoded = fc.qcsd_encoded_limit();
+                            self.qcsd_peer_fin_read = fc.manual_limit().and_then(|manual| {
+                                (received == final_size
+                                    && read == final_size
+                                    && fc.retired() == final_size
+                                    && encoded == manual
+                                    && final_size <= encoded
+                                    && !fc.manual_frame_pending())
+                                .then_some(QcsdPeerFinRead {
+                                    stream_id: self.stream_id,
+                                    final_size,
+                                    encoded_receive_limit: encoded,
+                                    manual_receive_limit: manual,
+                                    bytes_received: received,
+                                    bytes_read: read,
+                                    buffered_bytes: 0,
+                                })
+                            });
+                        }
                         self.set_state(RecvStreamState::DataRead {
                             final_received: received,
                             final_read: read,

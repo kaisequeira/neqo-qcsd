@@ -13,6 +13,10 @@
 mod chaff_manager;
 mod config;
 mod controller;
+pub use controller::{
+    BufloFinPermissionRelease, BufloPermissionAccounting, IncomingCreditConsumedRange,
+    IncomingCreditRealizationWitness,
+};
 mod defense;
 mod dependency_tracker;
 mod distribution;

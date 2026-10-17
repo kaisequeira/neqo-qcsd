@@ -316,6 +316,13 @@ pub(super) struct TraceFiles {
     physical_receive_advertisements:
         HashMap<(QcsdEndpointId, QcsdStreamId), Vec<PhysicalReceiveAdvertisement>>,
     terminal_slots: HashMap<QcsdSlotId, Packet>,
+    buflo_fin_defense_origin_ns: Option<u64>,
+    buflo_fin_raw_frontiers: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64)>,
+    buflo_fin_peer_reads: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64, u64, u64)>,
+    buflo_fin_release_proofs: HashMap<u64, Value>,
+    buflo_fin_replacement_counts: HashMap<u64, usize>,
+    buflo_fin_consumed_slots: HashMap<QcsdSlotId, ()>,
+    buflo_fin_pre_advertisements: HashMap<u64, Vec<(QcsdSlotId, Packet, u64, u64, u64, u64)>>,
 }
 
 impl TraceFiles {
@@ -359,7 +366,586 @@ impl TraceFiles {
             incoming_target_limits: HashMap::new(),
             physical_receive_advertisements: HashMap::new(),
             terminal_slots: HashMap::new(),
+            buflo_fin_defense_origin_ns: None,
+            buflo_fin_raw_frontiers: HashMap::new(),
+            buflo_fin_peer_reads: HashMap::new(),
+            buflo_fin_release_proofs: HashMap::new(),
+            buflo_fin_replacement_counts: HashMap::new(),
+            buflo_fin_consumed_slots: HashMap::new(),
+            buflo_fin_pre_advertisements: HashMap::new(),
         })
+    }
+
+    /// Bind the actual activation Instant, never a controller reduction delta.
+    pub(super) fn bind_buflo_fin_permission_defense_start(
+        &mut self,
+        start: Instant,
+    ) -> Result<(), Error> {
+        let origin_ns = self.elapsed_ns(start);
+        if self
+            .buflo_fin_defense_origin_ns
+            .is_some_and(|old| old != origin_ns)
+        {
+            return Err(Error::SlotInvariant(
+                "FIN permission defense origin changed".into(),
+            ));
+        }
+        self.buflo_fin_defense_origin_ns = Some(origin_ns);
+        Ok(())
+    }
+
+    /// Capture live owner identity before the controller removes pending
+    /// ranges. The post-reduction proof cannot manufacture this snapshot.
+    pub(super) fn prepare_buflo_fin_permission_observation(
+        &mut self,
+        controller: &QcsdController,
+        record: &TimestampedQcsdObservation,
+    ) -> Result<(), Error> {
+        if let QcsdObservation::ReceiveLimitAdvertised {
+            endpoint,
+            stream,
+            absolute_limit,
+            slot,
+        } = record.observation()
+            && controller.buflo_permission_accounting().is_some()
+        {
+            let owners = controller.pending_buflo_fin_permission_replacements(
+                *endpoint,
+                *stream,
+                *absolute_limit,
+                *slot,
+            );
+            if !owners.is_empty()
+                && self
+                    .buflo_fin_pre_advertisements
+                    .insert(record.sequence(), owners)
+                    .is_some()
+            {
+                return Err(Error::SlotInvariant(
+                    "FIN permission pre-reduction observation replayed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Explicitly synthetic metadata-only test seam. No transport proof,
+    /// receive permission, raw capture, controller state or runtime is created.
+    #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test premises remain explicit and separate from runtime authority"
+    )]
+    pub(super) fn test_buflo_fin_permission_snapshot(
+        &mut self,
+        accounting: &neqo_csdef::BufloPermissionAccounting,
+        witnesses: &HashMap<QcsdSlotId, neqo_csdef::IncomingCreditRealizationWitness>,
+        owners: Vec<(QcsdSlotId, Packet, u64, u64, u64, u64)>,
+        advertisements: Vec<(QcsdEndpointId, QcsdStreamId, u64, Instant, u64, u64)>,
+        record: &TimestampedQcsdObservation,
+        handoff: Option<Instant>,
+    ) -> Result<(), Error> {
+        if !owners.is_empty()
+            && self
+                .buflo_fin_pre_advertisements
+                .insert(record.sequence(), owners)
+                .is_some()
+        {
+            return Err(Error::SlotInvariant(
+                "synthetic pre-owner fixture repeated a sequence".into(),
+            ));
+        }
+        for (endpoint, stream, absolute_limit, at, production_ns, production_sequence) in
+            advertisements
+        {
+            let handoff_ns = self.elapsed_ns(at);
+            self.physical_receive_advertisements
+                .entry((endpoint, stream))
+                .or_default()
+                .push(PhysicalReceiveAdvertisement {
+                    absolute_limit,
+                    handoff_ns,
+                    production_ns,
+                    production_sequence,
+                });
+        }
+        self.reconcile_buflo_fin_permission_snapshot(accounting, witnesses, record, handoff)
+    }
+
+    pub(super) fn buflo_fin_permission_physical_summary(&self) -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "policy": "buflo-retained-owned-parser-demand-genuine-fin-permission-release-v1",
+            "defense_start_monotonic_ns": self.buflo_fin_defense_origin_ns,
+            "genuine_fin_release_records": self.buflo_fin_release_proofs.len(),
+            "replacement_advertisement_partitions": self.buflo_fin_replacement_counts.values().sum::<usize>(),
+            "timely_handoff_eventually_consumed_1200_slots": self.buflo_fin_consumed_slots.len(),
+            "wire_datagram_constant_size_claim": false,
+            "permission_is_received_data": false,
+        })
+    }
+
+    /// Separate append-only proof for the prospective policy. In particular,
+    /// the old first-advertisement latch cannot authenticate a replacement.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the prospective release proof keeps every causal join explicit"
+    )]
+    fn reconcile_buflo_fin_permission(
+        &mut self,
+        controller: &QcsdController,
+        record: &TimestampedQcsdObservation,
+        handoff: Option<Instant>,
+    ) -> Result<(), Error> {
+        let Some(accounting) = controller.buflo_permission_accounting() else {
+            return Ok(());
+        };
+        let witnesses: HashMap<_, _> =
+            if matches!(record.observation(), QcsdObservation::BytesRead { .. }) {
+                accounting
+                    .releases
+                    .iter()
+                    .filter_map(|release| {
+                        controller
+                            .incoming_credit_realization_witness(release.slot)
+                            .cloned()
+                            .map(|witness| (release.slot, witness))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        self.reconcile_buflo_fin_permission_snapshot(&accounting, &witnesses, record, handoff)
+    }
+
+    /// The runtime wrapper supplies only genuine immutable controller snapshots.
+    /// Factoring the checked reducer permits explicitly synthetic metadata tests
+    /// without minting a transport witness or reaching csdef-private ledgers.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the prospective release proof keeps every causal join explicit"
+    )]
+    fn reconcile_buflo_fin_permission_snapshot(
+        &mut self,
+        accounting: &neqo_csdef::BufloPermissionAccounting,
+        witnesses: &HashMap<QcsdSlotId, neqo_csdef::IncomingCreditRealizationWitness>,
+        record: &TimestampedQcsdObservation,
+        handoff: Option<Instant>,
+    ) -> Result<(), Error> {
+        let fail = |message: &str| Error::SlotInvariant(format!("FIN permission proof: {message}"));
+        let sequence = record.sequence();
+        let produced_ns = record.produced_monotonic_ns();
+        let pre_owners = self
+            .buflo_fin_pre_advertisements
+            .remove(&sequence)
+            .unwrap_or_default();
+        let mut replacement_partitions = Vec::new();
+        match record.observation() {
+            QcsdObservation::StreamOpened {
+                endpoint, stream, ..
+            } => {
+                if self
+                    .buflo_fin_raw_frontiers
+                    .insert((*endpoint, *stream), (0, sequence, produced_ns))
+                    .is_some()
+                {
+                    return Err(fail("request stream lifecycle was reused"));
+                }
+            }
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream,
+                bytes,
+            } => {
+                let raw = self
+                    .buflo_fin_raw_frontiers
+                    .get_mut(&(*endpoint, *stream))
+                    .ok_or_else(|| fail("raw read lacks opened stream"))?;
+                if sequence <= raw.1 || produced_ns < raw.2 {
+                    return Err(fail("raw read order regressed"));
+                }
+                raw.0 = raw
+                    .0
+                    .checked_add(*bytes)
+                    .ok_or_else(|| fail("raw read overflow"))?;
+                raw.1 = sequence;
+                raw.2 = produced_ns;
+                self.buflo_fin_peer_reads.remove(&(*endpoint, *stream));
+            }
+            QcsdObservation::PeerFinRead {
+                endpoint,
+                stream,
+                final_size,
+                encoded_receive_limit,
+                manual_receive_limit,
+                bytes_received,
+                bytes_read,
+                buffered_bytes,
+            } => {
+                let raw = self
+                    .buflo_fin_raw_frontiers
+                    .get(&(*endpoint, *stream))
+                    .ok_or_else(|| fail("FIN read lacks opened stream"))?;
+                if raw.0 != *final_size
+                    || *bytes_read != *final_size
+                    || *bytes_received != *final_size
+                    || *buffered_bytes != 0
+                    || encoded_receive_limit != manual_receive_limit
+                    || *encoded_receive_limit < *final_size
+                    || sequence <= raw.1
+                    || produced_ns < raw.2
+                    || self
+                        .buflo_fin_peer_reads
+                        .contains_key(&(*endpoint, *stream))
+                {
+                    return Err(fail(
+                        "FIN read is stale, replayed, or differs from actual raw frontier",
+                    ));
+                }
+                self.buflo_fin_peer_reads.insert(
+                    (*endpoint, *stream),
+                    (
+                        *final_size,
+                        *encoded_receive_limit,
+                        sequence,
+                        produced_ns,
+                        raw.1,
+                        raw.2,
+                    ),
+                );
+            }
+            _ => {}
+        }
+        for release in &accounting.releases {
+            if self
+                .buflo_fin_release_proofs
+                .contains_key(&release.release_index)
+            {
+                continue;
+            }
+            if release.release_index
+                != u64::try_from(self.buflo_fin_release_proofs.len()).unwrap_or(u64::MAX)
+                || !matches!(record.observation(), QcsdObservation::StreamFinished { endpoint, stream, finish: neqo_csdef::QcsdStreamFinish::Fin }
+                    if *endpoint == release.endpoint && *stream == release.stream)
+            {
+                return Err(fail("new release lacks its exact ordered FIN observation"));
+            }
+            let origin = self
+                .buflo_fin_defense_origin_ns
+                .ok_or_else(|| fail("actual defense start is unbound"))?;
+            let target_ns = origin
+                .checked_add(
+                    release
+                        .target_us
+                        .checked_mul(1_000)
+                        .ok_or_else(|| fail("target overflow"))?,
+                )
+                .ok_or_else(|| fail("target origin overflow"))?;
+            let deadline_ns = origin
+                .checked_add(
+                    release
+                        .deadline_us
+                        .checked_mul(1_000)
+                        .ok_or_else(|| fail("deadline overflow"))?,
+                )
+                .ok_or_else(|| fail("deadline origin overflow"))?;
+            let proof = self
+                .buflo_fin_peer_reads
+                .get(&(release.endpoint, release.stream))
+                .copied()
+                .ok_or_else(|| fail("release lacks genuine raw-read FIN producer record"))?;
+            if proof.0 != release.final_size
+                || release.start != release.final_size
+                || release.end != proof.1
+                || release.start >= release.end
+                || release.deadline_us.checked_sub(release.target_us) != Some(32_000)
+                || release.fin_at_us < release.target_us
+                || release.fin_at_us >= release.deadline_us
+                || sequence <= proof.2
+                || produced_ns < proof.3
+                || produced_ns < target_ns
+                || produced_ns >= deadline_ns
+            {
+                return Err(fail(
+                    "release frontier, clock, or FIN producer order differs",
+                ));
+            }
+            let original = self
+                .physical_receive_advertisements
+                .get(&(release.endpoint, release.stream))
+                .and_then(|ads| {
+                    ads.iter()
+                        .rev()
+                        .find(|ad| ad.production_sequence < proof.2)
+                        .filter(|ad| {
+                            ad.absolute_limit == proof.1
+                                && ad.production_ns <= ad.handoff_ns
+                                && ad.handoff_ns >= target_ns
+                                && ad.handoff_ns < deadline_ns
+                                && ad.handoff_ns <= proof.3
+                        })
+                })
+                .copied()
+                .ok_or_else(|| fail("released MAX lacks original physical coverage"))?;
+            let details = serde_json::json!({
+                "schema_version": 1, "policy": accounting.policy,
+                "release": release, "defense_start_monotonic_ns": origin,
+                "target_monotonic_ns": target_ns, "exclusive_deadline_monotonic_ns": deadline_ns,
+                "last_raw_read_production_sequence": proof.4, "last_raw_read_production_monotonic_ns": proof.5,
+                "peer_fin_read_production_sequence": proof.2, "peer_fin_read_production_monotonic_ns": proof.3,
+                "stream_fin_production_sequence": sequence, "stream_fin_production_monotonic_ns": produced_ns,
+                "original_max_production_sequence": original.production_sequence,
+                "original_max_production_monotonic_ns": original.production_ns,
+                "original_max_physical_handoff_monotonic_ns": original.handoff_ns,
+            });
+            self.event(
+                Instant::now(),
+                Some(release.endpoint),
+                "buflo_fin_permission_release",
+                "proved",
+                &details,
+            )?;
+            self.buflo_fin_release_proofs
+                .insert(release.release_index, details);
+        }
+        for release in &accounting.releases {
+            let done = self
+                .buflo_fin_replacement_counts
+                .get(&release.release_index)
+                .copied()
+                .unwrap_or(0);
+            if done > release.replacements.len() {
+                return Err(fail("replacement history shrank"));
+            }
+            for (index, replacement) in release.replacements.iter().enumerate().skip(done) {
+                let (endpoint, stream, start, end, reduced_at_us) = *replacement;
+                let prior = self
+                    .buflo_fin_release_proofs
+                    .get(&release.release_index)
+                    .ok_or_else(|| fail("replacement precedes proved release"))?;
+                let fin_sequence = prior["stream_fin_production_sequence"]
+                    .as_u64()
+                    .ok_or_else(|| fail("missing FIN sequence"))?;
+                let fin_ns = prior["stream_fin_production_monotonic_ns"]
+                    .as_u64()
+                    .ok_or_else(|| fail("missing FIN clock"))?;
+                let target_ns = prior["target_monotonic_ns"]
+                    .as_u64()
+                    .ok_or_else(|| fail("missing target clock"))?;
+                let deadline_ns = prior["exclusive_deadline_monotonic_ns"]
+                    .as_u64()
+                    .ok_or_else(|| fail("missing deadline clock"))?;
+                let handoff_ns = handoff
+                    .map(|value| self.elapsed_ns(value))
+                    .ok_or_else(|| fail("replacement lacks socket handoff"))?;
+                if !matches!(record.observation(), QcsdObservation::ReceiveLimitAdvertised { endpoint: actual_endpoint, stream: actual_stream, absolute_limit, .. }
+                    if *actual_endpoint == endpoint && *actual_stream == stream && *absolute_limit >= end)
+                    || endpoint != release.endpoint
+                    || start >= end
+                    || sequence <= fin_sequence
+                    || produced_ns < fin_ns
+                    || produced_ns > handoff_ns
+                    || handoff_ns < target_ns
+                    || handoff_ns >= deadline_ns
+                    || reduced_at_us < release.fin_at_us
+                    || reduced_at_us >= release.deadline_us
+                {
+                    return Err(fail(
+                        "replacement is stale, cross-stream, or outside the original physical window",
+                    ));
+                }
+                let owner = pre_owners
+                    .iter()
+                    .find(|owner| {
+                        owner.0 == release.slot
+                            && owner.1.direction() == Direction::Incoming
+                            && owner.1.length() == 1_200
+                            && owner.1.timestamp_us() == release.target_us
+                            && owner.2 <= start
+                            && end <= owner.3
+                            && owner.4 <= start
+                            && end <= owner.5
+                    })
+                    .ok_or_else(|| {
+                        fail("replacement lacks exact pre-reduction pending owner/range")
+                    })?;
+                let advancing = self
+                    .physical_receive_advertisements
+                    .get(&(endpoint, stream))
+                    .is_some_and(|ads| {
+                        let previous = ads
+                            .len()
+                            .checked_sub(2)
+                            .map(|index| ads[index].absolute_limit);
+                        previous.is_none_or(|limit| limit == owner.4 && limit <= start)
+                            && ads.last().is_some_and(|ad| {
+                                ad.production_sequence == sequence
+                                    && ad.production_ns == produced_ns
+                                    && ad.handoff_ns == handoff_ns
+                                    && ad.absolute_limit > owner.4
+                                    && ad.absolute_limit >= end
+                            })
+                    });
+                if !advancing {
+                    return Err(fail(
+                        "replacement does not advance the actual physical MAX history",
+                    ));
+                }
+                replacement_partitions.push((release.slot, start, end));
+                let prior_bytes: u64 = release.replacements[..=index]
+                    .iter()
+                    .map(|r| r.3 - r.2)
+                    .sum();
+                if prior_bytes > release.end - release.start {
+                    return Err(fail("replacement exceeds the proved released extent"));
+                }
+                self.event(Instant::now(), Some(endpoint), "buflo_fin_permission_replacement", "physically_handed_off",
+                    &serde_json::json!({"schema_version":1, "policy":accounting.policy,
+                        "release_index":release.release_index, "replacement_index":index,
+                        "slot":release.slot.0, "endpoint":endpoint.0, "stream":stream.0, "start":start, "end":end,
+                        "production_sequence":sequence, "production_monotonic_ns":produced_ns,
+                        "physical_handoff_monotonic_ns":handoff_ns, "controller_reduction_defense_elapsed_us":reduced_at_us,
+                        "original_target_monotonic_ns":target_ns, "original_exclusive_deadline_monotonic_ns":deadline_ns,
+                        "pre_reduction_owner_start":owner.2,"pre_reduction_owner_end":owner.3,
+                        "pre_reduction_advertised_limit":owner.4,"pre_reduction_requested_limit":owner.5}))?;
+                self.buflo_fin_replacement_counts
+                    .insert(release.release_index, index + 1);
+            }
+        }
+        for owner in pre_owners {
+            let mut partitions: Vec<_> = replacement_partitions
+                .iter()
+                .filter(|p| p.0 == owner.0 && owner.2 <= p.1 && p.2 <= owner.3)
+                .copied()
+                .collect();
+            partitions.sort_unstable_by_key(|p| (p.1, p.2));
+            let mut next = owner.2;
+            for partition in partitions {
+                if partition.1 != next || partition.2 <= partition.1 {
+                    return Err(fail(
+                        "replacement partition overlaps or leaves an owner gap",
+                    ));
+                }
+                next = partition.2;
+            }
+            if next != owner.3 {
+                return Err(fail(
+                    "pending owner was not fully represented by replacement proofs",
+                ));
+            }
+        }
+        if matches!(record.observation(), QcsdObservation::BytesRead { .. }) {
+            let mut slots: Vec<_> = accounting.releases.iter().map(|r| r.slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            for slot in slots {
+                if self.buflo_fin_consumed_slots.contains_key(&slot) {
+                    continue;
+                }
+                let Some(witness) = witnesses.get(&slot) else {
+                    continue;
+                };
+                let releases: Vec<_> = accounting
+                    .releases
+                    .iter()
+                    .filter(|r| r.slot == slot)
+                    .collect();
+                let first = releases[0];
+                let origin = self
+                    .buflo_fin_defense_origin_ns
+                    .ok_or_else(|| fail("consumption lacks actual defense origin"))?;
+                let target_ns = origin
+                    .checked_add(
+                        first
+                            .target_us
+                            .checked_mul(1_000)
+                            .ok_or_else(|| fail("target overflow"))?,
+                    )
+                    .ok_or_else(|| fail("target overflow"))?;
+                let deadline_ns = origin
+                    .checked_add(
+                        first
+                            .deadline_us
+                            .checked_mul(1_000)
+                            .ok_or_else(|| fail("deadline overflow"))?,
+                    )
+                    .ok_or_else(|| fail("deadline overflow"))?;
+                let mut ranges = witness.ranges.clone();
+                ranges.sort_unstable_by_key(|r| (r.endpoint, r.stream, r.start, r.end));
+                let bytes = ranges
+                    .iter()
+                    .try_fold(0_u64, |sum, r| sum.checked_add(r.end.checked_sub(r.start)?));
+                if witness.packet.direction() != Direction::Incoming
+                    || witness.packet.length() != 1_200
+                    || witness.requested != 1_200
+                    || witness.advertised != 1_200
+                    || witness.consumed != 1_200
+                    || witness.retired != 0
+                    || !witness.locally_realized
+                    || bytes != Some(1_200)
+                    || witness.packet.timestamp_us() != first.target_us
+                    || ranges.windows(2).any(|p| {
+                        p[0].endpoint == p[1].endpoint
+                            && p[0].stream == p[1].stream
+                            && p[0].end > p[1].start
+                    })
+                    || releases.iter().any(|r| {
+                        r.target_us != first.target_us
+                            || r.deadline_us != first.deadline_us
+                            || r.replacements.iter().map(|p| p.3 - p.2).sum::<u64>()
+                                != r.end - r.start
+                            || self
+                                .buflo_fin_replacement_counts
+                                .get(&r.release_index)
+                                .copied()
+                                .unwrap_or(0)
+                                != r.replacements.len()
+                    })
+                {
+                    return Err(fail(
+                        "same-cell eventual consumption is incomplete or retired",
+                    ));
+                }
+                let mut physical = Vec::new();
+                for range in ranges {
+                    if range.start >= range.end {
+                        return Err(fail("empty consumed range"));
+                    }
+                    let advertisement = self
+                        .physical_receive_advertisements
+                        .get(&(range.endpoint, range.stream))
+                        .and_then(|ads| {
+                            ads.iter().find(|ad| {
+                                ad.absolute_limit >= range.end
+                                    && ad.production_ns <= ad.handoff_ns
+                                    && ad.handoff_ns >= target_ns
+                                    && ad.handoff_ns < deadline_ns
+                                    && ad.handoff_ns <= produced_ns
+                            })
+                        })
+                        .ok_or_else(|| {
+                            fail("actual consumed range lacks same-window physical permission")
+                        })?;
+                    physical.push(serde_json::json!({"endpoint":range.endpoint.0,"stream":range.stream.0,
+                        "start":range.start,"end":range.end,"production_sequence":advertisement.production_sequence,
+                        "production_monotonic_ns":advertisement.production_ns,"physical_handoff_monotonic_ns":advertisement.handoff_ns}));
+                }
+                self.event(Instant::now(), Some(first.endpoint), "buflo_fin_permission_cell_realization", "full_1200_actual_raw_consumed",
+                    &serde_json::json!({"schema_version":1,"policy":accounting.policy,"slot":slot.0,
+                        "requested_bytes":1200,"effective_advertised_bytes":1200,"consumed_bytes":1200,"retired_bytes":0,
+                        "original_target_monotonic_ns":target_ns,"original_exclusive_deadline_monotonic_ns":deadline_ns,
+                        "final_read_production_sequence":sequence,"final_read_production_monotonic_ns":produced_ns,
+                        "ranges":physical,"gross_permission_is_not_data":true}))?;
+                self.buflo_fin_consumed_slots.insert(slot, ());
+            }
+        }
+        if let QcsdObservation::StreamFinished {
+            endpoint, stream, ..
+        } = record.observation()
+        {
+            self.buflo_fin_peer_reads.remove(&(*endpoint, *stream));
+        }
+        Ok(())
     }
 
     pub(super) fn elapsed_us(&self, now: Instant) -> u64 {
@@ -753,6 +1339,9 @@ impl TraceFiles {
             && matches!(record.observation(), QcsdObservation::BytesRead { .. })
         {
             self.reconcile_consumed_incoming_realizations(controller, record)?;
+        }
+        if let Some(controller) = controller {
+            self.reconcile_buflo_fin_permission(controller, record, receive_credit_handoff_at)?;
         }
         Ok(())
     }

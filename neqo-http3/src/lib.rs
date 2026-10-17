@@ -630,6 +630,8 @@ trait HttpRecvStreamEvents: RecvStreamEvents {
     fn qcsd_ignored_request_stream_frame(&self, _stream_id: StreamId, _frame_bytes: u64) {}
     #[cfg(feature = "qcsd")]
     fn qcsd_bytes_read(&self, _stream_id: StreamId, _bytes: u64) {}
+    #[cfg(feature = "qcsd")]
+    fn qcsd_peer_fin_read(&self, _proof: neqo_transport::recv_stream::QcsdPeerFinRead) {}
     fn extended_connect_new_session(&self, _stream_id: StreamId, _headers: Vec<Header>) {}
 }
 

@@ -225,6 +225,17 @@ impl StreamRegistry {
         self.streams.get_mut(&(endpoint, stream))
     }
 
+    /// Same live response-qualified chaff request used by the allocator.
+    pub(crate) fn is_activated_chaff_stream(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.streams
+            .get(&(endpoint, stream))
+            .is_some_and(StreamState::chaff_request_activated)
+    }
+
     /// Whether the exact live request stream belongs to the application.
     pub fn is_application_stream(&self, endpoint: QcsdEndpointId, stream: QcsdStreamId) -> bool {
         self.streams
@@ -799,6 +810,224 @@ impl StreamRegistry {
         let (absolute_limit, increase, scheduled) = state
             .receive
             .owned_data_continuation(state.parser_blocked_at, due_quantum)?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
+    }
+
+    /// Fresh scheduled parser bytes are limited to decoded unknown-length
+    /// successful applications. Chaff and all existing mode APIs are unchanged.
+    pub(crate) fn buflo_fresh_parser_bridge_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        owned_suffix: Option<(u64, u64)>,
+    ) -> u64 {
+        let Some(state) = self.streams.get(&(endpoint, stream)) else {
+            return 0;
+        };
+        if !state.receive_actions_available
+            || state.role != QcsdRequestRole::Application
+            || !matches!(state.observed_response_length,
+                ObservedResponseLength::Final { status, content_length: None }
+                if state.status == Some(status) && (200..300).contains(&status)
+                    && !matches!(status, 204 | 205))
+        {
+            return 0;
+        }
+        state
+            .receive
+            .buflo_fresh_parser_bridge_capacity(state.parser_blocked_at, owned_suffix)
+    }
+
+    pub(crate) fn claim_buflo_fresh_parser_bridge(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        amount: u64,
+        owned_suffix: Option<(u64, u64)>,
+    ) -> u64 {
+        if self.buflo_fresh_parser_bridge_capacity(endpoint, stream, owned_suffix) == 0 {
+            return 0;
+        }
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return 0;
+        };
+        state
+            .receive
+            .claim_buflo_fresh_parser_bridge(amount, state.parser_blocked_at, owned_suffix)
+    }
+
+    pub(crate) fn lease_buflo_fresh_parser_bridge(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        pristine_data_boundary: bool,
+        scheduled_backing: u64,
+        owned_suffix: Option<(u64, u64)>,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available
+            || state.role != QcsdRequestRole::Application
+            || !matches!(state.observed_response_length,
+                ObservedResponseLength::Final { status, content_length: None }
+                if state.status == Some(status) && (200..300).contains(&status)
+                    && !matches!(status, 204 | 205))
+        {
+            return None;
+        }
+        let (absolute_limit, increase, scheduled) = state.receive.lease_buflo_fresh_parser_bridge(
+            pristine_data_boundary,
+            scheduled_backing,
+            state.parser_blocked_at,
+            owned_suffix,
+        )?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
+    }
+
+    /// FIN permission release belongs only to the same decoded successful
+    /// unknown-length application response as retained parser service.
+    pub(crate) fn buflo_final_permission_response_eligible(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            state.receive_actions_available
+                && state.role == QcsdRequestRole::Application
+                && matches!(state.observed_response_length,
+                    ObservedResponseLength::Final { status, content_length: None }
+                        if state.status == Some(status) && (200..300).contains(&status)
+                            && !matches!(status, 204 | 205))
+        })
+    }
+
+    /// Capture genuine current DATA-end demand independently of whether the
+    /// first due transaction can stage a particular fresh-parser quantum.
+    /// This is intent only: no reservation, MAX, owner, or byte is created.
+    pub(crate) fn buflo_retained_parser_demand_boundary(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<u64> {
+        if !self.buflo_final_permission_response_eligible(endpoint, stream) {
+            return None;
+        }
+        match &self.streams.get(&(endpoint, stream))?.receive {
+            ReceiveState::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_exhausted,
+                pending_parser_boundary,
+                data_length,
+                ..
+            } if *data_length > 0
+                && *parser_lease_exhausted
+                && *pending_parser_boundary == Some(*consumed)
+                && *known_limit <= *consumed
+                && *advertised_limit == *requested_limit
+                && *requested_limit >= *consumed
+                && requested_limit.saturating_sub(*consumed) <= 1_200 =>
+            {
+                Some(*consumed)
+            }
+            _ => None,
+        }
+    }
+
+    /// The new retained service is still limited to an actual non-bodyless
+    /// successful unknown-length application response, never prepared chaff.
+    pub(crate) fn buflo_retained_parser_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        boundary: u64,
+        room: u64,
+    ) -> u64 {
+        let Some(state) = self.streams.get(&(endpoint, stream)) else {
+            return 0;
+        };
+        if !state.receive_actions_available
+            || state.role != QcsdRequestRole::Application
+            || !matches!(state.observed_response_length,
+                ObservedResponseLength::Final { status, content_length: None }
+                    if state.status == Some(status) && (200..300).contains(&status)
+                        && !matches!(status, 204 | 205))
+        {
+            return 0;
+        }
+        state.receive.buflo_retained_parser_capacity(boundary, room)
+    }
+
+    pub(crate) fn buflo_retained_parser_opportunity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        boundary: u64,
+        room: u64,
+    ) -> Option<AllocationOpportunity> {
+        (self.buflo_retained_parser_capacity(endpoint, stream, boundary, room) > 0).then_some(
+            AllocationOpportunity {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                exact: 0,
+                claimable: 0,
+            },
+        )
+    }
+
+    pub(crate) fn claim_buflo_retained_parser(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        boundary: u64,
+        room: u64,
+        amount: u64,
+    ) -> u64 {
+        let capacity = self.buflo_retained_parser_capacity(endpoint, stream, boundary, room);
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return 0;
+        };
+        state
+            .receive
+            .claim_buflo_retained_parser(boundary, room, amount.min(capacity))
+    }
+
+    pub(crate) fn lease_buflo_retained_parser(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        boundary: u64,
+        backing: u64,
+    ) -> Option<ParserLease> {
+        // The reservation is already debited, so recheck role/actual response
+        // without requiring another unit of currently available reservation.
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available
+            || state.role != QcsdRequestRole::Application
+            || !matches!(state.observed_response_length,
+                ObservedResponseLength::Final { status, content_length: None }
+                    if state.status == Some(status) && (200..300).contains(&status)
+                        && !matches!(status, 204 | 205))
+        {
+            return None;
+        }
+        let (absolute_limit, increase, scheduled) = state
+            .receive
+            .lease_buflo_retained_parser(boundary, backing)?;
         Some(ParserLease {
             endpoint,
             stream,

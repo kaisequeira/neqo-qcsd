@@ -77,6 +77,18 @@ struct PushInfo {
 }
 
 #[cfg(feature = "qcsd")]
+fn qcsd_publish_peer_fin_read(
+    conn: &mut Connection,
+    stream_id: StreamId,
+    conn_events: &dyn HttpRecvStreamEvents,
+) -> Res<()> {
+    if let Some(proof) = conn.qcsd_take_stream_peer_fin_read(stream_id)? {
+        conn_events.qcsd_peer_fin_read(proof);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "qcsd")]
 fn receive_frame(
     frame_reader: &mut FrameReader,
     conn: &mut Connection,
@@ -85,10 +97,14 @@ fn receive_frame(
     now: Instant,
 ) -> Res<(Option<HFrame>, bool)> {
     let observe = |bytes| conn_events.qcsd_bytes_read(stream_id, bytes);
-    frame_reader.receive(
+    let received = frame_reader.receive(
         &mut QcsdStreamReaderConnectionWrapper::new(conn, stream_id, &observe),
         now,
-    )
+    )?;
+    if received.1 {
+        qcsd_publish_peer_fin_read(conn, stream_id, conn_events)?;
+    }
+    Ok(received)
 }
 
 #[cfg(not(feature = "qcsd"))]
@@ -586,6 +602,12 @@ impl RecvStream for RecvMessage {
                         if *remaining_data_len > 0 {
                             return Err(Error::HttpFrame);
                         }
+                        #[cfg(feature = "qcsd")]
+                        qcsd_publish_peer_fin_read(
+                            conn,
+                            self.stream_id,
+                            self.conn_events.as_ref(),
+                        )?;
                         self.set_closed();
                         break Ok((written, fin));
                     } else if *remaining_data_len == 0 {

@@ -202,6 +202,7 @@ impl QcsdProfile {
             drop_unsatisfied_events: controller.drop_unsatisfied_events,
             keep_alive_lead_time_us: controller.keep_alive_lead_time_us,
             tail_wait_us: controller.tail_wait_us,
+            buflo_retained_parser_fin_permission: false,
             defense,
         };
         config.validate()?;

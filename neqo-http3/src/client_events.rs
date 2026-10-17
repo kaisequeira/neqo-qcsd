@@ -289,6 +289,20 @@ impl HttpRecvStreamEvents for Http3ClientEvents {
             bytes,
         });
     }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_peer_fin_read(&self, proof: neqo_transport::recv_stream::QcsdPeerFinRead) {
+        self.qcsd_observe(|endpoint| QcsdObservation::PeerFinRead {
+            endpoint,
+            stream: QcsdStreamId(proof.stream_id().as_u64()),
+            final_size: proof.final_size(),
+            encoded_receive_limit: proof.encoded_receive_limit(),
+            manual_receive_limit: proof.manual_receive_limit(),
+            bytes_received: proof.bytes_received(),
+            bytes_read: proof.bytes_read(),
+            buffered_bytes: proof.buffered_bytes(),
+        });
+    }
 }
 
 impl SendStreamEvents for Http3ClientEvents {

@@ -4838,6 +4838,23 @@ impl Connection {
         Ok(())
     }
 
+    /// Take an opaque proof minted only by a genuine drained peer-FIN read.
+    /// Existing reset/local-ended streams return None; no state or Stats
+    /// snapshot is reinterpreted as FIN. The proof is available only once.
+    ///
+    /// # Errors
+    /// Returns InvalidStreamId if the stream was already removed.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_take_stream_peer_fin_read(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Res<Option<crate::recv_stream::QcsdPeerFinRead>> {
+        Ok(self
+            .streams
+            .get_recv_stream_mut(stream_id)?
+            .qcsd_take_peer_fin_read())
+    }
+
     /// Read buffered data from stream. bool says whether read bytes includes
     /// the final data on stream.
     ///

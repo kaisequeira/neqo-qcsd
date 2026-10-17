@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Complete, resolved configuration for one QCSD controller.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -40,6 +44,9 @@ pub struct QcsdConfig {
     pub keep_alive_lead_time_us: u64,
     /// Time to wait after the defense completes, in microseconds.
     pub tail_wait_us: u64,
+    /// Prospective engineering policy; explicit opt-in, never an old receipt alias.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub buflo_retained_parser_fin_permission: bool,
     /// Selected defense and its parameters.
     pub defense: DefenseConfig,
 }
@@ -59,6 +66,7 @@ impl Default for QcsdConfig {
             drop_unsatisfied_events: false,
             keep_alive_lead_time_us: 100_000,
             tail_wait_us: 0,
+            buflo_retained_parser_fin_permission: false,
             defense: DefenseConfig::None,
         }
     }
@@ -152,6 +160,13 @@ impl QcsdConfig {
             return Err(Error::InvalidConfig(
                 "BuFLO and CS-BuFLO client-only adaptations require max_udp_payload_size=1200 so every candidate datagram, including PMTUD and transport control, stays within the validation ceiling"
                     .into(),
+            ));
+        }
+        if self.buflo_retained_parser_fin_permission
+            && !matches!(&self.defense, DefenseConfig::Buflo(_))
+        {
+            return Err(Error::InvalidConfig(
+                "retained parser/FIN permission is BuFLO-only".into(),
             ));
         }
         self.defense.validate(self.max_udp_payload_size)

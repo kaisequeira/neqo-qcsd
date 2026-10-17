@@ -342,6 +342,19 @@ pub enum QcsdObservation {
         #[serde(default)]
         slot: Option<QcsdSlotId>,
     },
+    /// Prospective genuine QUIC final-read evidence. This is not a grant,
+    /// retirement, received-byte increment, or permission to reassign a cell.
+    /// The live producer consumes the opaque transport proof before Fin.
+    PeerFinRead {
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        final_size: u64,
+        encoded_receive_limit: u64,
+        manual_receive_limit: u64,
+        bytes_received: u64,
+        bytes_read: u64,
+        buffered_bytes: u64,
+    },
     StreamFinished {
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,

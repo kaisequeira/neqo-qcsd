@@ -714,6 +714,166 @@ impl ReceiveState {
         }
     }
 
+    /// The controller separately proves that this exact positive suffix is
+    /// owned by a live, physically realized incoming cell. It is not peer
+    /// BLOCKED evidence and never qualifies an initial unowned parser gap.
+    fn buflo_fresh_owned_parser_suffix_matches(&self, owned_suffix: Option<(u64, u64)>) -> bool {
+        matches!(self, Self::ReceivingData {
+            advertised_limit, requested_limit, known_limit, consumed,
+            parser_lease_exhausted, last_parser_lease_boundary,
+            pending_parser_boundary, ..
+        } if owned_suffix == Some((*consumed, *requested_limit))
+            && *parser_lease_exhausted
+            && *advertised_limit == *requested_limit
+            && *known_limit <= *requested_limit
+            && *consumed < *requested_limit
+            && requested_limit.saturating_sub(*consumed) < MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+            && requested_limit.checked_add(MIN_HTTP3_DATA_OPPORTUNITY_BYTES).is_some()
+            && *pending_parser_boundary == Some(*consumed)
+            && *last_parser_lease_boundary != Some(*consumed))
+    }
+
+    /// Reserve the complete smallest nonempty DATA opportunity as fresh bytes.
+    /// An advertised offset difference is permission, not witnessed peer data.
+    /// This private candidate is used only by the scoped BuFLO application path;
+    /// its original pristine and lifetime guards still apply. A positive
+    /// unowned tail still requires the actual current peer BLOCKED report.
+    pub(crate) fn buflo_fresh_parser_bridge_capacity(
+        &self,
+        blocked_at: Option<u64>,
+        owned_suffix: Option<(u64, u64)>,
+    ) -> u64 {
+        let eligible = matches!(self, Self::ReceivingData {
+            requested_limit, consumed, reservation_available, ..
+        } if requested_limit.saturating_sub(*consumed) > 0
+            && requested_limit.saturating_sub(*consumed) < MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+                && requested_limit.checked_add(MIN_HTTP3_DATA_OPPORTUNITY_BYTES).is_some()
+            && *reservation_available >= MIN_HTTP3_DATA_OPPORTUNITY_BYTES);
+        if eligible
+            && (self.scheduled_parser_lease_ceiling_with_evidence(blocked_at, None) > 0
+                || self.buflo_fresh_owned_parser_suffix_matches(owned_suffix))
+        {
+            MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+        } else {
+            0
+        }
+    }
+
+    /// Debit only a complete fresh bridge from the existing scheduled reservation.
+    pub(crate) fn claim_buflo_fresh_parser_bridge(
+        &mut self,
+        amount: u64,
+        blocked_at: Option<u64>,
+        owned_suffix: Option<(u64, u64)>,
+    ) -> u64 {
+        let capacity = self.buflo_fresh_parser_bridge_capacity(blocked_at, owned_suffix);
+        if capacity == 0 || amount < capacity {
+            return 0;
+        }
+        self.claim(capacity)
+    }
+
+    /// Materialize exactly one due-owned fresh bridge at the original boundary.
+    /// The reservation was debited at staging; no unowned allowance is increased.
+    pub(crate) fn lease_buflo_fresh_parser_bridge(
+        &mut self,
+        pristine_data_boundary: bool,
+        scheduled_backing: u64,
+        blocked_at: Option<u64>,
+        owned_suffix: Option<(u64, u64)>,
+    ) -> Option<(u64, u64, bool)> {
+        let eligible = matches!(self, Self::ReceivingData { requested_limit, consumed, .. }
+            if requested_limit.saturating_sub(*consumed) > 0
+                && requested_limit.saturating_sub(*consumed) < MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+                && requested_limit.checked_add(MIN_HTTP3_DATA_OPPORTUNITY_BYTES).is_some());
+        if !eligible
+            || !pristine_data_boundary
+            || scheduled_backing < MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+            || (self.scheduled_parser_lease_ceiling_with_evidence(blocked_at, None) == 0
+                && !self.buflo_fresh_owned_parser_suffix_matches(owned_suffix))
+        {
+            return None;
+        }
+        self.parser_lease(true, MIN_HTTP3_DATA_OPPORTUNITY_BYTES, None)
+    }
+
+    /// Capacity for an already established, retained unknown-length DATA
+    /// demand. The controller owns the typed pristine boundary and disjoint
+    /// live scheduling ranges; grants and ACKs never count as consumption.
+    pub(crate) fn buflo_retained_parser_capacity(&self, boundary: u64, room: u64) -> u64 {
+        match self {
+            Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                reservation_available,
+                parser_lease_exhausted,
+                ..
+            } if *consumed == boundary
+                && *parser_lease_exhausted
+                && *advertised_limit == *requested_limit
+                && *known_limit <= *requested_limit
+                && requested_limit.saturating_sub(*consumed) <= 1_200 =>
+            {
+                (*reservation_available)
+                    .min(room)
+                    .min(1_200)
+                    .min(u64::MAX.saturating_sub(*requested_limit))
+            }
+            _ => 0,
+        }
+    }
+
+    /// Claim retained demand only from the same staged due-cell transaction.
+    pub(crate) fn claim_buflo_retained_parser(
+        &mut self,
+        boundary: u64,
+        room: u64,
+        amount: u64,
+    ) -> u64 {
+        let capacity = self.buflo_retained_parser_capacity(boundary, room);
+        self.claim(amount.min(capacity))
+    }
+
+    /// Materialize only the live same-stream reservation that the allocator
+    /// already debited. The lifetime unowned allowance is unchanged. An ACK
+    /// or this MAX increase does not clear the controller's retained demand.
+    pub(crate) fn lease_buflo_retained_parser(
+        &mut self,
+        boundary: u64,
+        backing: u64,
+    ) -> Option<(u64, u64, bool)> {
+        match self {
+            Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                parser_lease_exhausted,
+                pending_parser_boundary,
+                last_parser_lease_boundary,
+                ..
+            } if backing > 0
+                && backing <= 1_200
+                && *consumed == boundary
+                && *parser_lease_exhausted
+                && *advertised_limit == *requested_limit
+                && *known_limit <= *requested_limit
+                && requested_limit
+                    .saturating_sub(*consumed)
+                    .checked_add(backing)?
+                    <= 1_200 =>
+            {
+                *requested_limit = requested_limit.checked_add(backing)?;
+                *last_parser_lease_boundary = Some(boundary);
+                *pending_parser_boundary = None;
+                Some((*requested_limit, backing, true))
+            }
+            _ => None,
+        }
+    }
+
     /// Materialize an exact scheduled continuation with its live peer proof.
     /// A positive advertised suffix cannot authorize another maximum header
     /// lease. Its matching blocked report can support only the bounded owned

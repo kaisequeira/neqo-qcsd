@@ -457,6 +457,9 @@ enum Command {
         /// Explicit response completion policy for a pre-prepared stability or baseline run.
         #[arg(long, value_enum, requires = "workload", conflicts_with = "urls")]
         application_response_policy: Option<ApplicationResponsePolicy>,
+        /// Explicit prospective BuFLO retained-demand/genuine-FIN engineering policy.
+        #[arg(long)]
+        buflo_retained_parser_fin_permission: bool,
         /// Complete custom configuration for thesis defenses and imported runs.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -571,6 +574,7 @@ impl Args {
                 workload,
                 application_workload_source,
                 application_response_policy,
+                buflo_retained_parser_fin_permission,
                 config,
                 preset,
                 profile,
@@ -604,6 +608,9 @@ impl Args {
                     walkie_talkie_molded.as_deref(),
                     workload_id.as_deref(),
                 )?;
+                if buflo_retained_parser_fin_permission {
+                    config.buflo_retained_parser_fin_permission = true;
+                }
                 config.validate()?;
                 if urls.is_empty() == workload.is_none() {
                     return Err(Error::Argument(
@@ -2392,6 +2399,7 @@ struct RunCompletion<'a> {
     defense_diagnostics: Option<DefenseDiagnostics>,
     runner_wakeup_metrics: Option<RunnerWakeupMetrics>,
     terminal_primary_partial_cell: Option<serde_json::Value>,
+    buflo_fin_permission: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14520,6 +14528,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
             defense_start_monotonic_ns: None,
             application_completion_monotonic_ns: None,
             defense_diagnostics: None,
+            buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
         },
@@ -14569,6 +14578,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
                 defense_start_monotonic_ns: None,
                 application_completion_monotonic_ns: None,
                 defense_diagnostics: None,
+                buflo_fin_permission: None,
                 runner_wakeup_metrics: None,
                 terminal_primary_partial_cell: None,
             },
@@ -15130,6 +15140,9 @@ async fn execute_run_inner(
     if terminal_primary_partial_cell_policy_receipt(spec).is_some() {
         controller.enable_terminal_primary_partial_cell_policy()?;
     }
+    if spec.config.buflo_retained_parser_fin_permission {
+        controller.enable_buflo_retained_parser_fin_permission_policy()?;
+    }
     if front_v5_light_enabled(spec) {
         controller.enable_front_v5_light_padding_window()?;
     } else if front_v3_padding_window_enabled(spec) || front_v4_preparation_reserve_enabled(spec) {
@@ -15462,6 +15475,11 @@ async fn execute_run_inner(
                     } else {
                         defense_start = Some(loop_now);
                     }
+                }
+                if spec.config.buflo_retained_parser_fin_permission
+                    && let Some(start) = defense_start
+                {
+                    traces.bind_buflo_fin_permission_defense_start(start)?;
                 }
                 yield_to_exact_boundaries!('runner);
                 yield_to_tamaraw_service!();
@@ -16130,6 +16148,7 @@ async fn execute_run_inner(
                 application_completion_monotonic_ns: application_completion
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
+                buflo_fin_permission: controller.buflo_permission_accounting().map(|accounting| json!({"accounting": accounting, "physical_proof": traces.buflo_fin_permission_physical_summary()})),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
                 terminal_primary_partial_cell: controller
                     .terminal_primary_partial_cell()
@@ -16184,6 +16203,7 @@ async fn execute_run_inner(
                 application_completion_monotonic_ns: application_completion
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
+                buflo_fin_permission: controller.buflo_permission_accounting().map(|accounting| json!({"accounting": accounting, "physical_proof": traces.buflo_fin_permission_physical_summary()})),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
                 terminal_primary_partial_cell: controller
                     .terminal_primary_partial_cell()
@@ -16221,6 +16241,7 @@ async fn execute_run_inner(
             application_completion_monotonic_ns: application_completion
                 .map(|instant| elapsed_ns(process_start, instant)),
             defense_diagnostics: Some(controller.defense_diagnostics()),
+            buflo_fin_permission: controller.buflo_permission_accounting().map(|accounting| json!({"accounting": accounting, "physical_proof": traces.buflo_fin_permission_physical_summary()})),
             runner_wakeup_metrics: Some(runner_wakeup_metrics.clone()),
             terminal_primary_partial_cell: controller
                 .terminal_primary_partial_cell()
@@ -16269,6 +16290,7 @@ async fn execute_run_inner(
                 application_completion_monotonic_ns: application_completion
                     .map(|instant| elapsed_ns(process_start, instant)),
                 defense_diagnostics: Some(controller.defense_diagnostics()),
+                buflo_fin_permission: controller.buflo_permission_accounting().map(|accounting| json!({"accounting": accounting, "physical_proof": traces.buflo_fin_permission_physical_summary()})),
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
                 terminal_primary_partial_cell: controller
                     .terminal_primary_partial_cell()
@@ -17628,6 +17650,7 @@ fn forward_endpoint_qcsd_observation(
         // Its original adapter binding remains in the raw observation trace.
         endpoint.deferred_endpoint_ready = None;
     }
+    traces.prepare_buflo_fin_permission_observation(controller, record)?;
     forward_qcsd_observation(controller, record, defense_elapsed);
     Ok(())
 }
@@ -24731,7 +24754,18 @@ async fn drive_endpoint_output_with_clock_until_with_admitted_tail(
                 controller.flush_defense_observations();
                 ensure_defense_realizable(controller)?;
             }
-            if reduced_rolling_barrier || reconcile_staging {
+            // Newly reduced retained demand or FIN return can make incoming
+            // control work due after the outer poll. Service it at this fresh
+            // defense time before ordinary transport preparation. The original
+            // poll enforces every owner window; an unserviced boundary remains
+            // an ordinary handoff interrupt.
+            let reconciled_fin_permission_control =
+                controller.reconcile_due_buflo_fin_permission_control(drive_elapsed);
+            if reconciled_fin_permission_control {
+                controller.flush_defense_observations();
+                ensure_defense_realizable(controller)?;
+            }
+            if reduced_rolling_barrier || reconcile_staging || reconciled_fin_permission_control {
                 apply_queued_actions(
                     endpoints,
                     controller,
@@ -25719,6 +25753,7 @@ async fn process_output_once_with_clock_with_admitted_tail(
                             QcsdObservation::ReceiveLimitAdvertised { .. } => {
                                 "receive_limit_advertised"
                             }
+                            QcsdObservation::PeerFinRead { .. } => "peer_fin_read",
                             QcsdObservation::StreamFinished { .. } => "stream_finished",
                             QcsdObservation::ChaffRequestFailed { .. } => "chaff_request_failed",
                             QcsdObservation::ResourceCompleted { .. } => "resource_completed",
@@ -26539,6 +26574,9 @@ fn render_run_json(
         "responses": responses,
         "chaff_responses": chaff_responses,
     });
+    if let Some(proof) = &completion.buflo_fin_permission {
+        run["buflo_retained_parser_fin_permission"] = proof.clone();
+    }
     // A successful run's scientific DTO stays unchanged. These optional
     // failure observations do not replace the original error or authorize it.
     if completion_status != "complete" {
@@ -29046,6 +29084,7 @@ mod tests {
             defense_start_monotonic_ns: None,
             application_completion_monotonic_ns: None,
             defense_diagnostics: None,
+            buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
         };
@@ -29233,6 +29272,7 @@ mod tests {
                 defense_start_monotonic_ns: Some(3),
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
+                buflo_fin_permission: None,
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
                 terminal_primary_partial_cell: None,
             },
@@ -43789,6 +43829,7 @@ mod tests {
             defense_start_monotonic_ns: Some(0),
             application_completion_monotonic_ns: Some(50_000_000),
             defense_diagnostics: None,
+            buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: Some(json!(proof)),
         };
@@ -45368,6 +45409,7 @@ mod tests {
                 defense_start_monotonic_ns: None,
                 application_completion_monotonic_ns: None,
                 defense_diagnostics: None,
+                buflo_fin_permission: None,
                 runner_wakeup_metrics: None,
                 terminal_primary_partial_cell: None,
             },
@@ -45759,6 +45801,7 @@ mod tests {
             defense_start_monotonic_ns: None,
             application_completion_monotonic_ns: None,
             defense_diagnostics: None,
+            buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
         };
@@ -46953,6 +46996,7 @@ mod tests {
                     defense_start_monotonic_ns: None,
                     application_completion_monotonic_ns: Some(2),
                     defense_diagnostics: None,
+                    buflo_fin_permission: None,
                     runner_wakeup_metrics: None,
                     terminal_primary_partial_cell: None,
                 },
@@ -54443,6 +54487,7 @@ mod tests {
                 defense_start_monotonic_ns: Some(3),
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
+                buflo_fin_permission: None,
                 runner_wakeup_metrics: Some(RunnerWakeupMetrics::new()),
                 terminal_primary_partial_cell: None,
             },
@@ -58433,6 +58478,7 @@ mod tests {
                 defense_start_monotonic_ns: Some(3),
                 application_completion_monotonic_ns: Some(4),
                 defense_diagnostics: None,
+                buflo_fin_permission: None,
                 runner_wakeup_metrics: Some(metrics),
                 terminal_primary_partial_cell: None,
             },
