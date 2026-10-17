@@ -583,6 +583,9 @@ pub struct QcsdController {
         HashMap<(QcsdEndpointId, QcsdStreamId), BufloRetainedParserDemand>,
     // Known-length chaff uses original exact credit, separately from no-CL FIN release.
     buflo_known_chaff_demands: HashMap<(QcsdEndpointId, QcsdStreamId), u64>,
+    // Parser-exclusion scope only: these original ordinary exact rights are
+    // not speculative parser permission and do not debit its 1200-byte cap.
+    // Authoritative cell ownership remains in advertised_incoming_credit.
     buflo_known_chaff_service_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<(u64, u64)>>,
     buflo_peer_fin_reads: HashMap<(QcsdEndpointId, QcsdStreamId), BufloPeerFinRead>,
     buflo_fin_replacement_pending: HashMap<QcsdSlotId, QcsdEndpointId>,
@@ -3097,8 +3100,9 @@ impl QcsdController {
         (self.chaff.as_ref()?.estimate(resource) == length).then_some((consumed, requested))
     }
 
-    /// Only observed raw-read overlap frees this range budget. MAX and parsed
-    /// frame extent never count as consumption, and RESET never authorizes release.
+    /// Only observed raw-read overlap clears this parser-exclusion scope.
+    /// MAX and parsed frame extent never count as consumption, and RESET
+    /// never authorizes release of the original cell's receive rights.
     fn consume_buflo_known_chaff_service(
         &mut self,
         endpoint: QcsdEndpointId,
@@ -3119,38 +3123,6 @@ impl QcsdController {
         if remove {
             self.buflo_known_chaff_service_ranges.remove(&key);
         }
-    }
-
-    fn buflo_known_chaff_service_outstanding(&self) -> u64 {
-        self.buflo_known_chaff_service_ranges
-            .values()
-            .flatten()
-            .fold(0_u64, |total, (start, end)| {
-                total.saturating_add(end - start)
-            })
-    }
-
-    fn buflo_known_chaff_service_room(&self) -> u64 {
-        let mut used = self.buflo_known_chaff_service_outstanding();
-        for (key, ranges) in &self.parser_lease_ranges {
-            if self.buflo_retained_parser_demands.contains_key(key) {
-                for range in ranges
-                    .iter()
-                    .filter(|r| r.owner.is_some() && r.reservation_debited && !r.unowned)
-                {
-                    used = used.saturating_add(range.bytes());
-                }
-            }
-        }
-        for claim in self.control.claims.iter().filter(|c| {
-            c.reservation_debited
-                && self
-                    .buflo_retained_parser_demands
-                    .contains_key(&(c.endpoint, c.stream))
-        }) {
-            used = used.saturating_add(claim.remaining);
-        }
-        1_200_u64.saturating_sub(used)
     }
 
     /// Outstanding service is bounded by one actual cell per stream and
@@ -3191,7 +3163,6 @@ impl QcsdController {
                 on_stream = on_stream.saturating_add(claim.remaining);
             }
         }
-        all = all.saturating_add(self.buflo_known_chaff_service_outstanding());
         1_200_u64
             .saturating_sub(all)
             .min(1_200_u64.saturating_sub(on_stream))
@@ -6066,9 +6037,11 @@ impl QcsdController {
                     });
                 }
             }
-            // Native112 opt-in: a positive owned sub-header tail must not
-            // exclude known qualified chaff from every service turn. This is
-            // ordinary exact capacity, never speculative parser or FIN credit.
+            // Native113 qualified-known-capacity service v2. A genuine
+            // DATA-end intent affects fair priority, not exact body capacity.
+            // Each NEW cell still stages 1200 NEW offsets atomically. Earlier
+            // cells' unread rights retain their owners across RTT and cannot
+            // fund this cell. The separate unknown/parser cap stays unchanged.
             let mut known_chaff_service = None;
             if self.buflo_retained_parser_policy
                 && fair_stream_turns
@@ -6079,13 +6052,12 @@ impl QcsdController {
                 && incoming.remaining == 1_200
                 && self.incoming_slot_is_untouched(&incoming)
             {
-                let room = self.buflo_known_chaff_service_room();
                 let service_turn = self.application_complete
                     || !opportunities
                         .iter()
                         .any(|o| o.role == QcsdRequestRole::Application)
                     || self.buflo_chaff_service_turn == 5;
-                if service_turn && room > 0 {
+                if service_turn {
                     known_chaff_service = opportunities
                         .iter()
                         .filter(|o| {
@@ -6114,11 +6086,6 @@ impl QcsdController {
                     if self.buflo_known_chaff_demands.contains_key(&key)
                         || self.buflo_known_chaff_service_ranges.contains_key(&key)
                     {
-                        opportunity.exact = if known_chaff_service == Some(key) {
-                            opportunity.exact.min(room)
-                        } else {
-                            0
-                        };
                         opportunity.claimable = 0;
                     }
                 }
@@ -6127,18 +6094,15 @@ impl QcsdController {
                     opportunities.sort_by_key(|o| (o.endpoint, o.stream) != key);
                 }
             }
-            // The same global outstanding cap also applies to partial
-            // same-slot FIN replacement and every ordinary fallback route.
-            // Only a selected untouched whole-cell service may extend a
-            // tracked stream; partial replacement must use other capacity.
+            // Known qualified body capacity retains original exact-release
+            // semantics on every route, including existing partial replacement.
+            // Tracked rights still exclude speculative parser fallback until
+            // actual raw reads consume them; they are never a second budget.
             for opportunity in &mut opportunities {
                 let key = (opportunity.endpoint, opportunity.stream);
                 if self.buflo_known_chaff_demands.contains_key(&key)
                     || self.buflo_known_chaff_service_ranges.contains_key(&key)
                 {
-                    if known_chaff_service != Some(key) {
-                        opportunity.exact = 0;
-                    }
                     opportunity.claimable = 0;
                 }
             }
@@ -6232,18 +6196,9 @@ impl QcsdController {
                     })
                     .map(|c| c.remaining)
                     .sum::<u64>();
-                // Exact service is tracked only on whole-cell commit. Until
-                // then its staged bytes must already consume the same global
-                // budget as retained parser claims in this transaction.
-                let staged_known_chaff_total = staged_credit
-                    .iter()
-                    .filter(|credit| known_chaff_service == Some((credit.endpoint, credit.stream)))
-                    .map(|credit| credit.increase)
-                    .sum::<u64>();
                 let retained_room = self
                     .buflo_retained_parser_room(opportunity.endpoint, opportunity.stream)
-                    .saturating_sub(staged_total)
-                    .saturating_sub(staged_known_chaff_total);
+                    .saturating_sub(staged_total);
                 let retained_capacity = retained_boundary.map_or(0, |boundary| {
                     self.streams.buflo_retained_parser_capacity(
                         opportunity.endpoint,
@@ -6369,7 +6324,11 @@ impl QcsdController {
 
             if incoming.remaining == 0 || (!exact_window && !self.config.drop_unsatisfied_events) {
                 for credit in staged_credit {
-                    if known_chaff_service == Some((credit.endpoint, credit.stream)) {
+                    if known_chaff_service == Some((credit.endpoint, credit.stream))
+                        || self
+                            .buflo_known_chaff_service_ranges
+                            .contains_key(&(credit.endpoint, credit.stream))
+                    {
                         let tracked = self
                             .buflo_known_chaff_service_ranges
                             .entry((credit.endpoint, credit.stream))
@@ -29537,18 +29496,17 @@ mod tests {
         }
     }
 
-    // Explicit controller-state controls, not transport/wire evidence. These
-    // snapshots reproduce saved Dictionary stream96 raw1214/MAX1216, decoded
-    // HEADERS574+DATA header3+body637 and qualified Content-Length221756.
-    fn native112_known_chaff_snapshot(enabled: bool) -> QcsdController {
+    // Explicit synthetic controller snapshots of the saved Native112 failure,
+    // not transport/socket proof. Every chaff stream is tracked: there is no
+    // untracked reservoir to hide the old8 + fresh1200 allocation conflict.
+    fn native113_five_known_snapshot(complete: bool) -> QcsdController {
         let mut c = startup_cadence64_controller(true);
         c.enable_terminal_primary_partial_cell_policy().unwrap();
         c.bind_terminal_primary_stream(QcsdEndpointId(1), QcsdStreamId(0), 0)
             .unwrap();
-        if enabled {
-            c.enable_buflo_retained_parser_fin_permission_policy()
-                .unwrap();
-        }
+        c.enable_buflo_retained_parser_fin_permission_policy()
+            .unwrap();
+        c.config.max_chaff_streams = 5;
         c.chaff = Some(super::ChaffManager::new(
             ResourceManifest {
                 resources: vec![Resource {
@@ -29566,7 +29524,15 @@ mod tests {
             false,
         ));
         let ep = QcsdEndpointId(1);
-        for sid in [92, 96] {
+        // stream, raw consumed, MAX, framing, decoded DATA, old owner,
+        // original target, latest actual DATA-end time (all saved geometry).
+        for (sid, raw, max, framing, data, owner, target, read_at) in [
+            (80, 6_489, 6_492, 605, 5_884, 579, 18_496_000, 18_500_545),
+            (84, 6_029, 6_030, 600, 5_429, 585, 18_688_000, 18_692_341),
+            (88, 2_423, 2_424, 586, 1_837, 587, 18_752_000, 18_756_480),
+            (92, 1_224, 1_225, 582, 642, 583, 18_624_000, 18_652_259),
+            (96, 62_323, 62_325, 736, 61_587, 587, 18_752_000, 18_765_540),
+        ] {
             let stream = QcsdStreamId(sid);
             let role = QcsdRequestRole::Chaff {
                 resource_id: 9,
@@ -29616,26 +29582,61 @@ mod tests {
             );
             c.streams.get_mut(ep, stream).unwrap().receive =
                 crate::stream::ReceiveState::ReceivingData {
-                    advertised_limit: if sid == 96 { 1_216 } else { 16 },
-                    requested_limit: if sid == 96 { 1_216 } else { 16 },
-                    known_limit: 222_333,
+                    advertised_limit: max,
+                    requested_limit: max,
+                    known_limit: framing + 221_756,
                     reservation_capacity: 1_000,
                     reservation_available: 1_000,
-                    consumed: if sid == 96 { 1_214 } else { 16 },
+                    consumed: raw,
                     payload_floor: 221_756,
-                    framing_bytes: 577,
+                    framing_bytes: framing,
                     parser_lease_capacity: 1_000,
                     parser_lease_used: 0,
                     parser_lease_exhausted: false,
                     last_parser_lease_boundary: None,
                     pending_parser_boundary: None,
-                    data_length: if sid == 96 { 637 } else { 221_756 },
+                    data_length: data,
                 };
             c.buflo_chaff_ack_observed_at
                 .insert((ep, stream), Duration::ZERO);
+            c.buflo_chaff_last_read_at
+                .insert((ep, stream), Duration::from_micros(read_at));
+            c.advertised_incoming_credit.insert(
+                (ep, stream),
+                vec![AdvertisedIncomingCredit {
+                    slot: QcsdSlotId(owner),
+                    start: raw,
+                    end: max,
+                }],
+            );
+            // Native112 already tracked stream80 before its later three-byte
+            // tail. No new three-byte tiny-tail intent is fabricated here.
+            c.buflo_known_chaff_service_ranges
+                .insert((ep, stream), vec![(raw, max)]);
+            let slot = QcsdSlotId(owner);
+            c.pending_slots.entry(slot).or_insert(
+                Packet::new(Duration::from_micros(target), Direction::Incoming, 1_200).unwrap(),
+            );
+            c.incoming_credit_ledger
+                .entry(slot)
+                .or_insert(IncomingCreditLedger {
+                    packet: Packet::new(Duration::from_micros(target), Direction::Incoming, 1_200)
+                        .unwrap(),
+                    endpoint: Some(ep),
+                    multiple_endpoints: false,
+                    advertised: 1_200,
+                    local_realization_emitted: true,
+                    consumed: 1_200,
+                    retired: 0,
+                })
+                .consumed -= max - raw;
         }
-        // The active application is ordinary exact capacity. A second lower-ID
-        // chaff reservoir remains available after ApplicationComplete.
+        c.scheduled_incoming_requested_bytes = 4_800;
+        c.scheduled_incoming_advertised_bytes = 4_800;
+        c.scheduled_incoming_consumed_bytes = 4_792;
+        c.buflo_gross_advertised = 4_800;
+        // This is a synthetic active application only in the precomplete
+        // variant; it cannot serve as a chaff remainder reservoir.
         c.streams.get_mut(ep, QcsdStreamId(0)).unwrap().receive =
             crate::stream::ReceiveState::ReceivingData {
                 advertised_limit: 16,
@@ -29653,57 +29654,34 @@ mod tests {
                 pending_parser_boundary: None,
                 data_length: 100_000,
             };
-        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).unwrap();
-        let old = QcsdSlotId(11_263);
-        c.pending_slots.insert(old, packet);
-        c.incoming_credit_ledger.insert(
-            old,
-            IncomingCreditLedger {
-                packet,
-                endpoint: Some(ep),
-                multiple_endpoints: false,
-                advertised: 1_200,
-                local_realization_emitted: true,
-                consumed: 1_198,
-                retired: 0,
-            },
-        );
-        c.advertised_incoming_credit.insert(
-            (ep, QcsdStreamId(96)),
-            vec![AdvertisedIncomingCredit {
-                slot: old,
-                start: 1_214,
-                end: 1_216,
-            }],
-        );
-        c.scheduled_incoming_requested_bytes = 1_200;
-        c.scheduled_incoming_advertised_bytes = 1_200;
-        c.scheduled_incoming_consumed_bytes = 1_198;
-        c.buflo_gross_advertised = 1_200;
+        c.application_complete = complete;
+        if complete {
+            let _ = c.streams.close(ep, QcsdStreamId(0));
+        }
         c.buflo_chaff_service_turn = 5;
+        for sid in [80, 84, 88, 92, 96] {
+            c.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream: QcsdStreamId(sid),
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                Duration::from_micros(18_780_000),
+            );
+        }
         c.drain_actions().for_each(drop);
+        assert!(
+            !c.buflo_known_chaff_demands
+                .contains_key(&(ep, QcsdStreamId(80)))
+        );
+        assert_eq!(c.buflo_known_chaff_demands.len(), 4);
+        assert_eq!(c.buflo_known_chaff_service_ranges.len(), 5);
         c
     }
 
-    fn native112_header(c: &mut QcsdController, awaiting: bool, min_remaining: u64) {
-        c.observe(
-            QcsdObservation::HeaderProgress {
-                endpoint: QcsdEndpointId(1),
-                stream: QcsdStreamId(96),
-                min_remaining,
-                awaiting_data_frame: awaiting,
-            },
-            Duration::from_micros(63_000),
-        );
-    }
-
-    fn native112_due(
-        c: &mut QcsdController,
-        slot: u64,
-        at_us: u64,
-        service_us: u64,
-    ) -> Vec<QcsdAction> {
-        let slot = QcsdSlotId(slot);
+    fn native113_due(c: &mut QcsdController, at_us: u64, service_us: u64) -> Vec<QcsdAction> {
+        let slot = QcsdSlotId(589);
         let packet = Packet::new(Duration::from_micros(at_us), Direction::Incoming, 1_200).unwrap();
         c.pending_slots.insert(slot, packet);
         c.materialize_incoming_with_disposition(slot, packet, Duration::from_micros(at_us), None);
@@ -29711,382 +29689,234 @@ mod tests {
         c.drain_actions().collect()
     }
 
+    fn native113_tracked_bytes(c: &QcsdController) -> u64 {
+        c.buflo_known_chaff_service_ranges
+            .values()
+            .flatten()
+            .map(|(a, b)| b - a)
+            .sum()
+    }
+
     #[test]
-    fn buflo_native112_known_chaff_active_and_complete_get_exact_1198_plus2() {
+    fn buflo_native113_all_five_tiny_tails_get_new1200_without_old_right_reuse() {
+        let ep = QcsdEndpointId(1);
         for complete in [false, true] {
-            let mut c = native112_known_chaff_snapshot(true);
-            if complete {
-                c.application_complete = true;
-                let _ = c.streams.close(QcsdEndpointId(1), QcsdStreamId(0));
-            }
-            native112_header(&mut c, true, 1);
-            assert_eq!(
-                c.buflo_known_chaff_demands[&(QcsdEndpointId(1), QcsdStreamId(96))],
-                1_214
-            );
-            assert_eq!(c.buflo_known_chaff_service_room(), 1_198);
-            let actions = native112_due(&mut c, 11_264, 64_000, 64_000);
+            let mut c = native113_five_known_snapshot(complete);
+            let old_ranges = c.advertised_incoming_credit.clone();
+            let old_ledgers = c.incoming_credit_ledger.clone();
+            assert_eq!(native113_tracked_bytes(&c), 8);
+            let actions = native113_due(&mut c, 18_816_000, 18_816_000);
             let exact: Vec<_> = actions
                 .iter()
                 .filter_map(|a| match a {
                     QcsdAction::IncreaseReceiveLimit {
+                        endpoint,
                         stream,
                         absolute_limit,
                         packet,
                         slot,
-                        ..
                     } => {
-                        assert_eq!(*slot, QcsdSlotId(11_264));
-                        assert_eq!(packet.length(), 1_200);
-                        Some((stream.0, *absolute_limit))
+                        assert_eq!(
+                            (*endpoint, *slot, packet.length()),
+                            (ep, QcsdSlotId(589), 1_200)
+                        );
+                        Some((*stream, *absolute_limit))
                     }
                     _ => None,
                 })
                 .collect();
-            assert_eq!(
-                exact,
-                vec![(96, 2_414), (if complete { 92 } else { 0 }, 18)]
-            );
-            assert!(!actions.iter().any(|a| matches!(
-                a,
-                QcsdAction::LeaseParserReceive { .. } | QcsdAction::SlotMissed { .. }
-            )));
-            assert_eq!(c.buflo_known_chaff_service_outstanding(), 1_200);
-            assert_eq!(c.buflo_known_chaff_service_room(), 0);
+            // Stream92 is the oldest genuine 1..2-tail DATA-end candidate.
+            // Its OLD [1224,1225) remains slot583; NEW [1225,2425) is slot589.
+            assert_eq!(exact, vec![(QcsdStreamId(92), 2_425)]);
+            assert_eq!(c.advertised_incoming_credit, old_ranges);
+            for (slot, ledger) in old_ledgers {
+                assert_eq!(c.incoming_credit_ledger[&slot], ledger);
+            }
+            assert_eq!(native113_tracked_bytes(&c), 1_208);
             assert_eq!(
                 c.control
                     .credit
                     .iter()
-                    .filter(|r| r.slot == QcsdSlotId(11_264))
+                    .filter(|r| r.slot == QcsdSlotId(589))
                     .map(|r| r.increase)
                     .sum::<u64>(),
                 1_200
             );
+            assert!(!actions.iter().any(|a| matches!(
+                a,
+                QcsdAction::SlotMissed { .. } | QcsdAction::LeaseParserReceive { .. }
+            )));
+            assert!(c.control.claims.is_empty());
             assert!(c.buflo_fin_permission_releases.is_empty());
-            assert!(
-                !c.streams
-                    .buflo_final_permission_response_eligible(QcsdEndpointId(1), QcsdStreamId(96))
-            );
-        }
-    }
-
-    #[test]
-    fn buflo_native112_known_chaff_partial_header_keeps_shared1197_budget() {
-        let mut c = native112_known_chaff_snapshot(true);
-        native112_header(&mut c, true, 1);
-        let actions = native112_due(&mut c, 11_264, 64_000, 64_000);
-        for action in actions {
-            if let QcsdAction::IncreaseReceiveLimit {
-                endpoint,
-                stream,
-                absolute_limit,
-                slot,
-                ..
-            } = action
-            {
-                c.observe(
-                    QcsdObservation::ReceiveLimitAdvertised {
-                        endpoint,
-                        stream,
-                        absolute_limit,
-                        slot: Some(slot),
-                    },
-                    Duration::from_micros(64_001),
-                );
-            }
-        }
-        c.drain_actions().for_each(drop);
-        assert_eq!(
-            c.buflo_known_chaff_service_outstanding(),
-            1_200,
-            "physical MAX is permission, never consumption"
-        );
-        c.observe(
-            QcsdObservation::BytesRead {
-                endpoint: QcsdEndpointId(1),
-                stream: QcsdStreamId(96),
-                bytes: 3,
-            },
-            Duration::from_micros(70_000),
-        );
-        assert!(
-            !c.buflo_known_chaff_demands
-                .contains_key(&(QcsdEndpointId(1), QcsdStreamId(96)))
-        );
-        assert_eq!(c.buflo_known_chaff_service_outstanding(), 1_197);
-        assert_eq!(c.buflo_known_chaff_service_room(), 3);
-        assert_eq!(
-            c.buflo_retained_parser_room(QcsdEndpointId(1), QcsdStreamId(4)),
-            3
-        );
-        c.observe(
-            QcsdObservation::DataFrame {
-                endpoint: QcsdEndpointId(1),
-                stream: QcsdStreamId(96),
-                frame_header_bytes: 3,
-                data_bytes: 10_000,
-            },
-            Duration::from_micros(70_001),
-        );
-        assert_eq!(
-            c.buflo_known_chaff_service_outstanding(),
-            1_197,
-            "declared DATA extent cannot forget outstanding rights"
-        );
-        c.drain_actions().for_each(drop);
-        let actions = native112_due(&mut c, 11_265, 128_000, 128_000);
-        assert!(
-            !actions.iter().any(|a| matches!(
-                a,
-                QcsdAction::IncreaseReceiveLimit {
-                    stream: QcsdStreamId(96),
-                    ..
-                } | QcsdAction::LeaseParserReceive {
-                    stream: QcsdStreamId(96),
-                    ..
-                }
-            )),
-            "ordinary/parser fallback must not bypass retained1197 while DATA is incomplete"
-        );
-        assert_eq!(c.buflo_known_chaff_service_outstanding(), 1_197);
-        // Synthetic already-realized partial same-slot replacement queue,
-        // not a genuine FIN witness. The unchanged replacement allocator
-        // must use other chaff instead of bypassing the tracked stream cap.
-        let target = Duration::from_micros(192_000);
-        let packet = Packet::new(target, Direction::Incoming, 1_200).unwrap();
-        let slot = QcsdSlotId(11_266);
-        c.pending_slots.insert(slot, packet);
-        c.incoming_credit_ledger.insert(
-            slot,
-            IncomingCreditLedger {
-                packet,
-                endpoint: Some(QcsdEndpointId(1)),
-                multiple_endpoints: false,
-                advertised: 1_198,
-                local_realization_emitted: true,
-                consumed: 1_198,
-                retired: 0,
-            },
-        );
-        c.buflo_fin_replacement_pending
-            .insert(slot, QcsdEndpointId(1));
-        c.control.incoming.push(PendingIncoming {
-            slot,
-            packet,
-            endpoint: None,
-            remaining: 2,
-        });
-        c.process_incoming(192_000, target);
-        let partial: Vec<_> = c.drain_actions().collect();
-        assert!(
-            !partial.iter().any(|a| matches!(
-                a,
-                QcsdAction::IncreaseReceiveLimit {
-                    stream: QcsdStreamId(96),
-                    ..
-                } | QcsdAction::LeaseParserReceive {
-                    stream: QcsdStreamId(96),
-                    ..
-                }
-            )),
-            "partial replacement cannot bypass the same tracked1197 cap"
-        );
-        assert!(
-            partial.iter().any(|a| matches!(
-                a,
-                QcsdAction::IncreaseReceiveLimit {
+            // Synthetic timely physical observation drives the unchanged
+            // controller reducer. This is not a real socket handoff receipt.
+            c.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: ep,
                     stream: QcsdStreamId(92),
-                    ..
-                }
-            )),
-            "the original same-endpoint replacement path may use other eligible chaff"
-        );
-        assert_eq!(c.buflo_known_chaff_service_outstanding(), 1_197);
+                    absolute_limit: 2_425,
+                    slot: Some(QcsdSlotId(589)),
+                },
+                Duration::from_micros(18_817_000),
+            );
+            c.drain_actions().for_each(drop);
+            let read_at = Duration::from_micros(18_900_000); // RTT after original window is permitted.
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: QcsdStreamId(92),
+                    bytes: 3,
+                },
+                read_at,
+            );
+            assert_eq!(c.incoming_credit_ledger[&QcsdSlotId(589)].consumed, 2);
+            assert_eq!(native113_tracked_bytes(&c), 1_205);
+            c.observe(
+                QcsdObservation::DataFrame {
+                    endpoint: ep,
+                    stream: QcsdStreamId(92),
+                    frame_header_bytes: 3,
+                    data_bytes: 1_198,
+                },
+                read_at,
+            );
+            assert_eq!(
+                native113_tracked_bytes(&c),
+                1_205,
+                "decoded extent is never consumed data"
+            );
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: QcsdStreamId(92),
+                    bytes: 1_197,
+                },
+                read_at,
+            );
+            assert_eq!(c.incoming_credit_ledger[&QcsdSlotId(589)].consumed, 1_199);
+            assert!(!c.drain_actions().any(
+                |a| matches!(a, QcsdAction::SlotSatisfied { slot, .. } if slot == QcsdSlotId(589))
+            ));
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: QcsdStreamId(92),
+                    bytes: 1,
+                },
+                read_at,
+            );
+            assert!(c.drain_actions().any(
+                |a| matches!(a, QcsdAction::SlotSatisfied { slot, .. } if slot == QcsdSlotId(589))
+            ));
+            assert_eq!(native113_tracked_bytes(&c), 7);
+            assert_eq!(c.scheduled_incoming_retired_bytes, 0);
+            assert!(c.buflo_fin_permission_releases.is_empty());
+        }
     }
 
     #[test]
-    fn buflo_native112_known_chaff_scope_and_original_window_refuse() {
-        for case in 0..17 {
-            let mut c = native112_known_chaff_snapshot(case != 0);
-            let ep = QcsdEndpointId(1);
-            let stream = QcsdStreamId(96);
-            match case {
-                1 => c.streams.get_mut(ep, stream).unwrap().role = QcsdRequestRole::Application,
-                2 => {
-                    c.streams.get_mut(ep, stream).unwrap().role = QcsdRequestRole::Chaff {
-                        resource_id: 999,
-                        request_id: Some(crate::QcsdChaffRequestId(96)),
-                    }
-                }
-                3 => c.streams.get_mut(ep, stream).unwrap().response_headers(
-                    0,
-                    Some(200),
-                    Some(221_755),
-                ),
-                4 => c
-                    .streams
-                    .get_mut(ep, stream)
-                    .unwrap()
-                    .response_headers(0, Some(200), None),
-                5 => c.streams.get_mut(ep, stream).unwrap().response_headers(
-                    0,
-                    Some(204),
-                    Some(221_756),
-                ),
-                6 => {
-                    c.buflo_chaff_ack_observed_at.remove(&(ep, stream));
-                }
-                7 => {
-                    if let crate::stream::ReceiveState::ReceivingData { data_length, .. } =
-                        &mut c.streams.get_mut(ep, stream).unwrap().receive
-                    {
-                        *data_length = 638;
-                    }
-                }
-                8 => {
+    fn buflo_native113_finite_capacity_rollback_and_original_window_remain_strict() {
+        let ep = QcsdEndpointId(1);
+        for expired in [false, true] {
+            let mut c = native113_five_known_snapshot(true);
+            if !expired {
+                // All five qualified finite responses now have only 56 body
+                // bytes left. Their true combined exact capacity is 272,
+                // not1200: the transaction must roll back every staged byte.
+                c.buflo_known_chaff_demands.clear();
+                for sid in [80, 84, 88, 92, 96] {
+                    let key = (ep, QcsdStreamId(sid));
+                    let mut moved = None;
                     if let crate::stream::ReceiveState::ReceivingData {
-                        requested_limit, ..
-                    } = &mut c.streams.get_mut(ep, stream).unwrap().receive
+                        advertised_limit,
+                        requested_limit,
+                        consumed,
+                        framing_bytes,
+                        data_length,
+                        pending_parser_boundary,
+                        ..
+                    } = &mut c.streams.get_mut(key.0, key.1).unwrap().receive
                     {
-                        *requested_limit = 1_217;
+                        let tail = *requested_limit - *consumed;
+                        *data_length = 221_700;
+                        *consumed = *framing_bytes + *data_length;
+                        *requested_limit = *consumed + tail;
+                        *advertised_limit = *requested_limit;
+                        *pending_parser_boundary = Some(*consumed);
+                        moved = Some((*consumed, *requested_limit));
                     }
+                    let (raw, max) = moved.unwrap();
+                    let old = &mut c.advertised_incoming_credit.get_mut(&key).unwrap()[0];
+                    old.start = raw;
+                    old.end = max;
+                    c.buflo_known_chaff_service_ranges
+                        .insert(key, vec![(raw, max)]);
+                    c.retain_buflo_known_chaff_demand(key.0, key.1, true);
                 }
-                9 => {
-                    c.advertised_incoming_credit.remove(&(ep, stream));
-                }
-                10 => {
-                    c.incoming_credit_ledger
-                        .get_mut(&QcsdSlotId(11_263))
-                        .unwrap()
-                        .retired = 1;
-                }
-                11 => {
-                    c.incoming_credit_ledger
-                        .get_mut(&QcsdSlotId(11_263))
-                        .unwrap()
-                        .local_realization_emitted = false;
-                }
-                12 => {
-                    c.incoming_credit_ledger
-                        .get_mut(&QcsdSlotId(11_263))
-                        .unwrap()
-                        .endpoint = Some(QcsdEndpointId(2));
-                }
-                13 => {
-                    let _ = c.streams.close(ep, stream);
-                }
-                15 => c.observe(
-                    QcsdObservation::StreamDataAcknowledged {
-                        endpoint: ep,
-                        stream,
-                        role: QcsdRequestRole::Chaff {
-                            resource_id: 9,
-                            request_id: Some(crate::QcsdChaffRequestId(96)),
-                        },
-                        offset: 0,
-                        bytes: 64,
-                        fin: true,
-                    },
-                    Duration::from_micros(62_000),
-                ),
-                _ => {}
             }
-            if case == 16 {
-                c.retain_buflo_known_chaff_demand(ep, stream, true);
-            } else {
-                native112_header(&mut c, case != 14, 1);
-            }
-            assert!(c.buflo_known_chaff_demands.is_empty(), "case{case}");
-            assert!(c.buflo_known_chaff_service_ranges.is_empty(), "case{case}");
-            assert!(c.buflo_fin_permission_releases.is_empty(), "case{case}");
-            assert!(c.drain_actions().all(|a| !matches!(
+            let before: Vec<_> = [80, 84, 88, 92, 96]
+                .into_iter()
+                .map(|sid| {
+                    let s = QcsdStreamId(sid);
+                    (s, c.streams.get_mut(ep, s).unwrap().receive.clone())
+                })
+                .collect();
+            let ranges = c.advertised_incoming_credit.clone();
+            let tracked = c.buflo_known_chaff_service_ranges.clone();
+            let ledgers = c.incoming_credit_ledger.clone();
+            let turn = c.buflo_chaff_service_turn;
+            let actions = native113_due(
+                &mut c,
+                18_816_000,
+                if expired { 18_848_000 } else { 18_816_000 },
+            );
+            assert!(actions.iter().any(|a| matches!(a,QcsdAction::SlotMissed { slot,reason,.. }
+                if *slot==QcsdSlotId(589) && *reason==if expired {MissedSlotReason::DeadlineExpired} else {MissedSlotReason::InsufficientIncomingCapacity})));
+            assert!(!actions.iter().any(|a| matches!(
                 a,
                 QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::LeaseParserReceive { .. }
             )));
-        }
-        for tail in [0, 3, 8] {
-            let mut c = native112_known_chaff_snapshot(true);
-            let end = 1_214 + tail;
-            if let crate::stream::ReceiveState::ReceivingData {
-                requested_limit,
-                advertised_limit,
-                ..
-            } = &mut c
-                .streams
-                .get_mut(QcsdEndpointId(1), QcsdStreamId(96))
-                .unwrap()
-                .receive
-            {
-                *requested_limit = end;
-                *advertised_limit = end;
+            for (s, state) in before {
+                assert_eq!(c.streams.get_mut(ep, s).unwrap().receive, state);
             }
-            c.advertised_incoming_credit
-                .get_mut(&(QcsdEndpointId(1), QcsdStreamId(96)))
-                .unwrap()[0]
-                .end = end;
-            native112_header(&mut c, true, 1);
-            assert!(
-                c.buflo_known_chaff_demands.is_empty(),
-                "tail{tail} is outside the derived positive sub3 scope"
-            );
-        }
-        let mut c = native112_known_chaff_snapshot(true);
-        native112_header(&mut c, true, 1);
-        let actions = native112_due(&mut c, 11_264, 64_000, 96_000);
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            QcsdAction::SlotMissed {
-                reason: MissedSlotReason::DeadlineExpired,
-                ..
+            assert_eq!(c.advertised_incoming_credit, ranges);
+            assert_eq!(c.buflo_known_chaff_service_ranges, tracked);
+            for (slot, ledger) in ledgers {
+                assert_eq!(c.incoming_credit_ledger[&slot], ledger);
             }
-        )));
-        assert!(!actions.iter().any(|a| matches!(
-            a,
-            QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::LeaseParserReceive { .. }
-        )));
+            assert_eq!(c.buflo_chaff_service_turn, turn);
+            assert!(c.control.claims.is_empty());
+            assert!(c.buflo_fin_permission_releases.is_empty());
+        }
     }
 
     #[test]
-    fn buflo_native112_known_chaff_incomplete_cell_rolls_back_without_parser() {
-        let mut c = native112_known_chaff_snapshot(true);
-        let ep = QcsdEndpointId(1);
-        let _ = c.streams.close(ep, QcsdStreamId(0));
-        let _ = c.streams.close(ep, QcsdStreamId(92));
-        c.application_complete = true;
-        native112_header(&mut c, true, 1);
-        let before = c
-            .streams
-            .get_mut(ep, QcsdStreamId(96))
-            .unwrap()
-            .receive
-            .clone();
-        let actions = native112_due(&mut c, 11_264, 64_000, 64_000);
-        assert_eq!(
-            c.streams.get_mut(ep, QcsdStreamId(96)).unwrap().receive,
-            before
+    fn buflo_native113_unknown_parser1200_cap_is_independent_of_ordinary_known_rights() {
+        let (mut c, ep, s) = seed016_controller_snapshot(true);
+        c.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint: ep,
+                stream: s,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(63_000),
         );
-        assert!(actions.iter().all(|a| !matches!(
-            a,
-            QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::LeaseParserReceive { .. }
-        )));
-        assert_eq!(c.buflo_known_chaff_service_outstanding(), 2);
-        assert_eq!(c.buflo_known_chaff_demands[&(ep, QcsdStreamId(96))], 1_214);
-        assert!(c.control.claims.is_empty());
-        assert!(c.buflo_fin_permission_releases.is_empty());
-    }
-
-    #[test]
-    fn buflo_native112_known_chaff_staged_exact_and_unknown_parser_share_cap() {
-        let mut c = native112_known_chaff_snapshot(true);
-        let ep = QcsdEndpointId(1);
-        let _ = c.streams.close(ep, QcsdStreamId(0));
-        let _ = c.streams.close(ep, QcsdStreamId(92));
-        c.application_complete = true;
-        let secondary = QcsdStreamId(4);
+        let known = native113_five_known_snapshot(true);
+        c.buflo_known_chaff_service_ranges = known.buflo_known_chaff_service_ranges;
+        assert_eq!(native113_tracked_bytes(&c), 8);
+        assert_eq!(
+            c.buflo_retained_parser_room(ep, s),
+            1_200,
+            "known body rights are not speculative parser permission"
+        );
+        // Explicit synthetic parser ledgers, not transport evidence. Two
+        // different no-CL secondary streams share the unchanged aggregate cap.
+        let other = QcsdStreamId(8);
         c.observe(
             QcsdObservation::StreamOpened {
                 endpoint: ep,
-                stream: secondary,
+                stream: other,
                 role: QcsdRequestRole::Application,
                 expected_response_length: Some(1),
             },
@@ -30095,53 +29925,75 @@ mod tests {
         c.observe(
             QcsdObservation::ResponseHeaders {
                 endpoint: ep,
-                stream: secondary,
+                stream: other,
                 frame_bytes: 385,
                 status: Some(200),
                 content_length: None,
             },
             Duration::ZERO,
         );
-        c.streams.get_mut(ep, secondary).unwrap().receive =
-            crate::stream::ReceiveState::ReceivingData {
-                advertised_limit: 1_016,
-                requested_limit: 1_016,
-                known_limit: 1_015,
-                reservation_capacity: 1_000,
-                reservation_available: 1_000,
-                consumed: 1_015,
-                payload_floor: 1,
-                framing_bytes: 390,
-                parser_lease_capacity: 1_000,
-                parser_lease_used: 1_000,
-                parser_lease_exhausted: true,
-                last_parser_lease_boundary: None,
-                pending_parser_boundary: Some(1_015),
-                data_length: 625,
-            };
+        let copy = c.streams.get_mut(ep, s).unwrap().receive.clone();
+        c.streams.get_mut(ep, other).unwrap().receive = copy;
         c.buflo_retained_parser_demands.insert(
-            (ep, secondary),
+            (ep, other),
             super::BufloRetainedParserDemand {
                 boundary: Some(1_015),
             },
         );
-        native112_header(&mut c, true, 1);
-        c.drain_actions().for_each(drop);
-        let before = c.streams.get_mut(ep, secondary).unwrap().receive.clone();
-        let actions = native112_due(&mut c, 11_264, 64_000, 64_000);
-        assert!(
-            actions.iter().all(|a| !matches!(
-                a,
-                QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::LeaseParserReceive { .. }
-            )),
-            "oldowned2+stagedexact1198 leaves no shared room for the final2 parser bytes"
-        );
-        assert!(c.control.claims.is_empty());
-        assert_eq!(c.streams.get_mut(ep, secondary).unwrap().receive, before);
+        let packet =
+            Packet::new(Duration::from_micros(64_000), Direction::Incoming, 1_200).unwrap();
+        c.parser_lease_ranges
+            .get_mut(&(ep, s))
+            .unwrap()
+            .push(super::ParserLeaseRange {
+                start: 1_016,
+                end: 1_616,
+                owner: Some(crate::QcsdParserLeaseOwner {
+                    slot: QcsdSlotId(70_001),
+                    packet,
+                }),
+                reservation_debited: true,
+                unowned: false,
+                advertised: true,
+            });
+        for stream in [s, other] {
+            if let crate::stream::ReceiveState::ReceivingData {
+                reservation_available,
+                ..
+            } = &mut c.streams.get_mut(ep, stream).unwrap().receive
+            {
+                *reservation_available = 400;
+            }
+        }
+        assert_eq!(c.buflo_retained_parser_room(ep, s), 600);
+        c.control.claims.push(PendingClaim {
+            reservation_debited: true,
+            slot: QcsdSlotId(70_002),
+            packet,
+            endpoint: ep,
+            stream: other,
+            remaining: 600,
+        });
+        assert_eq!(c.buflo_retained_parser_room(ep, s), 0);
+        assert_eq!(c.buflo_retained_parser_room(ep, other), 0);
+        c.buflo_known_chaff_service_ranges
+            .insert((ep, QcsdStreamId(96)), vec![(62_323, 63_525)]);
+        assert_eq!(native113_tracked_bytes(&c), 1_208);
         assert_eq!(
-            c.streams.receive_limits(ep, QcsdStreamId(96)),
-            Some((1_216, 1_216))
+            c.buflo_retained_parser_room(ep, s),
+            0,
+            "known ordinary grant cannot free parser budget either"
         );
-        assert_eq!(c.buflo_known_chaff_service_outstanding(), 2);
+        c.control.claims.clear();
+        assert_eq!(c.buflo_retained_parser_room(ep, s), 600);
+        assert_eq!(
+            c.parser_lease_ranges[&(ep, s)]
+                .iter()
+                .filter(|r| r.owner.is_some())
+                .map(|r| r.end - r.start)
+                .sum::<u64>(),
+            600
+        );
+        assert!(c.buflo_fin_permission_releases.is_empty());
     }
 }
