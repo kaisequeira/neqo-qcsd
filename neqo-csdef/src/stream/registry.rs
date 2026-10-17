@@ -897,6 +897,61 @@ impl StreamRegistry {
 
     /// FIN permission release belongs only to the same decoded successful
     /// unknown-length application response as retained parser service.
+    /// Actual drained DATA-end of an ACK-activated, known-length chaff response.
+    /// The controller separately joins its qualified identity and owned suffix.
+    /// This proves exact existing capacity, never new parser or FIN permission.
+    pub(crate) fn buflo_known_chaff_data_end(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<(u32, u64, u64, u64)> {
+        let state = self.streams.get(&(endpoint, stream))?;
+        let QcsdRequestRole::Chaff { resource_id, .. } = state.role else {
+            return None;
+        };
+        if !state.receive_actions_available || !state.chaff_request_activated() {
+            return None;
+        }
+        let ObservedResponseLength::Final {
+            status,
+            content_length: Some(length),
+        } = state.observed_response_length
+        else {
+            return None;
+        };
+        if state.status != Some(status)
+            || !(200..300).contains(&status)
+            || matches!(status, 204 | 205)
+        {
+            return None;
+        }
+        match &state.receive {
+            ReceiveState::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                consumed,
+                framing_bytes,
+                data_length,
+                pending_parser_boundary,
+                ..
+            } if *data_length > 0
+                && length > *data_length
+                && framing_bytes.checked_add(*data_length) == Some(*consumed)
+                && *pending_parser_boundary == Some(*consumed)
+                && *advertised_limit == *requested_limit
+                && *requested_limit >= *consumed
+                && framing_bytes
+                    .checked_add(length)
+                    .is_some_and(|end| *known_limit >= end)
+                && *known_limit > *requested_limit =>
+            {
+                Some((resource_id, length, *consumed, *requested_limit))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn buflo_final_permission_response_eligible(
         &self,
         endpoint: QcsdEndpointId,
