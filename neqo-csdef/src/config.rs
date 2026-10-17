@@ -364,6 +364,9 @@ pub enum BufloDurationBudgetPolicy {
     /// Prospective fixed 1200-byte/64-ms/minimum-10-second/10000-cell budget.
     #[serde(rename = "rapid-v7-fixed-64ms-640s-duration-budget-v1")]
     RapidV7Fixed64ms640Seconds,
+    /// Explicit fixed 1200-byte/64-ms/minimum-10-second/20000-cell budget.
+    #[serde(rename = "rapid-v8-fixed-64ms-1280s-duration-budget-v1")]
+    RapidV8Fixed64ms1280Seconds,
 }
 
 impl BufloDurationBudgetPolicy {
@@ -373,6 +376,7 @@ impl BufloDurationBudgetPolicy {
         match self {
             Self::RapidV6Fixed200Seconds => (20_000, 10_000, 200_000_000),
             Self::RapidV7Fixed64ms640Seconds => (64_000, 10_000, 640_000_000),
+            Self::RapidV8Fixed64ms1280Seconds => (64_000, 20_000, 1_280_000_000),
         }
     }
 }
@@ -385,11 +389,13 @@ impl<'de> Deserialize<'de> for BufloDurationBudgetPolicy {
         match policy.as_str() {
             "rapid-v6-fixed-200s-duration-budget-v1" => Ok(Self::RapidV6Fixed200Seconds),
             "rapid-v7-fixed-64ms-640s-duration-budget-v1" => Ok(Self::RapidV7Fixed64ms640Seconds),
+            "rapid-v8-fixed-64ms-1280s-duration-budget-v1" => Ok(Self::RapidV8Fixed64ms1280Seconds),
             _ => Err(serde::de::Error::unknown_variant(
                 &policy,
                 &[
                     "rapid-v6-fixed-200s-duration-budget-v1",
                     "rapid-v7-fixed-64ms-640s-duration-budget-v1",
+                    "rapid-v8-fixed-64ms-1280s-duration-budget-v1",
                 ],
             )),
         }
@@ -408,13 +414,14 @@ pub struct BufloParameters {
     pub minimum_duration_us: u64,
     /// UDP payload target or receive-credit amount for every cell.
     pub packet_size: u16,
-    /// Per-direction bound; two directions together are capped at 20,000 cells.
+    /// Per-direction bound: at most 10,000 unless the exact named 1280-second
+    /// policy explicitly selects 20,000 (40,000 across both directions).
     pub max_events: u64,
     /// Explicit adaptation boundary; no cooperating peer is implemented.
     pub implementation_scope: QcsdImplementationScope,
     /// Must remain false for the client-only QUIC adaptation.
     pub paper_equivalent: bool,
-    /// Optional explicit fixed 200-second budget; omitted for historical receipts.
+    /// Optional closed fixed budget; absence retains historical receipt limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_budget_policy: Option<BufloDurationBudgetPolicy>,
 }
@@ -447,13 +454,20 @@ impl BufloParameters {
                 self.schema_version
             )));
         }
+        let maximum_events = if self.duration_budget_policy
+            == Some(BufloDurationBudgetPolicy::RapidV8Fixed64ms1280Seconds)
+        {
+            20_000
+        } else {
+            10_000
+        };
         if self.interval_us == 0
             || self.minimum_duration_us == 0
             || self.max_events == 0
-            || self.max_events > 10_000
+            || self.max_events > maximum_events
         {
             return Err(Error::InvalidConfig(
-                "BuFLO interval_us and minimum_duration_us must be positive and max_events must be in 1..=10000 so the two directions cannot exceed 20000 cells"
+                "BuFLO interval_us and minimum_duration_us must be positive; max_events is at most 10000 unless the exact named 1280-second policy selects 20000"
                     .into(),
             ));
         }
@@ -482,7 +496,7 @@ impl BufloParameters {
         };
         if guard_duration_us > guard_limit_us || self.minimum_duration_us >= guard_duration_us {
             return Err(Error::InvalidConfig(
-                "BuFLO per-direction event guard must be at most 120 seconds and cover the inclusive minimum-duration tick"
+                "BuFLO per-direction event guard must fit its registered duration budget (historical absence: 120 seconds) and cover the inclusive minimum-duration tick"
                     .into(),
             ));
         }
@@ -1297,6 +1311,49 @@ mod tests {
                 "{key}"
             );
         }
+        assert!(BufloParameters::from_json(raw, 1_199).is_err());
+    }
+
+    // Native115 component controls: exact named receipt, never a live graph proof.
+    #[test]
+    fn buflo_native115_budget1280_exact_policy_and_legacy_bytes() {
+        let raw = r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":20000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v8-fixed-64ms-1280s-duration-budget-v1"}"#;
+        let parameters = BufloParameters::from_json(raw, 1_200)
+            .expect("only the explicit prospective 1280-second tuple is admitted");
+        assert_eq!(parameters.interval_us.checked_mul(parameters.max_events), Some(1_280_000_000));
+        assert_eq!(parameters.duration_budget_policy.expect("named policy").fixed_tuple(),
+            (64_000, 20_000, 1_280_000_000));
+        assert_eq!(serde_json::to_string(&parameters).expect("exact retained bytes"), raw);
+        for legacy in [
+            r#"{"schema_version":1,"interval_us":20000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v6-fixed-200s-duration-budget-v1"}"#,
+            r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v7-fixed-64ms-640s-duration-budget-v1"}"#,
+        ] {
+            let old = BufloParameters::from_json(legacy, 1_200).expect("unchanged legacy tuple");
+            assert_eq!(serde_json::to_string(&old).expect("legacy bytes"), legacy);
+            let mut widened: serde_json::Value = serde_json::from_str(legacy).expect("legacy JSON");
+            widened["max_events"] = serde_json::json!(20_000);
+            assert!(BufloParameters::from_json(&widened.to_string(), 1_200).is_err());
+        }
+        for (key, value) in [
+            ("schema_version", serde_json::json!(2)),
+            ("interval_us", serde_json::json!(64_001)),
+            ("minimum_duration_us", serde_json::json!(10_000_001)),
+            ("packet_size", serde_json::json!(1_199)),
+            ("max_events", serde_json::json!(19_999)),
+            ("max_events", serde_json::json!(20_001)),
+            ("max_events", serde_json::json!(true)),
+            ("paper_equivalent", serde_json::json!(true)),
+            ("duration_budget_policy", serde_json::json!("rapid-v7-fixed-64ms-640s-duration-budget-v1")),
+            ("duration_budget_policy", serde_json::json!("unknown")),
+            ("duration_budget_policy", serde_json::Value::Null),
+        ] {
+            let mut changed: serde_json::Value = serde_json::from_str(raw).expect("fixture");
+            changed[key] = value;
+            assert!(BufloParameters::from_json(&changed.to_string(), 1_200).is_err(), "{key}");
+        }
+        let mut absent: serde_json::Value = serde_json::from_str(raw).expect("fixture");
+        absent.as_object_mut().expect("object").remove("duration_budget_policy");
+        assert!(BufloParameters::from_json(&absent.to_string(), 1_200).is_err());
         assert!(BufloParameters::from_json(raw, 1_199).is_err());
     }
 }

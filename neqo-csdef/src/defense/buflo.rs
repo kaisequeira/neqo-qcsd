@@ -242,9 +242,10 @@ impl Buflo {
             Direction::Incoming => (&mut self.next_incoming_us, &mut self.scheduled_incoming),
             Direction::Outgoing => (&mut self.next_outgoing_us, &mut self.scheduled_outgoing),
         };
-        // `max_events` is per-direction, with receipt validation capping the
-        // combined two-direction schedule at 20,000 cells. This keeps the
-        // canonical 6,000-cell direction at 120 seconds for rho=20ms.
+        // `max_events` is per-direction. Closed receipt validation permits
+        // 20,000 only for the named 1280-second policy; other policies retain
+        // their original bounds. The canonical 6,000-cell direction remains
+        // 120 seconds for rho=20ms. Count-before-due ordering is unchanged.
         if *count >= self.parameters.max_events {
             self.event_guard_triggered = true;
             return None;
@@ -271,9 +272,11 @@ impl Defense for Buflo {
             || self.parameters.interval_us == 64_000
                 && (self.parameters.schema_version != 1
                     || self.parameters.minimum_duration_us != 10_000_000
-                    || self.parameters.max_events != 10_000
-                    || self.parameters.duration_budget_policy
-                        != Some(crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds)
+                    || !matches!(
+                        (self.parameters.max_events, self.parameters.duration_budget_policy),
+                        (10_000, Some(crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
+                            | (20_000, Some(crate::BufloDurationBudgetPolicy::RapidV8Fixed64ms1280Seconds))
+                    )
                     || self.parameters.implementation_scope
                         != crate::QcsdImplementationScope::ClientOnlyQuic
                     || self.parameters.paper_equivalent)
@@ -1431,5 +1434,56 @@ mod tests {
                 "variant{variant}"
             );
         }
+    }
+
+    // Exact logical schedule/ACK DTO premises only; no arrived bytes or wire claim.
+    #[test]
+    fn buflo_native115_budget1280_acks_and_full_cells_still_fail_at_guard() {
+        let raw = r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":20000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v8-fixed-64ms-1280s-duration-budget-v1"}"#;
+        let parameters = BufloParameters::from_json(raw, 1_200).expect("exact new tuple");
+        let mut acknowledged = Buflo::from_parameters(parameters.clone());
+        assert!(acknowledged.enable_buflo_acknowledged_incoming_startup());
+        let zero = acknowledged.next_event(Duration::ZERO).expect("same outgoing tickzero");
+        assert_eq!((zero.timestamp_us(), zero.direction(), zero.length()),
+            (0, Direction::Outgoing, 1_200));
+        let mut ready = ready_startup(&acknowledged, 1);
+        ready.eligible_exact_capacity_bytes = Some(1_199);
+        assert!(!acknowledged.arm_buflo_incoming_after_ack(ready));
+        ready.eligible_exact_capacity_bytes = Some(1_200);
+        assert!(acknowledged.arm_buflo_incoming_after_ack(ready));
+        assert_eq!(acknowledged.next_event_at(), Some(Duration::from_micros(64_000)));
+        for direction in [Direction::Outgoing, Direction::Incoming] {
+            let packet = acknowledged.next_event(Duration::from_micros(64_000)).expect("original next grid");
+            assert_eq!((packet.timestamp_us(), packet.direction(), packet.length()),
+                (64_000, direction, 1_200));
+        }
+        let startup = acknowledged.diagnostics().buflo_incoming_startup.expect("receipt");
+        assert_eq!(startup.period_us, 64_000);
+        assert_eq!(startup.armed_at_us, Some(64_000));
+        let mut defense = Buflo::from_parameters(parameters);
+        for tick in 0..20_000u64 {
+            let elapsed = Duration::from_micros(tick * 64_000);
+            for direction in [Direction::Outgoing, Direction::Incoming] {
+                let packet = defense.next_event(elapsed).expect("one unchanged full cell");
+                assert_eq!((packet.timestamp(), packet.direction(), packet.length()),
+                    (elapsed, direction, 1_200));
+            }
+            assert!(defense.terminal_failure().is_none());
+            if tick == 10_000 {
+                let d = defense.diagnostics();
+                assert_eq!(d.buflo_scheduled_incoming_cells, 10_001);
+                assert_eq!(d.buflo_scheduled_outgoing_cells, 10_001);
+                assert!(!d.buflo_event_guard_triggered);
+            }
+        }
+        let before = defense.diagnostics();
+        assert_eq!(before.buflo_scheduled_incoming_cells, 20_000);
+        assert_eq!(before.buflo_scheduled_outgoing_cells, 20_000);
+        assert_eq!(defense.next_event(Duration::from_micros(1_280_000_000)), None);
+        assert_eq!(defense.terminal_failure(), Some("BuFLO event guard exhausted before normal completion"));
+        assert!(!defense.normally_complete());
+        assert_eq!(defense.terminal_chaff_cancellation_reason(), None);
+        assert!(!defense.can_release_chaff_send_shaping());
+        assert!(defense.diagnostics().buflo_event_guard_triggered);
     }
 }

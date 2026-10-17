@@ -1967,7 +1967,11 @@ fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), E
                     .is_some_and(|parameters| {
                         parameters.packet_size == 1_200 && parameters.interval_us == policy.period_us()
                             && (*policy != BufloIncomingCreditReleasePolicy::RapidV7Cadence64msAckStartPreparationReserve
-                                || parameters.duration_budget_policy == Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
+                                || matches!(
+                                    (parameters.max_events, parameters.duration_budget_policy),
+                                    (10_000, Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
+                                        | (20_000, Some(BufloDurationBudgetPolicy::RapidV8Fixed64ms1280Seconds))
+                                ))
                     })
         });
         if !valid_parameters || spec.config.control_interval_us != 5_000 {
@@ -2329,8 +2333,11 @@ fn validate_terminal_primary_partial_cell_policy(spec: &RunSpec) -> Result<(), E
                     parameters.packet_size == 1_200
                         && parameters.interval_us == source_policy_period
                         && (source_policy_period == 20_000
-                            || parameters.duration_budget_policy
-                                == Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
+                            || matches!(
+                                (parameters.max_events, parameters.duration_budget_policy),
+                                (10_000, Some(BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds))
+                                    | (20_000, Some(BufloDurationBudgetPolicy::RapidV8Fixed64ms1280Seconds))
+                            ))
                 })
         }),
         DefenseConfig::CsBuflo(config) => spec.defense_parameters.as_ref().is_some_and(|proof| {
@@ -58736,5 +58743,41 @@ mod tests {
         spec.defense_parameters = None;
         assert!(super::buflo_incoming_credit_release_receipt(&spec).is_none());
         assert!(super::buflo_kernel_preparation_policy_receipt(&spec).is_none());
+    }
+
+    // Source/parameter receipt component only; exact physical windows are retained.
+    #[test]
+    fn buflo_native115_budget1280_receipt_and_original_policy_windows() {
+        let mut spec = buflo_cadence64_bound_spec();
+        let output = trace_output_dir("buflo-native115-budget1280-bound-source");
+        let path = output.join("buflo1280.json");
+        let raw = r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":20000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v8-fixed-64ms-1280s-duration-budget-v1"}"#;
+        fs::write(&path, raw).expect("exact new parameter bytes");
+        spec.config.defense = DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+            parameters: path.to_str().expect("path").into(),
+        });
+        spec.defense_parameters = super::defense_parameter_provenance(&spec.config)
+            .expect("new exact receipt bound to actual parsed bytes");
+        super::validate_buflo_incoming_credit_release_policy(&spec).expect("same ACK/source policy");
+        super::validate_terminal_primary_partial_cell_policy(&spec).expect("same owned primary policy");
+        let run = buflo_incoming_credit_release_policy_run(&spec);
+        assert_eq!(run["defense_parameters"]["buflo_duration_budget"]["policy"],
+            "rapid-v8-fixed-64ms-1280s-duration-budget-v1");
+        assert_eq!(run["defense_parameters"]["buflo_duration_budget"]["max_events"], 20_000);
+        assert_eq!(run["defense_parameters"]["buflo_duration_budget"]["duration_budget_us"], 1_280_000_000u64);
+        assert_eq!(run["buflo_incoming_credit_release_policy"]["period_us"], 64_000);
+        assert_eq!(run["buflo_incoming_credit_release_policy"]["incoming_release_window_us"], 32_000);
+        assert_eq!(run["buflo_kernel_preparation_policy"]["outgoing_physical_window_us"], 5_000);
+        assert_eq!(run["buflo_kernel_preparation_policy"]["rolling_preparation_after_release_us"], 4_000);
+        // A typed DTO with the new policy but the legacy count must not enter
+        // either original ACK/release or terminal-primary policy path.
+        spec.defense_parameters.as_mut().expect("proof").buflo_parameters
+            .as_mut().expect("parsed parameters").max_events = 10_000;
+        assert!(super::validate_buflo_incoming_credit_release_policy(&spec).is_err());
+        assert!(super::validate_terminal_primary_partial_cell_policy(&spec).is_err());
+        spec.defense_parameters.as_mut().expect("proof").buflo_parameters
+            .as_mut().expect("parsed parameters").max_events = 20_000;
+        super::validate_buflo_incoming_credit_release_policy(&spec).expect("exact tuple restored");
+        fs::remove_dir_all(output).expect("private parameter fixture removed");
     }
 }
