@@ -6275,6 +6275,11 @@ impl QcsdController {
                     0
                 } else if retained_capacity > 0 {
                     retained_capacity
+                } else if retained_boundary.is_some() {
+                    // The retained materializer requires the full retained
+                    // quantum. A smaller fresh/generic claim would debit this
+                    // cell without producing any transport release identity.
+                    0
                 } else if fresh_parser_bridge {
                     self.streams.buflo_fresh_parser_bridge_capacity(
                         opportunity.endpoint,
@@ -30380,5 +30385,243 @@ mod tests {
             receive.lease_buflo_retained_parser(1_144, 128),
             Some((1_272, 128, true))
         );
+    }
+    #[test]
+    fn buflo_native121_retained_room_shortfall_never_creates_unmaterializable_fallback() {
+        // Conditional controller/ReceiveState fixture, not transport or raw proof.
+        // The prefix snapshots are the existing explicit1015/MAX1016 fixture.
+        // Real reducers/actions establish old128 owners and read progression;
+        // two later pristine boundaries reproduce current sid52/56's room64
+        // fresh3 branch and also room0's generic scheduled fallback branch.
+        for wanted_room in [64_u64, 0] {
+            let (mut c, ep, original_app, cover) = native118_parser_with_known_cover();
+            let template = c.streams.get_mut(ep, original_app).unwrap().receive.clone();
+            let register = |c: &mut QcsdController, stream: QcsdStreamId, at: Duration| {
+                c.observe(
+                    QcsdObservation::StreamOpened {
+                        endpoint: ep,
+                        stream,
+                        role: QcsdRequestRole::Application,
+                        expected_response_length: Some(1),
+                    },
+                    at,
+                );
+                c.observe(
+                    QcsdObservation::ResponseHeaders {
+                        endpoint: ep,
+                        stream,
+                        frame_bytes: 385,
+                        status: Some(200),
+                        content_length: None,
+                    },
+                    at,
+                );
+                c.streams.get_mut(ep, stream).unwrap().receive = template.clone();
+                c.parser_lease_ranges.insert(
+                    (ep, stream),
+                    vec![super::ParserLeaseRange {
+                        start: 1_015,
+                        end: 1_016,
+                        owner: None,
+                        reservation_debited: false,
+                        unowned: true,
+                        advertised: true,
+                    }],
+                );
+                c.observe(
+                    QcsdObservation::HeaderProgress {
+                        endpoint: ep,
+                        stream,
+                        min_remaining: 1,
+                        awaiting_data_frame: true,
+                    },
+                    at,
+                );
+                c.observe(
+                    QcsdObservation::StreamDataBlocked {
+                        endpoint: ep,
+                        stream,
+                        blocked_at: 1_016,
+                    },
+                    at,
+                );
+            };
+            for stream in (8..=36).step_by(4) {
+                register(&mut c, QcsdStreamId(stream), Duration::from_micros(63_000));
+            }
+            c.drain_actions().for_each(drop);
+            let first = QcsdSlotId(121_001);
+            let at = Duration::from_micros(64_000);
+            seed016_stage_due_remainder(&mut c, ep, first, at, 1_200);
+            let actions: Vec<_> = c.drain_actions().collect();
+            let probes: Vec<_> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    QcsdAction::LeaseParserReceive {
+                        stream,
+                        increase: 128,
+                        owner: Some(owner),
+                        ..
+                    } if owner.slot == first => Some(*stream),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                probes.len(),
+                9,
+                "the premise uses nine real due-owned128 grants"
+            );
+            assert_eq!(c.buflo_retained_parser_room(ep, original_app), 48);
+            let advertise = |c: &mut QcsdController, actions: &[QcsdAction], at: Duration| {
+                for action in actions {
+                    let (stream, absolute_limit, slot) = match *action {
+                        QcsdAction::LeaseParserReceive {
+                            stream,
+                            absolute_limit,
+                            owner: Some(_),
+                            ..
+                        } => (stream, absolute_limit, None),
+                        QcsdAction::IncreaseReceiveLimit {
+                            stream,
+                            absolute_limit,
+                            slot,
+                            ..
+                        } => (stream, absolute_limit, Some(slot)),
+                        _ => continue,
+                    };
+                    c.observe(
+                        QcsdObservation::ReceiveLimitAdvertised {
+                            endpoint: ep,
+                            stream,
+                            absolute_limit,
+                            slot,
+                        },
+                        at,
+                    );
+                }
+            };
+            advertise(&mut c, &actions, at + Duration::from_micros(1));
+            assert!(c.incoming_slot_is_locally_realized(first));
+            // Read oldunowned1+16owned, or oldunowned1+80owned. The explicit
+            // three-byte frame header uses a nonminimal legal length varint;
+            // its whole declared payload is then read before HeaderProgress.
+            let payload = if wanted_room == 64 { 14 } else { 78 };
+            for observation in [
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: original_app,
+                    bytes: 3,
+                },
+                QcsdObservation::DataFrame {
+                    endpoint: ep,
+                    stream: original_app,
+                    frame_header_bytes: 3,
+                    data_bytes: payload,
+                },
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: original_app,
+                    bytes: payload,
+                },
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream: original_app,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+            ] {
+                c.observe(observation, at + Duration::from_micros(2));
+            }
+            let target = if wanted_room == 0 {
+                // Free80owned from1152, then a second genuine128 due grant
+                // exactly fills the original shared1200 outstanding cap.
+                assert_eq!(c.buflo_retained_parser_room(ep, original_app), 128);
+                let second = QcsdSlotId(121_002);
+                let t = Duration::from_micros(128_000);
+                seed016_stage_due_remainder(&mut c, ep, second, t, 1_200);
+                let actions: Vec<_> = c.drain_actions().collect();
+                assert!(actions.iter().any(|a| matches!(a,
+                    QcsdAction::LeaseParserReceive { increase: 128, owner: Some(owner), .. }
+                        if owner.slot == second)));
+                advertise(&mut c, &actions, t + Duration::from_micros(1));
+                assert!(c.incoming_slot_is_locally_realized(second));
+                Duration::from_micros(192_000)
+            } else {
+                Duration::from_micros(128_000)
+            };
+            assert_eq!(c.buflo_retained_parser_room(ep, original_app), wanted_room);
+            for stream in [QcsdStreamId(52), QcsdStreamId(56)] {
+                register(&mut c, stream, target - Duration::from_micros(1));
+                assert_eq!(
+                    c.buflo_retained_parser_demands[&(ep, stream)].boundary,
+                    Some(1_015)
+                );
+                assert_eq!(
+                    c.streams
+                        .buflo_retained_parser_capacity(ep, stream, 1_015, wanted_room),
+                    0
+                );
+                assert!(
+                    c.streams
+                        .buflo_fresh_parser_bridge_capacity(ep, stream, None)
+                        > 0
+                );
+            }
+            c.drain_actions().for_each(drop);
+            let prior_cover = c.streams.receive_limits(ep, cover).unwrap().1;
+            let slot = QcsdSlotId(121_003);
+            seed016_stage_due_remainder(&mut c, ep, slot, target, 1_200);
+            let actions: Vec<_> = c.drain_actions().collect();
+            let known: u64 = actions
+                .iter()
+                .filter_map(|a| match a {
+                    QcsdAction::IncreaseReceiveLimit {
+                        stream,
+                        absolute_limit,
+                        slot: owner,
+                        ..
+                    } if *stream == cover && *owner == slot => Some(*absolute_limit - prior_cover),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(
+                known, 1_200,
+                "retained shortfall must leave full1200 known cover, never phantom3 or generic claims"
+            );
+            assert!(
+                c.control.claims.iter().all(|claim| claim.slot != slot),
+                "all staged bytes must have a materializable same-family release"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, QcsdAction::LeaseParserReceive { .. }))
+            );
+            advertise(&mut c, &actions, target + Duration::from_micros(1));
+            assert!(
+                c.incoming_slot_is_locally_realized(slot),
+                "physical advertisements must close the complete local1200 ledger"
+            );
+            // Raw reads advance in stream-offset order through earlier cover
+            // permissions before reaching this slot's freshly advertised1200.
+            let prior_unread_cover = prior_cover - c.streams.consumed(ep, cover).unwrap();
+            assert_eq!(
+                prior_unread_cover,
+                if wanted_room == 64 { 48 } else { 1_120 }
+            );
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: cover,
+                    bytes: prior_unread_cover + 1_200,
+                },
+                target + Duration::from_micros(2),
+            );
+            assert!(c.drain_actions().any(|a| matches!(a,
+                QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot)));
+            assert_eq!(c.scheduled_incoming_retired_bytes, 0);
+            assert_eq!(c.terminal_failure(), None);
+            assert_eq!(c.buflo_retained_parser_room(ep, original_app), wanted_room);
+        }
     }
 }
