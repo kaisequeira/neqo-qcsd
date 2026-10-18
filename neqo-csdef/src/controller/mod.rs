@@ -29296,7 +29296,7 @@ mod tests {
     }
 
     #[test]
-    fn buflo_seed016_intent_waits_for_full_probe_then_survives_mixed_tail() {
+    fn buflo_native119_intent_waits_for_full_retained_probe_then_survives_mixed_tail() {
         let (mut c, ep, app, cover) = native118_parser_with_known_cover();
         let before = c.streams.get_mut(ep, app).unwrap().receive.clone();
         let slot = QcsdSlotId(9_161);
@@ -29307,7 +29307,7 @@ mod tests {
             !actions
                 .iter()
                 .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. })),
-            "Native118 must not turn a smaller due remainder into a one/two-byte discovery lease"
+            "Native119 must not turn a smaller due remainder into a one/two-byte discovery lease"
         );
         assert!(actions.iter().any(|action| matches!(action,
             QcsdAction::IncreaseReceiveLimit { stream, absolute_limit: 1_002, slot: owner, .. }
@@ -29342,10 +29342,10 @@ mod tests {
         seed016_stage_due_remainder(&mut c, ep, next, later, 1_200);
         let actions: Vec<_> = c.drain_actions().collect();
         assert!(actions.iter().any(|action| matches!(action,
-            QcsdAction::LeaseParserReceive { stream, increase: 3, absolute_limit: 1_019,
+            QcsdAction::LeaseParserReceive { stream, increase: 16, absolute_limit: 1_032,
                 owner: Some(owner), .. } if *stream == app && owner.slot == next)));
         assert!(actions.iter().any(|action| matches!(action,
-            QcsdAction::IncreaseReceiveLimit { stream, absolute_limit: 2_199, slot: owner, .. }
+            QcsdAction::IncreaseReceiveLimit { stream, absolute_limit: 2_186, slot: owner, .. }
                 if *stream == cover && *owner == next)));
         let ranges = &c.parser_lease_ranges[&(ep, app)];
         assert_eq!(
@@ -29362,11 +29362,11 @@ mod tests {
                 .filter(|range| range.owner.is_some())
                 .map(|range| range.end - range.start)
                 .sum::<u64>(),
-            3
+            16
         );
         assert!(
             c.buflo_fresh_owned_parser_suffix(ep, app).is_none(),
-            "old unowned1 plus new owned3 is not forged wholly-owned suffix evidence"
+            "old unowned1 plus new owned16 is not forged wholly-owned suffix evidence"
         );
         assert_eq!(c.scheduled_incoming_retired_bytes, 0);
         assert!(c.buflo_fin_permission_releases.is_empty());
@@ -30069,7 +30069,7 @@ mod tests {
     }
 
     #[test]
-    fn buflo_native118_three_byte_probe_fills_known_chaff_and_progresses() {
+    fn buflo_native119_sixteen_byte_probe_fills_known_chaff_and_progresses() {
         let (mut c, ep, app, cover) = native118_parser_with_known_cover();
         let slot = QcsdSlotId(70_118);
         let target = Duration::from_micros(64_000);
@@ -30089,8 +30089,8 @@ mod tests {
             .collect();
         assert_eq!(
             probes,
-            vec![3],
-            "Native118 retained probe must be exactly three bytes"
+            vec![16],
+            "Native119 retained interoperability probe must be exactly sixteen bytes"
         );
         let known: Vec<_> = actions
             .iter()
@@ -30106,7 +30106,7 @@ mod tests {
             .collect();
         assert_eq!(
             known,
-            vec![1_197],
+            vec![1_184],
             "known qualified cover fills the same complete1200 cell"
         );
         assert!(c.control.claims.is_empty());
@@ -30120,7 +30120,7 @@ mod tests {
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint: ep,
                 stream: app,
-                absolute_limit: 1_019,
+                absolute_limit: 1_032,
                 slot: Some(slot),
             },
             at,
@@ -30129,19 +30129,21 @@ mod tests {
             QcsdObservation::ReceiveLimitAdvertised {
                 endpoint: ep,
                 stream: cover,
-                absolute_limit: 2_197,
+                absolute_limit: 2_184,
                 slot: Some(slot),
             },
             at,
         );
         assert_eq!(c.incoming_credit_ledger[&slot].consumed, 0);
-        // The old unowned1 plus new owned3 permit a two-byte DATA header and
-        // two actual body bytes. Only the observed DATA extent backs next cell.
+        // Conditional reducer continuation only: the old unowned1 plus new owned16
+        // permit a three-byte DATA header and fourteen observed body bytes.
+        // The separate connected H3 peer fixture supplies actual read evidence;
+        // this unit case does not promise that a remote peer will use credit.
         c.observe(
             QcsdObservation::BytesRead {
                 endpoint: ep,
                 stream: app,
-                bytes: 2,
+                bytes: 3,
             },
             at,
         );
@@ -30149,7 +30151,7 @@ mod tests {
             QcsdObservation::DataFrame {
                 endpoint: ep,
                 stream: app,
-                frame_header_bytes: 2,
+                frame_header_bytes: 3,
                 data_bytes: 428,
             },
             at,
@@ -30158,7 +30160,7 @@ mod tests {
             QcsdObservation::BytesRead {
                 endpoint: ep,
                 stream: app,
-                bytes: 2,
+                bytes: 14,
             },
             at,
         );
@@ -30166,7 +30168,7 @@ mod tests {
             QcsdObservation::BytesRead {
                 endpoint: ep,
                 stream: cover,
-                bytes: 1_197,
+                bytes: 1_184,
             },
             at,
         );
@@ -30200,7 +30202,7 @@ mod tests {
                     slot,
                     ..
                 } if *slot == next => {
-                    let prior = if *stream == app { 1_019 } else { 2_197 };
+                    let prior = if *stream == app { 1_032 } else { 2_184 };
                     Some((*stream, *absolute_limit - prior))
                 }
                 _ => None,
@@ -30208,7 +30210,7 @@ mod tests {
             .collect();
         assert_eq!(
             grants,
-            vec![(app, 426), (cover, 774)],
+            vec![(app, 414), (cover, 786)],
             "decoded application extent progresses before the qualified cover remainder"
         );
         assert!(
@@ -30299,39 +30301,39 @@ mod tests {
     }
 
     #[test]
-    fn buflo_native118_retained_capacity_and_lease_require_three() {
+    fn buflo_native119_retained_capacity_and_lease_require_sixteen() {
         let (mut c, ep, app) = seed016_controller_snapshot(true);
         let original = c.streams.get_mut(ep, app).unwrap().receive.clone();
         assert_eq!(
             original.buflo_retained_parser_capacity(1_015, 1_200),
-            3,
+            16,
             "retained capacity must not promise an unbounded unknown frame"
         );
-        for room in [0, 1, 2] {
+        for room in 0..16 {
             assert_eq!(original.buflo_retained_parser_capacity(1_015, room), 0);
         }
         assert_eq!(original.buflo_retained_parser_capacity(1_014, 1_200), 0);
-        for amount in [0, 1, 2, 4, 997, 1_200] {
+        for amount in [0, 1, 2, 3, 4, 15, 17, 997, 1_200] {
             let mut receive = original.clone();
             assert_eq!(
                 receive.lease_buflo_retained_parser(1_015, amount),
                 None,
-                "a direct forged lease cannot bypass the exact three-byte materialization gate"
+                "a direct forged lease cannot bypass the exact sixteen-byte materialization gate"
             );
             assert_eq!(receive, original);
         }
-        for amount in [0, 1, 2] {
+        for amount in 0..16 {
             let mut receive = original.clone();
             assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, amount), 0);
             assert_eq!(receive, original);
         }
         let mut receive = original.clone();
-        assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, 997), 3);
+        assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, 997), 16);
         assert_eq!(
-            receive.lease_buflo_retained_parser(1_015, 3),
-            Some((1_019, 3, true))
+            receive.lease_buflo_retained_parser(1_015, 16),
+            Some((1_032, 16, true))
         );
-        for available in [0, 1, 2] {
+        for available in 0..16 {
             let mut receive = original.clone();
             if let crate::stream::ReceiveState::ReceivingData {
                 reservation_available,
@@ -30345,38 +30347,38 @@ mod tests {
     }
 
     #[test]
-    fn buflo_native118_same_unread_boundary_cannot_accumulate_probes() {
+    fn buflo_native119_same_unread_boundary_cannot_accumulate_probes() {
         // Local cloned ReceiveState reducer only: no transport/arrived-byte proof.
         let (mut c, ep, app) = seed016_controller_snapshot(true);
         let mut receive = c.streams.get_mut(ep, app).unwrap().receive.clone();
-        assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, 3), 3);
+        assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, 16), 16);
         assert_eq!(
-            receive.lease_buflo_retained_parser(1_015, 3),
-            Some((1_019, 3, true))
+            receive.lease_buflo_retained_parser(1_015, 16),
+            Some((1_032, 16, true))
         );
-        receive.advertised(1_019);
+        receive.advertised(1_032);
         let unread = receive.clone();
         assert_eq!(
             receive.buflo_retained_parser_capacity(1_015, 1_200),
             0,
-            "same unread boundary must not accumulate another three-byte probe"
+            "same unread boundary must not accumulate another sixteen-byte probe"
         );
-        assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, 3), 0);
-        assert_eq!(receive.lease_buflo_retained_parser(1_015, 3), None);
+        assert_eq!(receive.claim_buflo_retained_parser(1_015, 1_200, 16), 0);
+        assert_eq!(receive.lease_buflo_retained_parser(1_015, 16), None);
         assert_eq!(
             receive, unread,
             "refused duplicate leaves all rights and budgets unchanged"
         );
-        receive.bytes_read(4);
+        receive.bytes_read(17);
         assert_eq!(
-            receive.buflo_retained_parser_capacity(1_019, 1_200),
-            3,
+            receive.buflo_retained_parser_capacity(1_032, 1_200),
+            16,
             "new consumed boundary permits real parser progress without a new lifetime budget"
         );
-        assert_eq!(receive.claim_buflo_retained_parser(1_019, 1_200, 3), 3);
+        assert_eq!(receive.claim_buflo_retained_parser(1_032, 1_200, 16), 16);
         assert_eq!(
-            receive.lease_buflo_retained_parser(1_019, 3),
-            Some((1_022, 3, true))
+            receive.lease_buflo_retained_parser(1_032, 16),
+            Some((1_048, 16, true))
         );
     }
 }

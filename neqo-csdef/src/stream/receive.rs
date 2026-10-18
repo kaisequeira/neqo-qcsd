@@ -820,9 +820,9 @@ impl ReceiveState {
             {
                 let capacity = (*reservation_available)
                     .min(room)
-                    .min(MIN_HTTP3_DATA_OPPORTUNITY_BYTES)
+                    .min(BUFLO_RETAINED_PARSER_PROBE_BYTES)
                     .min(u64::MAX.saturating_sub(*requested_limit));
-                if capacity == MIN_HTTP3_DATA_OPPORTUNITY_BYTES {
+                if capacity == BUFLO_RETAINED_PARSER_PROBE_BYTES {
                     capacity
                 } else {
                     0
@@ -839,7 +839,7 @@ impl ReceiveState {
         room: u64,
         amount: u64,
     ) -> u64 {
-        if amount < MIN_HTTP3_DATA_OPPORTUNITY_BYTES {
+        if amount < BUFLO_RETAINED_PARSER_PROBE_BYTES {
             return 0;
         }
         let capacity = self.buflo_retained_parser_capacity(boundary, room);
@@ -864,7 +864,7 @@ impl ReceiveState {
                 pending_parser_boundary,
                 last_parser_lease_boundary,
                 ..
-            } if backing == MIN_HTTP3_DATA_OPPORTUNITY_BYTES
+            } if backing == BUFLO_RETAINED_PARSER_PROBE_BYTES
                 && *consumed == boundary
                 && *parser_lease_exhausted
                 && *last_parser_lease_boundary != Some(boundary)
@@ -1517,6 +1517,12 @@ const MAX_HTTP3_FRAME_HEADER_BYTES: u64 = 16;
 /// one payload byte. This is a peer packetization opportunity, not a promise
 /// that an unobserved response body contains another byte.
 const MIN_HTTP3_DATA_OPPORTUNITY_BYTES: u64 = 3;
+
+/// One bounded retained-parser interoperability probe. This quantum follows
+/// the observed peer progress under the existing 16-byte parser lease; it is
+/// not a protocol promise that any peer must send at this credit size. Fresh
+/// three-byte DATA opportunities and the lifetime unowned budget are separate.
+const BUFLO_RETAINED_PARSER_PROBE_BYTES: u64 = 16;
 
 #[cfg(test)]
 mod tests {
