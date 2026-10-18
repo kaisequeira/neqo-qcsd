@@ -809,17 +809,24 @@ impl ReceiveState {
                 consumed,
                 reservation_available,
                 parser_lease_exhausted,
+                last_parser_lease_boundary,
                 ..
             } if *consumed == boundary
                 && *parser_lease_exhausted
+                && *last_parser_lease_boundary != Some(boundary)
                 && *advertised_limit == *requested_limit
                 && *known_limit <= *requested_limit
                 && requested_limit.saturating_sub(*consumed) <= 1_200 =>
             {
-                (*reservation_available)
+                let capacity = (*reservation_available)
                     .min(room)
-                    .min(1_200)
-                    .min(u64::MAX.saturating_sub(*requested_limit))
+                    .min(MIN_HTTP3_DATA_OPPORTUNITY_BYTES)
+                    .min(u64::MAX.saturating_sub(*requested_limit));
+                if capacity == MIN_HTTP3_DATA_OPPORTUNITY_BYTES {
+                    capacity
+                } else {
+                    0
+                }
             }
             _ => 0,
         }
@@ -832,6 +839,9 @@ impl ReceiveState {
         room: u64,
         amount: u64,
     ) -> u64 {
+        if amount < MIN_HTTP3_DATA_OPPORTUNITY_BYTES {
+            return 0;
+        }
         let capacity = self.buflo_retained_parser_capacity(boundary, room);
         self.claim(amount.min(capacity))
     }
@@ -854,10 +864,10 @@ impl ReceiveState {
                 pending_parser_boundary,
                 last_parser_lease_boundary,
                 ..
-            } if backing > 0
-                && backing <= 1_200
+            } if backing == MIN_HTTP3_DATA_OPPORTUNITY_BYTES
                 && *consumed == boundary
                 && *parser_lease_exhausted
+                && *last_parser_lease_boundary != Some(boundary)
                 && *advertised_limit == *requested_limit
                 && *known_limit <= *requested_limit
                 && requested_limit
