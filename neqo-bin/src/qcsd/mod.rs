@@ -15984,14 +15984,17 @@ async fn execute_run_inner(
                 next_wakeup = cs_retry_wakeup;
                 controller_deadline_selected = false;
             }
-            let wake = wait_for_activity_until(
-                endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.network_active)
-                    .map(|endpoint| &endpoint.socket),
+            let Some(wake) = wait_for_runner_activity_until(
+                &endpoints,
                 next_wakeup,
+                spec.config.buflo_retained_parser_fin_permission,
             )
-            .await?;
+            .await?
+            else {
+                // Re-enter through the unchanged exact-boundary checks before
+                // one bounded HTTP event. Already-parsed work needs no UDP.
+                continue 'runner;
+            };
             runner_wakeup_metrics.record(wake, controller_deadline_selected);
         }
         Ok(())
@@ -23641,6 +23644,33 @@ async fn wait_for_activity<'a>(
         .map(|either| either.factor_first().0)
         .await
         .map_err(Error::from)
+}
+
+// Native122: a transport read can queue HTTP work after this turn's bounded
+// HTTP step. Do not sleep on socket/timer readiness while that work is present.
+// The next runner turn still checks every exact boundary before another event.
+async fn wait_for_runner_activity_until(
+    endpoints: &[Endpoint],
+    wakeup: Instant,
+    service_buffered_http: bool,
+) -> Result<Option<ActivityWake>, Error> {
+    if service_buffered_http
+        && endpoints.iter().any(|endpoint| {
+            endpoint.network_active
+                && (!endpoint.deferred_data_readable.is_empty() || endpoint.client.has_events())
+        })
+    {
+        return Ok(None);
+    }
+    wait_for_activity_until(
+        endpoints
+            .iter()
+            .filter(|endpoint| endpoint.network_active)
+            .map(|endpoint| &endpoint.socket),
+        wakeup,
+    )
+    .await
+    .map(Some)
 }
 
 async fn wait_for_activity_until<'a>(

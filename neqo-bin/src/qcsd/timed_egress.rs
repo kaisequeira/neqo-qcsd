@@ -676,7 +676,8 @@ pub fn drop_process_privileges_permanently(
 /// `enqueue_before_tai_ns`, `sendmsg`, `enqueue_monotonic_ns`, then
 /// `enqueue_after_tai_ns`.  The two TAI values are therefore direct,
 /// send-sequence-local bounds; translating the MONOTONIC sample with a later
-/// clock phase is not required for their validity.
+/// clock phase is not required for their validity. Serialized sends retain the
+/// final sample before socket restoration; restoration failure is still fatal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TimedEnqueueReceipt {
     pub schema_version: u32,
@@ -770,6 +771,8 @@ pub struct SendAttemptReceipt {
 struct RawSendAttempt {
     enqueue_before_tai_ns: u64,
     enqueue_monotonic_ns: Option<u64>,
+    // Serialized sends retain this before verified socket restoration.
+    enqueue_after_tai_ns: Option<u64>,
     sendmsg_result: libc::ssize_t,
     send_errno: Option<libc::c_int>,
     post_send_error: Option<TimedEgressError>,
@@ -1130,6 +1133,7 @@ impl ActiveTimedEgressSocket {
                 Ok(RawSendAttempt {
                     enqueue_before_tai_ns,
                     enqueue_monotonic_ns,
+                    enqueue_after_tai_ns: None,
                     sendmsg_result: sent,
                     send_errno,
                     post_send_error,
@@ -1210,7 +1214,7 @@ impl ActiveTimedEgressSocket {
                 }),
             });
         }
-        let enqueue_after_tai_ns = match clock_tai_ns() {
+        let enqueue_after_tai_ns = match raw.enqueue_after_tai_ns.map_or_else(clock_tai_ns, Ok) {
             Ok(value) => value,
             Err(source) => {
                 let attempt = send_attempt_receipt(
@@ -1395,6 +1399,7 @@ impl ActiveTimedEgressSocket {
         let mut raw = RawSendAttempt {
             enqueue_before_tai_ns,
             enqueue_monotonic_ns,
+            enqueue_after_tai_ns: None,
             sendmsg_result: sent,
             send_errno,
             post_send_error,
@@ -3256,7 +3261,7 @@ fn send_attempt_receipt(
         latest_enqueue_tai_ns,
         enqueue_before_tai_ns: raw.enqueue_before_tai_ns,
         enqueue_monotonic_ns: raw.enqueue_monotonic_ns,
-        enqueue_after_tai_ns,
+        enqueue_after_tai_ns: enqueue_after_tai_ns.or(raw.enqueue_after_tai_ns),
         sendmsg_result: raw.sendmsg_result,
         send_errno: raw.send_errno,
         payload_bytes: batch.data().len(),
@@ -3825,9 +3830,13 @@ fn sendmsg_with_serialized_priority(
         let send_error = (sent < 0).then(io::Error::last_os_error);
         let send_errno = send_error.as_ref().and_then(io::Error::raw_os_error);
         let monotonic_result = clock_monotonic_ns();
+        // Bound the send itself, before TOS/priority restoration can block.
+        // This preserves TAI-before -> sendmsg -> MONOTONIC -> TAI-after order.
+        let tai_result = clock_tai_ns();
         let enqueue_monotonic_ns = monotonic_result.as_ref().ok().copied();
+        let enqueue_after_tai_ns = tai_result.as_ref().ok().copied();
         let post_send_error = send_error.map_or_else(
-            || monotonic_result.err(),
+            || monotonic_result.err().or_else(|| tai_result.err()),
             |source| {
                 Some(TimedEgressError::Io(
                     "sendmsg(SCM_TXTIME, serialized socket state)",
@@ -3838,6 +3847,7 @@ fn sendmsg_with_serialized_priority(
         Ok(RawSendAttempt {
             enqueue_before_tai_ns,
             enqueue_monotonic_ns,
+            enqueue_after_tai_ns,
             sendmsg_result: sent,
             send_errno,
             post_send_error,
