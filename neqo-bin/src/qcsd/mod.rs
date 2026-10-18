@@ -20463,6 +20463,66 @@ fn project_buflo_ordinary_guard_hints_from_sample(
     })
 }
 
+// Native117 reserves admission time for an ordinary transport microstep;
+// this is NOT an extension of any controller, socket, or physical deadline.
+#[cfg(target_os = "linux")]
+const BUFLO_ORDINARY_CONTROL_ADMISSION_LEAD: Duration = Duration::from_millis(1);
+
+#[cfg(target_os = "linux")]
+fn buflo_ordinary_output_has_no_exact_owner(endpoint: &Endpoint) -> bool {
+    endpoint.scheduled_outgoing.is_empty()
+        && endpoint
+            .client
+            .qcsd_pending_receive_action_identities()
+            .iter()
+            .all(|identity| identity.slot().is_none())
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_ordinary_control_work_boundary(
+    defense_clock: RunnerDefenseClock,
+    defense_start: Instant,
+    controller_deadline: Option<Duration>,
+    rolling_deadline: Option<Duration>,
+    observed_at: Instant,
+) -> Result<Option<OutputWorkBoundary>, Error> {
+    let RunnerDefenseClock::KernelTai {
+        start,
+        start_tai_ns,
+    } = defense_clock
+    else {
+        return Ok(None);
+    };
+    let Some(deadline) = controller_deadline else {
+        return Ok(None);
+    };
+    // The existing rolling guard owns its own admission and exact release.
+    if rolling_deadline.is_some_and(|rolling| rolling <= deadline) {
+        return Ok(None);
+    }
+    if start != defense_start {
+        return Err(Error::SlotInvariant(
+            "BuFLO ordinary control admission used another TAI epoch".into(),
+        ));
+    }
+    let offset = u64::try_from(deadline.as_nanos())
+        .map_err(|_| Error::DefenseExecution("BuFLO ordinary control deadline overflow".into()))?;
+    let resume_tai_ns = start_tai_ns.checked_add(offset).ok_or_else(|| {
+        Error::DefenseExecution("BuFLO ordinary control TAI deadline overflow".into())
+    })?;
+    let admission_tai_ns = resume_tai_ns
+        .checked_sub(duration_as_u64_nanos(BUFLO_ORDINARY_CONTROL_ADMISSION_LEAD))
+        .ok_or_else(|| {
+            Error::DefenseExecution("BuFLO ordinary control admission underflow".into())
+        })?;
+    let current_tai_ns = buflo_decision_tai_ns("ordinary control admission projection")?;
+    Ok(Some(OutputWorkBoundary::kernel_tai(
+        buflo_kernel_project_tai_hint(observed_at, current_tai_ns, admission_tai_ns)?,
+        buflo_kernel_project_tai_hint(observed_at, current_tai_ns, resume_tai_ns)?,
+        admission_tai_ns,
+    )))
+}
+
 #[expect(
     clippy::large_types_passed_by_value,
     reason = "the small Copy boundary is reduced by value into one authoritative winner"
@@ -24958,6 +25018,30 @@ async fn drive_endpoint_output_with_clock_until_with_admitted_tail(
             } else {
                 (None, None)
             };
+        #[cfg(target_os = "linux")]
+        if interrupt_new_buflo_guards
+            && matches!(controller.config().defense, DefenseConfig::Buflo(_))
+            && defense_clock.uses_kernel_tai()
+            && absolute_handoff_deadline.is_none()
+            && buflo_ordinary_output_has_no_exact_owner(&endpoints[output_endpoint_index])
+            && let Some(started) = defense_start
+        {
+            // No transport preparation has occurred. Yield through the original
+            // wakeup path so the actual controller poll services its boundary;
+            // the queued request/datagram and every exact owner remain untouched.
+            let observed_at = monotonic_clock();
+            if let Some(boundary) = buflo_ordinary_control_work_boundary(
+                defense_clock,
+                started,
+                kernel_controller_interrupt,
+                kernel_rolling_interrupt,
+                observed_at,
+            )? && let Some(wakeup) =
+                defense_clock.closed_output_wakeup(&boundary, observed_at)?
+            {
+                return Ok(Some(wakeup));
+            }
+        }
         let kernel_semantic_handoff_interrupt = kernel_controller_interrupt
             .into_iter()
             .chain(kernel_rolling_interrupt)
@@ -59212,5 +59296,369 @@ mod tests {
         );
         drop(endpoints);
         fs::remove_dir_all(output).expect("close diagnostic control artifacts");
+    }
+    // Native117 mechanism fixtures use connected HTTP/3 and the original
+    // controller control loop with one finite synthetic incoming opportunity.
+    // They are not live qualified sessions, receipt/FIN proof, or site credit.
+    #[derive(Debug)]
+    struct OrdinaryControlRetryFixture {
+        event: Option<Packet>,
+    }
+
+    impl Defense for OrdinaryControlRetryFixture {
+        fn observe(&mut self, _signal: DefenseSignal) {}
+        fn next_event(&mut self, elapsed: Duration) -> Option<Packet> {
+            self.event.filter(|packet| packet.timestamp() <= elapsed)?;
+            self.event.take()
+        }
+        fn next_event_at(&self) -> Option<Duration> {
+            self.event.map(Packet::timestamp)
+        }
+        fn is_complete(&self) -> bool {
+            false
+        }
+        fn is_outgoing_complete(&self) -> bool {
+            true
+        }
+        fn mode(&self) -> DefenseMode {
+            DefenseMode::ChaffAndShape
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn buflo_ordinary_control_yield_preserves_connected_work_until_real_poll() {
+        let output = trace_output_dir("native117-ordinary-control-yield");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let config = QcsdConfig {
+            max_udp_payload_size: 1_200,
+            defense: DefenseConfig::Buflo(neqo_csdef::BufloConfig {
+                parameters: "test-only-native117-boundary.json".into(),
+            }),
+            control_interval_us: 5_000,
+            drop_unsatisfied_events: false,
+            ..QcsdConfig::default()
+        };
+        let (mut endpoint, server) = connected_runner_endpoint_with_server_config(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            config.clone(),
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        assert!(endpoint.client.qcsd_has_pending_stream_send());
+        endpoint.test_force_socket_handoff_success = true;
+        let mut controller = QcsdController::with_defense(
+            config,
+            None,
+            Box::new(OrdinaryControlRetryFixture {
+                event: Some(
+                    Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("incoming"),
+                ),
+            }),
+        )
+        .expect("original controller with pending unavailable incoming work");
+        let mut endpoints = vec![endpoint];
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        controller.observe(
+            QcsdObservation::EndpointReady {
+                endpoint: endpoints[0].id,
+                origin: "https://127.0.0.1:4433".into(),
+                max_udp_payload_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        controller.poll(Duration::ZERO);
+        controller.flush_defense_observations();
+        let setup_actions: Vec<_> = controller.drain_actions().collect();
+        assert!(
+            matches!(setup_actions.as_slice(),
+            [QcsdAction::ReleaseChaffSendShaping { endpoint }]
+                if *endpoint == endpoints[0].id),
+            "only the original endpoint chaff-send release is pending during setup"
+        );
+        apply_action_batch(
+            &mut endpoints,
+            &mut controller,
+            None,
+            &mut traces,
+            started,
+            Duration::ZERO,
+            setup_actions,
+        )
+        .expect("apply the original setup action without preparing transport output");
+        assert_eq!(controller.next_deadline(), Some(Duration::from_millis(5)));
+        assert!(
+            controller.drain_actions().next().is_none(),
+            "no receive owner or invented output"
+        );
+        assert!(super::buflo_ordinary_output_has_no_exact_owner(
+            &endpoints[0]
+        ));
+        let start_tai_ns = 81_000_000_000_u64;
+        let before = Duration::from_micros(4_906);
+        {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns + 4_906_000);
+            let mut clock = || started + before;
+            assert_eq!(
+                drive_endpoint_output_with_clock_until(
+                    0,
+                    &mut endpoints,
+                    &mut controller,
+                    None,
+                    &mut traces,
+                    &observation_clock,
+                    Some(started),
+                    None,
+                    None,
+                    None,
+                    RunnerDefenseClock::KernelTai {
+                        start: started,
+                        start_tai_ns
+                    },
+                    true,
+                    super::OutputDriveCardinality::OneDatagram,
+                    super::PostOutputRollingBarrier::Apply,
+                    &mut clock,
+                )
+                .await
+                .expect("ordinary output yields before transport preparation"),
+                Some(started + Duration::from_millis(5))
+            );
+        }
+        assert!(
+            endpoints[0].client.qcsd_has_pending_stream_send(),
+            "same real request remains owned"
+        );
+        assert!(endpoints[0].scheduled_outgoing.is_empty());
+        assert!(
+            endpoints[0]
+                .client
+                .qcsd_pending_receive_action_identities()
+                .is_empty()
+        );
+        assert_eq!(controller.next_deadline(), Some(Duration::from_millis(5)));
+        // The actual controller poll, rather than a manufactured deadline
+        // advance, services the pending boundary. It cannot invent capacity.
+        controller.poll(Duration::from_millis(5));
+        assert_eq!(controller.next_deadline(), Some(Duration::from_millis(10)));
+        assert!(controller.drain_actions().next().is_none());
+        {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns + 5_000_000);
+            let mut clock = || started + Duration::from_millis(5);
+            assert_eq!(
+                drive_endpoint_output_with_clock_until(
+                    0,
+                    &mut endpoints,
+                    &mut controller,
+                    None,
+                    &mut traces,
+                    &observation_clock,
+                    Some(started),
+                    None,
+                    None,
+                    None,
+                    RunnerDefenseClock::KernelTai {
+                        start: started,
+                        start_tai_ns
+                    },
+                    true,
+                    super::OutputDriveCardinality::OneDatagram,
+                    super::PostOutputRollingBarrier::Apply,
+                    &mut clock,
+                )
+                .await
+                .expect("the same queued request now sends once"),
+                None
+            );
+        }
+        assert!(!endpoints[0].client.qcsd_has_pending_stream_send());
+        drop(traces);
+        let packets = fs::read_to_string(output.join("packets.csv")).expect("packet trace");
+        assert_eq!(
+            packets.lines().count(),
+            2,
+            "yield emitted nothing; only resumed ordinary send exists"
+        );
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .scheduled_incoming_consumed_bytes,
+            0
+        );
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove connected fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_ordinary_control_yield_has_exact_admission_and_preserves_rolling_ownership() {
+        let started = test_fixture::now();
+        let start_tai_ns = 82_000_000_000_u64;
+        let dc = RunnerDefenseClock::KernelTai {
+            start: started,
+            start_tai_ns,
+        };
+        let service = Duration::from_millis(5);
+        for (offset, expected) in [
+            (3_999_999, false),
+            (4_000_000, true),
+            (4_906_000, true),
+            (5_000_000, true),
+        ] {
+            let _tai = super::TestBufloDecisionTaiOverride::fixed(start_tai_ns + offset);
+            let boundary = super::buflo_ordinary_control_work_boundary(
+                dc,
+                started,
+                Some(service),
+                Some(Duration::from_millis(64)),
+                started,
+            )
+            .expect("bounded TAI projection")
+            .expect("earlier controller boundary");
+            assert_eq!(
+                boundary.kernel_admission_tai_ns,
+                Some(start_tai_ns + 4_000_000)
+            );
+            assert_eq!(
+                dc.closed_output_wakeup(&boundary, started)
+                    .expect("fresh TAI admission")
+                    .is_some(),
+                expected
+            );
+        }
+        assert!(
+            super::buflo_ordinary_control_work_boundary(dc, started, None, None, started,)
+                .expect("no controller boundary")
+                .is_none()
+        );
+        for rolling in [Duration::from_millis(4), service] {
+            assert!(
+                super::buflo_ordinary_control_work_boundary(
+                    dc,
+                    started,
+                    Some(service),
+                    Some(rolling),
+                    started,
+                )
+                .expect("original rolling guard owns equal or earlier boundary")
+                .is_none()
+            );
+        }
+        assert!(
+            super::buflo_ordinary_control_work_boundary(
+                RunnerDefenseClock::Monotonic,
+                started,
+                Some(service),
+                None,
+                started,
+            )
+            .expect("old monotonic path")
+            .is_none()
+        );
+        assert!(
+            super::buflo_ordinary_control_work_boundary(
+                dc,
+                started + Duration::from_nanos(1),
+                Some(service),
+                None,
+                started,
+            )
+            .is_err()
+        );
+        assert!(
+            super::buflo_ordinary_control_work_boundary(
+                RunnerDefenseClock::KernelTai {
+                    start: started,
+                    start_tai_ns: u64::MAX
+                },
+                started,
+                Some(service),
+                None,
+                started,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn buflo_ordinary_control_yield_excludes_owned_credit_and_keeps_postsend_failure() {
+        let output = trace_output_dir("native117-owned-credit-exclusion");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (endpoints, server, _controller, _slot, traces) =
+            staged_exact_incoming_credit_fixture(&output, started, &observation_clock);
+        let owners = endpoints[0].client.qcsd_pending_receive_action_identities();
+        assert!(owners.iter().any(|identity| identity.slot().is_some()));
+        assert!(
+            !super::buflo_ordinary_output_has_no_exact_owner(&endpoints[0]),
+            "actual slot-owned receive credit retains its original output path"
+        );
+        assert_eq!(
+            endpoints[0].client.qcsd_pending_receive_action_identities(),
+            owners
+        );
+        drop(traces);
+        drop(endpoints);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove owned-credit fixture");
+        // The original connected production microstep remains unchanged and
+        // still refuses an admitted send whose post-send TAI sample crosses.
+        let output = trace_output_dir("native117-original-postsend-refusal");
+        let started = test_fixture::now();
+        let observation_clock = QcsdObservationClock::new(started);
+        let (mut endpoint, server) = connected_runner_endpoint_with_server(
+            &output,
+            started,
+            &observation_clock,
+            QcsdEndpointId(0),
+            4_433,
+            5_000,
+        );
+        stage_unshaped_runner_request_for_output(&mut endpoint, started, 4_433);
+        endpoint.test_force_socket_handoff_success = true;
+        let mut controller =
+            QcsdController::new(QcsdConfig::default(), 0, None).expect("controller");
+        let mut traces = TraceFiles::new(&output, started).expect("trace files");
+        let start_tai_ns = 83_000_000_000_u64;
+        let boundary = start_tai_ns + 5_000_000;
+        let _tai = super::TestBufloDecisionTaiOverride::sequence([boundary - 1, boundary]);
+        let mut clock = || started;
+        let error = super::process_output_once_with_clock(
+            &mut endpoint,
+            &mut controller,
+            &mut traces,
+            &observation_clock,
+            started,
+            Some(started),
+            Some(started),
+            None,
+            RunnerDefenseClock::KernelTai {
+                start: started,
+                start_tai_ns,
+            },
+            Some(Duration::from_millis(5)),
+            &mut clock,
+        )
+        .await
+        .expect_err("post-send boundary crossing remains a hard failure");
+        assert!(matches!(error, Error::DefenseExecution(message)
+            if message.contains("crossed its CLOCK_TAI semantic interrupt")));
+        drop(traces);
+        let packets =
+            fs::read_to_string(output.join("packets.csv")).expect("original packet trace");
+        assert_eq!(
+            packets.lines().count(),
+            2,
+            "original sent evidence remains before refusal"
+        );
+        drop(endpoint);
+        drop(server);
+        fs::remove_dir_all(output).expect("remove original-refusal fixture");
     }
 }
