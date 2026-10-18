@@ -24002,6 +24002,102 @@ struct PreparedOutputFailure {
     receipt: PreparedOutputFailureReceipt,
 }
 
+const PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_PREFIX: &str =
+    "QCSD_PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_V1 ";
+const PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_RECORDS: usize = 16;
+const PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// Failure-only metadata from an already-built, already-drained microstep.
+/// No packet bytes, keys, new clocks, transport calls or controller effects.
+fn prepared_output_failure_diagnostic(
+    prepared: &PreparedOutputMicrostep,
+    receipt: &PreparedOutputFailureReceipt,
+) -> String {
+    // Reserve more than the fixed envelope's size, then check the exact final
+    // encoding as well. A diagnostic serialization problem never replaces the
+    // original failure or expands the log line without a finite bound.
+    let mut remaining = PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_LINE_BYTES
+        - PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_PREFIX.len()
+        - 1
+        - 2_048;
+    let mut observations = Vec::new();
+    let mut attributions = Vec::new();
+    let mut truncated = false;
+    for record in prepared
+        .observations
+        .iter()
+        .take(PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_RECORDS)
+    {
+        let item = json!({
+            "production_sequence": record.sequence(),
+            "production_monotonic_ns": record.produced_monotonic_ns(),
+            "observation": record.observation(),
+        });
+        let Ok(bytes) = serde_json::to_vec(&item) else {
+            truncated = true;
+            break;
+        };
+        if bytes.len().saturating_add(1) > remaining {
+            truncated = true;
+            break;
+        }
+        remaining -= bytes.len() + 1;
+        observations.push(item);
+    }
+    truncated |= observations.len() != prepared.observations.len();
+    for attribution in prepared
+        .attributed_datagrams
+        .iter()
+        .take(PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_RECORDS)
+    {
+        let item = json!({
+            "observed_bytes": attribution.observed,
+            "composition": attribution.composition,
+            "satisfied": attribution.satisfied.map(|satisfied| json!({
+                "slot": satisfied.slot.0,
+                "observed_bytes": satisfied.observed_size,
+                "status": satisfied.status,
+            })),
+        });
+        let Ok(bytes) = serde_json::to_vec(&item) else {
+            truncated = true;
+            break;
+        };
+        if bytes.len().saturating_add(1) > remaining {
+            truncated = true;
+            break;
+        }
+        remaining -= bytes.len() + 1;
+        attributions.push(item);
+    }
+    truncated |= attributions.len() != prepared.attributed_datagrams.len();
+    let diagnostic = json!({
+        "schema_version": 1,
+        "source": "already-drained-prepared-output-failure-v1",
+        "diagnostic_only": true,
+        "stage": receipt.stage,
+        "batch_sha256": receipt.batch_sha256,
+        "observation_count": prepared.observations.len(),
+        "attribution_count": prepared.attributed_datagrams.len(),
+        "max_records_per_kind": PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_RECORDS,
+        "max_line_bytes": PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_LINE_BYTES,
+        "truncated": truncated,
+        "observations": observations,
+        "attributions": attributions,
+    });
+    match serde_json::to_string(&diagnostic) {
+        Ok(encoded)
+            if encoded.len() + PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_PREFIX.len() + 1
+                <= PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_MAX_LINE_BYTES =>
+        {
+            encoded
+        }
+        _ => String::from(
+            "{\"schema_version\":1,\"diagnostic_only\":true,\"serialization_failed\":true}",
+        ),
+    }
+}
+
 impl PreparedOutputFailure {
     #[expect(
         clippy::too_many_arguments,
@@ -24058,7 +24154,7 @@ impl PreparedOutputFailure {
         error: Error,
         prepared: &PreparedOutputMicrostep,
     ) -> Self {
-        Self::new(
+        let failure = Self::new(
             stage,
             error,
             true,
@@ -24072,7 +24168,15 @@ impl PreparedOutputFailure {
                 .filter(|attribution| attribution.satisfied.is_some())
                 .count(),
             prepared.attributed_datagrams.len(),
-        )
+        );
+        // stderr is retained by the existing collector log independently of
+        // RUST_LOG. A failed diagnostic write cannot mask the original error.
+        let diagnostic = prepared_output_failure_diagnostic(prepared, &failure.receipt);
+        let _ = writeln!(
+            io::stderr().lock(),
+            "{PREPARED_OUTPUT_FAILURE_DIAGNOSTIC_PREFIX}{diagnostic}"
+        );
+        failure
     }
 
     fn into_parts(self) -> (Error, PreparedOutputFailureReceipt) {
