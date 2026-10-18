@@ -1522,7 +1522,7 @@ const MIN_HTTP3_DATA_OPPORTUNITY_BYTES: u64 = 3;
 /// the observed peer progress under the existing 16-byte parser lease; it is
 /// not a protocol promise that any peer must send at this credit size. Fresh
 /// three-byte DATA opportunities and the lifetime unowned budget are separate.
-const BUFLO_RETAINED_PARSER_PROBE_BYTES: u64 = 16;
+const BUFLO_RETAINED_PARSER_PROBE_BYTES: u64 = 128;
 
 #[cfg(test)]
 mod tests {
