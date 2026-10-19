@@ -16001,6 +16001,10 @@ async fn execute_run_inner(
                     controller_deadline_selected = true;
                 }
             }
+            #[cfg(target_os = "linux")]
+            let mut runner_wait_policy = RunnerWaitPolicy::Ordinary;
+            #[cfg(not(target_os = "linux"))]
+            let runner_wait_policy = RunnerWaitPolicy::Ordinary;
             if let Some(guard) =
                 next_buflo_exact_release_guard(&spec.config.defense, &controller, &endpoints)?
             {
@@ -16016,6 +16020,14 @@ async fn execute_run_inner(
                 // loop turn enters the CLOCK_TAI protected wait before any
                 // simultaneous socket readiness can consume the selection
                 // headroom.
+                // Retain the actual pending owner independently of which
+                // monotonic callback is earliest; that hint is not authority.
+                #[cfg(target_os = "linux")]
+                if let Some(runtime) = buflo_kernel_tx.as_ref() {
+                    runner_wait_policy = RunnerWaitPolicy::KernelBufloAdmission {
+                        admission_tai_ns: runtime.output_admission_tai_ns(&guard)?,
+                    };
+                }
                 if guard_wakeup <= next_wakeup {
                     next_wakeup = guard_wakeup;
                     controller_deadline_selected = false;
@@ -16027,6 +16039,11 @@ async fn execute_run_inner(
                 && !runtime.tick_zero_staged()?
             {
                 let stage_at = runtime.tick_zero_protected_selection_wake_hint()?;
+                runner_wait_policy = RunnerWaitPolicy::KernelBufloAdmission {
+                    admission_tai_ns: runtime
+                        .tick_zero_protected_selection_identity()?
+                        .admission_tai_ns,
+                };
                 if stage_at <= next_wakeup {
                     next_wakeup = stage_at;
                     controller_deadline_selected = false;
@@ -16062,11 +16079,12 @@ async fn execute_run_inner(
                 &endpoints,
                 next_wakeup,
                 spec.config.buflo_retained_parser_fin_permission,
+                runner_wait_policy,
             )
             .await?
             else {
-                // Re-enter through the unchanged exact-boundary checks before
-                // one bounded HTTP event. Already-parsed work needs no UDP.
+                // Already-parsed HTTP or an already-due pending kernel BuFLO
+                // admission re-enters the unchanged exact-boundary checks first.
                 continue 'runner;
             };
             runner_wakeup_metrics.record(wake, controller_deadline_selected);
@@ -20442,6 +20460,15 @@ enum ActivityWake {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerWaitPolicy {
+    Ordinary,
+    #[cfg(target_os = "linux")]
+    KernelBufloAdmission {
+        admission_tai_ns: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BufloExactReleaseGuard {
     endpoint_index: usize,
     endpoint: QcsdEndpointId,
@@ -23727,6 +23754,7 @@ async fn wait_for_runner_activity_until(
     endpoints: &[Endpoint],
     wakeup: Instant,
     service_buffered_http: bool,
+    wait_policy: RunnerWaitPolicy,
 ) -> Result<Option<ActivityWake>, Error> {
     if service_buffered_http
         && endpoints.iter().any(|endpoint| {
@@ -23736,27 +23764,48 @@ async fn wait_for_runner_activity_until(
     {
         return Ok(None);
     }
-    wait_for_activity_until(
+    wait_for_activity_until_with_policy(
         endpoints
             .iter()
             .filter(|endpoint| endpoint.network_active)
             .map(|endpoint| &endpoint.socket),
         wakeup,
+        wait_policy,
     )
     .await
-    .map(Some)
 }
 
 async fn wait_for_activity_until<'a>(
     sockets: impl IntoIterator<Item = &'a Socket>,
     wakeup: Instant,
 ) -> Result<ActivityWake, Error> {
-    // A future callback retains its absolute monotonic deadline instead of
-    // converting it to a relative sleep after every loop turn. An already-due
-    // callback still yields once so Tokio's current-thread reactor can publish
-    // socket readiness before the runner retries its work loop.
+    wait_for_activity_until_with_policy(sockets, wakeup, RunnerWaitPolicy::Ordinary)
+        .await?
+        .ok_or_else(|| Error::SlotInvariant("ordinary runner wait returned without a wake".into()))
+}
+
+async fn wait_for_activity_until_with_policy<'a>(
+    sockets: impl IntoIterator<Item = &'a Socket>,
+    wakeup: Instant,
+    wait_policy: RunnerWaitPolicy,
+) -> Result<Option<ActivityWake>, Error> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = wait_policy;
+    // The pending Native kernel BuFLO owner is independent of the chosen
+    // monotonic hint. Recheck authoritative TAI before either a due callback
+    // yield or a future timer/readiness wait, then enter the original owner.
+    // Before actual TAI admission, all original reactor behavior remains.
+    #[cfg(target_os = "linux")]
+    if let RunnerWaitPolicy::KernelBufloAdmission { admission_tai_ns } = wait_policy
+        && buflo_decision_tai_ns("pending kernel BuFLO admission before reactor wait")?
+            >= admission_tai_ns
+    {
+        return Ok(None);
+    }
     if remaining_wakeup_delay(wakeup, now()).is_none() {
-        return wait_for_activity(sockets, Duration::from_micros(1)).await;
+        return wait_for_activity(sockets, Duration::from_micros(1))
+            .await
+            .map(Some);
     }
     let readiness: Vec<_> = sockets
         .into_iter()
@@ -23765,7 +23814,7 @@ async fn wait_for_activity_until<'a>(
     let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wakeup));
     if readiness.is_empty() {
         timer.await;
-        return Ok(ActivityWake::Timer);
+        return Ok(Some(ActivityWake::Timer));
     }
     let sockets_ready =
         select_all(readiness).map(|(result, _, _)| result.map(|()| ActivityWake::SocketReady));
@@ -23773,6 +23822,7 @@ async fn wait_for_activity_until<'a>(
     select(sockets_ready, timeout_ready)
         .map(|either| either.factor_first().0)
         .await
+        .map(Some)
         .map_err(Error::from)
 }
 
