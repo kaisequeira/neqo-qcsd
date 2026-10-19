@@ -364,6 +364,26 @@ fn response_qualification_mode(
     }
 }
 
+fn response_qualification_mode_with_aggregate(
+    parallel_requests: usize,
+    total_requests: Option<usize>,
+    request_header_mode: Option<ChaffRequestHeaderModeArg>,
+    small_response_aggregate: bool,
+) -> Result<ResponseQualificationMode, Error> {
+    if !small_response_aggregate {
+        return response_qualification_mode(parallel_requests, total_requests, request_header_mode);
+    }
+    if parallel_requests != 8
+        || total_requests != Some(SUSTAINED_QUALIFICATION_REQUESTS)
+        || request_header_mode != Some(ChaffRequestHeaderModeArg::IdentityChaffV1)
+    {
+        return Err(Error::Argument(
+            "eight-response aggregate qualification requires40 requests/parallel8/identity-chaff-v1".into(),
+        ));
+    }
+    Ok(ResponseQualificationMode::SustainedIdentity)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -416,7 +436,7 @@ enum Command {
         /// Isolated chaff request-header derivation; paired with --total-requests.
         #[arg(long, value_enum)]
         request_header_mode: Option<ChaffRequestHeaderModeArg>,
-        /// Distinct five-small-response capability; never weakens ordinary qualification.
+        /// Distinct eight-small-response capability; never weakens ordinary qualification.
         #[arg(long)]
         small_response_aggregate: bool,
         #[arg(long, default_value_t = 1_048_576)]
@@ -533,6 +553,26 @@ enum Command {
 }
 
 impl Args {
+    // Shared with the public execute path, before logging, NSS, files, or network.
+    fn validate_response_qualification_arguments(&self) -> Result<(), Error> {
+        if let Command::QualifyChaffResponse {
+            parallel_requests,
+            total_requests,
+            request_header_mode,
+            small_response_aggregate,
+            ..
+        } = &self.command
+        {
+            response_qualification_mode_with_aggregate(
+                *parallel_requests,
+                *total_requests,
+                *request_header_mode,
+                *small_response_aggregate,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Execute the selected probe or research run.
     ///
     /// # Errors
@@ -545,25 +585,7 @@ impl Args {
         reason = "the binary deliberately uses Tokio's current-thread runtime"
     )]
     pub async fn execute(self) -> Result<(), Error> {
-        if let Command::QualifyChaffResponse {
-            parallel_requests,
-            total_requests,
-            request_header_mode,
-            small_response_aggregate,
-            ..
-        } = &self.command
-        {
-            let mode = response_qualification_mode(
-                *parallel_requests,
-                *total_requests,
-                *request_header_mode,
-            )?;
-            if *small_response_aggregate && mode != ResponseQualificationMode::SustainedIdentity {
-                return Err(Error::Argument(
-                    "aggregate qualification requires the exact sustained identity flags".into(),
-                ));
-            }
-        }
+        self.validate_response_qualification_arguments()?;
         neqo_common::log::init(None);
         nss::init()?;
         match self.command {
@@ -12510,19 +12532,12 @@ async fn qualify_chaff_response(
     packet_size: u16,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let mode = if small_response_aggregate {
-        if parallel_requests != 8
-            || total_requests != Some(SUSTAINED_QUALIFICATION_REQUESTS)
-            || request_header_mode != Some(ChaffRequestHeaderModeArg::IdentityChaffV1)
-        {
-            return Err(Error::Argument(
-                "eight-response aggregate qualification requires40 requests/parallel8/identity-chaff-v1".into(),
-            ));
-        }
-        ResponseQualificationMode::SustainedIdentity
-    } else {
-        response_qualification_mode(parallel_requests, total_requests, request_header_mode)?
-    };
+    let mode = response_qualification_mode_with_aggregate(
+        parallel_requests,
+        total_requests,
+        request_header_mode,
+        small_response_aggregate,
+    )?;
     let sustained_parallel = if small_response_aggregate {
         8
     } else {
@@ -48098,6 +48113,130 @@ mod tests {
                 .len()
                 + 1
         );
+    }
+
+    // The actual failed public command, with inert paths so this parser/preflight
+    // regression cannot read a workload, create an output, initialize NSS, or use a socket.
+    fn native129_public_qualification_argv(
+        parallel: &str,
+        total: Option<&str>,
+        header: Option<&str>,
+        aggregate: bool,
+    ) -> Vec<String> {
+        let mut argv: Vec<String> = [
+            "neqo-qcsd-client",
+            "qualify-chaff-response",
+            "--workload",
+            "/must-not-read/Fonts-prepared-workload.json",
+            "--application-resource-id",
+            "0",
+            "--selected-chaff-resource-id",
+            "5",
+            "--output-dir",
+            "/must-not-create/Fonts-response-0",
+            "--timeout-seconds",
+            "120",
+            "--max-response-bytes",
+            "1048576",
+            "--packet-size",
+            "1200",
+            "--parallel-requests",
+            parallel,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        if let Some(total) = total {
+            argv.extend(["--total-requests".to_owned(), total.to_owned()]);
+        }
+        if let Some(header) = header {
+            argv.extend(["--request-header-mode".to_owned(), header.to_owned()]);
+        }
+        if aggregate {
+            argv.push("--small-response-aggregate".to_owned());
+        }
+        argv
+    }
+
+    #[test]
+    fn qualify_chaff_response_public_argv_selects_aggregate8_without_weakening_ordinary5() {
+        let actual =
+            native129_public_qualification_argv("8", Some("40"), Some("identity-chaff-v1"), true);
+        let parsed = Args::try_parse_from(actual.clone()).expect("actual public aggregate argv");
+        assert!(
+            parsed.validate_response_qualification_arguments().is_ok(),
+            "the real public pre-NSS gate must accept exact aggregate8/40/identity"
+        );
+
+        for (parallel, total, header) in [
+            ("5", Some("40"), Some("identity-chaff-v1")),
+            ("5", None, None),
+            ("20", None, None),
+        ] {
+            let parsed = Args::try_parse_from(native129_public_qualification_argv(
+                parallel, total, header, false,
+            ))
+            .expect("ordinary public argv");
+            assert!(parsed.validate_response_qualification_arguments().is_ok());
+        }
+
+        // These parse as CLI syntax but must fail the very gate called by execute.
+        for (parallel, total, header, aggregate) in [
+            ("5", Some("40"), Some("identity-chaff-v1"), true),
+            ("7", Some("40"), Some("identity-chaff-v1"), true),
+            ("9", Some("40"), Some("identity-chaff-v1"), true),
+            ("8", Some("39"), Some("identity-chaff-v1"), true),
+            ("8", None, Some("identity-chaff-v1"), true),
+            ("8", Some("40"), None, true),
+            ("8", None, None, true),
+            ("8", Some("40"), Some("identity-chaff-v1"), false),
+            ("5", Some("40"), None, false),
+            ("5", None, Some("identity-chaff-v1"), false),
+            ("4", None, None, false),
+            ("21", None, None, false),
+        ] {
+            let parsed = Args::try_parse_from(native129_public_qualification_argv(
+                parallel, total, header, aggregate,
+            ))
+            .expect("semantic refusal has valid CLI syntax");
+            assert!(parsed.validate_response_qualification_arguments().is_err());
+        }
+
+        // Required arguments and malformed values are refused by the real Clap parser.
+        for flag in [
+            "--workload",
+            "--parallel-requests",
+            "--selected-chaff-resource-id",
+        ] {
+            let mut missing = actual.clone();
+            let index = missing
+                .iter()
+                .position(|value| value == flag)
+                .expect("flag");
+            missing.drain(index..index + 2);
+            assert!(Args::try_parse_from(missing).is_err());
+        }
+        assert!(
+            Args::try_parse_from(native129_public_qualification_argv(
+                "eight",
+                Some("40"),
+                Some("identity-chaff-v1"),
+                true,
+            ))
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(native129_public_qualification_argv(
+                "8",
+                Some("40"),
+                Some("identity"),
+                true,
+            ))
+            .is_err()
+        );
+        let mut unknown = actual;
+        unknown.push("--small-response-aggregates".to_owned());
+        assert!(Args::try_parse_from(unknown).is_err());
     }
 
     #[test]
