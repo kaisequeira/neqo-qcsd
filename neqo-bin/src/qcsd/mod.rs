@@ -11473,6 +11473,80 @@ struct StreamRecord {
     expected_chaff_response: Option<ExpectedChaffIdentity>,
 }
 
+const HTTP3_TERMINAL_STATE_MAX_ENDPOINTS: usize = 32;
+const HTTP3_TERMINAL_STATE_MAX_DESCRIPTION_BYTES: usize = 256;
+const HTTP3_TERMINAL_STATE_MAX_JSON_BYTES: usize = 16 * 1024;
+
+/// Failure-only current state, independent of the bounded HTTP/3 event queue.
+/// No event drain, new clock, network operation or primary-error replacement.
+fn http3_terminal_state_snapshot(endpoints: &[Endpoint]) -> Option<serde_json::Value> {
+    let mut entries = Vec::new();
+    let mut omitted = 0_usize;
+    for endpoint in endpoints {
+        let (state, reason) = match endpoint.client.state() {
+            Http3State::Closing(reason) => ("closing", reason),
+            Http3State::Closed(reason) => ("closed", reason),
+            _ => continue,
+        };
+        if entries.len() == HTTP3_TERMINAL_STATE_MAX_ENDPOINTS {
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        // Peer error variants carry the actual wire code. Error::code()
+        // deliberately maps both peer variants to zero, so match them first.
+        let (variant, code, description) = match reason {
+            neqo_transport::CloseReason::Application(code) => ("Application", code, None),
+            neqo_transport::CloseReason::Transport(neqo_transport::Error::PeerApplication(
+                code,
+            )) => ("Transport(PeerApplication)", code, None),
+            neqo_transport::CloseReason::Transport(neqo_transport::Error::Peer(code)) => {
+                ("Transport(Peer)", code, None)
+            }
+            neqo_transport::CloseReason::Transport(error) => {
+                ("Transport", error.code(), Some(error.to_string()))
+            }
+        };
+        let (description, description_truncated) = description.map_or((None, false), |text| {
+            let mut end = text.len().min(HTTP3_TERMINAL_STATE_MAX_DESCRIPTION_BYTES);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            (Some(text[..end].to_owned()), end < text.len())
+        });
+        entries.push(json!({
+            "endpoint_id": endpoint.id.0,
+            "http3_state": state,
+            "close_reason_variant": variant,
+            "close_code": code,
+            "transport_error_description": description,
+            "description_truncated": description_truncated,
+        }));
+    }
+    while !entries.is_empty() {
+        let value = json!({
+            "schema_version": 1,
+            "source": "runner-final-http3-state-snapshot-v1",
+            "observations_only": true,
+            "independent_of_http3_event_queue": true,
+            "time_basis": "final-run-json-not-event-timestamp",
+            "max_endpoints": HTTP3_TERMINAL_STATE_MAX_ENDPOINTS,
+            "max_description_bytes": HTTP3_TERMINAL_STATE_MAX_DESCRIPTION_BYTES,
+            "max_json_bytes": HTTP3_TERMINAL_STATE_MAX_JSON_BYTES,
+            "omitted_terminal_endpoints": omitted,
+            "entries": &entries,
+        });
+        let Ok(raw) = serde_json::to_vec(&value) else {
+            return None;
+        };
+        if raw.len() <= HTTP3_TERMINAL_STATE_MAX_JSON_BYTES {
+            return Some(value);
+        }
+        _ = entries.pop();
+        omitted = omitted.saturating_add(1);
+    }
+    None
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Http3FailureDiagnostic {
@@ -26844,6 +26918,9 @@ fn render_run_json(
     // A successful run's scientific DTO stays unchanged. These optional
     // failure observations do not replace the original error or authorize it.
     if completion_status != "complete" {
+        if let Some(snapshot) = http3_terminal_state_snapshot(endpoints) {
+            run["http3_terminal_state_snapshot"] = snapshot;
+        }
         let diagnostics: Vec<_> = endpoints
             .iter()
             .flat_map(|endpoint| endpoint.http3_failure_diagnostics.iter())
