@@ -13,13 +13,13 @@ use std::{
 use control_loop::{ControlLoop, PendingClaim, PendingCredit, PendingIncoming, PendingOutgoing};
 
 use crate::{
-    Buflo, Capacity, CapacityAdjustment, CsBuflo, Defense, DefenseConfig, DefenseDiagnostics,
-    DefenseMode, DefenseSignal, Direction, EventOutcome, Front, MissedSlotReason, QcsdAction,
-    QcsdChaffCancellationReason, QcsdConfig, QcsdEndpointId, QcsdObservation, QcsdParserLeaseOwner,
-    QcsdPrearmCancellationReason, QcsdReceiveActionIdentity, QcsdRequestRole, QcsdSlotId,
-    QcsdStreamId, ResourceManifest, Result, RoundRobinScheduler, SignalKind, StaticSchedule,
-    Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad, chaff_manager::ChaffManager,
-    stream::StreamRegistry,
+    Buflo, BufloAggregateStartupMember, Capacity, CapacityAdjustment, CsBuflo, Defense,
+    DefenseConfig, DefenseDiagnostics, DefenseMode, DefenseSignal, Direction, EventOutcome, Front,
+    MissedSlotReason, QcsdAction, QcsdChaffCancellationReason, QcsdConfig, QcsdEndpointId,
+    QcsdObservation, QcsdParserLeaseOwner, QcsdPrearmCancellationReason, QcsdReceiveActionIdentity,
+    QcsdRequestRole, QcsdSlotId, QcsdStreamId, ResourceManifest, Result, RoundRobinScheduler,
+    SignalKind, StaticSchedule, Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad,
+    chaff_manager::ChaffManager, stream::StreamRegistry,
 };
 
 /// Exact controller bookkeeping canceled after a typed receive-lifecycle rejection.
@@ -541,6 +541,7 @@ pub struct QcsdController {
     scheduler: RoundRobinScheduler,
     endpoint_origins: HashMap<QcsdEndpointId, String>,
     buflo_chaff_ack_observed_at: HashMap<(QcsdEndpointId, QcsdStreamId), Duration>,
+    buflo_aggregate_selected: Option<(u32, u64)>,
     buflo_startup_requested_chaff: HashMap<(QcsdEndpointId, u64), u32>,
     /// Only an independently validated prepared BuFLO policy may widen the
     /// incoming advertisement window; outgoing deadlines stay unchanged.
@@ -812,6 +813,7 @@ impl QcsdController {
             scheduler: RoundRobinScheduler::empty(),
             endpoint_origins: HashMap::new(),
             buflo_chaff_ack_observed_at: HashMap::new(),
+            buflo_aggregate_selected: None,
             buflo_startup_requested_chaff: HashMap::new(),
             buflo_incoming_half_period_window: None,
             buflo_incoming_stream_cursor: HashMap::new(),
@@ -1059,7 +1061,7 @@ impl QcsdController {
         if !matches!(self.config.defense, DefenseConfig::Buflo(_))
             || self.buflo_incoming_half_period_window != Some(Duration::from_micros(32_000))
             || !self.terminal_primary_partial_cell_policy
-            || self.defense.diagnostics().buflo_incoming_startup.is_none()
+            || !self.buflo_startup_present()
             || self.buflo_retained_parser_policy
             || self.control.next_slot_id != 0
             || !self.pending_slots.is_empty()
@@ -1200,6 +1202,154 @@ impl QcsdController {
         Ok(())
     }
 
+    /// Enable the separate, fully qualified five-small-response capability.
+    pub fn enable_buflo_aggregate_incoming_startup(
+        &mut self,
+        resource_id: u32,
+        body_bytes: u64,
+        manifest_sha256: [u8; 32],
+    ) -> Result<()> {
+        if !matches!(self.config.defense, DefenseConfig::Buflo(_))
+            || self.buflo_incoming_half_period_window != Some(Duration::from_micros(32_000))
+            || self.config.initial_max_stream_data != 16
+            || self.config.max_chaff_streams != 5
+            || !(1..1_200).contains(&body_bytes)
+            || body_bytes
+                .checked_sub(16)
+                .and_then(|n| n.checked_mul(5))
+                .is_none_or(|n| n < 1_200)
+            || self
+                .chaff
+                .as_ref()
+                .is_none_or(|c| c.estimate(resource_id) != body_bytes)
+            || self.buflo_aggregate_selected.is_some()
+            || self.control.next_slot_id != 0
+            || !self.pending_slots.is_empty()
+            || !self
+                .defense
+                .enable_buflo_aggregate_incoming_startup(manifest_sha256)
+        {
+            return Err(crate::Error::InvalidConfig(
+                "aggregate startup requires an unstarted fixed64ms five-stream exact-capacity contract".into(),
+            ));
+        }
+        self.buflo_aggregate_selected = Some((resource_id, body_bytes));
+        Ok(())
+    }
+
+    fn buflo_startup_present(&self) -> bool {
+        let d = self.defense.diagnostics();
+        d.buflo_incoming_startup.is_some() || d.buflo_incoming_aggregate_startup.is_some()
+    }
+
+    fn buflo_startup_timing(&self) -> Option<(u64, bool, Option<u64>)> {
+        let d = self.defense.diagnostics();
+        d.buflo_incoming_startup
+            .map(|s| (s.period_us, s.armed, s.armed_at_us))
+            .or_else(|| {
+                d.buflo_incoming_aggregate_startup
+                    .map(|s| (s.period_us, s.armed, s.armed_at_us))
+            })
+    }
+
+    fn arm_buflo_aggregate_incoming_if_ready(&mut self, elapsed: Duration) {
+        let Some((resource_id, body_bytes)) = self.buflo_aggregate_selected else {
+            return;
+        };
+        let Some(mut startup) = self.defense.diagnostics().buflo_incoming_aggregate_startup else {
+            return;
+        };
+        if startup.armed || self.scheduler.endpoints().len() != 1 {
+            return;
+        }
+        for endpoint in self.scheduler.endpoints() {
+            let mut members = Vec::new();
+            for opportunity in self.streams.allocation_opportunities_excluding(
+                *endpoint,
+                self.defense.mode(),
+                &self.control.receiver_continuation_reserves,
+                true,
+            ) {
+                let QcsdRequestRole::Chaff {
+                    resource_id: selected,
+                    request_id: Some(request_id),
+                } = opportunity.role
+                else {
+                    continue;
+                };
+                if selected != resource_id
+                    || opportunity.exact == 0
+                    || self
+                        .chaff
+                        .as_ref()
+                        .is_none_or(|c| c.estimate(selected) != body_bytes)
+                    || self
+                        .buflo_startup_requested_chaff
+                        .get(&(*endpoint, request_id.0))
+                        != Some(&selected)
+                {
+                    continue;
+                }
+                let key = (*endpoint, opportunity.stream);
+                let Some(ack) = self.buflo_chaff_ack_observed_at.get(&key).copied() else {
+                    continue;
+                };
+                if ack > elapsed {
+                    continue;
+                }
+                let Some(state) = self.streams.get_mut(key.0, key.1) else {
+                    continue;
+                };
+                let Some(final_size) = state.activated_chaff_request_final_size() else {
+                    continue;
+                };
+                let Some((advertised, requested)) = state.receive.limits() else {
+                    continue;
+                };
+                let Some(known) = requested.checked_add(opportunity.exact) else {
+                    continue;
+                };
+                if advertised != requested {
+                    continue;
+                }
+                members.push(BufloAggregateStartupMember {
+                    endpoint: endpoint.0,
+                    stream: opportunity.stream.0,
+                    resource_id: selected,
+                    request_id: request_id.0,
+                    request_stream_final_size: final_size,
+                    ack_observed_at_us: duration_as_floor_micros(ack),
+                    advertised_limit: advertised,
+                    requested_limit: requested,
+                    known_limit: known,
+                    eligible_exact_capacity_bytes: opportunity.exact,
+                });
+                if members.len() == 5 {
+                    break;
+                }
+            }
+            let Ok(members): std::result::Result<[BufloAggregateStartupMember; 5], _> =
+                members.try_into()
+            else {
+                continue;
+            };
+            let Some(capacity) = members.iter().try_fold(0_u64, |sum, m| {
+                sum.checked_add(m.eligible_exact_capacity_bytes)
+            }) else {
+                continue;
+            };
+            if capacity < 1_200 {
+                continue;
+            }
+            startup.ready_at_us = Some(duration_as_floor_micros(elapsed));
+            startup.aggregate_endpoint = Some(endpoint.0);
+            startup.members = Some(members);
+            startup.aggregate_eligible_exact_capacity_bytes = Some(capacity);
+            _ = self.defense.arm_buflo_incoming_after_aggregate_ack(startup);
+            return;
+        }
+    }
+
     /// Honor the explicit prepared 10 ms incoming advertisement policy.
     ///
     /// The caller must validate the bound fixed 1200-byte/20 ms preparation.
@@ -1254,6 +1404,10 @@ impl QcsdController {
     }
 
     fn arm_buflo_incoming_if_ready(&mut self, elapsed: Duration) {
+        if self.buflo_aggregate_selected.is_some() {
+            self.arm_buflo_aggregate_incoming_if_ready(elapsed);
+            return;
+        }
         let Some(mut startup) = self.defense.diagnostics().buflo_incoming_startup else {
             return;
         };
@@ -2371,7 +2525,7 @@ impl QcsdController {
                 self.streams.record_chaff_request_acknowledgment(
                     endpoint, stream, role, offset, bytes, fin,
                 );
-                if self.defense.diagnostics().buflo_incoming_startup.is_some()
+                if self.buflo_startup_present()
                     && self
                         .streams
                         .get_mut(endpoint, stream)
@@ -2913,7 +3067,7 @@ impl QcsdController {
             && self.buflo_incoming_half_period_window == Some(Duration::from_micros(32_000))
             && self.terminal_primary_partial_cell_policy
             && self.buflo_retained_parser_policy
-            && self.defense.diagnostics().buflo_incoming_startup.is_some()
+            && self.buflo_startup_present()
             && !self.application_complete
             && self.defense.terminal_failure().is_none()
     }
@@ -5002,20 +5156,17 @@ impl QcsdController {
     fn next_dynamic_slot(&mut self, packet: crate::Packet) -> QcsdSlotId {
         if matches!(self.config.defense, DefenseConfig::Buflo(_))
             && packet.direction() == Direction::Outgoing
-            && let Some(startup) = self.defense.diagnostics().buflo_incoming_startup
+            && let Some((period_us, armed, armed_at_us)) = self.buflo_startup_timing()
             && let Ok(timestamp_us) = u64::try_from(packet.timestamp().as_micros())
-            && matches!(startup.period_us, 20_000 | 64_000)
+            && matches!(period_us, 20_000 | 64_000)
             && packet
                 .timestamp()
                 .as_nanos()
-                .is_multiple_of(u128::from(startup.period_us) * 1_000)
-            && let Some(previous_incoming_us) = timestamp_us.checked_sub(startup.period_us)
-            && let Some(expected_outgoing_id) = (timestamp_us / startup.period_us).checked_mul(2)
+                .is_multiple_of(u128::from(period_us) * 1_000)
+            && let Some(previous_incoming_us) = timestamp_us.checked_sub(period_us)
+            && let Some(expected_outgoing_id) = (timestamp_us / period_us).checked_mul(2)
             && self.control.next_slot_id.checked_add(1) == Some(expected_outgoing_id)
-            && (!startup.armed
-                || startup
-                    .armed_at_us
-                    .is_some_and(|armed_at| previous_incoming_us < armed_at))
+            && (!armed || armed_at_us.is_some_and(|armed_at| previous_incoming_us < armed_at))
         {
             // Exactly one absent startup incoming identity is reserved. If
             // another ID is missing/reused, leave the existing strict kernel
@@ -7663,10 +7814,8 @@ impl QcsdController {
         };
         for request in requests {
             if self
-                .defense
-                .diagnostics()
-                .buflo_incoming_startup
-                .is_some_and(|startup| !startup.armed)
+                .buflo_startup_timing()
+                .is_some_and(|(_, armed, _)| !armed)
             {
                 self.buflo_startup_requested_chaff.insert(
                     (request.endpoint, request.request_id.0),
@@ -29003,6 +29152,240 @@ mod tests {
         )));
         assert!(!controller.defense_diagnostics().buflo_schedule_stop_latched);
         assert!(controller.terminal_failure().is_some());
+    }
+
+    // These are controller/ACK-ledger unit fixtures, not physical packet proof.
+    fn fonts_aggregate_fixture() -> (QcsdController, Vec<(QcsdStreamId, QcsdRequestRole)>) {
+        let params = BufloParameters {
+            schema_version: 1,
+            interval_us: 64_000,
+            minimum_duration_us: 10_000_000,
+            packet_size: 1_200,
+            max_events: 10_000,
+            implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+            paper_equivalent: false,
+            duration_budget_policy: Some(
+                crate::BufloDurationBudgetPolicy::RapidV7Fixed64ms640Seconds,
+            ),
+        };
+        let mut c = QcsdController::with_defense(
+            QcsdConfig {
+                defense: DefenseConfig::Buflo(crate::BufloConfig {
+                    parameters: "aggregate-fixture".into(),
+                }),
+                low_watermark: 24_000,
+                max_chaff_streams: 5,
+                initial_max_stream_data: 16,
+                max_stream_data_excess: 1_000,
+                max_udp_payload_size: 1_200,
+                ..QcsdConfig::default()
+            },
+            Some(ResourceManifest {
+                resources: vec![Resource {
+                    id: 5,
+                    url: "https://fonts.example/bag.svg".into(),
+                    kind: "Image".into(),
+                    content_length: Some(559),
+                    data_length: 559,
+                    chaff_priority: true,
+                    known_valid: true,
+                    depends_on: vec![],
+                    headers: vec![],
+                }],
+            }),
+            Box::new(Buflo::from_parameters(params)),
+        )
+        .expect("aggregate fixture");
+        c.enable_buflo_half_period_incoming_window_for_interval(64_000)
+            .expect("half period");
+        c.enable_buflo_aggregate_incoming_startup(5, 559, [0xab; 32])
+            .expect("aggregate opt-in");
+        ready(&mut c, 1, "https://fonts.example");
+        c.poll(Duration::ZERO);
+        let requests: Vec<_> = c
+            .drain_actions()
+            .filter_map(|a| match a {
+                QcsdAction::RequestChaff {
+                    resource,
+                    request_id,
+                    ..
+                } => Some((resource.id, request_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requests.len(), 5);
+        let mut roles = Vec::new();
+        for (index, (resource_id, request_id)) in requests.into_iter().enumerate() {
+            let stream = QcsdStreamId((index as u64 + 1) * 4);
+            let role = QcsdRequestRole::Chaff {
+                resource_id,
+                request_id: Some(request_id),
+            };
+            c.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    role,
+                    expected_response_length: Some(559),
+                },
+                Duration::ZERO,
+            );
+            c.observe(
+                QcsdObservation::StreamDataTransmitted {
+                    endpoint: QcsdEndpointId(1),
+                    stream,
+                    role,
+                    offset: 0,
+                    bytes: 85,
+                    fin: true,
+                    slot: Some(QcsdSlotId(0)),
+                },
+                Duration::ZERO,
+            );
+            roles.push((stream, role));
+        }
+        c.drain_actions().for_each(drop);
+        (c, roles)
+    }
+
+    fn fonts_ack(
+        c: &mut QcsdController,
+        member: (QcsdStreamId, QcsdRequestRole),
+        offset: u64,
+        bytes: u64,
+        fin: bool,
+        at: u64,
+    ) {
+        c.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint: QcsdEndpointId(1),
+                stream: member.0,
+                role: member.1,
+                offset,
+                bytes,
+                fin,
+            },
+            Duration::from_micros(at),
+        );
+    }
+
+    #[test]
+    fn fonts_aggregate_requires_five_contiguous_fin_acks_and_never_rearms() {
+        let (mut c, roles) = fonts_aggregate_fixture();
+        for member in roles.iter().take(4) {
+            fonts_ack(&mut c, *member, 0, 85, true, 100);
+        }
+        fonts_ack(&mut c, roles[4], 85, 0, true, 200);
+        fonts_ack(&mut c, roles[4], 0, 40, false, 300);
+        fonts_ack(&mut c, roles[4], 41, 44, false, 300);
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(400));
+        assert!(
+            !c.defense_diagnostics()
+                .buflo_incoming_aggregate_startup
+                .expect("receipt")
+                .armed
+        );
+        fonts_ack(&mut c, (QcsdStreamId(1000), roles[4].1), 40, 1, false, 450);
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(500));
+        assert!(
+            !c.defense_diagnostics()
+                .buflo_incoming_aggregate_startup
+                .expect("receipt")
+                .armed
+        );
+        fonts_ack(&mut c, roles[4], 40, 1, false, 600);
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(700));
+        let before = c
+            .defense_diagnostics()
+            .buflo_incoming_aggregate_startup
+            .expect("receipt");
+        assert!(before.armed);
+        assert_eq!(before.armed_at_us, Some(64_000));
+        assert_eq!(before.aggregate_eligible_exact_capacity_bytes, Some(2_715));
+        assert!(c.defense_diagnostics().buflo_incoming_startup.is_none());
+        fonts_ack(&mut c, roles[4], 0, 85, true, 800);
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(900));
+        assert_eq!(
+            c.defense_diagnostics().buflo_incoming_aggregate_startup,
+            Some(before)
+        );
+    }
+
+    #[test]
+    fn fonts_aggregate_refuses_foreign_connection_stale_and_duplicate_request() {
+        for case in 0..3 {
+            let (mut c, mut roles) = fonts_aggregate_fixture();
+            if case == 2 {
+                c.streams
+                    .get_mut(QcsdEndpointId(1), roles[4].0)
+                    .expect("stream")
+                    .role = roles[3].1;
+                roles[4].1 = roles[3].1;
+            }
+            for member in &roles {
+                fonts_ack(&mut c, *member, 0, 85, true, 100);
+            }
+            if case == 0 {
+                ready(&mut c, 2, "https://fonts.example");
+            }
+            if case == 1 {
+                c.streams
+                    .mark_receive_unavailable(QcsdEndpointId(1), roles[4].0);
+            }
+            c.arm_buflo_incoming_if_ready(Duration::from_micros(200));
+            assert!(
+                !c.defense_diagnostics()
+                    .buflo_incoming_aggregate_startup
+                    .expect("receipt")
+                    .armed,
+                "case{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn fonts_aggregate_ordinary_allocator_commits_whole1200_without_duplicate_offsets() {
+        let (mut c, roles) = fonts_aggregate_fixture();
+        for member in &roles {
+            fonts_ack(&mut c, *member, 0, 85, true, 100);
+        }
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(200));
+        // Unit-only outgoing reduction lets the original next cadence materialize;
+        // no kernel or wire claim is made by this fixture.
+        c.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint: QcsdEndpointId(1),
+                slot: QcsdSlotId(0),
+                observed_size: 1_200,
+            },
+            Duration::ZERO,
+        );
+        c.poll(Duration::from_micros(64_000));
+        let grants: Vec<_> = c
+            .drain_actions()
+            .filter_map(|a| match a {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } if slot == QcsdSlotId(3) => Some((stream, absolute_limit)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(grants.len(), 3);
+        assert_eq!(
+            grants.iter().map(|(_, limit)| limit - 16).sum::<u64>(),
+            1_200
+        );
+        let available = c.streams.aggregate_capacity().chaff_incoming;
+        assert_eq!(available, 1_515);
+        c.poll(Duration::from_micros(64_000));
+        assert!(
+            !c.drain_actions()
+                .any(|a| matches!(a, QcsdAction::IncreaseReceiveLimit { .. }))
+        );
+        assert_eq!(c.streams.aggregate_capacity().chaff_incoming, available);
     }
 
     fn startup_cadence64_controller(known_valid: bool) -> QcsdController {

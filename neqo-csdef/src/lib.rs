@@ -38,7 +38,8 @@ pub use controller::{
     QcsdReceiveCancellationPlan, TerminalPrimaryPartialCellDiagnostics,
 };
 pub use defense::{
-    Buflo, BufloIncomingStartupDiagnostics, BurstPair, Capacity, CapacityAdjustment, CsBuflo,
+    Buflo, BufloAggregateIncomingStartupDiagnostics, BufloAggregateStartupMember,
+    BufloIncomingStartupDiagnostics, BurstPair, Capacity, CapacityAdjustment, CsBuflo,
     CsBufloRateTransitionDiagnostics, Defense, DefenseDiagnostics, DefenseMode, DefenseSignal,
     EventOutcome, Front, HistoricalWalkieTalkieSchemaFiveDiagnostic, MIN_SHAPED_PAYLOAD,
     ReceiverContinuationDisposition, RoundRobinScheduler, SignalKind, StaticSchedule, Tamaraw,
@@ -60,8 +61,10 @@ pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{
     ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
     QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
-    ResponseOnlyChaffManifestV4, ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
+    ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV5, ResponseOnlyChaffQualification,
+    ResponseOnlyChaffQualificationV4, ResponseOnlyChaffQualificationV5,
     ResponseOnlyQualifiedChaffResource, ResponseOnlyQualifiedChaffResourceV4,
+    ResponseOnlyQualifiedChaffResourceV5, SmallResponseAggregateCapacityContract,
     normalize_content_encoding, sanitize_chaff_headers,
 };
 pub use rng::{SplitMix64, derive};

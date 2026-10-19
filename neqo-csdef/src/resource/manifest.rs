@@ -1042,6 +1042,317 @@ impl ResponseOnlyChaffManifestV4 {
     }
 }
 
+/// Exact small-response capability; it never changes an ordinary cell's physics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmallResponseAggregateCapacityContract {
+    pub policy: String,
+    pub defense: String,
+    pub period_us: u64,
+    pub packet_size_bytes: u64,
+    pub initial_max_stream_data: u64,
+    pub member_count: usize,
+    pub max_members: usize,
+    pub connection_count: usize,
+    pub minimum_initial_exact_capacity_bytes: u64,
+    pub body_range_bytes: [u64; 2],
+    pub count_claimable_or_parser_budget: bool,
+    pub same_original_approved_origin_required: bool,
+}
+impl SmallResponseAggregateCapacityContract {
+    /// SHA-256 of sorted compact UTF-8 JSON including one final newline.
+    pub const SHA256: &'static str =
+        "2ccc8a42e9ad289add902d44887d0e728c41ed61c18ef5a396108557918e4d76";
+
+    pub fn fixed() -> Self {
+        Self {
+            policy: "same-endpoint-five-acked-known-capacity-v1".into(),
+            defense: "buflo".into(),
+            period_us: 64_000,
+            packet_size_bytes: 1_200,
+            initial_max_stream_data: 16,
+            member_count: 5,
+            max_members: 5,
+            connection_count: 1,
+            minimum_initial_exact_capacity_bytes: 1_200,
+            body_range_bytes: [1, 1_199],
+            count_claimable_or_parser_budget: false,
+            same_original_approved_origin_required: true,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.policy != "same-endpoint-five-acked-known-capacity-v1"
+            || self.defense != "buflo"
+            || self.period_us != 64_000
+            || self.packet_size_bytes != 1_200
+            || self.initial_max_stream_data != 16
+            || self.member_count != 5
+            || self.max_members != 5
+            || self.connection_count != 1
+            || self.minimum_initial_exact_capacity_bytes != 1_200
+            || self.body_range_bytes != [1, 1_199]
+            || self.count_claimable_or_parser_budget
+            || !self.same_original_approved_origin_required
+        {
+            return Err(Error::InvalidConfig(
+                "invalid five-small-response capacity contract".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Sustained response evidence for one schema-five aggregate identity-chaff request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOnlyChaffQualificationV5 {
+    /// Qualification schema version. Sustained identity artifacts use five.
+    pub schema_version: u32,
+    /// Exact qualification discriminator. Current artifacts use `response-only`.
+    pub qualification_scope: String,
+    /// Qualified request method. Current response-only artifacts support only `GET`.
+    pub method: String,
+    /// Exact derivation primitive used to create the isolated chaff request headers.
+    pub request_header_primitive: IdentityChaffRequestHeaderPrimitive,
+    /// Exact production nonblocking HTTP/3 request-stream bytes, including HEADERS framing.
+    pub request_stream_bytes: u64,
+    /// Maximum simultaneously active request count covered by qualification.
+    pub qualified_parallel_chaff_streams: usize,
+    /// Complete responses observed across all independent sustained epochs.
+    pub qualified_completion_count: usize,
+    /// Stable identity response established by sustained qualification.
+    pub expected_response: ExpectedChaffResponse,
+    /// SHA-256 binding every sustained response-identity receipt.
+    pub response_qualification_sha256: String,
+    pub aggregate_capacity_contract_sha256: String,
+}
+
+/// One selected resource projected into the schema-five aggregate identity-chaff contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOnlyQualifiedChaffResourceV5 {
+    /// Stable manifest-local identifier.
+    pub id: u32,
+    /// Absolute HTTPS URL.
+    pub url: String,
+    /// Browser-style resource type retained from the application workload.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Qualified complete response-body length.
+    pub content_length: Option<u64>,
+    /// Qualified complete response-body length.
+    pub data_length: u64,
+    /// Selection priority retained from the application workload.
+    pub chaff_priority: bool,
+    /// Whether the isolated request passed sustained qualification.
+    pub known_valid: bool,
+    /// Qualified selected-resource projections are dependency-free.
+    pub depends_on: Vec<u32>,
+    /// Exact identity-chaff request headers qualified for this representation.
+    pub headers: Vec<(String, String)>,
+    /// Immutable sustained request/response and evidence bindings.
+    pub chaff_qualification: ResponseOnlyChaffQualificationV5,
+}
+
+/// Strict schema-five aggregate capability for fixed64ms client-only BuFLO.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOnlyChaffManifestV5 {
+    /// Qualified-chaff manifest schema version. Sustained artifacts use five.
+    pub schema_version: u32,
+    /// Exact artifact discriminator preventing application-manifest confusion.
+    pub artifact_type: String,
+    /// Exact qualification discriminator. Current artifacts use `response-only`.
+    pub qualification_scope: String,
+    /// Raw SHA-256 of the exact frozen application workload file.
+    pub application_workload_sha256: String,
+    /// Application navigation root bound to resource zero.
+    pub application_resource_id: u32,
+    /// Frozen application-source resource selected after candidate-prefix qualification.
+    pub selected_chaff_resource_id: u32,
+    /// Exact maximum concurrent response-qualified cohort. Current artifacts use five.
+    pub qualified_parallel_chaff_streams: usize,
+    /// Exactly one independently qualified, dependency-free chaff projection.
+    pub resources: Vec<ResponseOnlyQualifiedChaffResourceV5>,
+    pub aggregate_capacity_contract: SmallResponseAggregateCapacityContract,
+}
+
+impl ResponseOnlyQualifiedChaffResourceV5 {
+    fn as_resource(&self) -> Resource {
+        Resource {
+            id: self.id,
+            url: self.url.clone(),
+            kind: self.kind.clone(),
+            content_length: self.content_length,
+            data_length: self.data_length,
+            chaff_priority: self.chaff_priority,
+            known_valid: self.known_valid,
+            depends_on: self.depends_on.clone(),
+            headers: self.headers.clone(),
+        }
+    }
+
+    fn validate(&self, qualified_parallel_chaff_streams: usize) -> Result<()> {
+        let resource = self.as_resource();
+        ResourceManifest {
+            resources: vec![resource.clone()],
+        }
+        .validate()?;
+        let qualification = &self.chaff_qualification;
+        let primitive = &qualification.request_header_primitive;
+        if qualification.schema_version != 5
+            || qualification.qualification_scope != "buflo-small-response-aggregate-v1"
+            || qualification.method != "GET"
+            || qualification.qualified_parallel_chaff_streams != qualified_parallel_chaff_streams
+            || qualification.qualified_completion_count != 120
+            || qualification.request_stream_bytes == 0
+            || primitive.mode != "identity-chaff-v1"
+            || primitive.copied_from_application != ["accept", "accept-language"]
+            || primitive.forced != [("accept-encoding".into(), "identity".into())]
+        {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only qualification or request-header primitive is invalid"
+                    .into(),
+            ));
+        }
+        let response = &qualification.expected_response;
+        if !(200..300).contains(&response.status)
+            || response.content_encoding != "identity"
+            || !(1..1_200).contains(&response.body_bytes)
+            || response
+                .body_bytes
+                .checked_sub(16)
+                .and_then(|n| n.checked_mul(5))
+                .is_none_or(|n| n < 1_200)
+            || !is_lower_hex_sha256(&response.body_sha256)
+            || !is_lower_hex_sha256(&qualification.response_qualification_sha256)
+            || !is_lower_hex_sha256(&qualification.aggregate_capacity_contract_sha256)
+        {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only expected response or qualification receipt is invalid"
+                    .into(),
+            ));
+        }
+        if !self.known_valid
+            || !self.depends_on.is_empty()
+            || self.content_length != Some(response.body_bytes)
+            || self.data_length != response.body_bytes
+            || resource.effective_length() != response.body_bytes
+        {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only resource must be known-valid, dependency-free, and bind both length fields exactly to expected_response.body_bytes"
+                    .into(),
+            ));
+        }
+        let names: Vec<_> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        if names != ["accept", "accept-encoding", "accept-language"]
+            || self.headers[1].1 != "identity"
+        {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only headers must be the exact lowercase identity-chaff projection"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ResponseOnlyChaffManifestV5 {
+    /// Load and strictly validate a schema-five aggregate response-only chaff manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, parsed, or validated.
+    pub fn from_json_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let input = fs::read_to_string(path)?;
+        Self::from_json(&input)
+    }
+
+    /// Parse and strictly validate a schema-five aggregate response-only chaff manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema or any sustained qualification binding is invalid.
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self = serde_json::from_str(input)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate the schema-five aggregate sustained response-only selected-resource contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong discriminator, resource count, or qualification.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 5
+            || self.artifact_type != "qcsd-qualified-chaff-manifest"
+            || self.qualification_scope != "buflo-small-response-aggregate-v1"
+        {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate chaff requires version5 and scope buflo-small-response-aggregate-v1"
+                    .into(),
+            ));
+        }
+        if !is_lower_hex_sha256(&self.application_workload_sha256) {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only application_workload_sha256 must be a lowercase SHA-256"
+                    .into(),
+            ));
+        }
+        if self.application_resource_id != 0 || self.qualified_parallel_chaff_streams != 5 {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only chaff requires application resource zero and exactly five qualified parallel streams"
+                    .into(),
+            ));
+        }
+        if self.resources.len() != 1 || self.resources[0].id != self.selected_chaff_resource_id {
+            return Err(Error::InvalidConfig(
+                "schema-five aggregate response-only chaff requires exactly one resource matching selected_chaff_resource_id"
+                    .into(),
+            ));
+        }
+        self.aggregate_capacity_contract.validate()?;
+        if self.resources[0]
+            .chaff_qualification
+            .aggregate_capacity_contract_sha256
+            != SmallResponseAggregateCapacityContract::SHA256
+        {
+            return Err(Error::InvalidConfig(
+                "aggregate capacity contract SHA-256 differs".into(),
+            ));
+        }
+        if self.selected_chaff_resource_id == 0 {
+            return Err(Error::InvalidConfig(
+                "aggregate cover cannot replace application resource zero".into(),
+            ));
+        }
+        self.resources[0].validate(self.qualified_parallel_chaff_streams)
+    }
+
+    /// Generic resource view consumed by the transport-independent controller.
+    #[must_use]
+    pub fn resource_manifest(&self) -> ResourceManifest {
+        ResourceManifest {
+            resources: self
+                .resources
+                .iter()
+                .map(ResponseOnlyQualifiedChaffResourceV5::as_resource)
+                .collect(),
+        }
+    }
+
+    /// Qualification associated with a manifest-local resource identifier.
+    #[must_use]
+    pub fn qualification(&self, resource_id: u32) -> Option<&ResponseOnlyChaffQualificationV5> {
+        self.resources
+            .iter()
+            .find(|resource| resource.id == resource_id)
+            .map(|resource| &resource.chaff_qualification)
+    }
+}
+
 /// Resource/dependency input for application and chaff requests.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

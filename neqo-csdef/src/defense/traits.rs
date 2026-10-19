@@ -279,6 +279,52 @@ pub struct BufloIncomingStartupDiagnostics {
     pub eligible_exact_capacity_bytes: Option<u64>,
 }
 
+/// One genuine issued chaff request contributing exact capacity to aggregate startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BufloAggregateStartupMember {
+    pub endpoint: u64,
+    pub stream: u64,
+    pub resource_id: u32,
+    pub request_id: u64,
+    pub request_stream_final_size: u64,
+    pub ack_observed_at_us: u64,
+    pub advertised_limit: u64,
+    pub requested_limit: u64,
+    pub known_limit: u64,
+    pub eligible_exact_capacity_bytes: u64,
+}
+
+fn serialize_aggregate_manifest_sha256<S: serde::Serializer>(
+    bytes: &[u8; 32],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    serializer.serialize_str(&hex)
+}
+
+/// Separate schema-two startup; no single stream is represented as a whole cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BufloAggregateIncomingStartupDiagnostics {
+    pub schema_version: u32,
+    pub policy: &'static str,
+    pub time_basis: &'static str,
+    pub period_us: u64,
+    pub packet_size_bytes: u16,
+    pub armed: bool,
+    pub armed_at_us: Option<u64>,
+    pub ready_at_us: Option<u64>,
+    pub startup_suppressed_opportunities: u64,
+    pub aggregate_endpoint: Option<u64>,
+    pub member_count: usize,
+    pub members: Option<[BufloAggregateStartupMember; 5]>,
+    pub aggregate_eligible_exact_capacity_bytes: Option<u64>,
+    #[serde(serialize_with = "serialize_aggregate_manifest_sha256")]
+    pub qualification_manifest_sha256: [u8; 32],
+}
+
 /// Defense-specific counters recorded with the terminal run artifact.
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
 #[expect(
@@ -289,6 +335,9 @@ pub struct DefenseDiagnostics {
     /// Explicit new-policy startup; absent for every historical/default mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buflo_incoming_startup: Option<BufloIncomingStartupDiagnostics>,
+    /// Distinct bounded aggregate startup; absent for all schema-one paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buflo_incoming_aggregate_startup: Option<BufloAggregateIncomingStartupDiagnostics>,
     /// Incoming schedule bytes handed to the shared receive-credit adapter.
     pub scheduled_incoming_requested_bytes: u64,
     /// Scheduled receive-credit bytes currently or terminally attributed to
@@ -732,6 +781,17 @@ pub trait Defense: Debug {
     }
     /// Arm incoming cells only from the controller's actual qualified ACK proof.
     fn arm_buflo_incoming_after_ack(&mut self, _ready: BufloIncomingStartupDiagnostics) -> bool {
+        false
+    }
+    /// Opt into the separate fixed64ms/five-small-response startup capability.
+    fn enable_buflo_aggregate_incoming_startup(&mut self, _manifest_sha256: [u8; 32]) -> bool {
+        false
+    }
+    /// Arm only from five actual issued, ACK-activated, exact-capacity members.
+    fn arm_buflo_incoming_after_aggregate_ack(
+        &mut self,
+        _ready: BufloAggregateIncomingStartupDiagnostics,
+    ) -> bool {
         false
     }
     /// Consume one observation.
