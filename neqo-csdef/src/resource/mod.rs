@@ -8,9 +8,9 @@ mod manifest;
 pub use manifest::{
     ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
     QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
-    ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV5, ResponseOnlyChaffQualification,
-    ResponseOnlyChaffQualificationV4, ResponseOnlyChaffQualificationV5,
+    ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV6, ResponseOnlyChaffQualification,
+    ResponseOnlyChaffQualificationV4, ResponseOnlyChaffQualificationV6,
     ResponseOnlyQualifiedChaffResource, ResponseOnlyQualifiedChaffResourceV4,
-    ResponseOnlyQualifiedChaffResourceV5, SmallResponseAggregateCapacityContract,
+    ResponseOnlyQualifiedChaffResourceV6, SmallResponseAggregateCapacityContract,
     normalize_content_encoding, sanitize_chaff_headers,
 };

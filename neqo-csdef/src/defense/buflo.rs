@@ -374,8 +374,8 @@ impl Defense for Buflo {
         // representative schema-one stream for this distinct capability.
         self.incoming_startup = None;
         self.incoming_aggregate_startup = Some(BufloAggregateIncomingStartupDiagnostics {
-            schema_version: 2,
-            policy: "qualified-five-chaff-terminal-ack-aggregate-cadence-start-v1",
+            schema_version: 3,
+            policy: "qualified-eight-chaff-terminal-ack-aggregate-cadence-start-v1",
             time_basis: "native-controller-defense-elapsed-us-v1",
             period_us: 64_000,
             packet_size_bytes: 1_200,
@@ -384,7 +384,7 @@ impl Defense for Buflo {
             ready_at_us: None,
             startup_suppressed_opportunities: 0,
             aggregate_endpoint: None,
-            member_count: 5,
+            member_count: 8,
             members: None,
             aggregate_eligible_exact_capacity_bytes: None,
             qualification_manifest_sha256: manifest_sha256,
@@ -409,13 +409,13 @@ impl Defense for Buflo {
         };
         if current.armed
             || self.incoming_startup.is_some()
-            || ready.schema_version != 2
+            || ready.schema_version != 3
             || ready.policy != current.policy
             || ready.time_basis != current.time_basis
             || ready.period_us != 64_000
             || ready.packet_size_bytes != 1_200
             || ready.qualification_manifest_sha256 != current.qualification_manifest_sha256
-            || ready.member_count != 5
+            || ready.member_count != 8
             || ready.armed
             || ready.armed_at_us.is_some()
             || self.scheduled_outgoing == 0

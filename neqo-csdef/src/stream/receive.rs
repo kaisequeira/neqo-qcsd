@@ -617,6 +617,50 @@ impl ReceiveState {
         Some((*requested_limit, increase))
     }
 
+    /// Finish only an observed pre-body framing requirement for the separate
+    /// small-response aggregate capability. The caller authenticates the
+    /// issued request and its complete FIN ACK. No body estimate or reserve
+    /// becomes parser permission, and the ordinary allocator stays unchanged.
+    pub(crate) fn aggregate_prebody_framing_lease(
+        &mut self,
+        min_remaining: u64,
+        pristine_data_boundary: bool,
+    ) -> Option<(u64, u64)> {
+        let Self::ReceivingHeaders {
+            advertised_limit,
+            requested_limit,
+            consumed,
+            parser_lease_capacity,
+            parser_lease_used,
+            parser_lease_exhausted,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let remaining = parser_lease_capacity.checked_sub(*parser_lease_used)?;
+        let target = requested_limit.checked_add(min_remaining)?;
+        if min_remaining == 0
+            || min_remaining > remaining
+            || *parser_lease_exhausted
+            || *requested_limit != *advertised_limit
+            || *consumed != *requested_limit
+            || *last_parser_lease_boundary == Some(*consumed)
+            || (pristine_data_boundary && *pending_parser_boundary != Some(*consumed))
+            || (!pristine_data_boundary && pending_parser_boundary.is_some())
+        {
+            return None;
+        }
+        *last_parser_lease_boundary = Some(*consumed);
+        *pending_parser_boundary = None;
+        *parser_lease_used += min_remaining;
+        *parser_lease_exhausted = *parser_lease_used == *parser_lease_capacity;
+        *requested_limit = target;
+        Some((target, min_remaining))
+    }
+
     /// Lease one maximum HTTP/3 frame-header prefix at a pristine DATA
     /// boundary after all exact receive capacity has been consumed, or after
     /// a proven terminal scheduled tail that cannot expose the next frame.

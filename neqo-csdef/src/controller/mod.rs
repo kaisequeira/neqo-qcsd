@@ -1202,7 +1202,7 @@ impl QcsdController {
         Ok(())
     }
 
-    /// Enable the separate, fully qualified five-small-response capability.
+    /// Enable the separate, fully qualified eight-small-response capability.
     pub fn enable_buflo_aggregate_incoming_startup(
         &mut self,
         resource_id: u32,
@@ -1212,11 +1212,12 @@ impl QcsdController {
         if !matches!(self.config.defense, DefenseConfig::Buflo(_))
             || self.buflo_incoming_half_period_window != Some(Duration::from_micros(32_000))
             || self.config.initial_max_stream_data != 16
-            || self.config.max_chaff_streams != 5
-            || !(1..1_200).contains(&body_bytes)
+            || self.config.max_chaff_streams != 8
+            || self.config.max_stream_data_excess != 1_000
+            || !(515..1_200).contains(&body_bytes)
             || body_bytes
                 .checked_sub(16)
-                .and_then(|n| n.checked_mul(5))
+                .and_then(|n| n.checked_mul(8))
                 .is_none_or(|n| n < 1_200)
             || self
                 .chaff
@@ -1230,7 +1231,7 @@ impl QcsdController {
                 .enable_buflo_aggregate_incoming_startup(manifest_sha256)
         {
             return Err(crate::Error::InvalidConfig(
-                "aggregate startup requires an unstarted fixed64ms five-stream exact-capacity contract".into(),
+                "aggregate startup requires an unstarted fixed64ms eight-stream exact-capacity contract".into(),
             ));
         }
         self.buflo_aggregate_selected = Some((resource_id, body_bytes));
@@ -1324,11 +1325,11 @@ impl QcsdController {
                     known_limit: known,
                     eligible_exact_capacity_bytes: opportunity.exact,
                 });
-                if members.len() == 5 {
+                if members.len() == 8 {
                     break;
                 }
             }
-            let Ok(members): std::result::Result<[BufloAggregateStartupMember; 5], _> =
+            let Ok(members): std::result::Result<[BufloAggregateStartupMember; 8], _> =
                 members.try_into()
             else {
                 continue;
@@ -2135,6 +2136,10 @@ impl QcsdController {
                 self.release_application_send_shaping_for(endpoint);
             }
             QcsdObservation::EndpointClosed { endpoint } => {
+                if self.buflo_aggregate_selected.is_some() {
+                    self.buflo_startup_requested_chaff
+                        .retain(|(candidate, _), _| *candidate != endpoint);
+                }
                 let abandoned_prearm = self.abandon_closed_endpoint_prearm(endpoint);
                 self.actions.retain(|action| {
                     !matches!(action, QcsdAction::LeaseParserReceive { endpoint: candidate, .. } if *candidate == endpoint)
@@ -2220,6 +2225,20 @@ impl QcsdController {
                     demand.boundary = None;
                 }
                 self.release_exact_claims(endpoint, stream);
+                if self.buflo_aggregate_selected.is_some() {
+                    self.streams.retain_aggregate_framing_debt(
+                        endpoint,
+                        stream,
+                        min_remaining,
+                        awaiting_data_frame,
+                    );
+                }
+                self.try_buflo_aggregate_prebody_framing_lease(
+                    endpoint,
+                    stream,
+                    min_remaining,
+                    awaiting_data_frame,
+                );
                 self.try_parser_lease(endpoint, stream, awaiting_data_frame);
             }
             QcsdObservation::ResponseHeaders {
@@ -2404,6 +2423,12 @@ impl QcsdController {
                 resource_id,
                 request_id,
             } => {
+                if self.buflo_aggregate_selected.is_some() {
+                    self.buflo_startup_requested_chaff
+                        .retain(|(_, id), resource| {
+                            request_id.map_or(*resource != resource_id, |request| *id != request.0)
+                        });
+                }
                 if let Some(chaff) = &mut self.chaff {
                     chaff.request_failed(resource_id, request_id);
                 }
@@ -2534,6 +2559,17 @@ impl QcsdController {
                     self.buflo_chaff_ack_observed_at
                         .entry((endpoint, stream))
                         .or_insert(at);
+                    if self.buflo_aggregate_selected.is_some() {
+                        for (candidate, id, debt, pristine) in
+                            self.streams.aggregate_framing_debts()
+                        {
+                            if (candidate, id) == (endpoint, stream) {
+                                self.try_buflo_aggregate_prebody_framing_lease(
+                                    endpoint, stream, debt, pristine,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             QcsdObservation::SlotSatisfied {
@@ -2740,6 +2776,18 @@ impl QcsdController {
         finish: crate::QcsdStreamFinish,
         at: Duration,
     ) {
+        if self.buflo_aggregate_selected.is_some()
+            && let Some(QcsdRequestRole::Chaff {
+                request_id: Some(request_id),
+                ..
+            }) = self
+                .streams
+                .get_mut(endpoint, stream)
+                .map(|state| state.role)
+        {
+            self.buflo_startup_requested_chaff
+                .remove(&(endpoint, request_id.0));
+        }
         self.retain_terminal_primary_partial_fin(endpoint, stream, finish, at);
         self.release_buflo_final_permission(endpoint, stream, finish, at);
         self.buflo_peer_fin_reads.remove(&(endpoint, stream));
@@ -3057,6 +3105,96 @@ impl QcsdController {
         );
         ledger.advertised = remaining;
         self.scheduled_incoming_advertised_bytes -= bytes;
+    }
+
+    /// Typed pre-body framing can finish a small qualified response during its
+    /// first owned cell, freeing an ordinary stream slot in time to transmit
+    /// the replacement request at the next outgoing cadence. This does not
+    /// advertise any estimated body bytes or re-arm incoming startup.
+    fn try_buflo_aggregate_prebody_framing_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        min_remaining: u64,
+        pristine_data_boundary: bool,
+    ) {
+        let Some((resource_id, body_bytes)) = self.buflo_aggregate_selected else {
+            return;
+        };
+        if self.defense.terminal_failure().is_some()
+            || self.defense.is_complete()
+            || !self.defense.accepts_new_chaff_requests()
+            || self.scheduler.endpoints() != [endpoint]
+            || self
+                .chaff
+                .as_ref()
+                .is_none_or(|c| c.estimate(resource_id) != body_bytes)
+            || !self
+                .buflo_chaff_ack_observed_at
+                .contains_key(&(endpoint, stream))
+            || self
+                .control
+                .credit
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|r| !r.is_empty())
+        {
+            return;
+        }
+        let Some(QcsdRequestRole::Chaff {
+            resource_id: selected,
+            request_id: Some(request_id),
+        }) = self
+            .streams
+            .get_mut(endpoint, stream)
+            .map(|state| state.role)
+        else {
+            return;
+        };
+        if selected != resource_id
+            || self
+                .buflo_startup_requested_chaff
+                .get(&(endpoint, request_id.0))
+                != Some(&selected)
+        {
+            return;
+        }
+        let Some(lease) = self.streams.aggregate_prebody_framing_lease(
+            endpoint,
+            stream,
+            resource_id,
+            body_bytes,
+            min_remaining,
+            pristine_data_boundary,
+        ) else {
+            return;
+        };
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                reservation_debited: false,
+                start: lease.absolute_limit.saturating_sub(lease.increase),
+                end: lease.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: false,
+            });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: None,
+        });
     }
 
     /// Keep compulsory application request-ACK evidence inside the existing
@@ -5526,6 +5664,11 @@ impl QcsdController {
     }
 
     fn retry_pending_parser_leases(&mut self) {
+        if self.buflo_aggregate_selected.is_some() {
+            for (endpoint, stream, debt, pristine) in self.streams.aggregate_framing_debts() {
+                self.try_buflo_aggregate_prebody_framing_lease(endpoint, stream, debt, pristine);
+            }
+        }
         if !self.buflo_retained_parser_policy {
             for (endpoint, stream) in self.streams.pending_parser_boundaries() {
                 self.try_parser_lease(endpoint, stream, true);
@@ -7271,6 +7414,10 @@ impl QcsdController {
                 ..
             } = action
             {
+                if self.buflo_aggregate_selected.is_some() {
+                    self.buflo_startup_requested_chaff
+                        .retain(|(_, id), _| *id != request_id.0);
+                }
                 if let Some(chaff) = &mut self.chaff {
                     chaff.request_failed(resource.id, Some(request_id));
                 }
@@ -7816,6 +7963,7 @@ impl QcsdController {
             if self
                 .buflo_startup_timing()
                 .is_some_and(|(_, armed, _)| !armed)
+                || self.buflo_aggregate_selected.is_some()
             {
                 self.buflo_startup_requested_chaff.insert(
                     (request.endpoint, request.request_id.0),
@@ -29174,7 +29322,7 @@ mod tests {
                     parameters: "aggregate-fixture".into(),
                 }),
                 low_watermark: 24_000,
-                max_chaff_streams: 5,
+                max_chaff_streams: 8,
                 initial_max_stream_data: 16,
                 max_stream_data_excess: 1_000,
                 max_udp_payload_size: 1_200,
@@ -29213,7 +29361,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 8);
         let mut roles = Vec::new();
         for (index, (resource_id, request_id)) in requests.into_iter().enumerate() {
             let stream = QcsdStreamId((index as u64 + 1) * 4);
@@ -29226,7 +29374,7 @@ mod tests {
                     endpoint: QcsdEndpointId(1),
                     stream,
                     role,
-                    expected_response_length: Some(559),
+                    expected_response_length: None,
                 },
                 Duration::ZERO,
             );
@@ -29270,14 +29418,14 @@ mod tests {
     }
 
     #[test]
-    fn fonts_aggregate_requires_five_contiguous_fin_acks_and_never_rearms() {
+    fn fonts_aggregate_requires_eight_contiguous_fin_acks_and_never_rearms() {
         let (mut c, roles) = fonts_aggregate_fixture();
-        for member in roles.iter().take(4) {
+        for member in roles.iter().take(7) {
             fonts_ack(&mut c, *member, 0, 85, true, 100);
         }
-        fonts_ack(&mut c, roles[4], 85, 0, true, 200);
-        fonts_ack(&mut c, roles[4], 0, 40, false, 300);
-        fonts_ack(&mut c, roles[4], 41, 44, false, 300);
+        fonts_ack(&mut c, roles[7], 85, 0, true, 200);
+        fonts_ack(&mut c, roles[7], 0, 40, false, 300);
+        fonts_ack(&mut c, roles[7], 41, 44, false, 300);
         c.arm_buflo_incoming_if_ready(Duration::from_micros(400));
         assert!(
             !c.defense_diagnostics()
@@ -29285,7 +29433,7 @@ mod tests {
                 .expect("receipt")
                 .armed
         );
-        fonts_ack(&mut c, (QcsdStreamId(1000), roles[4].1), 40, 1, false, 450);
+        fonts_ack(&mut c, (QcsdStreamId(1000), roles[7].1), 40, 1, false, 450);
         c.arm_buflo_incoming_if_ready(Duration::from_micros(500));
         assert!(
             !c.defense_diagnostics()
@@ -29293,7 +29441,7 @@ mod tests {
                 .expect("receipt")
                 .armed
         );
-        fonts_ack(&mut c, roles[4], 40, 1, false, 600);
+        fonts_ack(&mut c, roles[7], 40, 1, false, 600);
         c.arm_buflo_incoming_if_ready(Duration::from_micros(700));
         let before = c
             .defense_diagnostics()
@@ -29301,9 +29449,9 @@ mod tests {
             .expect("receipt");
         assert!(before.armed);
         assert_eq!(before.armed_at_us, Some(64_000));
-        assert_eq!(before.aggregate_eligible_exact_capacity_bytes, Some(2_715));
+        assert_eq!(before.aggregate_eligible_exact_capacity_bytes, Some(4_344));
         assert!(c.defense_diagnostics().buflo_incoming_startup.is_none());
-        fonts_ack(&mut c, roles[4], 0, 85, true, 800);
+        fonts_ack(&mut c, roles[7], 0, 85, true, 800);
         c.arm_buflo_incoming_if_ready(Duration::from_micros(900));
         assert_eq!(
             c.defense_diagnostics().buflo_incoming_aggregate_startup,
@@ -29317,10 +29465,10 @@ mod tests {
             let (mut c, mut roles) = fonts_aggregate_fixture();
             if case == 2 {
                 c.streams
-                    .get_mut(QcsdEndpointId(1), roles[4].0)
+                    .get_mut(QcsdEndpointId(1), roles[7].0)
                     .expect("stream")
-                    .role = roles[3].1;
-                roles[4].1 = roles[3].1;
+                    .role = roles[6].1;
+                roles[7].1 = roles[6].1;
             }
             for member in &roles {
                 fonts_ack(&mut c, *member, 0, 85, true, 100);
@@ -29330,7 +29478,7 @@ mod tests {
             }
             if case == 1 {
                 c.streams
-                    .mark_receive_unavailable(QcsdEndpointId(1), roles[4].0);
+                    .mark_receive_unavailable(QcsdEndpointId(1), roles[7].0);
             }
             c.arm_buflo_incoming_if_ready(Duration::from_micros(200));
             assert!(
@@ -29379,13 +29527,584 @@ mod tests {
             1_200
         );
         let available = c.streams.aggregate_capacity().chaff_incoming;
-        assert_eq!(available, 1_515);
+        assert_eq!(available, 3_144);
         c.poll(Duration::from_micros(64_000));
         assert!(
             !c.drain_actions()
                 .any(|a| matches!(a, QcsdAction::IncreaseReceiveLimit { .. }))
         );
         assert_eq!(c.streams.aggregate_capacity().chaff_incoming, available);
+    }
+
+    // These controller fixtures make no physical packet or latency claim.
+    // Their typed observation/action API was already present in Native127.
+    fn fonts128_finish_framing_lease(
+        c: &mut QcsdController,
+        stream: QcsdStreamId,
+        previous: u64,
+        debt: u64,
+        at: u64,
+    ) {
+        let leases: Vec<_> = c
+            .drain_actions()
+            .filter_map(|action| match action {
+                QcsdAction::LeaseParserReceive {
+                    endpoint,
+                    stream: id,
+                    absolute_limit,
+                    increase,
+                    owner,
+                } => Some((endpoint, id, absolute_limit, increase, owner)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leases.len(),
+            1,
+            "genuine acknowledged pre-body framing debt must produce exactly one bounded lease"
+        );
+        assert_eq!(
+            leases[0],
+            (QcsdEndpointId(1), stream, previous + debt, debt, None)
+        );
+        let ranges = c
+            .parser_lease_ranges
+            .get(&(QcsdEndpointId(1), stream))
+            .expect("unowned framing ledger");
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].owner.is_none() && ranges[0].unowned && !ranges[0].reservation_debited);
+        c.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: QcsdEndpointId(1),
+                stream,
+                absolute_limit: previous + debt,
+                slot: None,
+            },
+            Duration::from_micros(at),
+        );
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint: QcsdEndpointId(1),
+                stream,
+                bytes: debt,
+            },
+            Duration::from_micros(at + 1),
+        );
+    }
+
+    fn fonts128_parse_initial_framing(
+        c: &mut QcsdController,
+        member: (QcsdStreamId, QcsdRequestRole),
+        at: u64,
+        header_debt_already_observed: bool,
+    ) {
+        if !header_debt_already_observed {
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: QcsdEndpointId(1),
+                    stream: member.0,
+                    bytes: 16,
+                },
+                Duration::from_micros(at),
+            );
+            c.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint: QcsdEndpointId(1),
+                    stream: member.0,
+                    min_remaining: 7,
+                    awaiting_data_frame: false,
+                },
+                Duration::from_micros(at + 1),
+            );
+        }
+        fonts128_finish_framing_lease(c, member.0, 16, 7, at + 2);
+        c.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint: QcsdEndpointId(1),
+                stream: member.0,
+                frame_bytes: 23,
+                status: Some(200),
+                content_length: Some(559),
+            },
+            Duration::from_micros(at + 4),
+        );
+        c.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint: QcsdEndpointId(1),
+                stream: member.0,
+                min_remaining: 1,
+                awaiting_data_frame: true,
+            },
+            Duration::from_micros(at + 5),
+        );
+        fonts128_finish_framing_lease(c, member.0, 23, 1, at + 6);
+        c.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint: QcsdEndpointId(1),
+                stream: member.0,
+                min_remaining: 2,
+                awaiting_data_frame: false,
+            },
+            Duration::from_micros(at + 8),
+        );
+        fonts128_finish_framing_lease(c, member.0, 24, 2, at + 9);
+        c.observe(
+            QcsdObservation::DataFrame {
+                endpoint: QcsdEndpointId(1),
+                stream: member.0,
+                frame_header_bytes: 3,
+                data_bytes: 559,
+            },
+            Duration::from_micros(at + 11),
+        );
+        assert_eq!(
+            c.streams.receive_limits(QcsdEndpointId(1), member.0),
+            Some((26, 26))
+        );
+        assert_eq!(c.streams.consumed(QcsdEndpointId(1), member.0), Some(26));
+        assert!(matches!(
+            c.streams
+                .get_mut(QcsdEndpointId(1), member.0)
+                .expect("live parsed stream")
+                .receive,
+            crate::stream::ReceiveState::ReceivingData {
+                parser_lease_used: 10,
+                ..
+            }
+        ));
+        assert!(
+            c.drain_actions()
+                .all(|a| !matches!(a, QcsdAction::LeaseParserReceive { .. }))
+        );
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one causal public-API fixture owns request/ACK/framing and sixteen ordinary whole cells"
+    )]
+    fn fonts128_run_sustained_refill(ack_replacements: bool) -> (u64, u64) {
+        let (mut c, roles) = fonts_aggregate_fixture();
+        let endpoint = QcsdEndpointId(1);
+        // A frame-reader requirement may precede its request's final ACK.
+        // Retaining that exact debt must not itself advertise any bytes.
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: roles[0].0,
+                bytes: 16,
+            },
+            Duration::from_micros(10),
+        );
+        c.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: roles[0].0,
+                min_remaining: 7,
+                awaiting_data_frame: false,
+            },
+            Duration::from_micros(20),
+        );
+        assert!(
+            c.drain_actions()
+                .all(|a| !matches!(a, QcsdAction::LeaseParserReceive { .. }))
+        );
+        fonts_ack(&mut c, roles[0], 0, 85, true, 30);
+        fonts128_parse_initial_framing(&mut c, roles[0], 40, true);
+        for (i, member) in roles.iter().copied().enumerate().skip(1) {
+            let at = 100 + u64::try_from(i).expect("small member index") * 20;
+            fonts_ack(&mut c, member, 0, 85, true, at);
+            fonts128_parse_initial_framing(&mut c, member, at + 1, false);
+        }
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(500));
+        assert!(
+            c.defense_diagnostics()
+                .buflo_incoming_aggregate_startup
+                .expect("receipt")
+                .armed
+        );
+        c.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(501),
+        );
+        c.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot: QcsdSlotId(0),
+                observed_size: 1_200,
+            },
+            Duration::from_micros(502),
+        );
+        c.drain_actions().for_each(drop);
+        let mut limits: std::collections::HashMap<_, _> =
+            roles.iter().map(|(s, _)| (*s, 26_u64)).collect();
+        let mut waiting = Vec::<(QcsdStreamId, QcsdRequestRole, u64)>::new();
+        let mut next_stream = 4 * (u64::try_from(roles.len()).expect("bounded members") + 1);
+        let mut finished = 0_u64;
+        let mut replacements = 0_u64;
+        let mut cells = 0_u64;
+        for tick in 0..16_u64 {
+            let at = (tick + 1) * 64_000;
+            let mut remaining = Vec::new();
+            for (stream, role, due) in waiting.drain(..) {
+                if ack_replacements && due == tick {
+                    fonts_ack(&mut c, (stream, role), 0, 85, true, at - 100);
+                    fonts128_parse_initial_framing(&mut c, (stream, role), at - 90, false);
+                    *limits.get_mut(&stream).expect("opened replacement") = 26;
+                } else {
+                    remaining.push((stream, role, due));
+                }
+            }
+            waiting = remaining;
+            c.poll(Duration::from_micros(at));
+            let actions: Vec<_> = c.drain_actions().collect();
+            if actions.iter().any(|a| {
+                matches!(
+                    a,
+                    QcsdAction::SlotMissed {
+                        reason: MissedSlotReason::InsufficientIncomingCapacity,
+                        ..
+                    }
+                )
+            }) {
+                assert!(
+                    !ack_replacements,
+                    "eight genuinely ACKed finite responses must sustain this bounded two-intervening-cell fixture: {actions:?}"
+                );
+                assert!(c.terminal_failure().is_some());
+                return (cells, replacements);
+            }
+            assert!(
+                actions
+                    .iter()
+                    .all(|a| !matches!(a, QcsdAction::SlotMissed { .. })),
+                "{actions:?}"
+            );
+            let outgoing: Vec<_> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    QcsdAction::SendPacket { slot, packet, .. }
+                    | QcsdAction::CommitPrearmedPacket { slot, packet, .. } => {
+                        Some((*slot, *packet))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outgoing.len(), 1);
+            assert_eq!(outgoing[0].1, outgoing_packet(Duration::from_micros(at)));
+            for action in &actions {
+                if let QcsdAction::RequestChaff {
+                    endpoint: e,
+                    resource,
+                    request_id,
+                } = action
+                {
+                    assert_eq!(*e, endpoint);
+                    assert_eq!(resource.id, 5);
+                    let stream = QcsdStreamId(next_stream);
+                    next_stream += 4;
+                    let role = QcsdRequestRole::Chaff {
+                        resource_id: resource.id,
+                        request_id: Some(*request_id),
+                    };
+                    c.observe(
+                        QcsdObservation::StreamOpened {
+                            endpoint,
+                            stream,
+                            role,
+                            expected_response_length: None,
+                        },
+                        Duration::from_micros(at + 1),
+                    );
+                    c.observe(
+                        QcsdObservation::StreamDataTransmitted {
+                            endpoint,
+                            stream,
+                            role,
+                            offset: 0,
+                            bytes: 85,
+                            fin: true,
+                            slot: Some(outgoing[0].0),
+                        },
+                        Duration::from_micros(at + 2),
+                    );
+                    assert_eq!(limits.insert(stream, 16), None);
+                    // FIN at k -> GET in outgoing k+1 -> ACK/framing by k+3:
+                    // exactly two intervening incoming cells, not an RTT promise.
+                    waiting.push((stream, role, tick + 2));
+                    replacements += 1;
+                }
+            }
+            c.observe(
+                QcsdObservation::SlotSatisfied {
+                    endpoint,
+                    slot: outgoing[0].0,
+                    observed_size: 1_200,
+                },
+                Duration::from_micros(at + 3),
+            );
+            let mut grants = Vec::new();
+            for action in actions {
+                if let QcsdAction::IncreaseReceiveLimit {
+                    endpoint: e,
+                    stream,
+                    absolute_limit,
+                    packet,
+                    slot,
+                } = action
+                {
+                    assert_eq!(e, endpoint);
+                    assert_eq!(packet, incoming_packet(Duration::from_micros(at)));
+                    let previous = limits.get_mut(&stream).expect("live stream");
+                    let increase = absolute_limit
+                        .checked_sub(*previous)
+                        .expect("monotonic offset");
+                    assert!(increase > 0 && absolute_limit <= 585);
+                    assert!(
+                        !waiting.iter().any(|(id, _, _)| *id == stream),
+                        "unACKed replacements contribute no capacity"
+                    );
+                    *previous = absolute_limit;
+                    grants.push((stream, absolute_limit, increase, slot));
+                }
+            }
+            assert_eq!(grants.iter().map(|g| g.2).sum::<u64>(), 1_200);
+            let slot = grants[0].3;
+            assert!(grants.iter().all(|g| g.3 == slot));
+            for &(stream, absolute_limit, _, _) in &grants {
+                c.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint,
+                        stream,
+                        absolute_limit,
+                        slot: Some(slot),
+                    },
+                    Duration::from_micros(at + 4),
+                );
+            }
+            assert!(c.incoming_slot_is_locally_realized(slot));
+            for &(stream, absolute_limit, bytes, _) in &grants {
+                c.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream,
+                        bytes,
+                    },
+                    Duration::from_micros(at + 5),
+                );
+                if absolute_limit == 585 {
+                    c.observe(
+                        QcsdObservation::StreamFinished {
+                            endpoint,
+                            stream,
+                            finish: QcsdStreamFinish::Fin,
+                        },
+                        Duration::from_micros(at + 6),
+                    );
+                    limits.remove(&stream).expect("one genuine FIN per stream");
+                    finished += 1;
+                }
+            }
+            c.drain_actions().for_each(drop);
+            assert_eq!(c.terminal_failure(), None);
+            cells += 1;
+        }
+        assert!(
+            finished >= 24 && replacements >= 24,
+            "at least three eight-member refill rounds"
+        );
+        let d = c.defense_diagnostics();
+        assert_eq!(d.scheduled_incoming_requested_bytes, 19_200);
+        assert_eq!(d.scheduled_incoming_consumed_bytes, 19_200);
+        assert_eq!(d.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(d.buflo_missed_incoming_cells, 0);
+        (cells, replacements)
+    }
+
+    #[test]
+    fn fonts128_exact_framing_and_sixteen_cadence_refill() {
+        assert_eq!(fonts128_run_sustained_refill(true).0, 16);
+    }
+
+    #[test]
+    fn fonts128_delayed_unacknowledged_replacements_fail_honestly() {
+        let (cells, replacements) = fonts128_run_sustained_refill(false);
+        assert_eq!(cells, 3);
+        assert!(replacements > 0);
+    }
+
+    #[test]
+    fn fonts128_framing_refuses_unproven_stale_closed_body_and_lifetime_debt() {
+        for case in 0..14 {
+            let (mut c, roles) = fonts_aggregate_fixture();
+            let endpoint = QcsdEndpointId(1);
+            let member = roles[0];
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream: member.0,
+                    bytes: 16,
+                },
+                Duration::from_micros(10),
+            );
+            let mut role = member.1;
+            let mut ack_endpoint = endpoint;
+            let mut fin = true;
+            match case {
+                0 => fin = false,
+                1 => role = QcsdRequestRole::Application,
+                2 => ack_endpoint = QcsdEndpointId(2),
+                3 => {
+                    role = QcsdRequestRole::Chaff {
+                        resource_id: 5,
+                        request_id: Some(crate::QcsdChaffRequestId(999)),
+                    }
+                }
+                4 => {
+                    role = QcsdRequestRole::Chaff {
+                        resource_id: 6,
+                        request_id: match member.1 {
+                            QcsdRequestRole::Chaff { request_id, .. } => request_id,
+                            _ => unreachable!(),
+                        },
+                    }
+                }
+                _ => {}
+            }
+            c.observe(
+                QcsdObservation::StreamDataAcknowledged {
+                    endpoint: ack_endpoint,
+                    stream: member.0,
+                    role,
+                    offset: 0,
+                    bytes: 85,
+                    fin,
+                },
+                Duration::from_micros(20),
+            );
+            match case {
+                5 => {
+                    c.streams.mark_receive_unavailable(endpoint, member.0);
+                }
+                6 => {
+                    if let crate::stream::ReceiveState::ReceivingHeaders {
+                        requested_limit, ..
+                    } = &mut c.streams.get_mut(endpoint, member.0).expect("live").receive
+                    {
+                        *requested_limit = 17;
+                    }
+                }
+                7 => {
+                    if let crate::stream::ReceiveState::ReceivingHeaders {
+                        parser_lease_used, ..
+                    } = &mut c.streams.get_mut(endpoint, member.0).expect("live").receive
+                    {
+                        *parser_lease_used = 994;
+                    }
+                }
+                8 => {
+                    if let crate::stream::ReceiveState::ReceivingHeaders {
+                        last_parser_lease_boundary,
+                        ..
+                    } = &mut c.streams.get_mut(endpoint, member.0).expect("live").receive
+                    {
+                        *last_parser_lease_boundary = Some(16);
+                    }
+                }
+                9 => {
+                    c.observe(
+                        QcsdObservation::ResponseHeaders {
+                            endpoint,
+                            stream: member.0,
+                            frame_bytes: 23,
+                            status: Some(200),
+                            content_length: Some(559),
+                        },
+                        Duration::from_micros(21),
+                    );
+                    c.observe(
+                        QcsdObservation::DataFrame {
+                            endpoint,
+                            stream: member.0,
+                            frame_header_bytes: 3,
+                            data_bytes: 559,
+                        },
+                        Duration::from_micros(22),
+                    );
+                }
+                10 => {
+                    c.observe(
+                        QcsdObservation::EndpointClosed { endpoint },
+                        Duration::from_micros(21),
+                    );
+                }
+                11 => {
+                    c.observe(
+                        QcsdObservation::ResponseHeaders {
+                            endpoint,
+                            stream: member.0,
+                            frame_bytes: 23,
+                            status: Some(200),
+                            content_length: Some(558),
+                        },
+                        Duration::from_micros(21),
+                    );
+                }
+                _ => {}
+            }
+            let debt = match case {
+                12 => 0,
+                13 => 1_001,
+                _ => 7,
+            };
+            c.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream: member.0,
+                    min_remaining: debt,
+                    awaiting_data_frame: false,
+                },
+                Duration::from_micros(30),
+            );
+            assert!(
+                c.drain_actions()
+                    .all(|a| !matches!(a, QcsdAction::LeaseParserReceive { .. })),
+                "case{case}"
+            );
+            c.retry_pending_parser_leases();
+            assert!(
+                c.drain_actions()
+                    .all(|a| !matches!(a, QcsdAction::LeaseParserReceive { .. })),
+                "retry case{case}"
+            );
+        }
+        // The old failed five-member aggregate is historical, not silently
+        // accepted as the prospective eight-member capability.
+        let (mut c, _) = fonts_aggregate_fixture();
+        c.config.max_chaff_streams = 5;
+        assert!(
+            c.enable_buflo_aggregate_incoming_startup(5, 559, [0xab; 32])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fonts128_full_559_residue_cycle_exposes_five_and_bounds_eight_conditionally() {
+        // Arithmetic only, independent of the real controller regression above.
+        // At most one partial FIFO body can be unavailable in addition to the
+        // explicitly modeled two intervening cells. This is not a latency proof.
+        let five: Vec<_> = (0..559_u64)
+            .map(|k| 5 * 559 - 1_200 - ((k * 1_200) % 559))
+            .collect();
+        assert_eq!(five[5], 1_185);
+        assert_eq!(five.iter().min(), Some(&1_037));
+        let eight: Vec<_> = (0..559_u64)
+            .map(|k| 8 * 559 - 2_400 - ((k * 1_200) % 559))
+            .collect();
+        assert_eq!(eight.iter().min(), Some(&1_514));
+        assert!(eight.iter().all(|n| *n >= 1_200));
+        for body in 515..1_200_u64 {
+            assert!(7 * body - 2_400 + 1 >= 1_200);
+        }
     }
 
     fn startup_cadence64_controller(known_valid: bool) -> QcsdController {

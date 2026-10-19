@@ -305,7 +305,7 @@ fn serialize_aggregate_manifest_sha256<S: serde::Serializer>(
     serializer.serialize_str(&hex)
 }
 
-/// Separate schema-two startup; no single stream is represented as a whole cell.
+/// Separate schema-three startup; no single stream is represented as a whole cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct BufloAggregateIncomingStartupDiagnostics {
     pub schema_version: u32,
@@ -319,7 +319,7 @@ pub struct BufloAggregateIncomingStartupDiagnostics {
     pub startup_suppressed_opportunities: u64,
     pub aggregate_endpoint: Option<u64>,
     pub member_count: usize,
-    pub members: Option<[BufloAggregateStartupMember; 5]>,
+    pub members: Option<[BufloAggregateStartupMember; 8]>,
     pub aggregate_eligible_exact_capacity_bytes: Option<u64>,
     #[serde(serialize_with = "serialize_aggregate_manifest_sha256")]
     pub qualification_manifest_sha256: [u8; 32],

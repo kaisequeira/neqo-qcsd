@@ -37,9 +37,9 @@ use neqo_csdef::{
     QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
     QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
     QcsdSlotOutcome, QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
-    ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV5,
+    ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV6,
     ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
-    ResponseOnlyChaffQualificationV5, SmallResponseAggregateCapacityContract, StaticMode,
+    ResponseOnlyChaffQualificationV6, SmallResponseAggregateCapacityContract, StaticMode,
     TimestampedQcsdObservation, TrafficMorphingEgress, WalkieTalkie,
     WalkieTalkieQualificationBinding, derive, normalize_content_encoding, sanitize_chaff_headers,
 };
@@ -1163,7 +1163,7 @@ enum RuntimeChaffManifest {
     SchemaTwo(ChaffManifest),
     ResponseOnlyV3(ResponseOnlyChaffManifest),
     ResponseOnlyV4(ResponseOnlyChaffManifestV4),
-    SmallResponseAggregateV5(ResponseOnlyChaffManifestV5),
+    SmallResponseAggregateV6(ResponseOnlyChaffManifestV6),
 }
 
 struct RuntimeChaffQualification<'a> {
@@ -1209,11 +1209,11 @@ impl RuntimeChaffManifest {
             Some(2) => ChaffManifest::from_json(input).map(Self::SchemaTwo),
             Some(3) => ResponseOnlyChaffManifest::from_json(input).map(Self::ResponseOnlyV3),
             Some(4) => ResponseOnlyChaffManifestV4::from_json(input).map(Self::ResponseOnlyV4),
-            Some(5) => {
-                ResponseOnlyChaffManifestV5::from_json(input).map(Self::SmallResponseAggregateV5)
+            Some(6) => {
+                ResponseOnlyChaffManifestV6::from_json(input).map(Self::SmallResponseAggregateV6)
             }
             _ => Err(neqo_csdef::Error::InvalidConfig(
-                "qualified chaff manifest schema_version must be 2, 3, 4, or explicit aggregate5"
+                "qualified chaff manifest schema_version must be 2, 3, 4, or explicit aggregate6"
                     .into(),
             )),
         }
@@ -1224,14 +1224,14 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => Some(manifest),
             Self::ResponseOnlyV3(_)
             | Self::ResponseOnlyV4(_)
-            | Self::SmallResponseAggregateV5(_) => None,
+            | Self::SmallResponseAggregateV6(_) => None,
         }
     }
 
     const fn is_response_only(&self) -> bool {
         matches!(
             self,
-            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) | Self::SmallResponseAggregateV5(_)
+            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) | Self::SmallResponseAggregateV6(_)
         )
     }
 
@@ -1240,7 +1240,7 @@ impl RuntimeChaffManifest {
     }
 
     const fn is_small_response_aggregate(&self) -> bool {
-        matches!(self, Self::SmallResponseAggregateV5(_))
+        matches!(self, Self::SmallResponseAggregateV6(_))
     }
 
     const fn uses_identity_chaff(&self) -> bool {
@@ -1252,7 +1252,7 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => &manifest.application_workload_sha256,
             Self::ResponseOnlyV3(manifest) => &manifest.application_workload_sha256,
             Self::ResponseOnlyV4(manifest) => &manifest.application_workload_sha256,
-            Self::SmallResponseAggregateV5(manifest) => &manifest.application_workload_sha256,
+            Self::SmallResponseAggregateV6(manifest) => &manifest.application_workload_sha256,
         }
     }
 
@@ -1261,7 +1261,7 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => manifest.application_resource_id,
             Self::ResponseOnlyV3(manifest) => manifest.application_resource_id,
             Self::ResponseOnlyV4(manifest) => manifest.application_resource_id,
-            Self::SmallResponseAggregateV5(manifest) => manifest.application_resource_id,
+            Self::SmallResponseAggregateV6(manifest) => manifest.application_resource_id,
         }
     }
 
@@ -1270,7 +1270,7 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => manifest.selected_chaff_resource_id,
             Self::ResponseOnlyV3(manifest) => manifest.selected_chaff_resource_id,
             Self::ResponseOnlyV4(manifest) => manifest.selected_chaff_resource_id,
-            Self::SmallResponseAggregateV5(manifest) => manifest.selected_chaff_resource_id,
+            Self::SmallResponseAggregateV6(manifest) => manifest.selected_chaff_resource_id,
         }
     }
 
@@ -1279,7 +1279,7 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => manifest.qualified_parallel_chaff_streams,
             Self::ResponseOnlyV3(manifest) => manifest.qualified_parallel_chaff_streams,
             Self::ResponseOnlyV4(manifest) => manifest.qualified_parallel_chaff_streams,
-            Self::SmallResponseAggregateV5(manifest) => manifest.qualified_parallel_chaff_streams,
+            Self::SmallResponseAggregateV6(manifest) => manifest.qualified_parallel_chaff_streams,
         }
     }
 
@@ -1288,7 +1288,7 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => manifest.resource_manifest(),
             Self::ResponseOnlyV3(manifest) => manifest.resource_manifest(),
             Self::ResponseOnlyV4(manifest) => manifest.resource_manifest(),
-            Self::SmallResponseAggregateV5(manifest) => manifest.resource_manifest(),
+            Self::SmallResponseAggregateV6(manifest) => manifest.resource_manifest(),
         }
     }
 
@@ -1324,8 +1324,8 @@ impl RuntimeChaffManifest {
                     expected_response: &qualification.expected_response,
                 },
             ),
-            Self::SmallResponseAggregateV5(manifest) => manifest.qualification(resource_id).map(
-                |qualification: &ResponseOnlyChaffQualificationV5| RuntimeChaffQualification {
+            Self::SmallResponseAggregateV6(manifest) => manifest.qualification(resource_id).map(
+                |qualification: &ResponseOnlyChaffQualificationV6| RuntimeChaffQualification {
                     request_stream_bytes: qualification.request_stream_bytes,
                     expected_response: &qualification.expected_response,
                 },
@@ -1340,7 +1340,7 @@ fn validate_chaff_manifest_defense(
 ) -> Result<(), Error> {
     if chaff.is_small_response_aggregate() && !matches!(defense, DefenseConfig::Buflo(_)) {
         return Err(Error::Argument(
-            "schema-five aggregate cover is fixed64ms BuFLO only".into(),
+            "schema-six aggregate cover is fixed64ms BuFLO only".into(),
         ));
     }
     if chaff.is_response_only()
@@ -1365,10 +1365,10 @@ fn bind_qualified_chaff_stream_limits(
     chaff: &RuntimeChaffManifest,
 ) -> Result<(), Error> {
     if chaff.is_small_response_aggregate()
-        && (config.max_chaff_streams != 5 || config.initial_max_stream_data != 16)
+        && (config.max_chaff_streams != 8 || config.initial_max_stream_data != 16)
     {
         return Err(Error::Argument(
-            "aggregate cover requires exactly five streams and initial16".into(),
+            "aggregate cover requires exactly eight streams and initial16".into(),
         ));
     }
     if matches!(config.defense, DefenseConfig::WalkieTalkie(_)) {
@@ -12276,11 +12276,11 @@ fn selected_small_response_aggregate_resource<'a>(
                 && r.origin() == application.origin()
                 && origin_policy.permits(r, application)
                 && (200..300).contains(&response.status)
-                && (1..1_200).contains(&response.bytes)
+                && (515..1_200).contains(&response.bytes)
                 && response
                     .bytes
                     .checked_sub(16)
-                    .and_then(|n| n.checked_mul(5))
+                    .and_then(|n| n.checked_mul(8))
                     .is_some_and(|n| n >= 1_200))
             .then_some((r, response))
         })
@@ -12293,7 +12293,7 @@ fn selected_small_response_aggregate_resource<'a>(
     });
     let Some((resource, response)) = candidates.first().copied() else {
         return Err(Error::Argument(
-            "no original auxiliary has five-stream exact capacity1200".into(),
+            "no original auxiliary has eight-stream exact capacity1200".into(),
         ));
     };
     if resource.id != selected_chaff_resource_id {
@@ -12430,11 +12430,11 @@ fn sustained_aggregate_representation_failure(
     requests: &[ResponseQualificationRequest],
 ) -> Option<&'static str> {
     if requests.iter().any(|request| {
-        !(1..1_200).contains(&request.body_bytes)
+        !(515..1_200).contains(&request.body_bytes)
             || request
                 .body_bytes
                 .checked_sub(16)
-                .and_then(|n| n.checked_mul(5))
+                .and_then(|n| n.checked_mul(8))
                 .is_none_or(|n| n < 1_200)
     }) {
         return Some("capacity");
@@ -12510,7 +12510,29 @@ async fn qualify_chaff_response(
     packet_size: u16,
     timeout_seconds: u64,
 ) -> Result<(), Error> {
-    let mode = response_qualification_mode(parallel_requests, total_requests, request_header_mode)?;
+    let mode = if small_response_aggregate {
+        if parallel_requests != 8
+            || total_requests != Some(SUSTAINED_QUALIFICATION_REQUESTS)
+            || request_header_mode != Some(ChaffRequestHeaderModeArg::IdentityChaffV1)
+        {
+            return Err(Error::Argument(
+                "eight-response aggregate qualification requires40 requests/parallel8/identity-chaff-v1".into(),
+            ));
+        }
+        ResponseQualificationMode::SustainedIdentity
+    } else {
+        response_qualification_mode(parallel_requests, total_requests, request_header_mode)?
+    };
+    let sustained_parallel = if small_response_aggregate {
+        8
+    } else {
+        SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS
+    };
+    let sustained_waves = if small_response_aggregate {
+        SUSTAINED_QUALIFICATION_REQUESTS / sustained_parallel
+    } else {
+        SUSTAINED_QUALIFICATION_WAVES
+    };
     if small_response_aggregate && mode != ResponseQualificationMode::SustainedIdentity {
         return Err(Error::Argument(
             "aggregate qualification requires sustained identity mode".into(),
@@ -12870,9 +12892,9 @@ async fn qualify_chaff_response(
         && sustained_requests_are_classifiable(&requests)
         && request_stream_bytes.is_some()
         && next_request_index == SUSTAINED_QUALIFICATION_REQUESTS
-        && request_waves == SUSTAINED_QUALIFICATION_WAVES
-        && max_concurrent_requests == SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS
-        && requests_opened_before_first_network_output == SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS
+        && request_waves == sustained_waves
+        && max_concurrent_requests == sustained_parallel
+        && requests_opened_before_first_network_output == sustained_parallel
         && incoming.oversized_packet_count == 0
         && outgoing.oversized_packet_count == 0
         && qualification_network_output_seen;
@@ -12903,7 +12925,7 @@ async fn qualify_chaff_response(
         .iter()
         .map(|request| SustainedResponseQualificationRequest {
             request_index: request.request_index,
-            wave_index: request.request_index / SUSTAINED_QUALIFICATION_PARALLEL_REQUESTS,
+            wave_index: request.request_index / sustained_parallel,
             stream_id: request.stream_id,
             request_stream_bytes: request.request_stream_bytes,
             status: request.status,
@@ -13012,8 +13034,8 @@ async fn qualify_chaff_response(
         }),
     };
     if small_response_aggregate {
-        receipt["schema_version"] = json!(6);
-        receipt["capacity_policy"] = json!("same-endpoint-five-acked-known-capacity-v1");
+        receipt["schema_version"] = json!(7);
+        receipt["capacity_policy"] = json!("same-endpoint-eight-acked-known-capacity-v1");
         receipt["aggregate_capacity_contract"] =
             json!(SmallResponseAggregateCapacityContract::fixed());
         receipt["capacity_contract_sha256"] = json!(SmallResponseAggregateCapacityContract::SHA256);
@@ -15040,7 +15062,7 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
             != BufloIncomingCreditReleasePolicy::RapidV7Cadence64msAckStartPreparationReserve
             || !spec.config.buflo_retained_parser_fin_permission
             || terminal_primary_partial_cell_policy_receipt(spec).is_none()
-            || spec.config.max_chaff_streams != 5
+            || spec.config.max_chaff_streams != 8
             || spec.config.initial_max_stream_data != 16
             || spec
                 .defense_parameters
@@ -47970,7 +47992,7 @@ mod tests {
             Some("identity")
         );
         requests[35].body_sha256 = Some("a".repeat(64));
-        requests[35].body_bytes = 255; // five*(255-16)=1195: not a whole cell.
+        requests[35].body_bytes = 514; // below the explicit two-intervening-cell eligibility floor.
         assert_eq!(
             super::sustained_aggregate_representation_failure(&requests),
             Some("capacity")
@@ -47987,21 +48009,21 @@ mod tests {
 
     fn fonts_aggregate_manifest_fixture() -> serde_json::Value {
         serde_json::json!({
-            "schema_version":5,"artifact_type":"qcsd-qualified-chaff-manifest",
-            "qualification_scope":"buflo-small-response-aggregate-v1",
+            "schema_version":6,"artifact_type":"qcsd-qualified-chaff-manifest",
+            "qualification_scope":"buflo-small-response-eight-aggregate-v1",
             "application_workload_sha256":"a".repeat(64),"application_resource_id":0,
-            "selected_chaff_resource_id":5,"qualified_parallel_chaff_streams":5,
+            "selected_chaff_resource_id":5,"qualified_parallel_chaff_streams":8,
             "aggregate_capacity_contract":super::SmallResponseAggregateCapacityContract::fixed(),
             "resources":[{"id":5,"url":"https://fonts.example/bag.svg","type":"Image",
                 "content_length":559,"data_length":559,"chaff_priority":true,
                 "known_valid":true,"depends_on":[],
                 "headers":[["accept","*/*"],["accept-encoding","identity"],["accept-language","en-US"]],
-                "chaff_qualification":{"schema_version":5,
-                    "qualification_scope":"buflo-small-response-aggregate-v1","method":"GET",
+                "chaff_qualification":{"schema_version":6,
+                    "qualification_scope":"buflo-small-response-eight-aggregate-v1","method":"GET",
                     "request_header_primitive":{"mode":"identity-chaff-v1",
                         "copied_from_application":["accept","accept-language"],
                         "forced":[["accept-encoding","identity"]]},
-                    "request_stream_bytes":85,"qualified_parallel_chaff_streams":5,
+                    "request_stream_bytes":85,"qualified_parallel_chaff_streams":8,
                     "qualified_completion_count":120,
                     "expected_response":{"status":200,"body_bytes":559,
                         "body_sha256":"b".repeat(64),"content_encoding":"identity"},
@@ -48025,7 +48047,7 @@ mod tests {
                     value["resources"][0]["chaff_qualification"]["aggregate_capacity_contract_sha256"] =
                         serde_json::json!("0".repeat(64))
                 }
-                1 => value["aggregate_capacity_contract"]["member_count"] = serde_json::json!(4),
+                1 => value["aggregate_capacity_contract"]["member_count"] = serde_json::json!(5),
                 2 => {
                     value["resources"][0]["content_length"] = serde_json::json!(255);
                     value["resources"][0]["data_length"] = serde_json::json!(255);
@@ -48036,7 +48058,7 @@ mod tests {
                     value["resources"][0]["chaff_qualification"]["expected_response"]["body_sha256"] =
                         serde_json::json!("B".repeat(64))
                 }
-                _ => value["schema_version"] = serde_json::json!(4),
+                _ => value["schema_version"] = serde_json::json!(5),
             }
             assert!(
                 super::RuntimeChaffManifest::from_json(&value.to_string()).is_err(),

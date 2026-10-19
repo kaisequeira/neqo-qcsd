@@ -36,6 +36,9 @@ pub struct StreamState {
     /// Actual post-header peer demand at one exact advertised frontier. The
     /// receive state rechecks this frontier at allocation and lease grant.
     parser_blocked_at: Option<u64>,
+    /// One genuine pre-body frame-reader debt at its exact raw frontier.
+    /// Retaining debt grants nothing before the issued request's FIN ACK.
+    aggregate_framing_debt: Option<(u64, u64, bool)>,
     /// Actual final HEADERS evidence, distinct from a prepared body estimate.
     observed_response_length: ObservedResponseLength,
     request_acknowledged_ranges: Vec<(u64, u64)>,
@@ -226,6 +229,7 @@ impl StreamRegistry {
                 receive_actions_available: true,
                 pre_header_blocked_at: None,
                 parser_blocked_at: None,
+                aggregate_framing_debt: None,
                 observed_response_length: ObservedResponseLength::Unobserved,
                 request_acknowledged_ranges: Vec::new(),
                 request_acknowledged_final_size: None,
@@ -279,6 +283,7 @@ impl StreamRegistry {
             return false;
         };
         state.receive_actions_available = false;
+        state.aggregate_framing_debt = None;
         state.pre_header_blocked_at = None;
         state.parser_blocked_at = None;
         state.receive.clear_parser_boundary();
@@ -771,6 +776,41 @@ impl StreamRegistry {
         }
     }
 
+    pub(crate) fn retain_aggregate_framing_debt(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        min_remaining: u64,
+        pristine_data_boundary: bool,
+    ) {
+        if let Some(state) = self.get_mut(endpoint, stream) {
+            state.aggregate_framing_debt = (state.receive_actions_available
+                && min_remaining > 0
+                && matches!(state.receive, ReceiveState::ReceivingHeaders { .. }))
+            .then_some((
+                state.receive.consumed(),
+                min_remaining,
+                pristine_data_boundary,
+            ));
+        }
+    }
+
+    pub(crate) fn aggregate_framing_debts(&self) -> Vec<(QcsdEndpointId, QcsdStreamId, u64, bool)> {
+        let mut debts: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|(&(endpoint, stream), state)| {
+                let (boundary, debt, pristine) = state.aggregate_framing_debt?;
+                (state.receive_actions_available
+                    && state.receive.consumed() == boundary
+                    && matches!(state.receive, ReceiveState::ReceivingHeaders { .. }))
+                .then_some((endpoint, stream, debt, pristine))
+            })
+            .collect();
+        debts.sort_unstable();
+        debts
+    }
+
     /// Invalidate transport-only pre-header proof after typed HTTP/3 progress.
     pub(crate) fn clear_pre_header_blocked(
         &mut self,
@@ -779,6 +819,7 @@ impl StreamRegistry {
     ) {
         if let Some(state) = self.get_mut(endpoint, stream) {
             state.pre_header_blocked_at = None;
+            state.aggregate_framing_debt = None;
         }
     }
 
@@ -1237,6 +1278,68 @@ impl StreamRegistry {
         let (absolute_limit, increase) = state
             .receive
             .pre_header_bootstrap_lease(advertised, live_scheduled_prefix)?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled: false,
+        })
+    }
+
+    /// The aggregate capability may finish a typed initial framing prefix,
+    /// never an inferred response-body prefix. HTTP/3 produces HeaderProgress
+    /// from its frame reader rather than its DATA-body reader. Before final
+    /// HEADERS, the observed debt is bounded by the remaining lifetime budget;
+    /// after final HEADERS only the at-most-16-byte DATA frame prefix qualifies.
+    pub(crate) fn aggregate_prebody_framing_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        resource_id: u32,
+        body_bytes: u64,
+        min_remaining: u64,
+        pristine_data_boundary: bool,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available
+            || !matches!(state.role, QcsdRequestRole::Chaff {
+                resource_id: selected,
+                request_id: Some(_),
+            } if selected == resource_id)
+            || state.activated_chaff_request_final_size().is_none()
+        {
+            return None;
+        }
+        if state.aggregate_framing_debt
+            != Some((
+                state.receive.consumed(),
+                min_remaining,
+                pristine_data_boundary,
+            ))
+        {
+            return None;
+        }
+        match state.observed_response_length {
+            ObservedResponseLength::Unobserved if state.status.is_none() => {
+                if pristine_data_boundary {
+                    return None;
+                }
+            }
+            ObservedResponseLength::Final {
+                status: 200,
+                content_length: Some(length),
+            } if state.status == Some(200) && length == body_bytes => {
+                if min_remaining > 16 {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        let (absolute_limit, increase) = state
+            .receive
+            .aggregate_prebody_framing_lease(min_remaining, pristine_data_boundary)?;
+        state.aggregate_framing_debt = None;
         Some(ParserLease {
             endpoint,
             stream,
