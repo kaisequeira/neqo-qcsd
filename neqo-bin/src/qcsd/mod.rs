@@ -16050,10 +16050,18 @@ async fn execute_run_inner(
                     endpoints
                         .iter_mut()
                         .fold((false, false), |state, endpoint| {
-                            let current = endpoint_candidate_egress_backlog(
-                                endpoint,
-                                exclude_stopped_buflo_chaff_sends,
-                            );
+                            let current = if matches!(&spec.config.defense, DefenseConfig::Buflo(_))
+                            {
+                                endpoint_buflo_egress_backlog(
+                                    endpoint,
+                                    exclude_stopped_buflo_chaff_sends,
+                                )
+                            } else {
+                                endpoint_candidate_egress_backlog(
+                                    endpoint,
+                                    exclude_stopped_buflo_chaff_sends,
+                                )
+                            };
                             (state.0 || current.0, state.1 || current.1)
                         })
                 } else {
@@ -17319,6 +17327,26 @@ fn endpoint_candidate_egress_backlog(
         required_stream_pending,
         application_send_halves_peer_confirmed(endpoint),
         defense_control_pending,
+    )
+}
+
+/// `BuFLO`'s guarded local abandonment also requires the QPACK decoder's
+/// handler and transport output to be empty. Keep that work in both the split
+/// STREAM stop-authority snapshot and the aggregate drain snapshot, before
+/// the schedule is irreversibly stopped. It must drain through the ordinary
+/// scheduled outgoing cells; this predicate neither emits output nor releases
+/// shaping. CS-BuFLO retains its existing request-causal decoder exclusion.
+fn endpoint_buflo_egress_backlog(
+    endpoint: &mut Endpoint,
+    exclude_stopped_buflo_chaff_sends: bool,
+) -> (bool, bool) {
+    let (stream_pending, aggregate_pending) =
+        endpoint_candidate_egress_backlog(endpoint, exclude_stopped_buflo_chaff_sends);
+    let decoder_pending = endpoint.client.qcsd_qpack_decoder_handler_pending()
+        || endpoint.client.qcsd_qpack_decoder_transport_pending();
+    (
+        stream_pending || decoder_pending,
+        aggregate_pending || decoder_pending,
     )
 }
 

@@ -3123,7 +3123,11 @@ impl QcsdController {
         };
         if self.defense.terminal_failure().is_some()
             || self.defense.is_complete()
-            || !self.defense.accepts_new_chaff_requests()
+            // Closing replenishment does not cancel framing service for an
+            // already-issued, peer-ACKed request. Finish only its observed
+            // bounded HEADERS/DATA-prefix debt while shaped output still has
+            // future cells; never create parser/control work after stop.
+            || self.defense.diagnostics().buflo_schedule_stop_latched
             || self.scheduler.endpoints() != [endpoint]
             || self
                 .chaff
@@ -29304,6 +29308,12 @@ mod tests {
 
     // These are controller/ACK-ledger unit fixtures, not physical packet proof.
     fn fonts_aggregate_fixture() -> (QcsdController, Vec<(QcsdStreamId, QcsdRequestRole)>) {
+        fonts_aggregate_fixture_with_initial_poll(true)
+    }
+
+    fn fonts_aggregate_fixture_with_initial_poll(
+        initial_controller_poll: bool,
+    ) -> (QcsdController, Vec<(QcsdStreamId, QcsdRequestRole)>) {
         let params = BufloParameters {
             schema_version: 1,
             interval_us: 64_000,
@@ -29349,7 +29359,20 @@ mod tests {
         c.enable_buflo_aggregate_incoming_startup(5, 559, [0xab; 32])
             .expect("aggregate opt-in");
         ready(&mut c, 1, "https://fonts.example");
-        c.poll(Duration::ZERO);
+        if initial_controller_poll {
+            c.poll(Duration::ZERO);
+        } else {
+            // A Defense-only resolved-cell component must not create a runner
+            // rolling preview and then advance its oracle behind that preview.
+            // Issue the same real chaff requests through the existing manager;
+            // materialize only the genuine Defense tick-zero premise here.
+            c.request_chaff_if_needed(true);
+            assert_eq!(
+                c.defense.next_event(Duration::ZERO),
+                Some(outgoing_packet(Duration::ZERO))
+            );
+            assert!(!c.has_rolling_outgoing_prearm());
+        }
         let requests: Vec<_> = c
             .drain_actions()
             .filter_map(|a| match a {
@@ -29918,6 +29941,219 @@ mod tests {
         assert_eq!(d.scheduled_incoming_retired_bytes, 0);
         assert_eq!(d.buflo_missed_incoming_cells, 0);
         (cells, replacements)
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one existing controller fixture binds real defense cursor closure, issued framing service and the irreversible stop guard"
+    )]
+    fn fonts129_issued_framing_survives_minimum_cursor_closure_and_refuses_after_stop() {
+        let (mut c, roles) = fonts_aggregate_fixture_with_initial_poll(false);
+        let endpoint = QcsdEndpointId(1);
+        for member in &roles {
+            fonts_ack(&mut c, *member, 0, 85, true, 100);
+        }
+        c.arm_buflo_incoming_if_ready(Duration::from_micros(200));
+        c.observe(
+            QcsdObservation::ApplicationComplete,
+            Duration::from_micros(501),
+        );
+        c.flush_defense_observations();
+        c.defense.observe(DefenseSignal {
+            at: Duration::from_micros(502),
+            kind: SignalKind::Resolved {
+                packet: outgoing_packet(Duration::ZERO),
+                outcome: EventOutcome::Satisfied { observed: 1_200 },
+            },
+        });
+        c.flush_defense_observations();
+        c.drain_actions().for_each(drop);
+
+        // As in resolved_buflo_terminal_defense, these are disclosed unit
+        // resolved-cell premises through the real Defense API. They advance
+        // its real cursors without claiming wire/allocator/timing evidence.
+        // The framing assertions below use the real controller observation
+        // reducer, stream registry and original parser-lease ledger/helper.
+        for tick in 1..=156_u64 {
+            let at = Duration::from_micros(tick * 64_000);
+            let mut events = 0;
+            while let Some(packet) = c.defense.next_event(at) {
+                assert_eq!(packet.timestamp(), at);
+                c.defense.observe(DefenseSignal {
+                    at,
+                    kind: SignalKind::Resolved {
+                        packet,
+                        outcome: EventOutcome::Satisfied { observed: 1_200 },
+                    },
+                });
+                events += 1;
+            }
+            assert_eq!(events, 2, "one ordinary outgoing/incoming pair");
+        }
+        assert_eq!(156 * 64_000, 9_984_000);
+        assert!(c.defense_diagnostics().buflo_minimum_duration_reached);
+        assert!(!c.defense.accepts_new_chaff_requests());
+        assert!(!c.defense_diagnostics().buflo_schedule_stop_latched);
+        assert_eq!(
+            c.defense.next_event_at(),
+            Some(Duration::from_micros(10_048_000))
+        );
+        c.request_chaff_if_needed(true);
+        assert!(
+            c.drain_actions()
+                .all(|a| !matches!(a, QcsdAction::RequestChaff { .. }))
+        );
+
+        let member = roles[0];
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: member.0,
+                bytes: 16,
+            },
+            Duration::from_micros(9_988_999),
+        );
+        c.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: member.0,
+                min_remaining: 7,
+                awaiting_data_frame: false,
+            },
+            Duration::from_micros(9_989_000),
+        );
+        // This first assertion is RED with the former accepts_new_chaff gate.
+        fonts128_finish_framing_lease(&mut c, member.0, 16, 7, 9_989_001);
+        c.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint,
+                stream: member.0,
+                frame_bytes: 23,
+                status: Some(200),
+                content_length: Some(559),
+            },
+            Duration::from_micros(9_989_004),
+        );
+        // Actual successful case004 observed 7+1+1+1, not a two-byte grant.
+        let mut previous = 23;
+        for (index, at) in [9_989_005, 9_989_008, 9_989_011].into_iter().enumerate() {
+            c.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint,
+                    stream: member.0,
+                    min_remaining: 1,
+                    awaiting_data_frame: index == 0,
+                },
+                Duration::from_micros(at),
+            );
+            fonts128_finish_framing_lease(&mut c, member.0, previous, 1, at + 1);
+            previous += 1;
+        }
+        c.observe(
+            QcsdObservation::DataFrame {
+                endpoint,
+                stream: member.0,
+                frame_header_bytes: 3,
+                data_bytes: 559,
+            },
+            Duration::from_micros(9_989_014),
+        );
+        assert_eq!(c.streams.receive_limits(endpoint, member.0), Some((26, 26)));
+        assert_eq!(c.streams.consumed(endpoint, member.0), Some(26));
+        assert!(matches!(
+            c.streams
+                .get_mut(endpoint, member.0)
+                .expect("issued member")
+                .receive,
+            crate::stream::ReceiveState::ReceivingData {
+                parser_lease_used: 10,
+                ..
+            }
+        ));
+        assert!(!c.defense.accepts_new_chaff_requests());
+        assert!(c.drain_actions().all(|a| !matches!(
+            a,
+            QcsdAction::RequestChaff { .. } | QcsdAction::LeaseParserReceive { .. }
+        )));
+
+        // Leave one genuinely issued/ACKed, unparsed response available. Typed
+        // peer-reset premises retire other unused fixture responses; no fake
+        // response body, scheduled credit or private latch assignment is used.
+        let after_stop = roles[1];
+        for member in &roles {
+            if *member != after_stop {
+                c.observe(
+                    QcsdObservation::StreamFinished {
+                        endpoint,
+                        stream: member.0,
+                        finish: QcsdStreamFinish::Reset,
+                    },
+                    Duration::from_micros(9_989_020),
+                );
+            }
+        }
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint,
+                stream: after_stop.0,
+                bytes: 16,
+            },
+            Duration::from_micros(9_989_021),
+        );
+        c.drain_actions().for_each(drop);
+        assert!(c.streams.aggregate_capacity().chaff_incoming < 1_200);
+        c.observe(
+            QcsdObservation::EgressBacklog { pending: true },
+            Duration::from_micros(9_989_025),
+        );
+        c.observe(
+            QcsdObservation::EgressStreamBacklog { pending: false },
+            Duration::from_micros(9_989_026),
+        );
+        assert!(
+            !c.has_rolling_outgoing_prearm(),
+            "the Defense-only prelude must leave no unreconciled runner preview"
+        );
+        c.flush_defense_observations();
+        assert!(c.defense_diagnostics().buflo_schedule_stop_latched);
+        assert!(
+            !c.defense.is_complete(),
+            "stop refusal is distinct from the existing complete guard"
+        );
+        assert_eq!(c.defense.next_event_at(), None);
+        c.drain_actions().for_each(drop);
+        c.observe(
+            QcsdObservation::HeaderProgress {
+                endpoint,
+                stream: after_stop.0,
+                min_remaining: 7,
+                awaiting_data_frame: false,
+            },
+            Duration::from_micros(9_989_027),
+        );
+        c.retry_pending_parser_leases();
+        assert!(c.drain_actions().all(|a| !matches!(
+            a,
+            QcsdAction::LeaseParserReceive { .. }
+                | QcsdAction::RequestChaff { .. }
+                | QcsdAction::IncreaseReceiveLimit { .. }
+        )));
+        assert_eq!(
+            c.streams.receive_limits(endpoint, after_stop.0),
+            Some((16, 16))
+        );
+        assert_eq!(c.streams.consumed(endpoint, after_stop.0), Some(16));
+        assert!(matches!(
+            c.streams
+                .get_mut(endpoint, after_stop.0)
+                .expect("retained issued member")
+                .receive,
+            crate::stream::ReceiveState::ReceivingHeaders {
+                parser_lease_used: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

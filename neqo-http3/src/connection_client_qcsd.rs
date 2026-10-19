@@ -170,24 +170,97 @@ impl Http3Client {
         stream_id: StreamId,
         role: QcsdRequestRole,
     ) -> Res<QcsdLocalChaffAbandonment> {
-        let receive = self
+        let Some(receive) = self
             .conn
             .qcsd_preview_local_chaff_abandonment(stream_id, role)
-            .ok_or(Error::InvalidInput)?;
-        if self.qcsd_qpack_decoder_handler_pending()
-            || self.qcsd_qpack_decoder_transport_pending()
-            || self.qcsd_has_pending_stream_send()
-            || self.qcsd_has_pending_defense_control()
-        {
-            return Err(Error::InvalidInput);
+        else {
+            let error = Error::InvalidInput;
+            self.qcsd_log_buflo_terminal_abandonment_refusal(
+                stream_id,
+                role,
+                "transport_preview",
+                None,
+                None,
+                None,
+                &error,
+            );
+            return Err(error);
+        };
+        // Preserve the original left-to-right short-circuit call sequence.
+        // The transport getters may memoize readiness; never evaluate an
+        // otherwise skipped getter merely to fill a diagnostic field.
+        let output_guard = if self.qcsd_qpack_decoder_handler_pending() {
+            Some(("qpack_decoder_handler", None, None))
+        } else if self.qcsd_qpack_decoder_transport_pending() {
+            Some(("qpack_decoder_transport", Some(true), None))
+        } else if self.qcsd_has_pending_stream_send() {
+            Some(("all_stream", Some(false), Some(true)))
+        } else if self.qcsd_has_pending_defense_control() {
+            Some(("defense_control", Some(false), Some(false)))
+        } else {
+            None
+        };
+        if let Some((first_guard, decoder_transport, all_stream)) = output_guard {
+            let error = Error::InvalidInput;
+            self.qcsd_log_buflo_terminal_abandonment_refusal(
+                stream_id,
+                role,
+                "global_output",
+                Some(first_guard),
+                decoder_transport,
+                all_stream,
+                &error,
+            );
+            return Err(error);
         }
-        let http3_receive_state = self
+        let http3_receive_state = match self
             .base_handler
-            .qcsd_abandon_drained_response(stream_id, &mut self.conn)?;
+            .qcsd_abandon_drained_response(stream_id, &mut self.conn)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                self.qcsd_log_buflo_terminal_abandonment_refusal(
+                    stream_id,
+                    role,
+                    "http3_handler",
+                    None,
+                    Some(false),
+                    Some(false),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
         Ok(QcsdLocalChaffAbandonment {
             receive,
             http3_receive_state,
         })
+    }
+
+    // Called only after an existing refusal. These extra queries take &self:
+    // no output drive, readiness-cache probe, credit grant or protocol mutation.
+    // None means the original short-circuit guard never evaluated that getter.
+    fn qcsd_log_buflo_terminal_abandonment_refusal(
+        &self,
+        stream_id: StreamId,
+        role: QcsdRequestRole,
+        stage: &str,
+        first_output_guard: Option<&str>,
+        decoder_transport: Option<bool>,
+        all_stream: Option<bool>,
+        error: &Error,
+    ) {
+        use std::io::Write as _;
+        // A failed diagnostic write must not replace the original refusal.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "QCSD_BUFLO_TERMINAL_ABANDON_REFUSAL stage={stage} stream={} role={role:?} first_output_guard={first_output_guard:?} qpack_decoder_handler_pending={} qpack_decoder_transport_pending={decoder_transport:?} http3_handler_stream_pending={} all_stream_pending={all_stream:?} defense_control_pending={} request_send_peer_confirmed={} error={error:?}",
+            stream_id.as_u64(),
+            self.qcsd_qpack_decoder_handler_pending(),
+            self.base_handler.qcsd_has_pending_stream_send(),
+            self.qcsd_has_pending_defense_control(),
+            self.qcsd_chaff_send_stream_peer_confirmed(stream_id),
+        );
     }
 
     /// Separate CS terminal cleanup. The runner must prove the original CS
