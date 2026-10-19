@@ -2361,6 +2361,13 @@ impl QcsdController {
                 bytes,
                 fin,
             } => {
+                if self.buflo_acknowledged_application_bootstrap_enabled()
+                    && self.streams.record_application_request_acknowledgment(
+                        endpoint, stream, role, offset, bytes, fin,
+                    )
+                {
+                    self.try_pre_header_bootstrap(endpoint, stream);
+                }
                 self.streams.record_chaff_request_acknowledgment(
                     endpoint, stream, role, offset, bytes, fin,
                 );
@@ -2898,12 +2905,34 @@ impl QcsdController {
         self.scheduled_incoming_advertised_bytes -= bytes;
     }
 
+    /// Keep compulsory application request-ACK evidence inside the existing
+    /// fixed64ms BuFLO prepared-policy opt-ins. This grants only bounded
+    /// pristine framing permission and never arms the chaff-only startup.
+    fn buflo_acknowledged_application_bootstrap_enabled(&self) -> bool {
+        matches!(self.config.defense, DefenseConfig::Buflo(_))
+            && self.buflo_incoming_half_period_window == Some(Duration::from_micros(32_000))
+            && self.terminal_primary_partial_cell_policy
+            && self.buflo_retained_parser_policy
+            && self.defense.diagnostics().buflo_incoming_startup.is_some()
+            && !self.application_complete
+            && self.defense.terminal_failure().is_none()
+    }
+
     fn try_pre_header_bootstrap(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
         let live_scheduled_prefix = self.live_advertised_scheduled_prefix(endpoint, stream);
-        let Some(lease) =
+        let mut lease =
             self.streams
-                .pre_header_bootstrap_lease(endpoint, stream, live_scheduled_prefix)
-        else {
+                .pre_header_bootstrap_lease(endpoint, stream, live_scheduled_prefix);
+        if lease.is_none() && self.buflo_acknowledged_application_bootstrap_enabled() {
+            lease = self
+                .streams
+                .acknowledged_application_pre_header_bootstrap_lease(
+                    endpoint,
+                    stream,
+                    live_scheduled_prefix,
+                );
+        }
+        let Some(lease) = lease else {
             return;
         };
         debug_assert!(!lease.scheduled);

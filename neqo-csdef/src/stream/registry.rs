@@ -143,6 +143,23 @@ impl StreamState {
             })
     }
 
+    /// The application request is causally available only after the same
+    /// exact, positive contiguous request-range and FIN proof used for chaff.
+    /// This evidence does not activate a chaff resource or incoming startup.
+    fn application_request_activated(&self) -> bool {
+        if self.role != QcsdRequestRole::Application || self.request_acknowledgment_invalid {
+            return false;
+        }
+        self.request_acknowledged_final_size
+            .is_some_and(|final_size| {
+                final_size > 0
+                    && self
+                        .request_acknowledged_ranges
+                        .first()
+                        .is_some_and(|(start, end)| *start == 0 && *end == final_size)
+            })
+    }
+
     /// Positive final request size after the same contiguous ACK/FIN check.
     pub fn activated_chaff_request_final_size(&self) -> Option<u64> {
         self.chaff_request_activated()
@@ -306,6 +323,31 @@ impl StreamRegistry {
             return 0;
         }
         state.record_request_acknowledgment(offset, bytes, fin)
+    }
+
+    /// Retain genuine ACK evidence for only this exact live application
+    /// stream. Reuse the fail-closed range/FIN ledger without treating the
+    /// application as a chaff request or a peer-blocked observation.
+    pub(crate) fn record_application_request_acknowledgment(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        role: QcsdRequestRole,
+        offset: u64,
+        bytes: u64,
+        fin: bool,
+    ) -> bool {
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return false;
+        };
+        if role != QcsdRequestRole::Application
+            || state.role != role
+            || !state.receive_actions_available
+        {
+            return false;
+        }
+        _ = state.record_request_acknowledgment(offset, bytes, fin);
+        state.application_request_activated()
     }
 
     pub fn remove_endpoint(&mut self, endpoint: QcsdEndpointId) {
@@ -1160,6 +1202,41 @@ impl StreamRegistry {
             .receive
             .pre_header_bootstrap_lease(blocked_at, live_scheduled_prefix)?;
         state.pre_header_blocked_at = None;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled: false,
+        })
+    }
+
+    /// A completely acknowledged application request permits the existing
+    /// pristine framing bootstrap without optional STREAM_DATA_BLOCKED. The
+    /// current advertised frontier is evidence of permission, not peer demand.
+    /// The unchanged receive leaf enforces the same absolute 1000-byte target,
+    /// lifetime budget, prepared/live prefix and zero parser-progress guards.
+    pub(crate) fn acknowledged_application_pre_header_bootstrap_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        live_scheduled_prefix: Option<(u64, u64)>,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available
+            || !state.application_request_activated()
+            || state.status.is_some()
+            || state.observed_response_length != ObservedResponseLength::Unobserved
+        {
+            return None;
+        }
+        let (advertised, requested) = state.receive.limits()?;
+        if advertised != requested {
+            return None;
+        }
+        let (absolute_limit, increase) = state
+            .receive
+            .pre_header_bootstrap_lease(advertised, live_scheduled_prefix)?;
         Some(ParserLease {
             endpoint,
             stream,
