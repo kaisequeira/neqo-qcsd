@@ -7442,7 +7442,20 @@ impl QcsdController {
             }
         }
 
-        let open_chaff_streams = self.streams.open_chaff_streams();
+        let mut open_chaff_streams = self.streams.open_chaff_streams();
+        if reason == QcsdChaffCancellationReason::CsBufloLocalEarlyTermination
+            && self.application_complete_delivered_to_defense
+        {
+            // The CS stop decision does not prove that the peer received a
+            // recently replenished request. Keep that stream live until the
+            // ordinary ACK observation proves its complete request and FIN;
+            // the unchanged local-abandonment adapter requires that proof.
+            open_chaff_streams.retain(|(endpoint, stream)| {
+                self.streams
+                    .get_mut(*endpoint, *stream)
+                    .is_some_and(|state| state.chaff_request_activated())
+            });
+        }
         if !open_chaff_streams.is_empty() {
             // The aggregate false that authorized terminal cancellation
             // predates the RESET/STOP work queued below and is no longer valid
@@ -7622,6 +7635,10 @@ impl QcsdController {
                 == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
                 && self.cs_buflo_local_et_before_application_complete
                 && !self.cs_buflo_application_passthrough)
+            || (self.defense.terminal_chaff_cancellation_reason()
+                == Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+                && self.application_complete_delivered_to_defense
+                && self.streams.open_chaff_count() > 0)
             || (self.defense.requires_terminal_chaff_drain()
                 && (self.actions.iter().any(|action| {
                     matches!(
@@ -23560,6 +23577,10 @@ mod tests {
         let endpoint = QcsdEndpointId(1);
         let application = QcsdStreamId(4);
         let chaff = QcsdStreamId(8);
+        let chaff_role = QcsdRequestRole::Chaff {
+            resource_id: 7,
+            request_id: Some(crate::QcsdChaffRequestId(7)),
+        };
         ready(&mut controller, 1, "https://one.example");
         assert!(controller.can_start_application_batch());
 
@@ -23594,17 +23615,23 @@ mod tests {
             QcsdRequestRole::Application,
             Some(2_000),
         );
-        controller.streams.open(
-            endpoint,
-            chaff,
-            QcsdRequestRole::Chaff {
-                resource_id: 7,
-                request_id: None,
+        controller
+            .streams
+            .open(endpoint, chaff, chaff_role, true, 16, 1_000, 1_000);
+        // Disclosed unit premise: this already-issued 74-byte request/FIN
+        // has left the send queue, but no peer ACK has arrived. The connected
+        // bin regression independently exercises real H3 packet/ACK exchange.
+        controller.observe(
+            QcsdObservation::StreamDataTransmitted {
+                endpoint,
+                stream: chaff,
+                role: chaff_role,
+                offset: 0,
+                bytes: 74,
+                fin: true,
+                slot: None,
             },
-            true,
-            16,
-            1_000,
-            1_000,
+            Duration::from_micros(2_000_002),
         );
         controller.observe(
             QcsdObservation::EgressBacklog { pending: true },
@@ -23621,11 +23648,6 @@ mod tests {
         assert!(matches!(
             actions.as_slice(),
             [
-                QcsdAction::CancelChaff {
-                    endpoint: QcsdEndpointId(1),
-                    stream: QcsdStreamId(8),
-                    reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
-                },
                 QcsdAction::ConfigureAutomaticReceive {
                     endpoint: QcsdEndpointId(1),
                     stream: QcsdStreamId(4),
@@ -23638,6 +23660,49 @@ mod tests {
         ));
         assert!(controller.cs_buflo_application_passthrough);
         assert!(controller.can_start_application_batch());
+        assert_eq!(controller.streams.open_chaff_count(), 1);
+        assert!(!controller.is_complete());
+        assert_eq!(
+            controller
+                .defense_diagnostics()
+                .cs_buflo_local_et_stream_cancellations,
+            0
+        );
+        // An empty transport backlog alone still cannot prove request FIN.
+        controller.observe(
+            QcsdObservation::EgressBacklog { pending: false },
+            Duration::from_micros(2_000_004),
+        );
+        controller.poll(Duration::from_micros(2_000_004));
+        assert!(controller.drain_actions().all(|action| !matches!(
+            action,
+            QcsdAction::CancelChaff { .. } | QcsdAction::DefenseComplete
+        )));
+        controller.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint,
+                stream: chaff,
+                role: chaff_role,
+                offset: 0,
+                bytes: 74,
+                fin: true,
+            },
+            Duration::from_micros(2_000_005),
+        );
+        controller.poll(Duration::from_micros(2_000_005));
+        assert!(matches!(
+            controller.drain_actions().collect::<Vec<_>>().as_slice(),
+            [QcsdAction::CancelChaff {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(8),
+                reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination,
+            }]
+        ));
+        assert_eq!(controller.streams.open_chaff_count(), 0);
+        assert!(
+            !controller.is_complete(),
+            "post-cancel empty snapshot still required"
+        );
         assert!(
             controller
                 .defense_diagnostics()

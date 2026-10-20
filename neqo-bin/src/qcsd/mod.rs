@@ -34531,7 +34531,7 @@ mod tests {
     fn cs_idle_terminal_controller(
         endpoint: &mut super::Endpoint,
         stream: neqo_transport::StreamId,
-    ) -> (QcsdController, QcsdAction) {
+    ) -> (QcsdController, Option<QcsdAction>) {
         let mut controller = QcsdController::with_defense(
             QcsdConfig {
                 defense: cs_projection_test_defense(),
@@ -34599,7 +34599,7 @@ mod tests {
                 reason: QcsdChaffCancellationReason::CsBufloLocalEarlyTermination }
                 if *e == endpoint.id && s.0 == stream.as_u64())
         });
-        let cancel = cancels.next().expect("genuine CS terminal cancellation");
+        let cancel = cancels.next();
         assert!(cancels.next().is_none());
         drop(cancels);
         (controller, cancel)
@@ -34607,8 +34607,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cs_complete_app_idle_initial_chaff_closes_locally_without_invented_drain_or_wire() {
-        // The same real H3 fixture first proves that unACKed request FIN stays
-        // a hard refusal; the positive case differs only by actual exchange.
+        // A request emitted immediately before onLoad must stay live until its
+        // real FIN ACK arrives. The already-ACKed case keeps the original path.
         for exchange_request in [false, true] {
             let output = trace_output_dir("cs-idle-initial-terminal");
             let (mut endpoint, mut server, stream) =
@@ -34631,7 +34631,83 @@ mod tests {
                     .is_err(),
                 "the old CS fully-drained policy remains strict"
             );
-            let (mut controller, cancel) = cs_idle_terminal_controller(&mut endpoint, stream);
+            let deferred_request = if exchange_request {
+                None
+            } else {
+                Some(
+                    endpoint
+                        .client
+                        .process_output(test_fixture::now())
+                        .dgram()
+                        .expect("real request/FIN datagram emitted before onLoad"),
+                )
+            };
+            let (mut controller, mut cancel) = cs_idle_terminal_controller(&mut endpoint, stream);
+            if !exchange_request {
+                assert!(cancel.is_none(), "unACKed request must not be cancelled");
+                assert!(!controller.is_complete());
+                assert_eq!(
+                    controller
+                        .defense_diagnostics()
+                        .cs_buflo_local_et_stream_cancellations,
+                    0
+                );
+                assert!(
+                    endpoint
+                        .client
+                        .qcsd_abandon_cs_idle_initial_chaff(stream, role)
+                        .is_err(),
+                    "the strict adapter still refuses an unACKed request FIN"
+                );
+                controller.observe(
+                    QcsdObservation::EgressBacklog { pending: false },
+                    Duration::from_micros(2),
+                );
+                controller.poll(Duration::from_micros(2));
+                assert!(controller.drain_actions().all(|action| !matches!(
+                    action,
+                    QcsdAction::CancelChaff { .. } | QcsdAction::DefenseComplete
+                )));
+                assert!(!controller.is_complete());
+                assert!(endpoint.terminal_local_abandonments.is_empty());
+                assert!(endpoint.streams.contains_key(&stream));
+                let reply = server
+                    .process(deferred_request, test_fixture::now())
+                    .dgram();
+                test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, reply);
+                assert!(
+                    endpoint
+                        .client
+                        .qcsd_chaff_send_stream_peer_confirmed(stream)
+                );
+                let acknowledged = endpoint.client.qcsd_timestamped_observations();
+                assert!(
+                    acknowledged
+                        .iter()
+                        .any(|record| matches!(record.observation(),
+                    QcsdObservation::StreamDataAcknowledged { stream: s, fin: true, .. }
+                        if s.0 == stream.as_u64()))
+                );
+                for record in acknowledged {
+                    controller.observe(record.into_observation(), Duration::from_micros(3));
+                }
+                controller.poll(Duration::from_micros(3));
+                let acknowledged_actions: Vec<_> = controller.drain_actions().collect();
+                assert!(
+                    !acknowledged_actions
+                        .iter()
+                        .any(|action| matches!(action, QcsdAction::DefenseComplete))
+                );
+                let mut cancels = acknowledged_actions.into_iter().filter(|action| {
+                    matches!(
+                        action,
+                        QcsdAction::CancelChaff { stream: s, .. } if s.0 == stream.as_u64()
+                    )
+                });
+                cancel = cancels.next();
+                assert!(cancels.next().is_none(), "one cleanup after genuine ACK");
+            }
+            let cancel = cancel.expect("genuine CS terminal cancellation after request FIN ACK");
             let before = endpoint.client.transport_stats().frame_tx;
             let started = test_fixture::now();
             let mut traces = TraceFiles::new(&output, started).unwrap();
@@ -34642,19 +34718,12 @@ mod tests {
                 None,
                 &mut traces,
                 started,
-                Duration::from_micros(1),
+                Duration::from_micros(3),
                 cancel,
                 false,
                 None,
             );
-            if !exchange_request {
-                assert!(matches!(
-                    result,
-                    Err(super::Error::Http3(neqo_http3::Error::InvalidInput))
-                ));
-                assert!(endpoints[0].terminal_local_abandonments.is_empty());
-                assert!(endpoints[0].streams.contains_key(&stream));
-            } else {
+            {
                 result.expect("CS terminal idle initial response must locally close without synthetic drain or wire cancellation");
                 let proof = &endpoints[0].terminal_local_abandonments[0];
                 assert_eq!(
