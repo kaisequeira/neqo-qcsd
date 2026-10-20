@@ -49191,20 +49191,45 @@ mod tests {
             provenance.sha256,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        for (defense, expected_kind) in [
+        // Golden digests bind the exact serialized bytes, including the final
+        // newline, independently of parsing or reserialization by the reader.
+        const BUFLO_PARAMETER_BYTES: &[u8] = concat!(
+            "{\"schema_version\":1,\"interval_us\":20000,",
+            "\"minimum_duration_us\":10000000,\"packet_size\":1200,",
+            "\"max_events\":6000,\"implementation_scope\":\"client_only_quic\",",
+            "\"paper_equivalent\":false}\n",
+        )
+        .as_bytes();
+        const CS_BUFLO_PARAMETER_BYTES: &[u8] = concat!(
+            "{\"schema_version\":1,\"packet_size\":1200,",
+            "\"initial_interval_us\":8192,\"minimum_interval_us\":4096,",
+            "\"maximum_interval_us\":32768,\"initial_adaptation_boundary_bytes\":16384,",
+            "\"quiet_time_us\":2000000,\"outgoing_padding_mode\":\"payload\",",
+            "\"incoming_padding_mode\":\"payload\",\"timing_sample_limit\":1000,",
+            "\"jitter_denominator\":100,\"jitter_max_numerator\":200,",
+            "\"early_termination\":\"local\",\"max_events\":1000,",
+            "\"implementation_scope\":\"client_only_quic\",\"paper_equivalent\":false}\n",
+        )
+        .as_bytes();
+        for (defense, expected_kind, parameter_bytes, expected_sha256) in [
             (
                 DefenseConfig::Buflo(neqo_csdef::BufloConfig {
                     parameters: path.to_string_lossy().into_owned(),
                 }),
                 "buflo",
+                BUFLO_PARAMETER_BYTES,
+                "0d3482abe464958e6a365c294549c51eae08ebc1064e42a0be6edc10391d4d8c",
             ),
             (
                 DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
                     parameters: path.to_string_lossy().into_owned(),
                 }),
                 "cs_buflo",
+                CS_BUFLO_PARAMETER_BYTES,
+                "81d1a6aefcde220112fc6c011aa0b8bccde8b74d378fff6d39d8c482cd43b0ad",
             ),
         ] {
+            fs::write(&path, parameter_bytes).expect("write valid parameter fixture");
             let config = QcsdConfig {
                 defense,
                 ..QcsdConfig::default()
@@ -49216,6 +49241,8 @@ mod tests {
             assert_eq!(provenance.implementation_scope, Some("client_only_quic"));
             assert_eq!(provenance.paper_equivalent, Some(false));
             if expected_kind == "cs_buflo" {
+                assert!(provenance.cs_buflo_parameters.is_some());
+                assert!(provenance.buflo_parameters.is_none());
                 assert_eq!(
                     provenance.early_termination_semantics,
                     Some(
@@ -49228,14 +49255,13 @@ mod tests {
                     Some(600)
                 );
             } else {
+                assert!(provenance.buflo_parameters.is_some());
+                assert!(provenance.cs_buflo_parameters.is_none());
                 assert_eq!(provenance.early_termination_semantics, None);
                 assert_eq!(provenance.reference_tcp_write_size_bytes, None);
                 assert_eq!(provenance.reference_nominal_tcp_packet_size_bytes, None);
             }
-            assert_eq!(
-                provenance.sha256,
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-            );
+            assert_eq!(provenance.sha256, expected_sha256);
         }
         fs::remove_file(path).expect("remove parameter fixture");
     }
@@ -60148,7 +60174,7 @@ mod tests {
             Some(super::BufloKernelIncomingRetryStep::Expired)
         ));
         let receipt = runtime.finish(Some("synthetic unfinished execution".into()));
-        assert_eq!(receipt.schema_version, 13);
+        assert_eq!(receipt.schema_version, 14);
         assert_eq!(receipt.incoming_credit_release_window_ns, 32_000_000);
         assert_eq!(
             receipt.preparation_policy.as_ref().expect("marker")["period_us"],
