@@ -32169,6 +32169,7 @@ mod incoming_terminal_process_clock_tests {
         retired: u64,
     ) -> (QcsdController, QcsdSlotId, Packet) {
         let config = QcsdConfig {
+            max_udp_payload_size: 1200,
             defense: if cs {
                 DefenseConfig::CsBuflo(CsBufloConfig {
                     parameters: "declared-only.json".into(),

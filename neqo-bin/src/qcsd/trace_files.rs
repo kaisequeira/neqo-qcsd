@@ -2850,6 +2850,7 @@ mod incoming_terminal_process_clock_tests {
             let packet = Packet::new(Duration::ZERO, Direction::Incoming, 600).expect("owned600");
             let mut controller = QcsdController::with_defense(
                 QcsdConfig {
+                    max_udp_payload_size: 1200,
                     initial_max_stream_data: 1,
                     defense: DefenseConfig::CsBuflo(CsBufloConfig {
                         parameters: "fixture-only.json".into(),
