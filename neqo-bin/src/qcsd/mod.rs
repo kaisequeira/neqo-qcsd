@@ -4044,37 +4044,274 @@ fn buflo_kernel_timed_error(context: &str, error: impl std::fmt::Display) -> Err
 }
 
 #[cfg(target_os = "linux")]
-fn sample_buflo_kernel_clock(
-    clock: impl FnOnce() -> Result<u64, timed_egress::TimedEgressError>,
-) -> Result<BufloKernelClockSample, Error> {
-    let tai_before_ns = timed_egress::clock_tai_ns()
-        .map_err(|error| buflo_kernel_timed_error("clock sample", error))?;
-    let clock_ns = clock().map_err(|error| buflo_kernel_timed_error("clock sample", error))?;
-    let tai_after_ns = timed_egress::clock_tai_ns()
-        .map_err(|error| buflo_kernel_timed_error("clock sample", error))?;
-    let bracket_width_ns = tai_after_ns.checked_sub(tai_before_ns).ok_or_else(|| {
-        Error::DefenseExecution("BuFLO kernel clock TAI bracket regressed".into())
-    })?;
-    if bracket_width_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
-        return Err(Error::DefenseExecution(format!(
-            "BuFLO kernel clock bracket {bracket_width_ns} ns exceeded 250000 ns"
-        )));
+const BUFLO_KERNEL_CLOCK_PHASE_MAX_ATTEMPTS: usize = 3;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BufloKernelClockDomain {
+    Monotonic,
+    Realtime,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum BufloKernelClockReadFailure {
+    BracketTooWide(BufloKernelClockSample),
+    Fatal(Error),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelDiscardedClockAttempt {
+    attempt: usize,
+    rejected_domain: BufloKernelClockDomain,
+    discarded_monotonic: Option<BufloKernelClockSample>,
+    rejected_sample: BufloKernelClockSample,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct BufloKernelClockPhaseAcquisition {
+    phase: BufloKernelClockPhase,
+    discarded_attempts: Vec<BufloKernelDiscardedClockAttempt>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct BufloKernelClockPhaseFailure {
+    error: Error,
+    discarded_attempts: Vec<BufloKernelDiscardedClockAttempt>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct BufloKernelClockAcquisitionOrder {
+    tai_after_ns: Option<u64>,
+    monotonic_ns: Option<u64>,
+    realtime_ns: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloKernelClockAcquisitionOrder {
+    fn observe(
+        &mut self,
+        domain: BufloKernelClockDomain,
+        reading: &Result<BufloKernelClockSample, BufloKernelClockReadFailure>,
+    ) -> Result<(), Error> {
+        let sample = match reading {
+            Ok(sample) | Err(BufloKernelClockReadFailure::BracketTooWide(sample)) => sample,
+            Err(BufloKernelClockReadFailure::Fatal(_)) => return Ok(()),
+        };
+        if self
+            .tai_after_ns
+            .is_some_and(|after| after > sample.tai_before_ns)
+        {
+            return Err(Error::DefenseExecution(
+                "BuFLO kernel clock phase cross-subsample TAI chronology was invalid".into(),
+            ));
+        }
+        let previous_clock_ns = match domain {
+            BufloKernelClockDomain::Monotonic => self.monotonic_ns,
+            BufloKernelClockDomain::Realtime => self.realtime_ns,
+        };
+        if previous_clock_ns.is_some_and(|clock| clock > sample.clock_ns) {
+            return Err(Error::DefenseExecution(
+                "BuFLO kernel clock acquisition clock value regressed".into(),
+            ));
+        }
+        self.tai_after_ns = Some(sample.tai_after_ns);
+        match domain {
+            BufloKernelClockDomain::Monotonic => self.monotonic_ns = Some(sample.clock_ns),
+            BufloKernelClockDomain::Realtime => self.realtime_ns = Some(sample.clock_ns),
+        }
+        Ok(())
     }
-    Ok(BufloKernelClockSample {
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_clock_bracket_error(width_ns: u64) -> Error {
+    Error::DefenseExecution(format!(
+        "BuFLO kernel clock bracket {width_ns} ns exceeded 250000 ns"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_clock_excessive_sample_valid(sample: &BufloKernelClockSample) -> bool {
+    sample.schema_version == 1
+        && sample.tai_after_ns.checked_sub(sample.tai_before_ns) == Some(sample.bracket_width_ns)
+        && sample.bracket_width_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_buflo_kernel_clock_with(
+    mut tai_clock: impl FnMut() -> Result<u64, timed_egress::TimedEgressError>,
+    clock: impl FnOnce() -> Result<u64, timed_egress::TimedEgressError>,
+) -> Result<BufloKernelClockSample, BufloKernelClockReadFailure> {
+    let mut fatal =
+        |error| BufloKernelClockReadFailure::Fatal(buflo_kernel_timed_error("clock sample", error));
+    let tai_before_ns = tai_clock().map_err(&mut fatal)?;
+    let clock_ns = clock().map_err(&mut fatal)?;
+    let tai_after_ns = tai_clock().map_err(&mut fatal)?;
+    let bracket_width_ns = tai_after_ns.checked_sub(tai_before_ns).ok_or_else(|| {
+        BufloKernelClockReadFailure::Fatal(Error::DefenseExecution(
+            "BuFLO kernel clock TAI bracket regressed".into(),
+        ))
+    })?;
+    let sample = BufloKernelClockSample {
         schema_version: 1,
         tai_before_ns,
         clock_ns,
         tai_after_ns,
         bracket_width_ns,
+    };
+    if bracket_width_ns > duration_as_u64_nanos(BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET) {
+        return Err(BufloKernelClockReadFailure::BracketTooWide(sample));
+    }
+    Ok(sample)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_buflo_kernel_clock(
+    clock: impl FnOnce() -> Result<u64, timed_egress::TimedEgressError>,
+) -> Result<BufloKernelClockSample, BufloKernelClockReadFailure> {
+    sample_buflo_kernel_clock_with(timed_egress::clock_tai_ns, clock)
+}
+
+#[cfg(target_os = "linux")]
+fn sample_buflo_kernel_clock_phase_with(
+    mut acquire: impl FnMut(
+        BufloKernelClockDomain,
+    ) -> Result<BufloKernelClockSample, BufloKernelClockReadFailure>,
+) -> Result<BufloKernelClockPhaseAcquisition, BufloKernelClockPhaseFailure> {
+    let mut discarded_attempts = Vec::new();
+    let mut order = BufloKernelClockAcquisitionOrder::default();
+    'attempt: for attempt in 1..=BUFLO_KERNEL_CLOCK_PHASE_MAX_ATTEMPTS {
+        let mut monotonic = None;
+        for domain in [
+            BufloKernelClockDomain::Monotonic,
+            BufloKernelClockDomain::Realtime,
+        ] {
+            let reading = acquire(domain);
+            // A wide bracket cannot hide raw-clock disorder across reads.
+            if let Err(error) = order.observe(domain, &reading) {
+                return Err(BufloKernelClockPhaseFailure {
+                    error,
+                    discarded_attempts,
+                });
+            }
+            let sample = match reading {
+                Ok(sample) => {
+                    if !buflo_kernel_clock_sample_valid(&sample) {
+                        return Err(BufloKernelClockPhaseFailure {
+                            error: Error::DefenseExecution(
+                                "BuFLO clock acquisition returned an invalid successful sample"
+                                    .into(),
+                            ),
+                            discarded_attempts,
+                        });
+                    }
+                    sample
+                }
+                Err(BufloKernelClockReadFailure::Fatal(error)) => {
+                    return Err(BufloKernelClockPhaseFailure {
+                        error,
+                        discarded_attempts,
+                    });
+                }
+                Err(BufloKernelClockReadFailure::BracketTooWide(sample)) => {
+                    if !buflo_kernel_clock_excessive_sample_valid(&sample) {
+                        return Err(BufloKernelClockPhaseFailure {
+                            error: Error::DefenseExecution(
+                                "BuFLO clock acquisition returned an invalid excessive bracket"
+                                    .into(),
+                            ),
+                            discarded_attempts,
+                        });
+                    }
+                    let error = buflo_kernel_clock_bracket_error(sample.bracket_width_ns);
+                    discarded_attempts.push(BufloKernelDiscardedClockAttempt {
+                        attempt,
+                        rejected_domain: domain,
+                        discarded_monotonic: monotonic,
+                        rejected_sample: sample,
+                    });
+                    if attempt == BUFLO_KERNEL_CLOCK_PHASE_MAX_ATTEMPTS {
+                        return Err(BufloKernelClockPhaseFailure {
+                            error,
+                            discarded_attempts,
+                        });
+                    }
+                    // Only clock reads repeat. The caller retains its already
+                    // completed helper transmission, job, window and ownership.
+                    // A partial MONOTONIC/REALTIME phase is never stitched into
+                    // the next attempt.
+                    continue 'attempt;
+                }
+            };
+            if domain == BufloKernelClockDomain::Monotonic {
+                monotonic = Some(sample);
+            } else {
+                let Some(monotonic) = monotonic else {
+                    return Err(BufloKernelClockPhaseFailure {
+                        error: Error::DefenseExecution(
+                            "BuFLO clock acquisition omitted its monotonic sample".into(),
+                        ),
+                        discarded_attempts,
+                    });
+                };
+                return match assemble_buflo_kernel_clock_phase(monotonic, sample) {
+                    Ok(phase) => Ok(BufloKernelClockPhaseAcquisition {
+                        phase,
+                        discarded_attempts,
+                    }),
+                    Err(error) => Err(BufloKernelClockPhaseFailure {
+                        error,
+                        discarded_attempts,
+                    }),
+                };
+            }
+        }
+    }
+    Err(BufloKernelClockPhaseFailure {
+        error: Error::DefenseExecution("BuFLO clock acquisition omitted its phase".into()),
+        discarded_attempts,
     })
 }
 
 #[cfg(target_os = "linux")]
 fn sample_buflo_kernel_clock_phase() -> Result<BufloKernelClockPhase, Error> {
-    assemble_buflo_kernel_clock_phase(
-        sample_buflo_kernel_clock(timed_egress::clock_monotonic_ns)?,
-        sample_buflo_kernel_clock(timed_egress::clock_realtime_ns)?,
-    )
+    let acquisition = sample_buflo_kernel_clock_phase_with(|domain| match domain {
+        BufloKernelClockDomain::Monotonic => {
+            sample_buflo_kernel_clock(timed_egress::clock_monotonic_ns)
+        }
+        BufloKernelClockDomain::Realtime => {
+            sample_buflo_kernel_clock(timed_egress::clock_realtime_ns)
+        }
+    });
+    let discarded_attempts = match &acquisition {
+        Ok(value) => &value.discarded_attempts,
+        Err(value) => &value.discarded_attempts,
+    };
+    if !discarded_attempts.is_empty() {
+        // This bounded diagnostic is not a clock-mapping/packet receipt. The
+        // original selected schema1 phase and every original physical gate
+        // remain unchanged. Preserve rejected measurements on success or error.
+        let diagnostic = serde_json::to_vec(&serde_json::json!({
+            "record_type": "qcsd-buflo-kernel-clock-acquisition-discarded-attempts-v1",
+            "attempt_limit": BUFLO_KERNEL_CLOCK_PHASE_MAX_ATTEMPTS,
+            "selected_valid_phase": acquisition.is_ok(),
+            "discarded_attempts": discarded_attempts,
+        }))
+        .map_err(|error| buflo_kernel_timed_error("clock retry diagnostic", error))?;
+        let mut stderr = std::io::stderr().lock();
+        std::io::Write::write_all(&mut stderr, &diagnostic)
+            .and_then(|()| std::io::Write::write_all(&mut stderr, b"\n"))
+            .map_err(|error| buflo_kernel_timed_error("clock retry diagnostic", error))?;
+    }
+    acquisition
+        .map(|value| value.phase)
+        .map_err(|value| value.error)
 }
 
 #[cfg(target_os = "linux")]
@@ -55598,6 +55835,258 @@ mod tests {
             selected_upper_offset_ns: 10,
             semantics: super::BUFLO_KERNEL_INSTANT_ALIGNMENT_SEMANTICS,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bounded_clock_sample(before: u64, clock: u64, width: u64) -> super::BufloKernelClockSample {
+        super::BufloKernelClockSample {
+            schema_version: 1,
+            tai_before_ns: before,
+            clock_ns: clock,
+            tai_after_ns: before + width,
+            bracket_width_ns: width,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_retries_279710ns_without_reusing_partial_phase() {
+        use super::{BufloKernelClockDomain as D, BufloKernelClockReadFailure as F};
+        let old_monotonic = bounded_clock_sample(1_000, 500, 10);
+        let wide_realtime = bounded_clock_sample(1_020, 520, 279_710);
+        let fresh_monotonic = bounded_clock_sample(300_000, 299_500, 10);
+        let fresh_realtime = bounded_clock_sample(300_020, 299_520, 10);
+        let mut reads = std::collections::VecDeque::from([
+            (D::Monotonic, Ok(old_monotonic.clone())),
+            (D::Realtime, Err(F::BracketTooWide(wide_realtime.clone()))),
+            (D::Monotonic, Ok(fresh_monotonic.clone())),
+            (D::Realtime, Ok(fresh_realtime.clone())),
+        ]);
+        let result = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            let (expected, value) = reads.pop_front().expect("bounded clock read");
+            assert_eq!(domain, expected);
+            value
+        })
+        .expect("fresh whole <=250us phase");
+        assert!(reads.is_empty());
+        assert_eq!(result.phase.monotonic, fresh_monotonic);
+        assert_eq!(result.phase.realtime, fresh_realtime);
+        assert_eq!(result.discarded_attempts.len(), 1);
+        let rejected = &result.discarded_attempts[0];
+        assert_eq!(rejected.attempt, 1);
+        assert_eq!(rejected.rejected_domain, D::Realtime);
+        assert_eq!(rejected.discarded_monotonic, Some(old_monotonic));
+        assert_eq!(rejected.rejected_sample, wide_realtime);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_exhausts_three_wide_attempts_and_preserves_refusal() {
+        use super::{BufloKernelClockDomain as D, BufloKernelClockReadFailure as F};
+        let mut calls = 0;
+        let failure = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            assert_eq!(domain, D::Monotonic);
+            calls += 1;
+            Err(F::BracketTooWide(bounded_clock_sample(
+                calls * 1_000_000,
+                calls * 1_000_000 - 500,
+                279_710,
+            )))
+        })
+        .expect_err("exact finite acquisition exhaustion");
+        assert_eq!(calls, 3);
+        assert_eq!(failure.discarded_attempts.len(), 3);
+        assert!(matches!(&failure.error, super::Error::DefenseExecution(_)));
+        assert_eq!(
+            failure.error.to_string(),
+            "client defence execution failed: BuFLO kernel clock bracket 279710 ns exceeded 250000 ns"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_retains_inclusive_bound_and_ordinary_one_attempt_path() {
+        use super::BufloKernelClockDomain as D;
+        let mut calls = 0;
+        let result = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            calls += 1;
+            Ok(match domain {
+                D::Monotonic => bounded_clock_sample(1_000_000, 999_500, 250_000),
+                D::Realtime => bounded_clock_sample(1_250_010, 1_249_510, 10),
+            })
+        })
+        .expect("inclusive exact250us remains valid");
+        assert_eq!(calls, 2);
+        assert!(result.discarded_attempts.is_empty());
+        assert!(super::buflo_kernel_clock_phase_valid(&result.phase));
+        let mut tai = std::collections::VecDeque::from([Ok(10), Ok(250_011)]);
+        let too_wide = super::sample_buflo_kernel_clock_with(
+            || tai.pop_front().expect("two TAI reads"),
+            || Ok(12),
+        )
+        .expect_err("250001ns remains over bound");
+        assert!(matches!(
+            too_wide,
+            super::BufloKernelClockReadFailure::BracketTooWide(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_never_retries_fatal_clock_read_or_tai_regression() {
+        use super::{BufloKernelClockDomain as D, BufloKernelClockReadFailure as F};
+        let mut calls = 0;
+        let failure = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            assert_eq!(domain, D::Monotonic);
+            calls += 1;
+            Err(F::Fatal(super::Error::DefenseExecution(
+                "injected clock failure".into(),
+            )))
+        })
+        .expect_err("fatal clock errors are not retryable");
+        assert_eq!(calls, 1);
+        assert!(failure.discarded_attempts.is_empty());
+        let mut tai = std::collections::VecDeque::from([Ok(20), Ok(19)]);
+        let regression = super::sample_buflo_kernel_clock_with(
+            || tai.pop_front().expect("two TAI reads"),
+            || Ok(7),
+        )
+        .expect_err("TAI regression is fatal");
+        assert!(matches!(regression, F::Fatal(_)));
+        let os_error = super::sample_buflo_kernel_clock_with(
+            || {
+                Err(super::timed_egress::TimedEgressError::Protocol(
+                    "injected read failure".into(),
+                ))
+            },
+            || panic!("middle clock must not be called after a failed first TAI read"),
+        )
+        .expect_err("OS/protocol read error is fatal");
+        assert!(matches!(os_error, F::Fatal(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_never_retries_cross_subsample_chronology_failure() {
+        use super::BufloKernelClockDomain as D;
+        let mut calls = 0;
+        let failure = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            calls += 1;
+            Ok(match domain {
+                D::Monotonic => bounded_clock_sample(1_000, 500, 10),
+                D::Realtime => bounded_clock_sample(1_005, 505, 10),
+            })
+        })
+        .expect_err("narrow disordered samples are fatal, never retried");
+        assert_eq!(calls, 2);
+        assert!(failure.discarded_attempts.is_empty());
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("cross-subsample TAI chronology")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_wide_sample_cannot_hide_known_tai_disorder() {
+        use super::{BufloKernelClockDomain as D, BufloKernelClockReadFailure as F};
+        for cross_attempt in [false, true] {
+            let first = if cross_attempt {
+                Err(F::BracketTooWide(bounded_clock_sample(1_000, 500, 279_710)))
+            } else {
+                Ok(bounded_clock_sample(1_000, 500, 10))
+            };
+            let second = if cross_attempt {
+                (D::Monotonic, Ok(bounded_clock_sample(280_709, 280_209, 10)))
+            } else {
+                (
+                    D::Realtime,
+                    Err(F::BracketTooWide(bounded_clock_sample(1_005, 505, 279_710))),
+                )
+            };
+            let mut reads = std::collections::VecDeque::from([(D::Monotonic, first), second]);
+            let failure = super::sample_buflo_kernel_clock_phase_with(|domain| {
+                let (expected, sample) = reads.pop_front().expect("must not retry known disorder");
+                assert_eq!(domain, expected);
+                sample
+            })
+            .expect_err("TAI chronology is fatal even alongside an excessive bracket");
+            assert!(reads.is_empty());
+            assert_eq!(failure.discarded_attempts.len(), usize::from(cross_attempt));
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .contains("cross-subsample TAI chronology")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_discarded_bracket_cannot_hide_same_clock_regression() {
+        use super::{BufloKernelClockDomain as D, BufloKernelClockReadFailure as F};
+        let mut reads = std::collections::VecDeque::from([
+            Err(F::BracketTooWide(bounded_clock_sample(1_000, 500, 279_710))),
+            Ok(bounded_clock_sample(300_000, 499, 10)),
+        ]);
+        let failure = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            assert_eq!(domain, D::Monotonic);
+            reads
+                .pop_front()
+                .expect("must not retry known clock regression")
+        })
+        .expect_err("same-clock regression remains fatal across discarded attempts");
+        assert!(reads.is_empty());
+        assert_eq!(failure.discarded_attempts.len(), 1);
+        assert!(failure.error.to_string().contains("clock value regressed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_cannot_repair_realtime_intersection_or_expired_window() {
+        use super::BufloKernelClockDomain as D;
+        let result = super::sample_buflo_kernel_clock_phase_with(|domain| {
+            Ok(match domain {
+                D::Monotonic => bounded_clock_sample(300_000, 299_500, 10),
+                D::Realtime => bounded_clock_sample(300_020, 299_020, 10),
+            })
+        })
+        .expect("fresh narrow acquisition");
+        let retained_realtime = (500, 510);
+        assert_eq!(
+            super::intersect_clock_offset_bounds(
+                retained_realtime,
+                super::clock_offset_bounds(&result.phase.realtime),
+            ),
+            None,
+            "new narrow sample must still fail the unchanged realtime intersection"
+        );
+        assert!(!super::buflo_kernel_interval_within_half_open_window(
+            1_500, 2_000, 1_000, 2_000,
+        ));
+        assert!(!super::buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &result.phase,
+            result.phase.monotonic.clock_ns + 1,
+            result.phase.monotonic.tai_before_ns,
+            result.phase.realtime.clock_ns,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_clock_acquisition_rejects_a_mislabelled_retryable_sample() {
+        use super::BufloKernelClockReadFailure as F;
+        let mut calls = 0;
+        let failure = super::sample_buflo_kernel_clock_phase_with(|_| {
+            calls += 1;
+            Err(F::BracketTooWide(bounded_clock_sample(1_000, 500, 250_000)))
+        })
+        .expect_err("retryable classification cannot disguise another failure");
+        assert_eq!(calls, 1);
+        assert!(failure.discarded_attempts.is_empty());
     }
 
     #[cfg(target_os = "linux")]
