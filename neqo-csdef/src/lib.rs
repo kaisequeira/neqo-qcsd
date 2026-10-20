@@ -15,7 +15,7 @@ mod config;
 mod controller;
 pub use controller::{
     BufloFinPermissionRelease, BufloPermissionAccounting, IncomingCreditConsumedRange,
-    IncomingCreditRealizationWitness,
+    IncomingCreditRealizationWitness, IncomingTerminalProcessWitness,
 };
 mod defense;
 mod dependency_tracker;

@@ -15685,6 +15685,9 @@ async fn execute_run_inner(
     terminal_artifact: &mut Option<StagedTerminalRunArtifact>,
 ) -> Result<Vec<ResponseResult>, Error> {
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
+    if matches!(&spec.config.defense, DefenseConfig::CsBuflo(_)) {
+        traces.require_cs_incoming_process_witnesses();
+    }
     let observation_clock = QcsdObservationClock::new(process_start);
     let mut endpoints = create_run_endpoints(spec, process_start, &observation_clock)?;
     // Complete all fallible controller/workload construction before creating
@@ -19159,6 +19162,7 @@ fn record_queued_terminal_actions(
         let terminal_us = terminal_slot
             .map(|slot| controller_terminal_resolution_us(controller, slot))
             .transpose()?;
+        traces.bind_cs_incoming_process_witness(controller, &action, now)?;
         if !record_terminal_action(
             traces,
             now,
@@ -20392,6 +20396,7 @@ fn apply_action(
         } => TerminalActionSemantics::ExplicitCancellation(MissedSlotReason::EndpointClosed),
         _ => TerminalActionSemantics::OpportunityResolution,
     };
+    traces.bind_cs_incoming_process_witness(controller, &action, terminal_trace_at)?;
     if record_terminal_action(
         traces,
         terminal_trace_at,

@@ -20,9 +20,9 @@ use std::{
 };
 
 use neqo_csdef::{
-    Direction, MissedSlotReason, Packet, QcsdCongestionReason, QcsdController, QcsdEndpointId,
-    QcsdObservation, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome,
-    QcsdStreamId, TimestampedQcsdObservation,
+    Direction, EventOutcome, IncomingTerminalProcessWitness, MissedSlotReason, Packet,
+    QcsdCongestionReason, QcsdController, QcsdEndpointId, QcsdObservation, QcsdSendPolicy,
+    QcsdSlotComposition, QcsdSlotId, QcsdSlotOutcome, QcsdStreamId, TimestampedQcsdObservation,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -316,6 +316,8 @@ pub(super) struct TraceFiles {
     physical_receive_advertisements:
         HashMap<(QcsdEndpointId, QcsdStreamId), Vec<PhysicalReceiveAdvertisement>>,
     terminal_slots: HashMap<QcsdSlotId, Packet>,
+    cs_incoming_process_witnesses_required: bool,
+    cs_incoming_process_witnesses: HashMap<QcsdSlotId, IncomingTerminalProcessWitness>,
     buflo_fin_defense_origin_ns: Option<u64>,
     buflo_fin_raw_frontiers: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64)>,
     buflo_fin_peer_reads: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64, u64, u64)>,
@@ -366,6 +368,8 @@ impl TraceFiles {
             incoming_target_limits: HashMap::new(),
             physical_receive_advertisements: HashMap::new(),
             terminal_slots: HashMap::new(),
+            cs_incoming_process_witnesses_required: false,
+            cs_incoming_process_witnesses: HashMap::new(),
             buflo_fin_defense_origin_ns: None,
             buflo_fin_raw_frontiers: HashMap::new(),
             buflo_fin_peer_reads: HashMap::new(),
@@ -374,6 +378,97 @@ impl TraceFiles {
             buflo_fin_consumed_slots: HashMap::new(),
             buflo_fin_pre_advertisements: HashMap::new(),
         })
+    }
+
+    /// Hardwired by execute_run_inner for CS; no public flag or policy input.
+    pub(super) fn require_cs_incoming_process_witnesses(&mut self) {
+        self.cs_incoming_process_witnesses_required = true;
+    }
+
+    /// Bind the opaque controller-issued clock witness to the original trace
+    /// owner before its independently timestamped, later action is serialized.
+    pub(super) fn bind_cs_incoming_process_witness(
+        &mut self,
+        controller: &QcsdController,
+        action: &neqo_csdef::QcsdAction,
+        serialized_at: Instant,
+    ) -> Result<(), Error> {
+        if !self.cs_incoming_process_witnesses_required {
+            return Ok(());
+        }
+        let neqo_csdef::QcsdAction::SlotSatisfied {
+            endpoint,
+            packet,
+            slot,
+        } = action
+        else {
+            return Ok(());
+        };
+        if packet.direction() != Direction::Incoming {
+            return Ok(());
+        }
+        let witness = controller
+            .incoming_terminal_process_witness(*slot)
+            .ok_or_else(|| {
+                Error::SlotInvariant(format!(
+                    "incoming slot {} lacks an owned process-clock witness",
+                    slot.0
+                ))
+            })?;
+        let pending = self.pending_slots.get(slot).ok_or_else(|| {
+            Error::SlotInvariant(format!(
+                "incoming slot {} has no original trace owner",
+                slot.0
+            ))
+        })?;
+        let correct_outcome = matches!(witness.outcome(), EventOutcome::Satisfied { observed }
+            if observed == packet.length());
+        if witness.slot() != *slot
+            || witness.packet() != *packet
+            || pending.packet != *packet
+            || self.pending_slot_endpoint(*slot) != *endpoint
+            || witness.endpoint() != *endpoint
+            || !correct_outcome
+            || controller.terminal_slot_resolution_at(*slot) != Some(witness.terminal_at())
+            || self.terminal_slots.contains_key(slot)
+            || self.cs_incoming_process_witnesses.contains_key(slot)
+            || witness.captured_at() < self.start
+            || witness.captured_at() > serialized_at
+        {
+            return Err(Error::SlotInvariant(format!(
+                "incoming slot {} process-clock witness identity/order differs",
+                slot.0
+            )));
+        }
+        let consumed_at_us = self.elapsed_us(witness.captured_at());
+        if pending
+            .credit_advertised_at_us
+            .is_none_or(|advertised| consumed_at_us < advertised)
+        {
+            return Err(Error::SlotInvariant(format!(
+                "incoming slot {} process-clock witness predates its advertisement",
+                slot.0
+            )));
+        }
+        let captured_ns = u64::try_from(
+            witness.captured_at().duration_since(self.start).as_nanos(),
+        )
+        .map_err(|_| Error::SlotInvariant("incoming process-clock witness overflow".into()))?;
+        let serialized_ns = u64::try_from(serialized_at.duration_since(self.start).as_nanos())
+            .map_err(|_| {
+                Error::SlotInvariant("incoming action serialization clock overflow".into())
+            })?;
+        self.event(serialized_at, *endpoint, "incoming_terminal_process_clock", "owned_resolution", &serde_json::json!({
+            "schema_version": 1,
+            "source": "native-owned-incoming-terminal-process-clock-v1",
+            "slot": slot.0, "packet": packet, "endpoint": endpoint.map(|value| value.0),
+            "captured_process_monotonic_ns": captured_ns,
+            "serialized_process_monotonic_ns": serialized_ns,
+            "controller_terminal_defense_elapsed_us": u64::try_from(witness.terminal_at().as_micros()).unwrap_or(u64::MAX),
+            "observed_consumed_bytes": packet.length(),
+        }))?;
+        self.cs_incoming_process_witnesses.insert(*slot, witness);
+        Ok(())
     }
 
     /// Bind the actual activation Instant, never a controller reduction delta.
@@ -1123,7 +1218,7 @@ impl TraceFiles {
     }
 
     pub(super) fn ensure_no_pending_slots(&self) -> Result<(), Error> {
-        if self.pending_slots.is_empty() {
+        if self.pending_slots.is_empty() && self.cs_incoming_process_witnesses.is_empty() {
             Ok(())
         } else {
             let slots = self
@@ -1619,6 +1714,34 @@ impl TraceFiles {
             return Err(Error::SlotInvariant(format!("slot {} {detail}", slot.0)));
         }
         let mut qcsd = row.qcsd;
+        let consumed_at_us = if self.cs_incoming_process_witnesses_required
+            && packet.direction() == Direction::Incoming
+            && matches!(row.satisfaction, "satisfied" | "full")
+        {
+            let witness = self
+                .cs_incoming_process_witnesses
+                .get(&slot)
+                .ok_or_else(|| {
+                    Error::SlotInvariant(format!(
+                        "incoming slot {} terminal trace lacks its process-clock witness",
+                        slot.0
+                    ))
+                })?;
+            if witness.packet() != packet
+                || witness.slot() != slot
+                || u64::try_from(witness.terminal_at().as_micros()).unwrap_or(u64::MAX)
+                    != row.terminal_defense_elapsed_us
+                || self.pending_slot_endpoint(slot) != row.endpoint
+            {
+                return Err(Error::SlotInvariant(format!(
+                    "incoming slot {} terminal trace changed process-clock ownership",
+                    slot.0
+                )));
+            }
+            self.elapsed_us(witness.captured_at())
+        } else {
+            terminal_time_us
+        };
         if let Some(pending) = self.pending_slots.get(&slot) {
             if pending.packet != packet {
                 return Err(Error::SlotInvariant(format!(
@@ -1634,9 +1757,9 @@ impl TraceFiles {
                     .credit_advertised_at_us
                     .map(|advertised| advertised.saturating_sub(pending.action_time_us));
                 if row.satisfaction == "satisfied" || row.satisfaction == "full" {
-                    qcsd.credit_consumed_at_us = Some(terminal_time_us);
+                    qcsd.credit_consumed_at_us = Some(consumed_at_us);
                     qcsd.credit_consumption_delay_us =
-                        Some(terminal_time_us.saturating_sub(pending.action_time_us));
+                        Some(consumed_at_us.saturating_sub(pending.action_time_us));
                 }
             }
         }
@@ -1645,6 +1768,7 @@ impl TraceFiles {
         // schema-one/two outcome identity while preserving every older field.
         qcsd.schema_version = Some(3);
         qcsd.terminal_defense_elapsed_us = Some(row.terminal_defense_elapsed_us);
+        self.cs_incoming_process_witnesses.remove(&slot);
         self.pending_slots.remove(&slot);
         self.incoming_target_limits.remove(&slot);
         self.terminal_slots.insert(slot, packet);
@@ -2687,5 +2811,336 @@ mod incoming_realization_tests {
             missing.traces.event_rows.is_empty(),
             "missing handoff cannot publish an observation"
         );
+    }
+}
+
+#[cfg(test)]
+mod incoming_terminal_process_clock_tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    use neqo_csdef::{
+        CsBufloConfig, DefenseConfig, QcsdAction, QcsdConfig, QcsdObservationClock,
+        QcsdRequestRole, StaticSchedule, Trace,
+    };
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct OwnedFixture {
+        controller: QcsdController,
+        traces: TraceFiles,
+        path: std::path::PathBuf,
+        endpoint: QcsdEndpointId,
+        slot: QcsdSlotId,
+        packet: Packet,
+    }
+    impl OwnedFixture {
+        fn new(consumed: u64) -> Self {
+            let start = Instant::now();
+            let path = std::env::temp_dir().join(format!(
+                "neqo-native136-owned-process-clock-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("fresh fixture");
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 600).expect("owned600");
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    initial_max_stream_data: 1,
+                    defense: DefenseConfig::CsBuflo(CsBufloConfig {
+                        parameters: "fixture-only.json".into(),
+                    }),
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+            )
+            .expect("controller");
+            let endpoint = QcsdEndpointId(0);
+            let stream = QcsdStreamId(4);
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: "https://clock.example".into(),
+                    max_udp_payload_size: 1200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: None,
+                },
+                Duration::ZERO,
+            );
+            // The original one-byte initial window is not scheduled credit.
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: 1,
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::ZERO);
+            let action = controller
+                .drain_actions()
+                .find(|a| matches!(a, QcsdAction::IncreaseReceiveLimit { .. }))
+                .expect("original owned receive action");
+            let QcsdAction::IncreaseReceiveLimit {
+                slot,
+                absolute_limit,
+                packet: actual,
+                ..
+            } = action
+            else {
+                unreachable!()
+            };
+            assert_eq!(actual, packet);
+            let mut traces = TraceFiles::new(&path, start).expect("traces");
+            traces.require_cs_incoming_process_witnesses();
+            let advertised = Instant::now();
+            traces
+                .register_incoming_action(
+                    advertised,
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    packet,
+                    slot,
+                )
+                .expect("register owner");
+            let clock = QcsdObservationClock::new(start);
+            let record = clock.record_at(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                advertised,
+            );
+            controller.observe(
+                record.observation().clone(),
+                advertised.duration_since(start),
+            );
+            traces
+                .observation_after_controller(
+                    Some(endpoint),
+                    &record,
+                    &controller,
+                    Some(advertised),
+                )
+                .expect("original physical advertisement");
+            for bytes in [1, 1, 1, consumed - 3] {
+                let at = Instant::now().duration_since(start);
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream,
+                        bytes,
+                    },
+                    at,
+                );
+            }
+            Self {
+                controller,
+                traces,
+                path,
+                endpoint,
+                slot,
+                packet,
+            }
+        }
+        fn action(&self) -> QcsdAction {
+            QcsdAction::SlotSatisfied {
+                endpoint: Some(self.endpoint),
+                packet: self.packet,
+                slot: self.slot,
+            }
+        }
+        fn row(&self, serialized_at: Instant) -> ScheduleTraceRow<'static> {
+            ScheduleTraceRow {
+                action_time_us: self.traces.elapsed_us(serialized_at),
+                endpoint: Some(self.endpoint),
+                packet: self.packet,
+                satisfaction: "satisfied",
+                observed: None,
+                miss_reason: "",
+                slot: self.slot,
+                qcsd: QcsdTraceColumns::exact(600, None),
+                terminal_defense_elapsed_us: u64::try_from(
+                    self.controller
+                        .terminal_slot_resolution_at(self.slot)
+                        .expect("real controller resolution")
+                        .as_micros(),
+                )
+                .expect("bounded"),
+            }
+        }
+    }
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn queued_serialization_10127us_keeps_independent_consumption_clock() {
+        let mut f = OwnedFixture::new(600);
+        let witness = f
+            .controller
+            .incoming_terminal_process_witness(f.slot)
+            .expect("actual owned600 witness");
+        let serialized = witness.captured_at() + Duration::from_micros(10127);
+        let action = f.action();
+        f.traces
+            .bind_cs_incoming_process_witness(&f.controller, &action, serialized)
+            .expect("bind independent witness");
+        let row = f.row(serialized);
+        f.traces.schedule(&row).expect("saved schedule");
+        f.traces.schedule.flush().expect("schedule flush");
+        let text = fs::read_to_string(f.path.join("schedule.csv")).expect("raw schedule");
+        let mut lines = text.lines();
+        let headers: Vec<_> = lines.next().expect("headers").split(',').collect();
+        let values: Vec<_> = lines.next().expect("one terminal").split(',').collect();
+        let field = |name| {
+            values[headers.iter().position(|v| *v == name).expect("column")]
+                .parse::<u64>()
+                .expect("integer")
+        };
+        let consumed = field("credit_consumed_at_us");
+        assert_eq!(consumed, f.traces.elapsed_us(witness.captured_at()));
+        let serialized_us = f.traces.elapsed_us(serialized);
+        assert_eq!(serialized_us - consumed, 10127);
+        // Original h controller-action bound remains 10000us. Only the genuine
+        // earlier clock witness passes; late serialization is still exposed.
+        assert!(consumed >= row.terminal_defense_elapsed_us);
+        assert!(consumed - row.terminal_defense_elapsed_us <= 10000);
+        assert!(serialized_us - row.terminal_defense_elapsed_us > 10000);
+        let event = f
+            .traces
+            .event_rows
+            .iter()
+            .find(|r| r.event == "incoming_terminal_process_clock")
+            .expect("separate serialization event");
+        assert_eq!(
+            event.monotonic_ns,
+            u64::try_from(serialized.duration_since(f.traces.start).as_nanos()).expect("bounded")
+        );
+        assert!(f.traces.cs_incoming_process_witnesses.is_empty());
+    }
+
+    #[test]
+    fn incomplete_credit_cannot_supply_process_clock_witness() {
+        let mut f = OwnedFixture::new(599);
+        assert!(
+            f.controller
+                .incoming_terminal_process_witness(f.slot)
+                .is_none()
+        );
+        let action = f.action();
+        assert!(
+            f.traces
+                .bind_cs_incoming_process_witness(&f.controller, &action, Instant::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn wrong_slot_packet_or_owner_is_rejected() {
+        for bad in 0..3 {
+            let mut f = OwnedFixture::new(600);
+            let witness = f
+                .controller
+                .incoming_terminal_process_witness(f.slot)
+                .expect("witness");
+            let action = QcsdAction::SlotSatisfied {
+                endpoint: Some(if bad == 0 {
+                    QcsdEndpointId(9)
+                } else {
+                    f.endpoint
+                }),
+                packet: if bad == 1 {
+                    Packet::new(Duration::from_micros(1), Direction::Incoming, 600)
+                        .expect("different target")
+                } else {
+                    f.packet
+                },
+                slot: if bad == 2 {
+                    QcsdSlotId(f.slot.0 + 1)
+                } else {
+                    f.slot
+                },
+            };
+            assert!(
+                f.traces
+                    .bind_cs_incoming_process_witness(
+                        &f.controller,
+                        &action,
+                        witness.captured_at() + Duration::from_micros(10127)
+                    )
+                    .is_err()
+            );
+            assert!(f.traces.cs_incoming_process_witnesses.is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_or_backwards_serialization_is_rejected() {
+        let mut f = OwnedFixture::new(600);
+        let witness = f
+            .controller
+            .incoming_terminal_process_witness(f.slot)
+            .expect("witness");
+        let action = f.action();
+        assert!(
+            f.traces
+                .bind_cs_incoming_process_witness(
+                    &f.controller,
+                    &action,
+                    witness.captured_at() - Duration::from_nanos(1)
+                )
+                .is_err()
+        );
+        let serialized = witness.captured_at() + Duration::from_micros(10127);
+        f.traces
+            .bind_cs_incoming_process_witness(&f.controller, &action, serialized)
+            .expect("first exact bind");
+        assert!(
+            f.traces
+                .bind_cs_incoming_process_witness(&f.controller, &action, serialized)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schedule_cannot_substitute_clock_or_omit_witness() {
+        for missing in [false, true] {
+            let mut f = OwnedFixture::new(600);
+            let witness = f
+                .controller
+                .incoming_terminal_process_witness(f.slot)
+                .expect("witness");
+            let serialized = witness.captured_at() + Duration::from_micros(10127);
+            let action = f.action();
+            if !missing {
+                f.traces
+                    .bind_cs_incoming_process_witness(&f.controller, &action, serialized)
+                    .expect("bind");
+            }
+            let mut row = f.row(serialized);
+            if !missing {
+                row.terminal_defense_elapsed_us += 1;
+            }
+            assert!(f.traces.schedule(&row).is_err());
+        }
     }
 }

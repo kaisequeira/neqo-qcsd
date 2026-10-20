@@ -7,7 +7,7 @@ mod control_loop;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use control_loop::{ControlLoop, PendingClaim, PendingCredit, PendingIncoming, PendingOutgoing};
@@ -21,6 +21,51 @@ use crate::{
     SignalKind, StaticSchedule, Tamaraw, TrafficMorphing, WalkieTalkie, WtfPad,
     chaff_manager::ChaffManager, stream::StreamRegistry,
 };
+
+/// Independently sampled process-clock evidence for one owned incoming terminal.
+/// Construction is private to the actual controller terminal transition.
+#[derive(Clone, Copy, Debug)]
+pub struct IncomingTerminalProcessWitness {
+    slot: QcsdSlotId,
+    packet: crate::Packet,
+    endpoint: Option<QcsdEndpointId>,
+    outcome: EventOutcome,
+    captured_at: Instant,
+    terminal_at: Duration,
+}
+
+impl IncomingTerminalProcessWitness {
+    /// Original run-unique scheduled cell identity.
+    #[must_use]
+    pub const fn slot(&self) -> QcsdSlotId {
+        self.slot
+    }
+    /// Exact packet owned by the completed ledger.
+    #[must_use]
+    pub const fn packet(&self) -> crate::Packet {
+        self.packet
+    }
+    /// Original logical owner, including explicit cross-endpoint fan-out.
+    #[must_use]
+    pub const fn endpoint(&self) -> Option<QcsdEndpointId> {
+        self.endpoint
+    }
+    /// Outcome already selected by the original credit reducer.
+    #[must_use]
+    pub const fn outcome(&self) -> EventOutcome {
+        self.outcome
+    }
+    /// Independent process Instant sampled at that owned transition.
+    #[must_use]
+    pub const fn captured_at(&self) -> Instant {
+        self.captured_at
+    }
+    /// Original defense-relative resolution time, retained separately.
+    #[must_use]
+    pub const fn terminal_at(&self) -> Duration {
+        self.terminal_at
+    }
+}
 
 /// Exact controller bookkeeping canceled after a typed receive-lifecycle rejection.
 ///
@@ -624,6 +669,9 @@ pub struct QcsdController {
     /// `Duration at` without substituting an adapter-production or trace-write
     /// timestamp from another clock domain.
     terminal_slot_resolution_at: HashMap<QcsdSlotId, Duration>,
+    // CS receipt metadata only; no signal, RNG, credit or controller decision
+    // consumes this independently sampled process-clock ledger.
+    incoming_terminal_process_witnesses: HashMap<QcsdSlotId, IncomingTerminalProcessWitness>,
     application_complete: bool,
     /// Whether the application-complete signal has crossed the ordered
     /// defense-observation boundary.  `application_complete` is set when the
@@ -854,6 +902,7 @@ impl QcsdController {
             last_delivered_observation_at: None,
             pending_slots: HashMap::new(),
             terminal_slot_resolution_at: HashMap::new(),
+            incoming_terminal_process_witnesses: HashMap::new(),
             application_complete: false,
             application_complete_delivered_to_defense: false,
             adapter_egress_backlog_pending: true,
@@ -1962,6 +2011,15 @@ impl QcsdController {
     #[must_use]
     pub fn terminal_slot_resolution_at(&self, slot: QcsdSlotId) -> Option<Duration> {
         self.terminal_slot_resolution_at.get(&slot).copied()
+    }
+
+    /// Independent process-clock witness from the actual CS incoming terminal.
+    #[must_use]
+    pub fn incoming_terminal_process_witness(
+        &self,
+        slot: QcsdSlotId,
+    ) -> Option<IncomingTerminalProcessWitness> {
+        self.incoming_terminal_process_witnesses.get(&slot).copied()
     }
 
     /// Terminalize every outstanding scheduled slot after a run aborts.
@@ -4140,6 +4198,27 @@ impl QcsdController {
     }
 
     fn finish_incoming_slot_if_resolved(&mut self, slot: QcsdSlotId, at: Duration) {
+        self.finish_incoming_slot_if_resolved_with_process_clock(
+            slot,
+            at,
+            &mut Self::incoming_terminal_process_now,
+        );
+    }
+
+    fn incoming_terminal_process_now() -> Instant {
+        #![expect(
+            clippy::disallowed_methods,
+            reason = "owned receipt timing requires an independent process-clock sample; no controller decision consumes it"
+        )]
+        Instant::now()
+    }
+
+    fn finish_incoming_slot_if_resolved_with_process_clock(
+        &mut self,
+        slot: QcsdSlotId,
+        at: Duration,
+        process_clock: &mut impl FnMut() -> Instant,
+    ) {
         if self
             .incoming_credit_ledger
             .get(&slot)
@@ -4200,6 +4279,27 @@ impl QcsdController {
             });
             EventOutcome::Missed(reason)
         };
+        if ledger.retired == 0 && matches!(&self.config.defense, DefenseConfig::CsBuflo(_)) {
+            // Independent process-clock sample at the actual owned-credit
+            // terminal transition. The complete original ledger remains the
+            // owner; no controller `Duration at` is projected onto this clock.
+            let captured_at = process_clock();
+            let previous = self.incoming_terminal_process_witnesses.insert(
+                slot,
+                IncomingTerminalProcessWitness {
+                    slot,
+                    packet: ledger.packet,
+                    endpoint: ledger.action_endpoint(),
+                    outcome,
+                    captured_at,
+                    terminal_at: at,
+                },
+            );
+            assert!(
+                previous.is_none(),
+                "incoming terminal process witness was reused"
+            );
+        }
         self.resolve_slot(at, slot, outcome);
     }
 
@@ -32054,6 +32154,116 @@ mod tests {
             assert_eq!(c.scheduled_incoming_retired_bytes, 0);
             assert_eq!(c.terminal_failure(), None);
             assert_eq!(c.buflo_retained_parser_room(ep, original_app), wanted_room);
+        }
+    }
+}
+
+#[cfg(test)]
+mod incoming_terminal_process_clock_tests {
+    use super::*;
+    use crate::{CsBufloConfig, Packet, Trace};
+
+    fn owned_controller(
+        cs: bool,
+        consumed: u64,
+        retired: u64,
+    ) -> (QcsdController, QcsdSlotId, Packet) {
+        let config = QcsdConfig {
+            defense: if cs {
+                DefenseConfig::CsBuflo(CsBufloConfig {
+                    parameters: "declared-only.json".into(),
+                })
+            } else {
+                DefenseConfig::None
+            },
+            ..QcsdConfig::default()
+        };
+        let mut controller = QcsdController::with_defense(
+            config,
+            None,
+            Box::new(StaticSchedule::new(Trace::default(), false)),
+        )
+        .expect("fixture controller");
+        let slot = QcsdSlotId(19663);
+        let packet = Packet::new(Duration::from_micros(69694894), Direction::Incoming, 600)
+            .expect("owned cell");
+        controller.pending_slots.insert(slot, packet);
+        controller.incoming_credit_ledger.insert(
+            slot,
+            IncomingCreditLedger {
+                packet,
+                endpoint: Some(QcsdEndpointId(0)),
+                multiple_endpoints: false,
+                advertised: 600,
+                local_realization_emitted: true,
+                consumed,
+                retired,
+            },
+        );
+        (controller, slot, packet)
+    }
+
+    #[test]
+    fn owned_terminal_process_clock_samples_once_only_at_complete_credit() {
+        let (mut controller, slot, packet) = owned_controller(true, 599, 0);
+        let causal_process = Instant::now();
+        let logical_terminal = Duration::from_micros(69705143);
+        let mut calls = 0;
+        let mut clock = || {
+            calls += 1;
+            causal_process
+        };
+        controller.finish_incoming_slot_if_resolved_with_process_clock(
+            slot,
+            logical_terminal,
+            &mut clock,
+        );
+        assert!(controller.incoming_terminal_process_witness(slot).is_none());
+        controller
+            .incoming_credit_ledger
+            .get_mut(&slot)
+            .expect("owned incomplete ledger")
+            .consumed = 600;
+        controller.finish_incoming_slot_if_resolved_with_process_clock(
+            slot,
+            logical_terminal,
+            &mut clock,
+        );
+        controller.finish_incoming_slot_if_resolved_with_process_clock(
+            slot,
+            logical_terminal,
+            &mut clock,
+        );
+        assert_eq!(calls, 1);
+        let witness = controller
+            .incoming_terminal_process_witness(slot)
+            .expect("causal clock");
+        assert_eq!(witness.captured_at(), causal_process);
+        assert_eq!(witness.terminal_at(), logical_terminal);
+        assert_eq!(witness.slot(), slot);
+        assert_eq!(witness.packet(), packet);
+        assert_eq!(witness.endpoint(), Some(QcsdEndpointId(0)));
+        assert_eq!(witness.outcome(), EventOutcome::Satisfied { observed: 600 });
+        assert_eq!(
+            controller.terminal_slot_resolution_at(slot),
+            Some(logical_terminal)
+        );
+        assert!(
+            matches!(controller.next_action(), Some(QcsdAction::SlotSatisfied { slot: actual, .. }) if actual == slot)
+        );
+        assert!(controller.next_action().is_none());
+    }
+
+    #[test]
+    fn retired_or_non_cs_credit_never_mints_full_consumption_clock() {
+        for (cs, consumed, retired) in [(true, 594, 6), (false, 600, 0)] {
+            let (mut controller, slot, _) = owned_controller(cs, consumed, retired);
+            controller.finish_incoming_slot_if_resolved_with_process_clock(
+                slot,
+                Duration::from_micros(500),
+                &mut || panic!("no full CS consumption witness authorized"),
+            );
+            assert!(controller.incoming_terminal_process_witness(slot).is_none());
         }
     }
 }
