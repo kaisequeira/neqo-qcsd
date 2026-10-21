@@ -41,6 +41,8 @@ pub struct StreamState {
     aggregate_framing_debt: Option<(u64, u64, bool)>,
     /// Actual final HEADERS evidence, distinct from a prepared body estimate.
     observed_response_length: ObservedResponseLength,
+    /// Original prepared response extent, never replaced by live HEADERS.
+    expected_chaff_body_bytes: u64,
     request_acknowledged_ranges: Vec<(u64, u64)>,
     request_acknowledged_final_size: Option<u64>,
     request_acknowledgment_invalid: bool,
@@ -200,9 +202,69 @@ pub struct AllocationOpportunity {
 #[derive(Debug, Default)]
 pub struct StreamRegistry {
     streams: HashMap<(QcsdEndpointId, QcsdStreamId), StreamState>,
+    /// Prospective controller-only capability; default false, no runner opt-in.
+    cs_live_chaff_headers: bool,
 }
 
 impl StreamRegistry {
+    pub(crate) fn enable_cs_live_chaff_headers(&mut self) -> bool {
+        if self.cs_live_chaff_headers || !self.streams.is_empty() {
+            return false;
+        }
+        self.cs_live_chaff_headers = true;
+        true
+    }
+
+    pub(crate) const fn cs_live_chaff_headers_enabled(&self) -> bool {
+        self.cs_live_chaff_headers
+    }
+
+    /// A saved estimate alone cannot fund a current chaff response. This
+    /// capability requires actual, consistent 200 HEADERS with the unchanged
+    /// prepared extent and an exact live request FIN ACK. Applications retain
+    /// their original allocation behavior; full body validation stays external.
+    fn scheduled_capacity_available(&self, state: &StreamState) -> bool {
+        if !self.cs_live_chaff_headers || state.role == QcsdRequestRole::Application {
+            return true;
+        }
+        state.activated_chaff_request_final_size().is_some()
+            && state.expected_chaff_body_bytes > 0
+            && matches!(state.observed_response_length,
+                ObservedResponseLength::Final { status: 200, content_length: Some(length) }
+                    if length == state.expected_chaff_body_bytes)
+            && state.status == Some(200)
+    }
+
+    /// Finish only a current pre-HEADERS debt. The existing aggregate wrapper
+    /// authenticates exact role, FIN ACK, retained offset and lifetime budget;
+    /// its receive-state leaf is unchanged. No DATA/body forecast is leased.
+    pub(crate) fn cs_live_chaff_header_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        min_remaining: u64,
+        prepared_body_bytes: u64,
+    ) -> Option<ParserLease> {
+        if !self.cs_live_chaff_headers {
+            return None;
+        }
+        let state = self.streams.get(&(endpoint, stream))?;
+        let QcsdRequestRole::Chaff { resource_id, request_id: Some(_) } = state.role else {
+            return None;
+        };
+        if state.observed_response_length != ObservedResponseLength::Unobserved
+            || state.status.is_some()
+            || state.expected_chaff_body_bytes == 0
+            || state.expected_chaff_body_bytes != prepared_body_bytes
+        {
+            return None;
+        }
+        let expected = state.expected_chaff_body_bytes;
+        self.aggregate_prebody_framing_lease(
+            endpoint, stream, resource_id, expected, min_remaining, false,
+        )
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "stream registration keeps all Figure-7 initialization inputs explicit"
@@ -231,6 +293,7 @@ impl StreamRegistry {
                 parser_blocked_at: None,
                 aggregate_framing_debt: None,
                 observed_response_length: ObservedResponseLength::Unobserved,
+                expected_chaff_body_bytes: expected,
                 request_acknowledged_ranges: Vec::new(),
                 request_acknowledged_final_size: None,
                 request_acknowledgment_invalid: false,
@@ -375,7 +438,9 @@ impl StreamRegistry {
         self.streams
             .iter()
             .filter(|((candidate, _), state)| {
-                *candidate == endpoint && state.receive_actions_available
+                *candidate == endpoint
+                    && state.receive_actions_available
+                    && self.scheduled_capacity_available(state)
             })
             .fold(Capacity::default(), |mut capacity, (_, state)| {
                 let available = state.receive.available();
@@ -405,7 +470,9 @@ impl StreamRegistry {
     pub fn aggregate_capacity(&self) -> Capacity {
         self.streams
             .values()
-            .filter(|state| state.receive_actions_available)
+            .filter(|state| {
+                state.receive_actions_available && self.scheduled_capacity_available(state)
+            })
             .fold(Capacity::default(), |mut total, state| {
                 let available = state.receive.available();
                 match state.role {
@@ -435,6 +502,7 @@ impl StreamRegistry {
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
                     && state.receive_actions_available
+                    && self.scheduled_capacity_available(state)
                     && (mode == DefenseMode::ChaffAndShape
                         || matches!(state.role, QcsdRequestRole::Chaff { .. }))
                     && (state.receive.available() > 0 || state.receive.claimable() > 0)
@@ -646,6 +714,9 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         amount: u64,
     ) -> Option<CreditRelease> {
+        if !self.scheduled_capacity_available(self.streams.get(&(endpoint, stream))?) {
+            return None;
+        }
         let state = self.get_mut(endpoint, stream)?;
         if !state.receive_actions_available {
             return None;
@@ -665,6 +736,11 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         amount: u64,
     ) -> u64 {
+        if self.streams.get(&(endpoint, stream)).is_none_or(|state| {
+            !self.scheduled_capacity_available(state)
+        }) {
+            return 0;
+        }
         self.get_mut(endpoint, stream).map_or(0, |state| {
             if state.receive_actions_available {
                 state.receive.claim(amount)
@@ -2473,3 +2549,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cs_live_chaff_headers_tests.rs"]
+mod cs_live_chaff_headers_tests;

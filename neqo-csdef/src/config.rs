@@ -47,6 +47,9 @@ pub struct QcsdConfig {
     /// Prospective engineering policy; explicit opt-in, never an old receipt alias.
     #[serde(default, skip_serializing_if = "is_false")]
     pub buflo_retained_parser_fin_permission: bool,
+    /// Prospective CS-only live chaff HEADERS progress; absent is the historical default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cs_live_chaff_header_progress: bool,
     /// Selected defense and its parameters.
     pub defense: DefenseConfig,
 }
@@ -67,6 +70,7 @@ impl Default for QcsdConfig {
             keep_alive_lead_time_us: 100_000,
             tail_wait_us: 0,
             buflo_retained_parser_fin_permission: false,
+            cs_live_chaff_header_progress: false,
             defense: DefenseConfig::None,
         }
     }
@@ -167,6 +171,20 @@ impl QcsdConfig {
         {
             return Err(Error::InvalidConfig(
                 "retained parser/FIN permission is BuFLO-only".into(),
+            ));
+        }
+        if self.cs_live_chaff_header_progress
+            && (!matches!(&self.defense, DefenseConfig::CsBuflo(_))
+                || self.control_interval_us != 5_000
+                || self.initial_max_stream_data != 16
+                || self.max_stream_data_excess != 1_000
+                || self.max_udp_payload_size != 1_200
+                || self.max_chaff_streams != 5
+                || self.use_empty_resources
+                || self.drop_unsatisfied_events)
+        {
+            return Err(Error::InvalidConfig(
+                "live chaff HEADERS requires exact CS/5000us/16+1000/five-stream/1200 configuration".into(),
             ));
         }
         self.defense.validate(self.max_udp_payload_size)
@@ -1357,3 +1375,7 @@ mod tests {
         assert!(BufloParameters::from_json(raw, 1_199).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "cs_live_chaff_activation_tests.rs"]
+mod cs_live_chaff_activation_tests;

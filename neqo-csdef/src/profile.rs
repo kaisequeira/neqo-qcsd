@@ -203,6 +203,7 @@ impl QcsdProfile {
             keep_alive_lead_time_us: controller.keep_alive_lead_time_us,
             tail_wait_us: controller.tail_wait_us,
             buflo_retained_parser_fin_permission: false,
+            cs_live_chaff_header_progress: false,
             defense,
         };
         config.validate()?;

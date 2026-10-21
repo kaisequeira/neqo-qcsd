@@ -15700,6 +15700,20 @@ async fn execute_run_inner(
             .as_ref()
             .map(RuntimeChaffManifest::resource_manifest),
     )?;
+    if controller.configure_cs_live_chaff_header_progress()? {
+        traces.event(
+            self::now(),
+            None,
+            "cs_live_chaff_header_progress_policy",
+            "enabled_before_controller_work",
+            &json!({
+                "policy": "cs-live-chaff-current-HEADERS-unowned-parser-permission-v1",
+                "resolved_config_flag": true,
+                "scheduled_credit_issued": false,
+                "wire_handoff_claimed": false,
+            }),
+        )?;
+    }
     let incoming_policy = bound_buflo_incoming_credit_release_policy(spec)?;
     if incoming_policy != BufloIncomingCreditReleasePolicy::LegacyControlInterval {
         controller
@@ -20900,6 +20914,28 @@ fn apply_action(
                     "front_padding_preparation_window",
                     "registered",
                     &window,
+                )?;
+            }
+            if let QcsdAction::LeaseParserReceive {
+                endpoint: lease_endpoint, stream, absolute_limit, increase, owner: None,
+            } = &trace_action
+                && let Some((header_debt, prepared_body_bytes)) = controller
+                    .cs_live_chaff_header_lease_witness(*lease_endpoint, *stream, *absolute_limit, *increase)
+            {
+                traces.event(
+                    applied_action_trace_at,
+                    endpoint_id,
+                    "cs_live_chaff_header_progress_permission",
+                    "adapter_accepted_pending_wire_advertisement",
+                    &json!({
+                        "policy": "cs-live-chaff-current-HEADERS-unowned-parser-permission-v1",
+                        "endpoint": lease_endpoint, "stream": stream,
+                        "range_start": absolute_limit - increase, "range_end": absolute_limit,
+                        "increase": increase, "observed_header_debt": header_debt,
+                        "prepared_body_bytes": prepared_body_bytes,
+                        "owner": null, "scheduled_credit_issued": false,
+                        "wire_handoff_claimed": false,
+                    }),
                 )?;
             }
             traces.event(

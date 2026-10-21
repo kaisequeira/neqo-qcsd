@@ -638,6 +638,7 @@ pub struct QcsdController {
     buflo_fin_permission_releases: Vec<BufloFinPermissionRelease>,
     buflo_gross_advertised: u64,
     /// Exact CS terminal parser suffixes survive controller stream retirement.
+    cs_live_chaff_header_lease_witnesses: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
     cs_buflo_terminal_parser_allowances:
         HashMap<(QcsdEndpointId, QcsdStreamId), CsBufloTerminalParserAllowance>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
@@ -889,6 +890,7 @@ impl QcsdController {
             buflo_fin_replacement_pending: HashMap::new(),
             buflo_fin_permission_releases: Vec::new(),
             buflo_gross_advertised: 0,
+            cs_live_chaff_header_lease_witnesses: HashMap::new(),
             cs_buflo_terminal_parser_allowances: HashMap::new(),
             incoming_credit_ledger: HashMap::new(),
             incoming_consumed_ranges: HashMap::new(),
@@ -936,6 +938,83 @@ impl QcsdController {
             rolling_outgoing_prearm: None,
             rolling_reconcile_due: None,
         })
+    }
+
+    /// Enable the prospective live-CS chaff HEADERS capability before any
+    /// endpoint, stream or scheduled work. The runner invokes the separately
+    /// bound resolved-config gate before creating any controller work.
+    /// It changes no cadence, terminal predicate, parser budget or body check.
+    ///
+    /// # Errors
+    /// Rejects non-CS or changed fixed receive parameters, repeated activation,
+    /// and every controller that has already acquired work.
+    pub fn enable_cs_live_chaff_header_progress(&mut self) -> Result<()> {
+        let diagnostics = self.defense.diagnostics();
+        if !diagnostics.cs_buflo_client_only
+            || !diagnostics.cs_buflo_payload_padding
+            || diagnostics.cs_buflo_runtime_udp_packet_size_bytes != 600
+            || diagnostics.cs_buflo_incoming_interval_us != 8_192
+            || diagnostics.cs_buflo_outgoing_interval_us != 8_192
+            || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || !self.defense.incoming_slot_must_resolve_in_window()
+            || self.defense.mode() != DefenseMode::ChaffAndShape
+            || self.config.control_interval_us != 5_000
+            || self.config.initial_max_stream_data != 16
+            || self.config.max_stream_data_excess != 1_000
+            || self.config.max_udp_payload_size != 1_200
+            || self.config.max_chaff_streams != 5
+            || self.config.use_empty_resources
+            || self.config.drop_unsatisfied_events
+            || self.control.next_slot_id != 0
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.control.credit.is_empty()
+            || !self.control.claims.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+            || self.application_complete
+            || self.defense.terminal_failure().is_some()
+            || self.defense.is_complete()
+            || !self.streams.enable_cs_live_chaff_headers()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "live chaff HEADERS requires unstarted CS/5000us/16+1000/five-stream/1200 configuration".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply only the explicit resolved Native policy before any work.
+    /// Returning false preserves the historical default and changes no state.
+    ///
+    /// # Errors
+    /// Returns the original strict configuration/unstarted-controller error.
+    pub fn configure_cs_live_chaff_header_progress(&mut self) -> Result<bool> {
+        if !self.config.cs_live_chaff_header_progress {
+            return Ok(false);
+        }
+        self.config.validate()?;
+        self.enable_cs_live_chaff_header_progress()?;
+        Ok(true)
+    }
+
+    /// Source-created witness for this exact unowned parser action.
+    /// It asserts permission only, never scheduled credit or wire handoff.
+    #[must_use]
+    pub fn cs_live_chaff_header_lease_witness(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        increase: u64,
+    ) -> Option<(u64, u64)> {
+        if !self.streams.cs_live_chaff_headers_enabled() {
+            return None;
+        }
+        let &(limit, amount, debt, prepared) =
+            self.cs_live_chaff_header_lease_witnesses.get(&(endpoint, stream))?;
+        (limit == absolute_limit && amount == increase && amount == debt)
+            .then_some((debt, prepared))
     }
 
     /// Resolved configuration used for the run.
@@ -2283,13 +2362,18 @@ impl QcsdController {
                     demand.boundary = None;
                 }
                 self.release_exact_claims(endpoint, stream);
-                if self.buflo_aggregate_selected.is_some() {
+                if self.buflo_aggregate_selected.is_some()
+                    || (self.streams.cs_live_chaff_headers_enabled() && !awaiting_data_frame)
+                {
                     self.streams.retain_aggregate_framing_debt(
                         endpoint,
                         stream,
                         min_remaining,
                         awaiting_data_frame,
                     );
+                }
+                if !awaiting_data_frame {
+                    self.try_cs_live_chaff_header_lease(endpoint, stream, min_remaining);
                 }
                 self.try_buflo_aggregate_prebody_framing_lease(
                     endpoint,
@@ -2608,6 +2692,13 @@ impl QcsdController {
                 self.streams.record_chaff_request_acknowledgment(
                     endpoint, stream, role, offset, bytes, fin,
                 );
+                if self.streams.cs_live_chaff_headers_enabled() {
+                    for (candidate, id, debt, pristine) in self.streams.aggregate_framing_debts() {
+                        if (candidate, id) == (endpoint, stream) && !pristine {
+                            self.try_cs_live_chaff_header_lease(endpoint, stream, debt);
+                        }
+                    }
+                }
                 if self.buflo_startup_present()
                     && self
                         .streams
@@ -3163,6 +3254,56 @@ impl QcsdController {
         );
         ledger.advertised = remaining;
         self.scheduled_incoming_advertised_bytes -= bytes;
+    }
+
+    /// Unowned HEADERS permission cannot inherit or erase a scheduled cell.
+    /// Require the same prepared resource extent and a live endpoint; registry
+    /// and receive-state guards retain all FIN-ACK/current-offset/budget checks.
+    fn try_cs_live_chaff_header_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        min_remaining: u64,
+    ) {
+        if !self.streams.cs_live_chaff_headers_enabled()
+            || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || !self.incoming_requires_explicit_physical_ownership()
+            || self.application_complete
+            || self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || !self.scheduler.endpoints().contains(&endpoint)
+            || self.control.credit.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self.control.claims.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self.parser_lease_ranges.get(&(endpoint, stream)).is_some_and(|r| !r.is_empty())
+        {
+            return;
+        }
+        let Some(state) = self.streams.get_mut(endpoint, stream) else { return; };
+        let QcsdRequestRole::Chaff { resource_id, request_id: Some(_) } = state.role else {
+            return;
+        };
+        let Some(manager) = self.chaff.as_ref() else { return; };
+        let expected = manager.estimate(resource_id);
+        if expected == 0 {
+            return;
+        }
+        let Some(lease) = self.streams.cs_live_chaff_header_lease(endpoint, stream, min_remaining, expected) else {
+            return;
+        };
+        self.cs_live_chaff_header_lease_witnesses.insert(
+            (endpoint, stream), (lease.absolute_limit, lease.increase, min_remaining, expected),
+        );
+        self.parser_lease_ranges.entry((endpoint, stream)).or_default().push(ParserLeaseRange {
+            reservation_debited: false,
+            start: lease.absolute_limit - lease.increase,
+            end: lease.absolute_limit,
+            owner: None,
+            unowned: true,
+            advertised: false,
+        });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint, stream, absolute_limit: lease.absolute_limit, increase: lease.increase, owner: None,
+        });
     }
 
     /// Typed pre-body framing can finish a small qualified response during its
@@ -32268,3 +32409,7 @@ mod incoming_terminal_process_clock_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cs_live_chaff_headers_tests.rs"]
+mod cs_live_chaff_headers_tests;
