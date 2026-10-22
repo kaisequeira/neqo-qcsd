@@ -6399,6 +6399,16 @@ impl QcsdController {
             }
             let fair_stream_turns =
                 self.buflo_incoming_half_period_window == Some(Duration::from_micros(32_000));
+            // A complete retained primary can use only a pristine whole cell.
+            // Retain the first successful application turn: later small probes
+            // may wrap back across that primary without serving it. Replacing
+            // the cursor with that last probe repeats the same cyclic prefix.
+            // The cursor is still published only with a committed staging pass.
+            let retain_first_application_turn = self.buflo_retained_parser_policy
+                && self.terminal_primary_partial_cell_policy
+                && fair_stream_turns
+                && incoming.remaining == 1_200
+                && incoming.remaining == u64::from(incoming.packet.length());
             let mut staged_credit = Vec::new();
             let mut staged_claims: Vec<PendingClaim> = Vec::new();
             let mut staged_stream_turns = HashMap::new();
@@ -6791,8 +6801,14 @@ impl QcsdController {
                 }
                 if !allow_parser {
                     if incoming.remaining < remaining_before {
-                        staged_stream_turns
-                            .insert((opportunity.endpoint, false), opportunity.stream);
+                        if retain_first_application_turn {
+                            staged_stream_turns
+                                .entry((opportunity.endpoint, false))
+                                .or_insert(opportunity.stream);
+                        } else {
+                            staged_stream_turns
+                                .insert((opportunity.endpoint, false), opportunity.stream);
+                        }
                     }
                     continue;
                 }
@@ -6972,7 +6988,13 @@ impl QcsdController {
                     && opportunity.role == QcsdRequestRole::Application
                     && incoming.remaining < remaining_before
                 {
-                    staged_stream_turns.insert((opportunity.endpoint, false), opportunity.stream);
+                    if retain_first_application_turn {
+                        staged_stream_turns
+                            .entry((opportunity.endpoint, false))
+                            .or_insert(opportunity.stream);
+                    } else {
+                        staged_stream_turns.insert((opportunity.endpoint, false), opportunity.stream);
+                    }
                 }
             }
 
@@ -32342,6 +32364,301 @@ mod tests {
             assert_eq!(c.buflo_retained_parser_room(ep, original_app), wanted_room);
         }
     }
+    // Reduced from the closed Native140 r.bing.com grant cycle. These explicit
+    // receive snapshots are controller fixtures, not transport or capture proof.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "One connected regression preserves the observed three-stream cursor, typed128 grants, physical ownership and raw-byte accounting"
+    )]
+    fn buflo_retained_application_fanout_keeps_first_turn_before_wrapped_primary() {
+        let mut c = startup_cadence64_controller(true);
+        let ep = QcsdEndpointId(1);
+        let primary = QcsdStreamId(0);
+        let first = QcsdStreamId(16);
+        let wrapped = QcsdStreamId(8);
+        c.enable_terminal_primary_partial_cell_policy().unwrap();
+        c.bind_terminal_primary_stream(ep, primary, 0).unwrap();
+        c.enable_buflo_retained_parser_fin_permission_policy()
+            .unwrap();
+
+        // Actual primary raw frontier:927 HEADERS +14 DATA framing +3675 body.
+        // The other two snapshots retain their observed pre-slot7901 frontiers.
+        // No historical body length is promoted into current DATA capacity.
+        for (stream, raw, body, framing) in [
+            (primary, 4_616, 3_675, 941),
+            (wrapped, 420_984, 410_029, 10_955),
+            (first, 420_856, 409_896, 10_960),
+        ] {
+            if stream != primary {
+                c.observe(
+                    QcsdObservation::StreamOpened {
+                        endpoint: ep,
+                        stream,
+                        role: QcsdRequestRole::Application,
+                        expected_response_length: Some(1),
+                    },
+                    Duration::ZERO,
+                );
+            }
+            c.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint: ep,
+                    stream,
+                    frame_bytes: framing,
+                    status: Some(200),
+                    content_length: None,
+                },
+                Duration::ZERO,
+            );
+            c.streams.get_mut(ep, stream).unwrap().receive =
+                crate::stream::ReceiveState::ReceivingData {
+                    advertised_limit: raw,
+                    requested_limit: raw,
+                    known_limit: raw,
+                    reservation_capacity: 1_000,
+                    reservation_available: 1_000,
+                    consumed: raw,
+                    payload_floor: body,
+                    framing_bytes: framing,
+                    parser_lease_capacity: 1_000,
+                    parser_lease_used: 1_000,
+                    parser_lease_exhausted: true,
+                    last_parser_lease_boundary: Some(
+                        raw - if stream == primary { 1_200 } else { 128 },
+                    ),
+                    pending_parser_boundary: None,
+                    data_length: body,
+                };
+            for observation in [
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: ep,
+                    stream,
+                    blocked_at: raw,
+                },
+            ] {
+                c.observe(observation, Duration::ZERO);
+            }
+        }
+        assert_eq!(
+            c.streams
+                .owned_data_continuation_capacity(ep, primary, 1_200),
+            1_200
+        );
+        for (stream, boundary) in [(wrapped, 420_984), (first, 420_856)] {
+            assert_eq!(
+                c.buflo_retained_parser_demands[&(ep, stream)].boundary,
+                Some(boundary)
+            );
+        }
+
+        // Keep the existing genuinely qualified/ACK-activated cover fixture.
+        // Its known capacity funds944; it neither creates an application turn
+        // nor substitutes an estimate for the primary's unknown DATA frontier.
+        let cover = QcsdStreamId(80);
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 14,
+            request_id: None,
+        };
+        for observation in [
+            QcsdObservation::StreamOpened {
+                endpoint: ep,
+                stream: cover,
+                role,
+                expected_response_length: Some(24_064),
+            },
+            QcsdObservation::StreamDataTransmitted {
+                endpoint: ep,
+                stream: cover,
+                role,
+                offset: 0,
+                bytes: 63,
+                fin: true,
+                slot: None,
+            },
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint: ep,
+                stream: cover,
+                role,
+                offset: 0,
+                bytes: 63,
+                fin: true,
+            },
+            QcsdObservation::ResponseHeaders {
+                endpoint: ep,
+                stream: cover,
+                frame_bytes: 16,
+                status: Some(200),
+                content_length: Some(24_064),
+            },
+        ] {
+            c.observe(observation, Duration::ZERO);
+        }
+        c.streams.get_mut(ep, cover).unwrap().receive =
+            crate::stream::ReceiveState::ReceivingData {
+                advertised_limit: 1_000,
+                requested_limit: 1_000,
+                known_limit: 24_080,
+                reservation_capacity: 1_000,
+                reservation_available: 1_000,
+                consumed: 1_000,
+                payload_floor: 24_064,
+                framing_bytes: 16,
+                parser_lease_capacity: 1_000,
+                parser_lease_used: 0,
+                parser_lease_exhausted: false,
+                last_parser_lease_boundary: None,
+                pending_parser_boundary: None,
+                data_length: 984,
+            };
+        assert!(
+            c.streams
+                .get_mut(ep, cover)
+                .unwrap()
+                .chaff_request_activated()
+        );
+        c.buflo_incoming_stream_cursor.insert((ep, false), wrapped);
+        c.drain_actions().for_each(drop);
+
+        let target = Duration::from_micros(252_800_000);
+        let slot = QcsdSlotId(7_901);
+        seed016_stage_due_remainder(&mut c, ep, slot, target, 1_200);
+        let actions: Vec<_> = c.drain_actions().collect();
+        let probes: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::LeaseParserReceive {
+                    stream,
+                    increase,
+                    owner: Some(owner),
+                    ..
+                } if owner.slot == slot => Some((*stream, *increase)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(probes, vec![(wrapped, 128), (first, 128)]);
+        assert!(actions.iter().any(|action| matches!(action,
+            QcsdAction::IncreaseReceiveLimit {
+                stream, absolute_limit: 1_944, slot: owner, ..
+            } if *stream == cover && *owner == slot)));
+        assert_eq!(
+            c.buflo_incoming_stream_cursor[&(ep, false)],
+            first,
+            "last-success overwrites16 with wrapped8 and repeats the same starvation cycle"
+        );
+
+        for action in &actions {
+            let (stream, limit, owner) = match *action {
+                QcsdAction::LeaseParserReceive {
+                    stream,
+                    absolute_limit,
+                    owner: Some(_),
+                    ..
+                } => (stream, absolute_limit, None),
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    slot,
+                    ..
+                } => (stream, absolute_limit, Some(slot)),
+                _ => continue,
+            };
+            c.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: ep,
+                    stream,
+                    absolute_limit: limit,
+                    slot: owner,
+                },
+                target + Duration::from_micros(1),
+            );
+        }
+        assert!(c.incoming_slot_is_locally_realized(slot));
+        for stream in [first, wrapped] {
+            let limit = c.streams.receive_limits(ep, stream).unwrap().0;
+            for observation in [
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream,
+                    bytes: 3,
+                },
+                QcsdObservation::DataFrame {
+                    endpoint: ep,
+                    stream,
+                    frame_header_bytes: 3,
+                    data_bytes: 125,
+                },
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream,
+                    bytes: 125,
+                },
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: ep,
+                    stream,
+                    blocked_at: limit,
+                },
+            ] {
+                c.observe(observation, target + Duration::from_micros(2));
+            }
+            assert_eq!(
+                c.buflo_retained_parser_demands[&(ep, stream)].boundary,
+                Some(limit)
+            );
+        }
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint: ep,
+                stream: cover,
+                bytes: 944,
+            },
+            target + Duration::from_micros(2),
+        );
+        assert!(c.drain_actions().any(|action| matches!(action,
+            QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot)));
+        assert!(c.control.claims.is_empty());
+        assert!(!c.incoming_credit_ledger.contains_key(&slot));
+
+        let next = QcsdSlotId(7_903);
+        seed016_stage_due_remainder(
+            &mut c,
+            ep,
+            next,
+            target + Duration::from_micros(64_000),
+            1_200,
+        );
+        let actions: Vec<_> = c.drain_actions().collect();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action,
+            QcsdAction::LeaseParserReceive {
+                stream, absolute_limit: 5_816, increase: 1_200, owner: Some(owner), ..
+            } if *stream == primary && owner.slot == next))
+                .count(),
+            1
+        );
+        assert_eq!(c.buflo_incoming_stream_cursor[&(ep, false)], primary);
+        assert_eq!(c.scheduled_incoming_requested_bytes, 2_400);
+        assert_eq!(c.scheduled_incoming_consumed_bytes, 1_200);
+        assert_eq!(c.scheduled_incoming_retired_bytes, 0);
+        assert!(c.buflo_fin_permission_releases.is_empty());
+        assert_eq!(c.terminal_failure(), None);
+    }
+
     // Synthetic snapshots are controller fixtures, not transport/capture evidence.
     #[test]
     #[expect(
