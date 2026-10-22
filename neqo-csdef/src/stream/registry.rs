@@ -1328,6 +1328,99 @@ impl StreamRegistry {
         })
     }
 
+    /// Retain real pristine peer demand independently of ACK arrival order.
+    /// This intent cannot claim or materialize any receive permission.
+    pub(crate) fn accepts_buflo_initial_headers_blocked(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frontier: u64,
+    ) -> bool {
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            state.receive_actions_available
+                && state.role == QcsdRequestRole::Application
+                && !state.request_acknowledgment_invalid
+                && state.status.is_none()
+                && state.observed_response_length == ObservedResponseLength::Unobserved
+                && state.receive.buflo_initial_headers_capacity(frontier, 1_200) > 0
+        })
+    }
+
+    /// Service retained demand only after the complete request range and FIN
+    /// are acknowledged. No response/frame fact is fabricated.
+    pub(crate) fn buflo_initial_headers_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frontier: u64,
+        room: u64,
+    ) -> u64 {
+        let Some(state) = self.streams.get(&(endpoint, stream)) else {
+            return 0;
+        };
+        if !state.receive_actions_available
+            || !state.application_request_activated()
+            || state.status.is_some()
+            || state.observed_response_length != ObservedResponseLength::Unobserved
+        {
+            return 0;
+        }
+        state.receive.buflo_initial_headers_capacity(frontier, room)
+    }
+
+    pub(crate) fn buflo_initial_headers_opportunity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frontier: u64,
+        room: u64,
+    ) -> Option<AllocationOpportunity> {
+        (self.buflo_initial_headers_capacity(endpoint, stream, frontier, room) > 0).then_some(
+            AllocationOpportunity {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                exact: 0,
+                claimable: 0,
+            },
+        )
+    }
+
+    pub(crate) fn claim_buflo_initial_headers(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frontier: u64,
+        room: u64,
+        amount: u64,
+    ) -> u64 {
+        let capacity = self.buflo_initial_headers_capacity(endpoint, stream, frontier, room);
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return 0;
+        };
+        state.receive.claim_buflo_initial_headers(frontier, room, amount.min(capacity))
+    }
+
+    pub(crate) fn lease_buflo_initial_headers(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frontier: u64,
+        backing: u64,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available
+            || !state.application_request_activated()
+            || state.status.is_some()
+            || state.observed_response_length != ObservedResponseLength::Unobserved
+        {
+            return None;
+        }
+        let (absolute_limit, increase, scheduled) =
+            state.receive.lease_buflo_initial_headers(frontier, backing)?;
+        Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled })
+    }
+
     /// A completely acknowledged application request permits the existing
     /// pristine framing bootstrap without optional STREAM_DATA_BLOCKED. The
     /// current advertised frontier is evidence of permission, not peer demand.

@@ -617,6 +617,84 @@ impl ReceiveState {
         Some((*requested_limit, increase))
     }
 
+    /// A peer blocked at the unchanged slotless bootstrap ceiling can retain
+    /// one separate scheduling reservation while no response byte is parsed.
+    /// This is demand for new permission, not a decoded HEADERS/body extent.
+    const fn buflo_initial_headers_reservation(&self, frontier: u64) -> Option<(u64, u64)> {
+        match self {
+            Self::ReceivingHeaders {
+                advertised_limit,
+                requested_limit,
+                known_limit,
+                reservation_capacity,
+                reservation_available,
+                consumed,
+                payload_floor,
+                framing_bytes,
+                parser_lease_capacity,
+                parser_lease_used,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } if frontier == PRE_HEADER_BOOTSTRAP_TARGET
+                && *advertised_limit == frontier
+                && *requested_limit == frontier
+                && *known_limit <= frontier
+                && *consumed == 0
+                && *framing_bytes == 0
+                && *payload_floor > 0
+                && *parser_lease_used > 0
+                && *parser_lease_used <= *parser_lease_capacity
+                && *reservation_capacity > 0
+                && last_parser_lease_boundary.is_none()
+                && pending_parser_boundary.is_none() =>
+            {
+                Some((*reservation_capacity, *reservation_available))
+            }
+            _ => None,
+        }
+    }
+
+    /// Require the entire existing reservation and shared owned-service room.
+    /// A partial staging remainder must not strand this one-shot permission.
+    pub(crate) fn buflo_initial_headers_capacity(&self, frontier: u64, room: u64) -> u64 {
+        self.buflo_initial_headers_reservation(frontier)
+            .filter(|(capacity, available)| capacity == available && *capacity <= room)
+            .map_or(0, |(capacity, _)| capacity)
+    }
+
+    pub(crate) fn claim_buflo_initial_headers(
+        &mut self,
+        frontier: u64,
+        room: u64,
+        amount: u64,
+    ) -> u64 {
+        let capacity = self.buflo_initial_headers_capacity(frontier, room);
+        if capacity == 0 || amount < capacity {
+            return 0;
+        }
+        self.claim(capacity)
+    }
+
+    /// Materialize only the complete reservation already debited by a new due
+    /// slot. The old slotless range, parser budget, and unknown extent remain
+    /// unchanged. The controller attaches the actual pending slot owner.
+    pub(crate) fn lease_buflo_initial_headers(
+        &mut self,
+        frontier: u64,
+        backing: u64,
+    ) -> Option<(u64, u64, bool)> {
+        let (capacity, available) = self.buflo_initial_headers_reservation(frontier)?;
+        if backing != capacity || available != 0 {
+            return None;
+        }
+        let Self::ReceivingHeaders { requested_limit, .. } = self else {
+            return None;
+        };
+        *requested_limit = requested_limit.checked_add(backing)?;
+        Some((*requested_limit, backing, true))
+    }
+
     /// Finish only an observed pre-body framing requirement for the separate
     /// small-response aggregate capability. The caller authenticates the
     /// issued request and its complete FIN ACK. No body estimate or reserve
