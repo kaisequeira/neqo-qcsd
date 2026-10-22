@@ -6691,6 +6691,43 @@ impl QcsdController {
                 }
                 opportunities.extend(claims);
             }
+            // Preserve the next fair bound-primary turn before the exact-first
+            // expansion below. Its pristine unknown DATA frontier needs one
+            // complete due cell; even one earlier exact byte would otherwise
+            // make that existing whole-cell continuation permanently ineligible.
+            // This does not promote over a selected chaff service turn, create
+            // an extra cell, or bypass any stream/claim/physical-window guard.
+            let fair_owned_primary_turn = (self.buflo_retained_parser_policy
+                && fair_stream_turns
+                && self.terminal_primary_partial_cell_policy
+                && self.incoming_requires_explicit_physical_ownership()
+                && incoming.remaining == 1_200
+                && incoming.remaining == u64::from(incoming.packet.length()))
+            .then(|| opportunities.first().copied())
+            .flatten()
+            .filter(|opportunity| {
+                opportunity.role == QcsdRequestRole::Application
+                    && opportunity.exact == 0
+                    && self.terminal_primary_stream
+                        == Some((opportunity.endpoint, opportunity.stream))
+                    && !self
+                        .control
+                        .claims
+                        .iter()
+                        .chain(staged_claims.iter())
+                        .any(|claim| {
+                            claim.endpoint == opportunity.endpoint
+                                && claim.stream == opportunity.stream
+                                && !claim.reservation_debited
+                        })
+                    && self.streams.owned_data_continuation_capacity(
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        incoming.remaining,
+                    ) == incoming.remaining
+            })
+            .map(|opportunity| (opportunity.endpoint, opportunity.stream));
+
             // Retained unknown-length parser permission is not decoded DATA
             // capacity. Serve every application's known extent before any
             // parser probe can consume this cell. The original remainder
@@ -6719,6 +6756,14 @@ impl QcsdController {
                         .into_iter()
                         .map(|opportunity| (opportunity, true)),
                 );
+            }
+            if let Some(primary) = fair_owned_primary_turn
+                && let Some(index) = allocation_passes.iter().position(|(opportunity, allow)| {
+                    *allow && (opportunity.endpoint, opportunity.stream) == primary
+                })
+            {
+                let primary_turn = allocation_passes.remove(index);
+                allocation_passes.insert(0, primary_turn);
             }
             for (opportunity, allow_parser) in allocation_passes {
                 if incoming.remaining == 0 {
@@ -32296,6 +32341,562 @@ mod tests {
             assert_eq!(c.terminal_failure(), None);
             assert_eq!(c.buflo_retained_parser_room(ep, original_app), wanted_room);
         }
+    }
+    // Synthetic snapshots are controller fixtures, not transport/capture evidence.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "One regression exercises whole-cell fair turns, byte competition, eligibility guards and selected chaff"
+    )]
+    fn buflo_bound_primary_whole_cell_fair_turn_keeps_one_byte_and_guard_contracts() {
+        let fixture = || {
+            let mut c = startup_cadence64_controller(true);
+            let ep = QcsdEndpointId(1);
+            let primary = QcsdStreamId(0);
+            let known = QcsdStreamId(8);
+            c.enable_terminal_primary_partial_cell_policy().unwrap();
+            c.bind_terminal_primary_stream(ep, primary, 0).unwrap();
+            c.enable_buflo_retained_parser_fin_permission_policy()
+                .unwrap();
+            c.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint: ep,
+                    stream: primary,
+                    frame_bytes: 16,
+                    status: Some(200),
+                    content_length: None,
+                },
+                Duration::ZERO,
+            );
+            c.streams.get_mut(ep, primary).unwrap().receive =
+                crate::stream::ReceiveState::ReceivingData {
+                    advertised_limit: 3_416,
+                    requested_limit: 3_416,
+                    known_limit: 3_416,
+                    reservation_capacity: 1_000,
+                    reservation_available: 1_000,
+                    consumed: 3_416,
+                    payload_floor: 1,
+                    framing_bytes: 24,
+                    parser_lease_capacity: 1_000,
+                    parser_lease_used: 1_000,
+                    parser_lease_exhausted: true,
+                    last_parser_lease_boundary: Some(2_216),
+                    pending_parser_boundary: None,
+                    data_length: 3_392,
+                };
+            for observation in [
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream: primary,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: ep,
+                    stream: primary,
+                    blocked_at: 3_416,
+                },
+            ] {
+                c.observe(observation, Duration::ZERO);
+            }
+            c.drain_actions().for_each(drop);
+
+            // Establish and fully consume one real synthetic due owner before the
+            // competing stream exists. No preceding primary claim/right remains.
+            let (prior, packet, at) = install_exact_parser_cell(&mut c, 0, 1_200);
+            assert!(c.drain_actions().any(|action| matches!(action,
+                QcsdAction::LeaseParserReceive {
+                    stream, absolute_limit: 4_616, increase: 1_200, owner: Some(owner), ..
+                } if stream == primary && owner.slot == prior && owner.packet == packet)));
+            c.observe(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint: ep,
+                    stream: primary,
+                    absolute_limit: 4_616,
+                    slot: None,
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::DataFrame {
+                    endpoint: ep,
+                    stream: primary,
+                    frame_header_bytes: 3,
+                    data_bytes: 1_197,
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::BytesRead {
+                    endpoint: ep,
+                    stream: primary,
+                    bytes: 1_200,
+                },
+                at,
+            );
+            assert!(c.drain_actions().any(|action| matches!(action,
+                QcsdAction::SlotSatisfied { slot, .. } if slot == prior)));
+            assert!(!c.incoming_credit_ledger.contains_key(&prior));
+            assert!(c.control.claims.is_empty());
+            assert!(
+                c.parser_lease_ranges
+                    .get(&(ep, primary))
+                    .is_none_or(Vec::is_empty)
+            );
+            c.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream: primary,
+                    min_remaining: 1,
+                    awaiting_data_frame: true,
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: ep,
+                    stream: primary,
+                    blocked_at: 4_616,
+                },
+                at,
+            );
+            assert_eq!(c.streams.consumed(ep, primary), Some(4_616));
+            assert_eq!(c.streams.receive_limits(ep, primary), Some((4_616, 4_616)));
+            assert_eq!(
+                c.streams
+                    .owned_data_continuation_capacity(ep, primary, 1_200),
+                1_200
+            );
+            assert!(c.drain_actions().next().is_none());
+
+            // Only one exact byte is currently known on the other application. Its
+            // exhausted reservation cannot supply a parser claim. Qualified chaff
+            // funds the remaining1199, so the original allocator commits the theft
+            // rather than hiding it behind an incomplete-cell rollback.
+            c.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: ep,
+                    stream: known,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(1),
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint: ep,
+                    stream: known,
+                    frame_bytes: 16,
+                    status: Some(200),
+                    content_length: None,
+                },
+                at,
+            );
+            c.streams.get_mut(ep, known).unwrap().receive =
+                crate::stream::ReceiveState::ReceivingData {
+                    advertised_limit: 1_000,
+                    requested_limit: 1_000,
+                    known_limit: 1_000,
+                    reservation_capacity: 1_000,
+                    reservation_available: 0,
+                    consumed: 1_000,
+                    payload_floor: 1,
+                    framing_bytes: 16,
+                    parser_lease_capacity: 1_000,
+                    parser_lease_used: 1_000,
+                    parser_lease_exhausted: true,
+                    last_parser_lease_boundary: Some(1_000),
+                    pending_parser_boundary: None,
+                    data_length: 984,
+                };
+            c.observe(
+                QcsdObservation::HeaderProgress {
+                    endpoint: ep,
+                    stream: known,
+                    min_remaining: 1,
+                    awaiting_data_frame: false,
+                },
+                at,
+            );
+            let cover = QcsdStreamId(80);
+            let role = QcsdRequestRole::Chaff {
+                resource_id: 14,
+                request_id: None,
+            };
+            c.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint: ep,
+                    stream: cover,
+                    role,
+                    expected_response_length: Some(24_064),
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::StreamDataTransmitted {
+                    endpoint: ep,
+                    stream: cover,
+                    role,
+                    offset: 0,
+                    bytes: 63,
+                    fin: true,
+                    slot: None,
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::StreamDataAcknowledged {
+                    endpoint: ep,
+                    stream: cover,
+                    role,
+                    offset: 0,
+                    bytes: 63,
+                    fin: true,
+                },
+                at,
+            );
+            c.observe(
+                QcsdObservation::ResponseHeaders {
+                    endpoint: ep,
+                    stream: cover,
+                    frame_bytes: 16,
+                    status: Some(200),
+                    content_length: Some(24_064),
+                },
+                at,
+            );
+            c.streams.get_mut(ep, cover).unwrap().receive =
+                crate::stream::ReceiveState::ReceivingData {
+                    advertised_limit: 1_000,
+                    requested_limit: 1_000,
+                    known_limit: 24_080,
+                    reservation_capacity: 1_000,
+                    reservation_available: 1_000,
+                    consumed: 1_000,
+                    payload_floor: 24_064,
+                    framing_bytes: 16,
+                    parser_lease_capacity: 1_000,
+                    parser_lease_used: 0,
+                    parser_lease_exhausted: false,
+                    last_parser_lease_boundary: None,
+                    pending_parser_boundary: None,
+                    data_length: 984,
+                };
+            assert!(
+                c.streams
+                    .get_mut(ep, cover)
+                    .unwrap()
+                    .chaff_request_activated()
+            );
+            c.drain_actions().for_each(drop);
+            (c, ep, primary, known, cover)
+        };
+
+        // The preceding committed primary cell leaves cursor0. Only the known
+        // app's1byte and chaff's1199 are allowed on its turn; the next fair primary
+        // turn must own1200 before that same exact byte can be spent again.
+        let (mut c, ep, primary, known, cover) = fixture();
+        let mut primary_limit = 4_616;
+        for index in 1..=4_u64 {
+            assert_eq!(c.streams.get_mut(ep, known).unwrap().receive.available(), 1);
+            assert!(c.control.claims.is_empty());
+            assert_eq!(
+                c.streams
+                    .owned_data_continuation_capacity(ep, primary, 1_200),
+                1_200
+            );
+            let (slot, packet, at) = install_exact_parser_cell(&mut c, index, 1_200);
+            let actions: Vec<_> = c.drain_actions().collect();
+            if index % 2 == 0 {
+                primary_limit += 1_200;
+                assert_eq!(
+                    actions
+                        .iter()
+                        .filter(|action| matches!(action,
+                    QcsdAction::LeaseParserReceive {
+                        stream, absolute_limit, increase: 1_200, owner: Some(owner), ..
+                    } if *stream == primary && *absolute_limit == primary_limit
+                        && owner.slot == slot && owner.packet == packet))
+                        .count(),
+                    1
+                );
+                assert!(!actions.iter().any(|action| matches!(action,
+                    QcsdAction::IncreaseReceiveLimit { slot: owner, .. } if *owner == slot)));
+                c.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: ep,
+                        stream: primary,
+                        absolute_limit: primary_limit,
+                        slot: None,
+                    },
+                    at,
+                );
+                c.observe(
+                    QcsdObservation::DataFrame {
+                        endpoint: ep,
+                        stream: primary,
+                        frame_header_bytes: 3,
+                        data_bytes: 1_197,
+                    },
+                    at,
+                );
+                c.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint: ep,
+                        stream: primary,
+                        bytes: 1_200,
+                    },
+                    at,
+                );
+                c.observe(
+                    QcsdObservation::HeaderProgress {
+                        endpoint: ep,
+                        stream: primary,
+                        min_remaining: 1,
+                        awaiting_data_frame: true,
+                    },
+                    at,
+                );
+                c.observe(
+                    QcsdObservation::StreamDataBlocked {
+                        endpoint: ep,
+                        stream: primary,
+                        blocked_at: primary_limit,
+                    },
+                    at,
+                );
+            } else {
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. }))
+                );
+                let grants: Vec<_> = actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        QcsdAction::IncreaseReceiveLimit {
+                            stream,
+                            absolute_limit,
+                            slot: owner,
+                            ..
+                        } if *owner == slot => Some((*stream, *absolute_limit)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(grants.len(), 2);
+                assert_eq!(grants[0].0, known);
+                assert_eq!(grants[1].0, cover);
+                let known_before = c.streams.consumed(ep, known).unwrap();
+                let cover_before = c.streams.consumed(ep, cover).unwrap();
+                assert_eq!(grants[0].1 - known_before, 1);
+                assert_eq!(grants[1].1 - cover_before, 1_199);
+                for (stream, absolute) in grants {
+                    c.observe(
+                        QcsdObservation::ReceiveLimitAdvertised {
+                            endpoint: ep,
+                            stream,
+                            absolute_limit: absolute,
+                            slot: Some(slot),
+                        },
+                        at,
+                    );
+                    let consumed = c.streams.consumed(ep, stream).unwrap();
+                    c.observe(
+                        QcsdObservation::BytesRead {
+                            endpoint: ep,
+                            stream,
+                            bytes: absolute - consumed,
+                        },
+                        at,
+                    );
+                }
+                c.observe(
+                    QcsdObservation::HeaderProgress {
+                        endpoint: ep,
+                        stream: known,
+                        min_remaining: 1,
+                        awaiting_data_frame: false,
+                    },
+                    at,
+                );
+            }
+            assert!(c.drain_actions().any(|action| matches!(action,
+                QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot)));
+            assert!(!c.incoming_credit_ledger.contains_key(&slot));
+            assert!(c.control.claims.is_empty());
+        }
+        let diagnostics = c.defense_diagnostics();
+        assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 6_000);
+        assert_eq!(diagnostics.scheduled_incoming_advertised_bytes, 6_000);
+        assert_eq!(diagnostics.scheduled_incoming_consumed_bytes, 6_000);
+        assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+        assert!(c.buflo_fin_permission_releases.is_empty());
+        assert_eq!(c.terminal_failure(), None);
+
+        // The same first-fair-primary position must not bypass these original
+        // eligibility guards. Inspect allocation before the later materializer:
+        // the pending-claim variant must preserve its ORIGINAL claim unchanged.
+        for invalid in 0..4 {
+            let (mut c, ep, primary, known, cover) = fixture();
+            c.buflo_incoming_stream_cursor.insert((ep, false), known);
+            match invalid {
+                0 => {
+                    if let crate::stream::ReceiveState::ReceivingData {
+                        pending_parser_boundary,
+                        ..
+                    } = &mut c.streams.get_mut(ep, primary).unwrap().receive
+                    {
+                        *pending_parser_boundary = None;
+                    }
+                }
+                1 => {
+                    if let crate::stream::ReceiveState::ReceivingData {
+                        last_parser_lease_boundary,
+                        ..
+                    } = &mut c.streams.get_mut(ep, primary).unwrap().receive
+                    {
+                        *last_parser_lease_boundary = Some(4_616);
+                    }
+                }
+                2 => {
+                    if let crate::stream::ReceiveState::ReceivingData {
+                        requested_limit, ..
+                    } = &mut c.streams.get_mut(ep, primary).unwrap().receive
+                    {
+                        *requested_limit = 4_617;
+                    }
+                }
+                _ => {
+                    let packet =
+                        Packet::new(Duration::from_micros(6_000), Direction::Incoming, 1_200)
+                            .unwrap();
+                    c.control.claims.push(PendingClaim {
+                        reservation_debited: false,
+                        slot: QcsdSlotId(9_000),
+                        packet,
+                        endpoint: ep,
+                        stream: primary,
+                        remaining: 1_200,
+                    });
+                }
+            }
+            let primary_before = c.streams.get_mut(ep, primary).unwrap().receive.clone();
+            let prior_claims: Vec<_> = c
+                .control
+                .claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.slot,
+                        claim.stream,
+                        claim.remaining,
+                        claim.reservation_debited,
+                    )
+                })
+                .collect();
+            let at = Duration::from_micros(10_000);
+            let packet = Packet::new(at, Direction::Incoming, 1_200).unwrap();
+            let slot = QcsdSlotId(9_100 + invalid);
+            c.pending_slots.insert(slot, packet);
+            c.materialize_incoming(slot, packet, at);
+            c.process_incoming(10_000, at);
+            let actions: Vec<_> = c.drain_actions().collect();
+            assert_eq!(
+                c.streams.get_mut(ep, primary).unwrap().receive,
+                primary_before
+            );
+            assert!(
+                !c.control
+                    .claims
+                    .iter()
+                    .any(|claim| claim.slot == slot && claim.stream == primary)
+            );
+            assert_eq!(
+                c.control
+                    .claims
+                    .iter()
+                    .map(|claim| (
+                        claim.slot,
+                        claim.stream,
+                        claim.remaining,
+                        claim.reservation_debited
+                    ))
+                    .collect::<Vec<_>>(),
+                prior_claims
+            );
+            let grants: Vec<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    QcsdAction::IncreaseReceiveLimit {
+                        stream,
+                        slot: owner,
+                        ..
+                    } if *owner == slot => Some(*stream),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(grants, vec![known, cover]);
+        }
+
+        // Keep the existing explicit known-chaff service turn ahead of an
+        // otherwise eligible primary. Reuse its established qualified92 oracle.
+        let mut c = native113_five_known_snapshot(false);
+        let ep = QcsdEndpointId(1);
+        let primary = QcsdStreamId(0);
+        c.observe(
+            QcsdObservation::ResponseHeaders {
+                endpoint: ep,
+                stream: primary,
+                frame_bytes: 16,
+                status: Some(200),
+                content_length: None,
+            },
+            Duration::from_micros(18_780_000),
+        );
+        c.streams.get_mut(ep, primary).unwrap().receive =
+            crate::stream::ReceiveState::ReceivingData {
+                advertised_limit: 4_616,
+                requested_limit: 4_616,
+                known_limit: 4_616,
+                reservation_capacity: 1_000,
+                reservation_available: 1_000,
+                consumed: 4_616,
+                payload_floor: 1,
+                framing_bytes: 27,
+                parser_lease_capacity: 1_000,
+                parser_lease_used: 1_000,
+                parser_lease_exhausted: true,
+                last_parser_lease_boundary: Some(3_416),
+                pending_parser_boundary: Some(4_616),
+                data_length: 4_589,
+            };
+        assert_eq!(
+            c.streams
+                .owned_data_continuation_capacity(ep, primary, 1_200),
+            1_200
+        );
+        let actions = native113_due(&mut c, 18_816_000, 18_816_000);
+        let grants: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                QcsdAction::IncreaseReceiveLimit {
+                    stream,
+                    absolute_limit,
+                    ..
+                } => Some((*stream, *absolute_limit)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(grants, vec![(QcsdStreamId(92), 2_425)]);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, QcsdAction::LeaseParserReceive { .. }))
+        );
+        assert!(c.control.claims.is_empty());
     }
 }
 
