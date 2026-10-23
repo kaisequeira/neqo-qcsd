@@ -15805,6 +15805,9 @@ async fn execute_run_inner(
             "the ETF scheduler contract is supported only on Linux".into(),
         ));
     }
+    #[cfg(target_os = "linux")]
+    let mut buflo_pre_selection_diagnostic =
+        buflo_kernel_tx.as_ref().map(|_| BufloPreSelectionDiagnostic::new());
     let mut defense_start = None;
     let mut application_completion = None;
     let mut application_complete_observed = false;
@@ -15896,11 +15899,15 @@ async fn execute_run_inner(
             }};
         }
         macro_rules! yield_to_exact_boundaries {
-            ($runner:lifetime) => {
+            ($runner:lifetime, $phase:expr) => {
                 #[cfg(target_os = "linux")]
                 if let Some(runtime) = buflo_kernel_tx.as_mut()
                     && let Some(started) = runtime.activation_start(defense_start)?
-                    && dispatch_due_buflo_kernel_release(
+                {
+                    if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
+                        diagnostic.record($phase);
+                    }
+                    let kernel_release_result = dispatch_due_buflo_kernel_release(
                         &spec.config.defense,
                         &mut endpoints,
                         &mut controller,
@@ -15910,9 +15917,19 @@ async fn execute_run_inner(
                         started,
                         runtime,
                     )
-                    .await?
-                {
-                    continue $runner;
+                    .await;
+                    if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
+                        diagnostic.record("protected-check-return");
+                        if kernel_release_result.is_err() {
+                            let failed_slot = buflo_pre_selection_failure_slot(
+                                runtime.protected_selection_wait_entries.last(),
+                            );
+                            diagnostic.finish_protected_check(failed_slot);
+                        }
+                    }
+                    if kernel_release_result? {
+                        continue $runner;
+                    }
                 }
                 #[cfg(target_os = "linux")]
                 let legacy_buflo_release = buflo_kernel_tx.is_none();
@@ -15978,7 +15995,7 @@ async fn execute_run_inner(
                         }
                     };
                 }
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "runner-loop-entry");
                 yield_to_tamaraw_service!();
                 record_buflo_incoming_startup_ready(
                     &controller,
@@ -15989,7 +16006,7 @@ async fn execute_run_inner(
 
                 let elapsed_before_http = defense_elapsed_at!(loop_now);
                 for endpoint_index in 0..endpoints.len() {
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "before-socket-input");
                     yield_to_tamaraw_service!();
                     if matches!(spec.config.defense, DefenseConfig::Tamaraw(_))
                         && let Some(started) = defense_start
@@ -16027,7 +16044,7 @@ async fn execute_run_inner(
                             !bound_ordinary_work || defense_start.is_none(),
                         )?;
                     }
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-socket-input");
                     yield_to_tamaraw_service!();
                     {
                         let endpoint = &mut endpoints[endpoint_index];
@@ -16047,10 +16064,10 @@ async fn execute_run_inner(
                         &observation_clock,
                         elapsed_before_http.unwrap_or(Duration::ZERO),
                     )?;
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-http-and-application-progress");
                     yield_to_tamaraw_service!();
                 }
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-endpoint-input-cycle");
                 yield_to_tamaraw_service!();
 
                 activate_needed_endpoints(
@@ -16103,7 +16120,7 @@ async fn execute_run_inner(
                 {
                     traces.bind_buflo_fin_permission_defense_start(start)?;
                 }
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-endpoint-activation");
                 yield_to_tamaraw_service!();
 
                 // Refresh after input/HTTP processing: actions reduced below must
@@ -16125,7 +16142,7 @@ async fn execute_run_inner(
                         &mut traces,
                         barrier_elapsed,
                     )?;
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-observation-reduction");
                     yield_to_tamaraw_service!();
                     let application_stream_in_flight = has_in_flight_application_stream(
                         endpoints
@@ -16141,7 +16158,7 @@ async fn execute_run_inner(
                     }
                     controller.flush_defense_observations();
                     ensure_defense_realizable(&controller)?;
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-batch-flush-realizability");
                     yield_to_tamaraw_service!();
                     let reconcile_rolling = rolling_lifecycle_before_batch
                         || rolling_output_lifecycle_active(&controller, &endpoints);
@@ -16161,7 +16178,7 @@ async fn execute_run_inner(
                             barrier_now,
                             barrier_elapsed,
                         )?;
-                        yield_to_exact_boundaries!('runner);
+                        yield_to_exact_boundaries!('runner, "after-ordinary-queued-actions");
                         yield_to_tamaraw_service!();
                     }
                     let request_work_guard = next_buflo_exact_release_guard(
@@ -16212,7 +16229,7 @@ async fn execute_run_inner(
                     {
                         runtime.mark_tick_zero_application_ready(started_requests)?;
                     }
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-request-dispatch");
                     let batch_started = application_batches.after_dispatch(started_requests)?;
                     handle_all_qcsd_observations(
                         &mut endpoints,
@@ -16225,7 +16242,7 @@ async fn execute_run_inner(
                         traces.observation(None, &record)?;
                         controller.observe(record.into_observation(), barrier_elapsed);
                     }
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-request-observation-reduction");
                     yield_to_tamaraw_service!();
                 }
 
@@ -16235,7 +16252,7 @@ async fn execute_run_inner(
                         Error::DefenseExecution("runner wake deadline overflow".into())
                     })?;
                 for endpoint_index in 0..endpoints.len() {
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "before-first-output-drive");
                     yield_to_tamaraw_service!();
                     // Flush output that was already available (including newly
                     // dispatched application requests) so its Wire signals precede
@@ -16281,7 +16298,7 @@ async fn execute_run_inner(
                         next_wakeup = wakeup;
                         controller_deadline_selected = false;
                     }
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-first-output-drive");
                     yield_to_tamaraw_service!();
                 }
             }
@@ -16295,7 +16312,7 @@ async fn execute_run_inner(
                     &mut traces,
                     defense_elapsed,
                 )?;
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-control-observation-reduction");
                 let candidate_defense = is_candidate_defense(&spec.config.defense);
                 let exclude_stopped_buflo_chaff_sends =
                     matches!(&spec.config.defense, DefenseConfig::Buflo(_))
@@ -16370,7 +16387,7 @@ async fn execute_run_inner(
                 )?;
                 controller.flush_defense_observations();
                 ensure_defense_realizable(&controller)?;
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-control-flush-realizability");
                 if controller.has_rolling_outgoing_prearm()
                     || controller.has_due_rolling_reconciliation()
                 {
@@ -16380,7 +16397,7 @@ async fn execute_run_inner(
                     controller.reconcile_due_rolling(defense_elapsed)?;
                     controller.flush_defense_observations();
                     ensure_defense_realizable(&controller)?;
-                    yield_to_exact_boundaries!('runner);
+                    yield_to_exact_boundaries!('runner, "after-control-rolling-reconciliation");
                 }
                 #[cfg(target_os = "linux")]
                 let kernel_tick_zero_pending = match buflo_kernel_tx.as_ref() {
@@ -16402,11 +16419,11 @@ async fn execute_run_inner(
                         defense_elapsed,
                     )?;
                 }
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-control-poll-actions");
             }
 
             for endpoint_index in 0..endpoints.len() {
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "before-second-output-drive");
                 if let Some(boundary) = tamaraw_ordinary_work_boundary(
                     &controller,
                     defense_start,
@@ -16454,7 +16471,7 @@ async fn execute_run_inner(
                     next_wakeup = wakeup;
                     controller_deadline_selected = false;
                 }
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-second-output-drive");
                 if let Some(boundary) = tamaraw_ordinary_work_boundary(
                     &controller,
                     defense_start,
@@ -16475,7 +16492,7 @@ async fn execute_run_inner(
                     input_elapsed,
                     !bound_ordinary_work || defense_start.is_none(),
                 )?;
-                yield_to_exact_boundaries!('runner);
+                yield_to_exact_boundaries!('runner, "after-second-socket-input");
                 if let Some(boundary) = tamaraw_ordinary_work_boundary(
                     &controller,
                     defense_start,
@@ -16619,14 +16636,22 @@ async fn execute_run_inner(
                 next_wakeup = cs_retry_wakeup;
                 controller_deadline_selected = false;
             }
-            let Some(wake) = wait_for_runner_activity_until(
+            #[cfg(target_os = "linux")]
+            if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
+                diagnostic.record("before-runner-reactor-wait");
+            }
+            let runner_wake_result = wait_for_runner_activity_until(
                 &endpoints,
                 next_wakeup,
                 spec.config.buflo_retained_parser_fin_permission,
                 runner_wait_policy,
             )
-            .await?
-            else {
+            .await;
+            #[cfg(target_os = "linux")]
+            if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
+                diagnostic.record("after-runner-reactor-wait");
+            }
+            let Some(wake) = runner_wake_result? else {
                 // Already-parsed HTTP or an already-due pending kernel BuFLO
                 // admission re-enters the unchanged exact-boundary checks first.
                 continue 'runner;
@@ -23406,6 +23431,132 @@ impl Drop for BufloPostSelectionDiagnostic {
     }
 }
 
+
+// Bounded last-phase context for a failure before protected selection.
+// The original post-confirm twelve-sample diagnostic below remains separate.
+#[cfg(target_os = "linux")]
+const BUFLO_PRE_SELECTION_MAX_SAMPLES: usize = 10;
+
+#[cfg(target_os = "linux")]
+fn buflo_pre_selection_failure_slot(
+    entry: Option<&BufloKernelProtectedSelectionWaitEntry>,
+) -> Option<u64> {
+    entry
+        .filter(|entry| entry.failure.is_some() && entry.dispatch_confirmed_tai_ns.is_none())
+        .map(|entry| entry.slot)
+}
+
+#[cfg(target_os = "linux")]
+struct BufloPreSelectionDiagnostic {
+    samples: [Option<BufloPostSelectionSample>; BUFLO_PRE_SELECTION_MAX_SAMPLES],
+    len: usize,
+    truncated: bool,
+    emitted: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloPreSelectionDiagnostic {
+    const fn new() -> Self {
+        Self {
+            samples: [None; BUFLO_PRE_SELECTION_MAX_SAMPLES],
+            len: 0,
+            truncated: false,
+            emitted: false,
+        }
+    }
+
+    fn record_with(
+        &mut self,
+        phase: &'static str,
+        mut tai: impl FnMut() -> Option<u64>,
+        cpu: impl FnOnce() -> Option<u64>,
+    ) {
+        if self.emitted {
+            return;
+        }
+        if self.len == self.samples.len() {
+            self.samples.rotate_left(1);
+            self.len -= 1;
+            self.truncated = true;
+        }
+        let tai_before_ns = tai();
+        let thread_cpu_ns = cpu();
+        let tai_after_ns = tai();
+        self.samples[self.len] = Some(BufloPostSelectionSample {
+            phase,
+            tai_before_ns,
+            thread_cpu_ns,
+            tai_after_ns,
+        });
+        self.len += 1;
+    }
+
+    fn record(&mut self, phase: &'static str) {
+        self.record_with(
+            phase,
+            || timed_egress::clock_tai_ns().ok(),
+            || timed_egress::clock_thread_cpu_ns().ok(),
+        );
+    }
+
+    fn finish_protected_check_with(
+        &mut self,
+        failed_slot: Option<u64>,
+        tai: impl FnMut() -> Option<u64>,
+        cpu: impl FnOnce() -> Option<u64>,
+        emit: impl FnOnce(&str),
+    ) {
+        let Some(slot) = failed_slot else {
+            return;
+        };
+        if self.emitted {
+            return;
+        }
+        // Reuse the fixed twelve-sample clock record and serialization bound.
+        // Ten retained ordinary phases plus the failure-return sample fit
+        // without discarding the immediately preceding work-unit boundary.
+        let mut failure = BufloPostSelectionDiagnostic::new(slot);
+        failure.samples[..self.len].copy_from_slice(&self.samples[..self.len]);
+        failure.len = self.len;
+        failure.truncated = self.truncated;
+        failure.record_with("pre-selection-failure-return", tai, cpu);
+        // This local snapshot must not trigger the independent post-confirm
+        // Drop emitter. The pre-selection record is emitted at most once.
+        failure.complete();
+        self.emitted = true;
+        let value = json!({
+            "schema_version": 1,
+            "source": "buflo-pre-selection-failure-boundaries-v1",
+            "diagnostic_only": true,
+            "slot": slot,
+            "sample_order": "CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after",
+            "retained_phase_limit": BUFLO_PRE_SELECTION_MAX_SAMPLES,
+            "max_samples": BUFLO_POST_SELECTION_MAX_SAMPLES,
+            "truncated": failure.truncated,
+            "samples": &failure.samples[..failure.len],
+            "phase_or_deadline_authority": false,
+        });
+        if let Ok(encoded) = serde_json::to_string(&value)
+            && encoded.len() <= BUFLO_POST_SELECTION_MAX_JSON_BYTES
+        {
+            emit(&encoded);
+        }
+    }
+
+    fn finish_protected_check(&mut self, failed_slot: Option<u64>) {
+        self.finish_protected_check_with(
+            failed_slot,
+            || timed_egress::clock_tai_ns().ok(),
+            || timed_egress::clock_thread_cpu_ns().ok(),
+            |encoded| {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "QCSD_PRE_SELECTION_FAILURE_BOUNDARIES_V1 {encoded}"
+                );
+            },
+        );
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn validate_buflo_kernel_main(
@@ -58382,6 +58533,173 @@ mod tests {
             1,
             true
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_pre_selection_actual_first_read_late_entry_stays_failed_and_emits() {
+        const RELEASE: u64 = 1_792_740_463_767_997_721;
+        let identity = super::BufloKernelProtectedSelectionIdentity {
+            slot: 2_296,
+            tick: 1_148,
+            tick_zero: false,
+            admission_tai_ns: RELEASE - 10_000_000,
+            selection_tai_ns: RELEASE - 5_000_000,
+            release_tai_ns: RELEASE,
+            preparation_deadline_tai_ns: Some(RELEASE + 4_000_000),
+        };
+        let step = super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+            Ok(RELEASE + 5_783_633)
+        });
+        let super::BufloKernelProtectedSelectionStep::Failed { entry, error } = step else {
+            panic!("actual late first read must retain the original strict refusal");
+        };
+        assert_eq!(entry.clock_read_attempts, 1);
+        assert_eq!(entry.confirmation_attempts, 0);
+        assert_eq!(entry.wait_duration_ns, 0);
+        assert!(entry.dispatch_confirmed_tai_ns.is_none());
+        assert_eq!(entry.failure.as_ref().expect("failure").kind, "selection-expired");
+        assert!(error.to_string().contains("selection expired"));
+        let mut diagnostic = super::BufloPreSelectionDiagnostic::new();
+        diagnostic.record_with(
+            "after-runner-reactor-wait",
+            || Some(RELEASE + 5_783_000),
+            || Some(10_000),
+        );
+        let mut emitted = Vec::new();
+        diagnostic.finish_protected_check_with(
+            super::buflo_pre_selection_failure_slot(Some(&entry)),
+            || Some(RELEASE + 5_784_000),
+            || Some(11_000),
+            |raw| emitted.push(raw.to_owned()),
+        );
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(entry.failure.as_ref().expect("unchanged failure").kind, "selection-expired");
+        let super::BufloKernelProtectedSelectionStep::Ready(ready) =
+            super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
+                Ok(RELEASE - 1_000_000)
+            })
+        else {
+            panic!("an in-window read still follows the original ready branch");
+        };
+        assert!(super::buflo_pre_selection_failure_slot(Some(&ready)).is_none());
+        assert!(super::buflo_pre_selection_failure_slot(None).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_pre_selection_late_entry_retains_cpu_and_off_cpu_boundaries() {
+        let wall_gap = 15_783_633_u64;
+        for cpu_gap in [50_000_u64, wall_gap] {
+            let mut diagnostic = super::BufloPreSelectionDiagnostic::new();
+            let mut first = [1_000_000_000, 1_000_000_010].into_iter();
+            diagnostic.record_with(
+                "before-runner-reactor-wait",
+                || first.next(),
+                || Some(500_000),
+            );
+            let mut second = [1_000_000_000 + wall_gap, 1_000_000_010 + wall_gap].into_iter();
+            diagnostic.record_with(
+                "after-runner-reactor-wait",
+                || second.next(),
+                || Some(500_000 + cpu_gap),
+            );
+            let mut emitted = Vec::new();
+            diagnostic.finish_protected_check_with(
+                Some(2_296),
+                || Some(1_100_000_000),
+                || Some(20_000_000),
+                |raw| emitted.push(raw.to_owned()),
+            );
+            assert_eq!(emitted.len(), 1);
+            let value: serde_json::Value =
+                serde_json::from_str(&emitted[0]).expect("diagnostic JSON");
+            let samples = value["samples"].as_array().expect("bounded samples");
+            assert_eq!(
+                samples[1]["tai_before_ns"].as_u64().expect("TAI")
+                    - samples[0]["tai_before_ns"].as_u64().expect("TAI"),
+                wall_gap
+            );
+            assert_eq!(
+                samples[1]["thread_cpu_ns"].as_u64().expect("CPU")
+                    - samples[0]["thread_cpu_ns"].as_u64().expect("CPU"),
+                cpu_gap
+            );
+            assert_eq!(value["source"], "buflo-pre-selection-failure-boundaries-v1");
+            assert_eq!(value["slot"], 2_296);
+            assert_eq!(value["phase_or_deadline_authority"], false);
+            assert_eq!(
+                samples.last().expect("return sample")["phase"],
+                "pre-selection-failure-return"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_pre_selection_context_rolls_ten_and_emits_only_once_on_failure() {
+        let mut diagnostic = super::BufloPreSelectionDiagnostic::new();
+        for index in 0..15_u64 {
+            diagnostic.record_with("ordinary-boundary", || Some(index), || Some(index));
+        }
+        assert_eq!(diagnostic.len, super::BUFLO_PRE_SELECTION_MAX_SAMPLES);
+        assert!(diagnostic.truncated);
+        assert_eq!(
+            diagnostic.samples[0].expect("oldest retained").tai_before_ns,
+            Some(5)
+        );
+        let mut emitted = Vec::new();
+        diagnostic.finish_protected_check_with(
+            None,
+            || panic!("successful check must not sample failure clocks"),
+            || panic!("successful check must not sample failure CPU"),
+            |_| panic!("successful check must not emit"),
+        );
+        diagnostic.finish_protected_check_with(
+            Some(2_296),
+            || Some(16),
+            || Some(16),
+            |raw| emitted.push(raw.to_owned()),
+        );
+        diagnostic.finish_protected_check_with(
+            Some(2_296),
+            || panic!("no duplicate clocks"),
+            || panic!("no duplicate CPU"),
+            |_| panic!("no duplicate emission"),
+        );
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].len() <= super::BUFLO_POST_SELECTION_MAX_JSON_BYTES);
+        let value: serde_json::Value =
+            serde_json::from_str(&emitted[0]).expect("diagnostic JSON");
+        let samples = value["samples"].as_array().expect("bounded samples");
+        assert_eq!(samples.len(), 11);
+        assert_eq!(samples[0]["tai_before_ns"], 5);
+        assert_eq!(samples[9]["tai_before_ns"], 14);
+        assert_eq!(samples[10]["phase"], "pre-selection-failure-return");
+        assert_eq!(value["truncated"], true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_pre_selection_nullable_clocks_never_authorize_a_phase() {
+        let mut diagnostic = super::BufloPreSelectionDiagnostic::new();
+        diagnostic.record_with("before-protected-check", || None, || None);
+        let mut emitted = Vec::new();
+        diagnostic.finish_protected_check_with(
+            Some(2_296),
+            || None,
+            || None,
+            |raw| emitted.push(raw.to_owned()),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&emitted[0]).expect("nullable JSON");
+        assert!(value["samples"].as_array().expect("samples").iter().all(|row| {
+            row["tai_before_ns"].is_null()
+                && row["thread_cpu_ns"].is_null()
+                && row["tai_after_ns"].is_null()
+        }));
+        assert_eq!(value["diagnostic_only"], true);
+        assert_eq!(value["phase_or_deadline_authority"], false);
     }
 
     #[cfg(target_os = "linux")]
