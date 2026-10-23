@@ -362,6 +362,13 @@ impl Http3Client {
         }
     }
 
+    /// Bounded first-error observations independent of the public HTTP/3 event queue.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub const fn qcsd_error_diagnostics(&self) -> &neqo_transport::QcsdErrorDiagnostics {
+        self.conn.qcsd_error_diagnostics()
+    }
+
     pub(crate) const fn connection(&self) -> &Connection {
         &self.conn
     }
@@ -566,6 +573,8 @@ impl Http3Client {
         if let Err(e) = &output
             && e.connection_error()
         {
+            #[cfg(feature = "qcsd")]
+            self.conn.qcsd_record_first_http3_error(now, "fetch", format_args!("{e:?}"), format_args!("{e}"), e.code());
             self.close(now, e.code(), "");
         }
         output
@@ -608,6 +617,8 @@ impl Http3Client {
         if let Err(e) = &output
             && e.connection_error()
         {
+            #[cfg(feature = "qcsd")]
+            self.conn.qcsd_record_first_http3_error(now, "connect", format_args!("{e:?}"), format_args!("{e}"), e.code());
             self.close(now, e.code(), "");
         }
         output
@@ -722,6 +733,8 @@ impl Http3Client {
         if let Err(e) = &res
             && e.connection_error()
         {
+            #[cfg(feature = "qcsd")]
+            self.conn.qcsd_record_first_http3_error(now, "read_data", format_args!("{e:?}"), format_args!("{e}"), e.code());
             self.close(now, e.code(), "");
         }
         res
@@ -820,19 +833,19 @@ impl Http3Client {
         match self.base_handler.state() {
             Http3State::ZeroRtt | Http3State::Connected | Http3State::GoingAway(..) => {
                 let res = self.check_connection_events(now);
-                if self.check_result(now, &res) {
+                if self.check_result(now, &res, "connection_events") {
                     return;
                 }
                 self.push_handler
                     .borrow_mut()
                     .maybe_send_max_push_id_frame(&mut self.base_handler);
                 let res = self.base_handler.process_sending(&mut self.conn, now);
-                self.check_result(now, &res);
+                self.check_result(now, &res, "process_sending");
             }
             Http3State::Closed { .. } => {}
             _ => {
                 let res = self.check_connection_events(now);
-                _ = self.check_result(now, &res);
+                _ = self.check_result(now, &res, "connection_events");
             }
         }
     }
@@ -893,9 +906,13 @@ impl Http3Client {
 
     /// This function takes the provided result and check for an error.
     /// An error results in closing the connection.
-    fn check_result<ERR>(&mut self, now: Instant, res: &Res<ERR>) -> bool {
+    fn check_result<ERR>(&mut self, now: Instant, res: &Res<ERR>, phase: &'static str) -> bool {
+        #[cfg(not(feature = "qcsd"))]
+        let _ = phase;
         match &res {
             Err(Error::HttpGoaway) => {
+                #[cfg(feature = "qcsd")]
+                self.conn.qcsd_record_first_http3_error(now, phase, format_args!("{:?}", Error::HttpGoaway), format_args!("{}", Error::HttpGoaway), Error::HttpGeneralProtocol.code());
                 qinfo!("[{self}] Connection error: goaway stream_id increased");
                 self.close(
                     now,
@@ -905,6 +922,8 @@ impl Http3Client {
                 true
             }
             Err(e) => {
+                #[cfg(feature = "qcsd")]
+                self.conn.qcsd_record_first_http3_error(now, phase, format_args!("{e:?}"), format_args!("{e}"), e.code());
                 qinfo!("[{self}] Connection error: {e}");
                 self.close(now, e.code(), format!("{e}"));
                 true
@@ -1304,6 +1323,53 @@ mod tests {
         qpack_encoder_receiver::EncoderRecvStream,
         settings::{H3_RESERVED_SETTINGS, HSetting, HSettingType},
     };
+
+    #[cfg(feature = "qcsd")]
+    #[test]
+    fn qcsd_first_error_retains_peer_close_before_generic_http3_code() {
+        let (mut client, mut server) = connect();
+        let at = now();
+        client.conn.qcsd_enable_with_observation_clock(
+            QcsdEndpointId(0), false, neqo_csdef::QcsdObservationClock::new(at),
+        );
+        assert!(client.qcsd_error_diagnostics().first_http3_error.is_none());
+        assert!(client.qcsd_error_diagnostics().first_peer_close.is_none());
+        let reason = "é".repeat(300);
+        server.conn.close(at, 0x77, &reason);
+        let packet = server.conn.process_output(at).dgram().expect("actual peer close");
+        client.process_input(packet, at);
+        let peer = client.qcsd_error_diagnostics().first_peer_close.as_ref().unwrap();
+        assert!(peer.application);
+        assert_eq!(peer.error_code, 0x77);
+        assert_eq!(peer.processing_monotonic_ns, Some(0));
+        assert_eq!(peer.reason_phrase, "é".repeat(127));
+        assert!(!peer.reason_truncated);
+        // The unchanged peer encoder limited its wire reason to254 bytes first.
+        assert_eq!(client.state(), Http3State::Closing(CloseReason::Transport(
+            neqo_transport::Error::PeerApplication(0x77),
+        )));
+        let original = Error::Transport(neqo_transport::Error::PeerApplication(0x77));
+        assert_eq!(original.code(), 3);
+        assert!(client.check_result(at, &Err::<(), _>(original), "connection_events"));
+        let diagnostics = client.qcsd_error_diagnostics();
+        let first = diagnostics.first_http3_error.as_ref().unwrap();
+        let peer = diagnostics.first_peer_close.as_ref().unwrap();
+        assert_eq!(first.close_code, 3);
+        assert!(first.error_debug.contains("PeerApplication(119)"));
+        assert_eq!(first.phase, "connection_events");
+        assert_eq!(first.processing_monotonic_ns, Some(0));
+        assert!(peer.connection_sequence < first.connection_sequence);
+        let saved_error = first.error_debug.clone();
+        let saved_order = first.connection_sequence;
+        assert!(client.check_result(at, &Err::<(), _>(Error::Internal), "process_sending"));
+        let first = client.qcsd_error_diagnostics().first_http3_error.as_ref().unwrap();
+        assert_eq!(first.error_debug, saved_error);
+        assert_eq!(first.connection_sequence, saved_order);
+        // Diagnostics neither replace the peer reason nor make the close successful.
+        assert_eq!(client.state(), Http3State::Closing(CloseReason::Transport(
+            neqo_transport::Error::PeerApplication(0x77),
+        )));
+    }
 
     fn assert_closed(client: &Http3Client, expected: &Error) {
         match client.state() {

@@ -11793,6 +11793,69 @@ const HTTP3_TERMINAL_STATE_MAX_ENDPOINTS: usize = 32;
 const HTTP3_TERMINAL_STATE_MAX_DESCRIPTION_BYTES: usize = 256;
 const HTTP3_TERMINAL_STATE_MAX_JSON_BYTES: usize = 16 * 1024;
 
+/// Failure-only first causes. All strings are capped before retention; these
+/// observations never drain events, sample clocks or replace the primary error.
+fn http3_first_error_snapshot(endpoints: &[Endpoint]) -> Option<serde_json::Value> {
+    let mut entries = Vec::new();
+    let mut omitted = 0_usize;
+    for endpoint in endpoints {
+        let retained = endpoint.client.qcsd_error_diagnostics();
+        if retained.first_http3_error.is_none() && retained.first_peer_close.is_none() {
+            continue;
+        }
+        if entries.len() == HTTP3_TERMINAL_STATE_MAX_ENDPOINTS {
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        let first_http3_error = retained.first_http3_error.as_ref().map(|error| json!({
+            "processing_monotonic_ns": error.processing_monotonic_ns,
+            "connection_sequence": error.connection_sequence,
+            "phase": &error.phase,
+            "error_debug": &error.error_debug,
+            "error_display": &error.error_display,
+            "mapped_close_code": error.close_code,
+            "transport_state_debug": &error.transport_state_debug,
+            "text_truncated": error.text_truncated,
+        }));
+        let first_peer_close = retained.first_peer_close.as_ref().map(|close| json!({
+            "processing_monotonic_ns": close.processing_monotonic_ns,
+            "connection_sequence": close.connection_sequence,
+            "frame_kind": if close.application { "application" } else { "transport" },
+            "error_code": close.error_code,
+            "triggering_frame_type": close.triggering_frame_type,
+            "reason_phrase": &close.reason_phrase,
+            "reason_truncated": close.reason_truncated,
+        }));
+        entries.push(json!({
+            "endpoint_id": endpoint.id.0,
+            "first_http3_error": first_http3_error,
+            "first_peer_close": first_peer_close,
+        }));
+    }
+    while !entries.is_empty() {
+        let value = json!({
+            "schema_version": 1,
+            "source": "runner-first-http3-error-and-peer-close-v1",
+            "observations_only": true,
+            "independent_of_http3_event_queue": true,
+            "time_basis": "existing-adapter-processing-Instant-against-original-runner-origin",
+            "order_basis": "first-retained-cause-order-per-connection-not-global-event-sequence",
+            "max_endpoints": HTTP3_TERMINAL_STATE_MAX_ENDPOINTS,
+            "max_text_bytes": 256,
+            "max_json_bytes": HTTP3_TERMINAL_STATE_MAX_JSON_BYTES,
+            "omitted_endpoints": omitted,
+            "entries": &entries,
+        });
+        let Ok(raw) = serde_json::to_vec(&value) else { return None; };
+        if raw.len() <= HTTP3_TERMINAL_STATE_MAX_JSON_BYTES {
+            return Some(value);
+        }
+        _ = entries.pop();
+        omitted = omitted.saturating_add(1);
+    }
+    None
+}
+
 /// Failure-only current state, independent of the bounded HTTP/3 event queue.
 /// No event drain, new clock, network operation or primary-error replacement.
 fn http3_terminal_state_snapshot(endpoints: &[Endpoint]) -> Option<serde_json::Value> {
@@ -27869,6 +27932,9 @@ fn render_run_json(
     // A successful run's scientific DTO stays unchanged. These optional
     // failure observations do not replace the original error or authorize it.
     if completion_status != "complete" {
+        if let Some(first_causes) = http3_first_error_snapshot(endpoints) {
+            run["http3_first_error_observations"] = first_causes;
+        }
         if let Some(snapshot) = http3_terminal_state_snapshot(endpoints) {
             run["http3_terminal_state_snapshot"] = snapshot;
         }

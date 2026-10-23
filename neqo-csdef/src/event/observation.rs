@@ -45,6 +45,19 @@ impl QcsdObservationClock {
         }
     }
 
+    /// Read the existing trace origin without sampling a clock or consuming a sequence.
+    /// Failure diagnostics use the adapter's already supplied processing instant.
+    #[must_use]
+    pub fn elapsed_ns_at(&self, produced_at: Instant) -> u64 {
+        u64::try_from(
+            produced_at
+                .checked_duration_since(self.origin)
+                .unwrap_or_default()
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     /// Timestamp an observation at its production instant.
     #[must_use]
     pub fn record_at(

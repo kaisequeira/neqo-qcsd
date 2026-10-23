@@ -279,6 +279,44 @@ impl AddressValidationInfo {
     }
 }
 
+/// Bounded original HTTP/3 error before its application-close code loses its variant.
+#[cfg(feature = "qcsd")]
+#[derive(Debug)]
+pub struct QcsdFirstHttp3Error {
+    /// Existing processing instant expressed against the original runner trace clock.
+    pub processing_monotonic_ns: Option<u64>,
+    /// Order of the first error/peer-close observations on this connection only.
+    pub connection_sequence: u64,
+    pub phase: String,
+    pub error_debug: String,
+    pub error_display: String,
+    pub close_code: u64,
+    pub transport_state_debug: String,
+    pub text_truncated: bool,
+}
+
+/// First decoded peer CONNECTION_CLOSE, independent of the HTTP/3 event queue.
+#[cfg(feature = "qcsd")]
+#[derive(Debug)]
+pub struct QcsdFirstPeerClose {
+    pub processing_monotonic_ns: Option<u64>,
+    pub connection_sequence: u64,
+    pub application: bool,
+    pub error_code: u64,
+    pub triggering_frame_type: u64,
+    pub reason_phrase: String,
+    pub reason_truncated: bool,
+}
+
+/// Failure-only retained observations; these never authorize or alter a transition.
+#[cfg(feature = "qcsd")]
+#[derive(Debug, Default)]
+pub struct QcsdErrorDiagnostics {
+    pub first_http3_error: Option<QcsdFirstHttp3Error>,
+    pub first_peer_close: Option<QcsdFirstPeerClose>,
+    next_sequence: u64,
+}
+
 /// A QUIC Connection
 ///
 /// First, create a new connection using `new_client()` or `new_server()`.
@@ -371,6 +409,8 @@ pub struct Connection {
     /// Shared production clock for causal multi-endpoint trace ordering.
     #[cfg(feature = "qcsd")]
     qcsd_observation_clock: Option<QcsdObservationClock>,
+    #[cfg(feature = "qcsd")]
+    qcsd_error_diagnostics: QcsdErrorDiagnostics,
     /// Bounded packet-number provenance used to classify cover-induced ACKs.
     #[cfg(feature = "qcsd")]
     qcsd_packet_classifier: qcsd::QcsdPacketClassifier,
@@ -446,6 +486,92 @@ impl Debug for Connection {
     )
 )]
 impl Connection {
+    /// Retained first errors only; no event drain, clock sample or state mutation.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub const fn qcsd_error_diagnostics(&self) -> &QcsdErrorDiagnostics {
+        &self.qcsd_error_diagnostics
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_bounded_error_text(value: fmt::Arguments<'_>) -> (String, bool) {
+        struct Text {
+            value: String,
+            truncated: bool,
+        }
+        impl fmt::Write for Text {
+            fn write_str(&mut self, value: &str) -> fmt::Result {
+                let mut end = value.len().min(256_usize.saturating_sub(self.value.len()));
+                while !value.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.value.push_str(&value[..end]);
+                if end < value.len() {
+                    self.truncated = true;
+                    return Err(fmt::Error);
+                }
+                Ok(())
+            }
+        }
+        let mut text = Text { value: String::new(), truncated: false };
+        let _format_result = fmt::write(&mut text, value);
+        (text.value, text.truncated)
+    }
+
+    /// Called only at an existing HTTP/3 error-to-close boundary.
+    /// Formatting is bounded and only the first error is retained.
+    #[cfg(feature = "qcsd")]
+    pub fn qcsd_record_first_http3_error(
+        &mut self,
+        now: Instant,
+        phase: &'static str,
+        error_debug: fmt::Arguments<'_>,
+        error_display: fmt::Arguments<'_>,
+        close_code: u64,
+    ) {
+        if self.qcsd_error_diagnostics.first_http3_error.is_some() {
+            return;
+        }
+        let processing_monotonic_ns = self.qcsd_observation_clock.as_ref()
+            .map(|clock| clock.elapsed_ns_at(now));
+        let (phase, phase_truncated) = Self::qcsd_bounded_error_text(format_args!("{phase}"));
+        let (error_debug, debug_truncated) = Self::qcsd_bounded_error_text(error_debug);
+        let (error_display, display_truncated) = Self::qcsd_bounded_error_text(error_display);
+        let (transport_state_debug, state_truncated) =
+            Self::qcsd_bounded_error_text(format_args!("{:?}", self.state));
+        let connection_sequence = self.qcsd_error_diagnostics.next_sequence;
+        self.qcsd_error_diagnostics.next_sequence = connection_sequence.saturating_add(1);
+        self.qcsd_error_diagnostics.first_http3_error = Some(QcsdFirstHttp3Error {
+            processing_monotonic_ns, connection_sequence, phase, error_debug, error_display,
+            close_code, transport_state_debug,
+            text_truncated: phase_truncated || debug_truncated || display_truncated || state_truncated,
+        });
+    }
+
+    #[cfg(feature = "qcsd")]
+    fn qcsd_record_first_peer_close(
+        &mut self,
+        now: Instant,
+        error_code: CloseError,
+        triggering_frame_type: u64,
+        reason_phrase: &str,
+    ) {
+        if self.qcsd_error_diagnostics.first_peer_close.is_some() {
+            return;
+        }
+        let processing_monotonic_ns = self.qcsd_observation_clock.as_ref()
+            .map(|clock| clock.elapsed_ns_at(now));
+        let (reason_phrase, reason_truncated) =
+            Self::qcsd_bounded_error_text(format_args!("{reason_phrase}"));
+        let connection_sequence = self.qcsd_error_diagnostics.next_sequence;
+        self.qcsd_error_diagnostics.next_sequence = connection_sequence.saturating_add(1);
+        self.qcsd_error_diagnostics.first_peer_close = Some(QcsdFirstPeerClose {
+            processing_monotonic_ns, connection_sequence,
+            application: matches!(error_code, CloseError::Application(_)),
+            error_code: error_code.code(), triggering_frame_type, reason_phrase, reason_truncated,
+        });
+    }
+
     /// A long default for timer resolution, so that we don't tax the
     /// system too hard when we don't need to.
     const LOOSE_TIMER_RESOLUTION: Duration = Duration::from_millis(50);
@@ -590,6 +716,8 @@ impl Connection {
             qcsd_next_stream_transmission_sequence: 0,
             #[cfg(feature = "qcsd")]
             qcsd_observation_clock: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_error_diagnostics: QcsdErrorDiagnostics::default(),
             #[cfg(feature = "qcsd")]
             qcsd_packet_classifier: qcsd::QcsdPacketClassifier::default(),
             #[cfg(feature = "qcsd")]
@@ -4297,6 +4425,8 @@ impl Connection {
                 reason_phrase,
             } => {
                 self.stats.borrow_mut().frame_rx.connection_close += 1;
+                #[cfg(feature = "qcsd")]
+                self.qcsd_record_first_peer_close(now, error_code, frame_type, &reason_phrase);
                 qinfo!(
                     "[{self}] ConnectionClose received. Error code: {error_code:?} frame type {frame_type:x} reason {reason_phrase}"
                 );

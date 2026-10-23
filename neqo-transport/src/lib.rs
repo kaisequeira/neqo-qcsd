@@ -88,6 +88,9 @@ pub use self::{
     stats::FrameStats,
 };
 
+#[cfg(feature = "qcsd")]
+pub use connection::{QcsdErrorDiagnostics, QcsdFirstHttp3Error, QcsdFirstPeerClose};
+
 pub type TransportError = u64;
 const ERROR_APPLICATION_CLOSE: TransportError = 12;
 const ERROR_CRYPTO_BUFFER_EXCEEDED: TransportError = 13;
