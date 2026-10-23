@@ -4271,6 +4271,10 @@ pub fn clock_tai_ns() -> Result<u64, TimedEgressError> {
     clock_ns(libc::CLOCK_TAI, "clock_gettime(CLOCK_TAI)")
 }
 
+pub fn clock_thread_cpu_ns() -> Result<u64, TimedEgressError> {
+    clock_ns(libc::CLOCK_THREAD_CPUTIME_ID, "clock_gettime(CLOCK_THREAD_CPUTIME_ID)")
+}
+
 pub fn clock_monotonic_ns() -> Result<u64, TimedEgressError> {
     clock_ns(libc::CLOCK_MONOTONIC, "clock_gettime(CLOCK_MONOTONIC)")
 }

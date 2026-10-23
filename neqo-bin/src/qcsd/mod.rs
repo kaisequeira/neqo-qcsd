@@ -23275,6 +23275,138 @@ fn next_buflo_kernel_guard(
     Ok(Some(guard))
 }
 
+// Bounded preparation diagnostics only. No sample authorizes a phase, changes
+// a transport Instant or replaces the original CLOCK_TAI/physical validators.
+#[cfg(target_os = "linux")]
+const BUFLO_POST_SELECTION_MAX_SAMPLES: usize = 12;
+
+#[cfg(target_os = "linux")]
+const BUFLO_POST_SELECTION_MAX_JSON_BYTES: usize = 8 * 1024;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BufloPostSelectionSample {
+    phase: &'static str,
+    tai_before_ns: Option<u64>,
+    thread_cpu_ns: Option<u64>,
+    tai_after_ns: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+struct BufloPostSelectionDiagnostic {
+    slot: u64,
+    samples: [Option<BufloPostSelectionSample>; BUFLO_POST_SELECTION_MAX_SAMPLES],
+    len: usize,
+    truncated: bool,
+    emit_on_failure: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloPostSelectionDiagnostic {
+    fn new(slot: u64) -> Self {
+        Self {
+            slot,
+            samples: [None; BUFLO_POST_SELECTION_MAX_SAMPLES],
+            len: 0,
+            truncated: false,
+            emit_on_failure: true,
+        }
+    }
+
+    fn record_with(
+        &mut self,
+        phase: &'static str,
+        mut tai: impl FnMut() -> Option<u64>,
+        cpu: impl FnOnce() -> Option<u64>,
+    ) {
+        if self.len == self.samples.len() {
+            self.truncated = true;
+            return;
+        }
+        let tai_before_ns = tai();
+        let thread_cpu_ns = cpu();
+        let tai_after_ns = tai();
+        self.samples[self.len] = Some(BufloPostSelectionSample {
+            phase,
+            tai_before_ns,
+            thread_cpu_ns,
+            tai_after_ns,
+        });
+        self.len += 1;
+    }
+
+    fn record(&mut self, phase: &'static str) {
+        // These are diagnostics, not extra phase confirmations. In particular
+        // they do not consume the test/production decision-clock seam.
+        self.record_with(
+            phase,
+            || timed_egress::clock_tai_ns().ok(),
+            || timed_egress::clock_thread_cpu_ns().ok(),
+        );
+    }
+
+    fn complete(&mut self) {
+        self.emit_on_failure = false;
+    }
+
+    fn emit_failure_with(
+        &mut self,
+        tai: impl FnMut() -> Option<u64>,
+        cpu: impl FnOnce() -> Option<u64>,
+        emit: impl FnOnce(&str),
+    ) {
+        if !self.emit_on_failure {
+            return;
+        }
+        // Always retain the return boundary, including an early `?` inside a
+        // work unit. If full, replace only the final diagnostic sample and
+        // report truncation; the fixed twelve-sample allocation never grows.
+        if self.len == self.samples.len() {
+            self.len -= 1;
+            self.truncated = true;
+        }
+        self.record_with("failure-return", tai, cpu);
+        // Emission is attempted at most once, including serialization/write
+        // failure. None of this context authorizes a physical release.
+        self.complete();
+        let value = json!({
+            "schema_version": 1,
+            "source": "buflo-post-selection-failure-boundaries-v1",
+            "diagnostic_only": true,
+            "slot": self.slot,
+            "sample_order": "CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after",
+            "max_samples": BUFLO_POST_SELECTION_MAX_SAMPLES,
+            "truncated": self.truncated,
+            "samples": &self.samples[..self.len],
+            "phase_or_deadline_authority": false,
+        });
+        if let Ok(encoded) = serde_json::to_string(&value)
+            && encoded.len() <= BUFLO_POST_SELECTION_MAX_JSON_BYTES
+        {
+            emit(&encoded);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BufloPostSelectionDiagnostic {
+    fn drop(&mut self) {
+        // No ordinary per-event disk log. A final pair of real CLOCK_TAI reads
+        // brackets thread CPU time at failure return; errors remain JSON null.
+        self.emit_failure_with(
+            || timed_egress::clock_tai_ns().ok(),
+            || timed_egress::clock_thread_cpu_ns().ok(),
+            |encoded| {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "QCSD_POST_SELECTION_FAILURE_BOUNDARIES_V1 {encoded}"
+                );
+            },
+        );
+    }
+}
+
+
 #[cfg(target_os = "linux")]
 fn validate_buflo_kernel_main(
     guard: &BufloExactReleaseGuard,
@@ -23806,6 +23938,8 @@ async fn dispatch_buflo_kernel_release(
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<(), Error> {
     runtime.confirm_protected_selection(guard.slot.0)?;
+    let mut preparation_diagnostic = BufloPostSelectionDiagnostic::new(guard.slot.0);
+    preparation_diagnostic.record("post-confirm");
     let logical_elapsed = guard.packet.timestamp();
     // Kernel dispatch intentionally advances every endpoint's Neqo clock to
     // this globally ordered adapter release. The same action batch can prearm
@@ -23813,13 +23947,18 @@ async fn dispatch_buflo_kernel_release(
     // Raw trace chronology remains contemporaneous monotonic time, and later
     // transport calls clamp to this bounded floor until that clock catches up.
     advance_endpoint_transport_floors(endpoints, guard.release);
+    preparation_diagnostic.record("post-transport-floor");
     handle_all_qcsd_observations(endpoints, controller, traces, logical_elapsed)?;
+    preparation_diagnostic.record("post-observation-reduction");
     controller.flush_defense_observations();
     ensure_defense_realizable(controller)?;
+    preparation_diagnostic.record("post-first-flush-realizability");
     if guard.phase == BufloExactReleasePhase::Prearmed {
         controller.reconcile_due_rolling(logical_elapsed)?;
+        preparation_diagnostic.record("post-reconcile");
         controller.flush_defense_observations();
         ensure_defense_realizable(controller)?;
+        preparation_diagnostic.record("post-second-flush-realizability");
         apply_queued_actions(
             endpoints,
             controller,
@@ -23828,6 +23967,7 @@ async fn dispatch_buflo_kernel_release(
             now(),
             logical_elapsed,
         )?;
+        preparation_diagnostic.record("post-queued-actions");
     }
     if !buflo_guard_identity_matches_runner(guard, endpoints, BufloExactReleasePhase::Committed) {
         return Err(Error::DefenseExecution(format!(
@@ -23839,12 +23979,15 @@ async fn dispatch_buflo_kernel_release(
     let captured_incoming_credit =
         buflo_kernel_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
     runtime.retain_credit_identities(job_id, &captured_incoming_credit)?;
-    let prepared = match prepare_output_once_with_evidence(
+    preparation_diagnostic.record("post-job-credit-inventory");
+    preparation_diagnostic.record("pre-transport-output");
+    let prepared_result = prepare_output_once_with_evidence(
         &mut endpoints[guard.endpoint_index],
         now(),
     )
-    .await
-    {
+    .await;
+    preparation_diagnostic.record("post-transport-output");
+    let prepared = match prepared_result {
         Err(failure) => {
             return Err(retain_buflo_prepared_output_failure(
                 runtime,
@@ -23916,6 +24059,7 @@ async fn dispatch_buflo_kernel_release(
             PreparedOutputFailure::from_prepared("main-validation", error, &prepared),
         ));
     }
+    preparation_diagnostic.complete();
     let (physical_time, main_item_id) = match runtime.transmit_exact_main(
         job_id,
         guard.endpoint_index,
@@ -58238,6 +58382,168 @@ mod tests {
             1,
             true
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_post_selection_failure_boundaries_distinguish_cpu_and_off_cpu_gap() {
+        let wall_gap = 11_304_021_u64;
+        for cpu_gap in [50_000_u64, wall_gap] {
+            let mut diagnostic = super::BufloPostSelectionDiagnostic::new(9_120);
+            let mut before = [1_000_000_000, 1_000_000_010].into_iter();
+            diagnostic.record_with("post-confirm", || before.next(), || Some(500_000));
+            let mut after = [1_000_000_000 + wall_gap, 1_000_000_010 + wall_gap].into_iter();
+            diagnostic.record_with(
+                "post-queued-actions",
+                || after.next(),
+                || Some(500_000 + cpu_gap),
+            );
+            diagnostic.complete();
+            let first = diagnostic.samples[0].expect("first real-order sample");
+            let second = diagnostic.samples[1].expect("second real-order sample");
+            assert_eq!(
+                second.tai_before_ns.expect("TAI") - first.tai_before_ns.expect("TAI"),
+                wall_gap
+            );
+            assert_eq!(
+                second.thread_cpu_ns.expect("CPU") - first.thread_cpu_ns.expect("CPU"),
+                cpu_gap
+            );
+            assert!(
+                wall_gap > 5_000_000,
+                "diagnostics preserve a physically expired window"
+            );
+            assert_eq!(first.phase, "post-confirm");
+            assert_eq!(second.phase, "post-queued-actions");
+            assert!(!diagnostic.truncated);
+        }
+        let mut diagnostic = super::BufloPostSelectionDiagnostic::new(9_120);
+        for _ in 0..super::BUFLO_POST_SELECTION_MAX_SAMPLES + 3 {
+            diagnostic.record_with("bounded-clock-failure", || None, || None);
+        }
+        diagnostic.complete();
+        assert_eq!(diagnostic.len, super::BUFLO_POST_SELECTION_MAX_SAMPLES);
+        assert!(diagnostic.truncated);
+        assert!(diagnostic.samples.iter().flatten().all(|row| {
+            row.tai_before_ns.is_none()
+                && row.thread_cpu_ns.is_none()
+                && row.tai_after_ns.is_none()
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_post_selection_failure_emission_records_final_return_once() {
+        let mut diagnostic = super::BufloPostSelectionDiagnostic::new(9_120);
+        let mut first_tai = [1_000, 1_010].into_iter();
+        diagnostic.record_with("post-confirm", || first_tai.next(), || Some(50));
+        let mut final_tai = [12_000, 12_010].into_iter();
+        let mut emitted = Vec::new();
+        diagnostic.emit_failure_with(
+            || final_tai.next(),
+            || Some(100),
+            |encoded| emitted.push(encoded.to_owned()),
+        );
+        assert_eq!(emitted.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&emitted[0]).expect("JSON diagnostic");
+        assert_eq!(value["slot"], 9_120);
+        assert_eq!(value["diagnostic_only"], true);
+        assert_eq!(value["phase_or_deadline_authority"], false);
+        let samples = value["samples"].as_array().expect("sample array");
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0]["phase"], "post-confirm");
+        assert_eq!(samples[1]["phase"], "failure-return");
+        assert_eq!(samples[1]["tai_before_ns"], 12_000);
+        assert_eq!(samples[1]["thread_cpu_ns"], 100);
+        assert_eq!(samples[1]["tai_after_ns"], 12_010);
+        diagnostic.emit_failure_with(
+            || panic!("an emitted failure must not read clocks again"),
+            || panic!("an emitted failure must not read CPU again"),
+            |_| panic!("an emitted failure must not emit twice"),
+        );
+        assert!(!diagnostic.emit_on_failure);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_post_selection_success_disarms_clocks_and_emission() {
+        let mut diagnostic = super::BufloPostSelectionDiagnostic::new(9_120);
+        diagnostic.record_with("post-confirm", || Some(1_000), || Some(50));
+        diagnostic.complete();
+        diagnostic.emit_failure_with(
+            || panic!("successful validation must not sample failure clocks"),
+            || panic!("successful validation must not sample failure CPU"),
+            |_| panic!("successful validation must not emit a failure"),
+        );
+        assert_eq!(diagnostic.len, 1);
+        assert!(!diagnostic.emit_on_failure);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_post_selection_failure_clock_errors_remain_nullable() {
+        let mut diagnostic = super::BufloPostSelectionDiagnostic::new(9_120);
+        let tai_reads = std::cell::Cell::new(0);
+        let cpu_reads = std::cell::Cell::new(0);
+        let mut emitted = None;
+        diagnostic.emit_failure_with(
+            || {
+                tai_reads.set(tai_reads.get() + 1);
+                None
+            },
+            || {
+                cpu_reads.set(cpu_reads.get() + 1);
+                None
+            },
+            |encoded| emitted = Some(encoded.to_owned()),
+        );
+        assert_eq!(tai_reads.get(), 2);
+        assert_eq!(cpu_reads.get(), 1);
+        let value: serde_json::Value =
+            serde_json::from_str(&emitted.expect("nullable failure still emits")).expect("JSON");
+        let sample = &value["samples"][0];
+        assert_eq!(sample["phase"], "failure-return");
+        assert!(sample["tai_before_ns"].is_null());
+        assert!(sample["thread_cpu_ns"].is_null());
+        assert!(sample["tai_after_ns"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buflo_post_selection_failure_output_is_bounded_and_keeps_final_sample() {
+        let mut diagnostic = super::BufloPostSelectionDiagnostic::new(u64::MAX);
+        for _ in 0..super::BUFLO_POST_SELECTION_MAX_SAMPLES + 3 {
+            diagnostic.record_with("bounded-work-unit", || Some(u64::MAX), || Some(u64::MAX));
+        }
+        let mut emitted = None;
+        diagnostic.emit_failure_with(
+            || Some(u64::MAX),
+            || Some(u64::MAX),
+            |encoded| emitted = Some(encoded.to_owned()),
+        );
+        let encoded = emitted.expect("bounded maximum-value diagnostic");
+        assert!(encoded.len() <= super::BUFLO_POST_SELECTION_MAX_JSON_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("JSON");
+        let samples = value["samples"].as_array().expect("sample array");
+        assert_eq!(samples.len(), super::BUFLO_POST_SELECTION_MAX_SAMPLES);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(samples.last().expect("final sample")["phase"], "failure-return");
+        assert_eq!(diagnostic.len, super::BUFLO_POST_SELECTION_MAX_SAMPLES);
+
+        // Exercise the actual encoded-byte guard, even for a future accidental
+        // oversized phase label; this test allocation is never production data.
+        let long_phase = Box::leak(
+            "x".repeat(super::BUFLO_POST_SELECTION_MAX_JSON_BYTES)
+                .into_boxed_str(),
+        );
+        let mut oversized = super::BufloPostSelectionDiagnostic::new(9_120);
+        oversized.record_with(long_phase, || None, || None);
+        oversized.emit_failure_with(
+            || None,
+            || None,
+            |_| panic!("an oversized diagnostic must not reach the output sink"),
+        );
+        assert!(!oversized.emit_on_failure);
     }
 
     #[cfg(target_os = "linux")]
