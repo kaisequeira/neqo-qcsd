@@ -6854,13 +6854,51 @@ impl QcsdController {
             })
             .map(|opportunity| (opportunity.endpoint, opportunity.stream));
 
-            // Retained unknown-length parser permission is not decoded DATA
-            // capacity. Serve every application's known extent before any
-            // parser probe can consume this cell. The original remainder
-            // order (including explicit known-chaff service turns) is retained.
+            // Ordinary pristine cells share the existing cyclic application
+            // order with an eligible retained secondary parser boundary. A
+            // known application extent must not indefinitely preempt that turn.
+            // This changes priority only: the original allocator still requires
+            // new owned offsets, the shared parser cap and a complete1200 cell.
+            let fair_retained_application_turns = self.buflo_retained_parser_policy
+                && fair_stream_turns
+                && !terminal_chaff_incoming
+                && tagged_disposition.is_none()
+                && reserve_disposition.is_none()
+                && incoming.packet.length() == 1_200
+                && incoming.remaining == 1_200
+                && self.incoming_slot_is_untouched(&incoming)
+                && known_chaff_service.is_none()
+                && fair_owned_primary_turn.is_none()
+                && !self.buflo_fin_replacement_pending.contains_key(&incoming.slot)
+                && opportunities.iter().any(|opportunity| {
+                    opportunity.role == QcsdRequestRole::Application
+                        && opportunity.exact == 0
+                        && self.buflo_secondary_fresh_parser_bridge_enabled(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                        )
+                        && self.buflo_retained_parser_demands
+                            .get(&(opportunity.endpoint, opportunity.stream))
+                            .and_then(|demand| demand.boundary)
+                            .is_some_and(|boundary| {
+                                self.streams.buflo_retained_parser_capacity(
+                                    opportunity.endpoint,
+                                    opportunity.stream,
+                                    boundary,
+                                    self.buflo_retained_parser_room(
+                                        opportunity.endpoint,
+                                        opportunity.stream,
+                                    ),
+                                ) > 0
+                            })
+                });
+            // Every special/partial/primary/known-chaff/replacement turn keeps
+            // the original exact-first pass. Eligible ordinary application
+            // turns use the same existing cyclic opportunity order for both.
             let mut allocation_passes = Vec::new();
             if self.buflo_retained_parser_policy
                 && fair_stream_turns
+                && !fair_retained_application_turns
                 && opportunities
                     .first()
                     .is_some_and(|opportunity| opportunity.role == QcsdRequestRole::Application)
@@ -33661,6 +33699,7 @@ mod tests {
         );
         assert!(c.control.claims.is_empty());
     }
+    include!("mixed_known_unknown_parser_tests.rs");
 }
 
 #[cfg(test)]
