@@ -506,6 +506,22 @@ impl Http3Connection {
     }
 
     #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_qpack_encoder_handler_pending(&self) -> bool {
+        self.qpack_encoder.borrow().has_pending_send()
+    }
+
+    #[cfg(feature = "qcsd")]
+    pub(crate) fn qcsd_cs_terminal_receive_ready(
+        &mut self,
+        stream_id: StreamId,
+        kind: crate::QcsdCsTerminalReceiveKind,
+    ) -> Res<()> {
+        self.recv_streams.get_mut(&stream_id).ok_or(Error::InvalidStreamId)?
+            .http_stream().ok_or(Error::InvalidInput)?
+            .qcsd_cs_terminal_receive_ready(kind)
+    }
+
+    #[cfg(feature = "qcsd")]
     pub(crate) fn qcsd_qpack_decoder_handler_pending(&self) -> bool {
         self.qpack_decoder.borrow().has_pending_send()
     }

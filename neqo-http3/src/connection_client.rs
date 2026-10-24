@@ -48,7 +48,7 @@ use crate::{
 #[path = "connection_client_qcsd.rs"]
 mod qcsd;
 #[cfg(feature = "qcsd")]
-pub use qcsd::QcsdLocalChaffAbandonment;
+pub use qcsd::{QcsdCsTerminalReadiness, QcsdLocalChaffAbandonment};
 
 // This is used for filtering send_streams and recv_Streams with a stream_ids greater than or equal
 // a given id. Only the same type (bidirectional or unidirectional) streams are filtered.

@@ -719,6 +719,8 @@ pub struct QcsdController {
     buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: u64,
     cs_buflo_local_et_pending_request_cancellations: u64,
     cs_buflo_local_et_stream_cancellations: u64,
+    // Complete-application CS cleanup is counted only after the real adapter acknowledgement.
+    cs_terminal_cancellations_pending: HashSet<(QcsdEndpointId, QcsdStreamId)>,
     cs_buflo_application_passthrough: bool,
     cs_buflo_local_et_before_application_complete: bool,
     cs_buflo_local_et_application_receive_streams_handed_off: u64,
@@ -927,6 +929,7 @@ impl QcsdController {
             buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: 0,
             cs_buflo_local_et_pending_request_cancellations: 0,
             cs_buflo_local_et_stream_cancellations: 0,
+            cs_terminal_cancellations_pending: HashSet::new(),
             cs_buflo_application_passthrough: false,
             cs_buflo_local_et_before_application_complete: false,
             cs_buflo_local_et_application_receive_streams_handed_off: 0,
@@ -3958,6 +3961,9 @@ impl QcsdController {
         stream: QcsdStreamId,
         pristine_data_boundary: bool,
     ) {
+        if self.cs_terminal_cancellations_pending.contains(&(endpoint, stream)) {
+            return;
+        }
         let retained_boundary = (self.buflo_retained_parser_policy
             && self.buflo_secondary_fresh_parser_bridge_enabled(endpoint, stream)
             && self.defense.terminal_failure().is_none())
@@ -7594,7 +7600,8 @@ impl QcsdController {
                             || self.streams.aggregate_capacity().chaff_incoming >= required
                     },
                 );
-        self.rolling_reconcile_due.is_some()
+        !self.cs_terminal_cancellations_pending.is_empty()
+            || self.rolling_reconcile_due.is_some()
             || !self.pending_slots.is_empty()
             || !self.control.incoming.is_empty()
             || !self.control.outgoing.is_empty()
@@ -7863,6 +7870,43 @@ impl QcsdController {
         );
     }
 
+    /// Acknowledge only an actually applied, complete-application CS cleanup.
+    /// Queuing or deferring CancelChaff never closes a stream or increments its
+    /// applied diagnostic. Duplicate or foreign acknowledgements fail closed.
+    ///
+    /// # Errors
+    /// Returns a controller invariant error for an unissued/terminal identity
+    /// or a different defense/application phase.
+    pub fn acknowledge_cs_terminal_chaff_cancellation(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        at: Duration,
+    ) -> Result<()> {
+        if !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || !self.application_complete_delivered_to_defense
+            || self.defense.terminal_chaff_cancellation_reason()
+                != Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
+            || !self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || !self.cs_terminal_cancellations_pending.contains(&(endpoint, stream))
+            || !self.streams.get_mut(endpoint, stream).is_some_and(|state|
+                matches!(state.role, QcsdRequestRole::Chaff { request_id: Some(_), .. })
+                    && state.chaff_request_activated())
+        {
+            return Err(crate::Error::ControllerInvariant(
+                "CS terminal cancellation acknowledgement lacks its exact live pending identity".into(),
+            ));
+        }
+        self.close_stream(endpoint, stream, crate::QcsdStreamFinish::LocalError, at);
+        self.cs_terminal_cancellations_pending.remove(&(endpoint, stream));
+        self.cs_buflo_local_et_stream_cancellations =
+            self.cs_buflo_local_et_stream_cancellations.saturating_add(1);
+        self.terminal_chaff_cancellation_empty_snapshot_required = true;
+        self.terminal_chaff_cancellation_empty_snapshot_observed = false;
+        Ok(())
+    }
+
     fn terminalize_local_chaff(&mut self, at: Duration) {
         if !self.defense.is_complete() || self.defense.terminal_failure().is_some() {
             return;
@@ -7937,6 +7981,12 @@ impl QcsdController {
                     .is_some_and(|state| state.chaff_request_activated())
             });
         }
+        let acknowledged_cs_cleanup = reason == QcsdChaffCancellationReason::CsBufloLocalEarlyTermination
+            && matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            && self.application_complete_delivered_to_defense;
+        if acknowledged_cs_cleanup {
+            open_chaff_streams.retain(|key| !self.cs_terminal_cancellations_pending.contains(key));
+        }
         if !open_chaff_streams.is_empty() {
             // The aggregate false that authorized terminal cancellation
             // predates the RESET/STOP work queued below and is no longer valid
@@ -7954,6 +8004,10 @@ impl QcsdController {
                 stream,
                 reason,
             });
+            if acknowledged_cs_cleanup {
+                self.cs_terminal_cancellations_pending.insert((endpoint, stream));
+                continue;
+            }
             self.close_stream(endpoint, stream, crate::QcsdStreamFinish::LocalError, at);
             match reason {
                 QcsdChaffCancellationReason::BufloTerminalSubcellTail => {
@@ -8102,7 +8156,8 @@ impl QcsdController {
         self.terminalize_local_chaff(elapsed);
         self.handoff_cs_buflo_application_after_local_et();
         self.release_cs_buflo_application_send_cleanup_if_needed();
-        let has_backlog = self.control.incoming_backlog() > 0
+        let has_backlog = !self.cs_terminal_cancellations_pending.is_empty()
+            || self.control.incoming_backlog() > 0
             || self.control.claim_backlog() > 0
             || !self.control.receiver_continuations.is_empty()
             || !self.control.outgoing.is_empty()

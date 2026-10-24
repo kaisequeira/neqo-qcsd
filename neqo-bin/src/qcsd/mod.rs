@@ -12448,6 +12448,13 @@ struct DeferredEndpointReady {
     production_monotonic_ns: u64,
 }
 
+struct PendingCsTerminalCancellation {
+    action: QcsdAction,
+    // Actual encoded/received packet progress, not clock advancement. A
+    // repeated action drain cannot immediately retry the same blocked call.
+    deferred_packet_progress: (usize, usize),
+}
+
 struct Endpoint {
     id: QcsdEndpointId,
     origin: Uri,
@@ -12486,6 +12493,7 @@ struct Endpoint {
     /// Chaff and application requests share the peer's request-stream quota.
     /// Retain controller-reserved chaff identities until real peer credit.
     pending_chaff_requests: VecDeque<QcsdAction>,
+    pending_cs_terminal_cancellations: VecDeque<PendingCsTerminalCancellation>,
     chaff_stream_limit_blocked: bool,
     streams: HashMap<StreamId, StreamRecord>,
     /// Every application request send half opened on this endpoint. Entries
@@ -17606,6 +17614,7 @@ fn create_endpoint_inventory(
                 pending,
                 application_stream_limit_blocked: false,
                 pending_chaff_requests: VecDeque::new(),
+                pending_cs_terminal_cancellations: VecDeque::new(),
                 chaff_stream_limit_blocked: false,
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
@@ -18018,6 +18027,7 @@ fn candidate_aggregate_snapshot_should_emit(
 
 fn endpoint_send_terminal(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
     endpoint.pending_chaff_requests.is_empty()
+        && endpoint.pending_cs_terminal_cancellations.is_empty()
         && (!candidate_defense
             || (!endpoint_egress_backlog_pending(endpoint, true)
                 && application_send_halves_peer_confirmed(endpoint)
@@ -20302,6 +20312,36 @@ fn apply_action_batch(
     Ok(())
 }
 
+fn cs_terminal_packet_progress(endpoint: &Endpoint) -> (usize, usize) {
+    let stats = endpoint.client.transport_stats();
+    (stats.packets_rx, stats.packets_tx)
+}
+
+fn retry_pending_cs_terminal_cancellations(
+    endpoints: &mut [Endpoint],
+    controller: &mut QcsdController,
+    chaff_manifest: Option<&RuntimeChaffManifest>,
+    traces: &mut TraceFiles,
+    now: Instant,
+    defense_elapsed: Duration,
+) -> Result<(), Error> {
+    for index in 0..endpoints.len() {
+        let progress = cs_terminal_packet_progress(&endpoints[index]);
+        let pending = std::mem::take(&mut endpoints[index].pending_cs_terminal_cancellations);
+        for item in pending {
+            if item.deferred_packet_progress == progress {
+                endpoints[index].pending_cs_terminal_cancellations.push_back(item);
+                continue;
+            }
+            // Apply once after genuine protocol I/O progress. If still busy,
+            // apply_action requeues with this new exact packet fingerprint.
+            apply_action(endpoints, controller, chaff_manifest, traces, now,
+                defense_elapsed, item.action, false, None)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_queued_actions(
     endpoints: &mut [Endpoint],
     controller: &mut QcsdController,
@@ -20310,6 +20350,9 @@ fn apply_queued_actions(
     now: Instant,
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
+    retry_pending_cs_terminal_cancellations(
+        endpoints, controller, chaff_manifest, traces, now, defense_elapsed,
+    )?;
     loop {
         retry_pending_chaff_requests(
             endpoints,
@@ -20594,6 +20637,54 @@ fn abandon_buflo_terminal_chaff(
 /// handoff. Complete-application cleanup accepts either an exact drained
 /// response or the separately proved untouched initial sixteen-byte window;
 /// its unread QUIC bytes remain buffered. No STOP/RESET/credit/QPACK is queued.
+fn cs_terminal_chaff_readiness(
+    endpoint: &mut Endpoint,
+    controller: &QcsdController,
+    stream: StreamId,
+) -> Result<neqo_http3::QcsdCsTerminalReadiness, Error> {
+    let diagnostics = controller.defense_diagnostics();
+    if !matches!(controller.config().defense, DefenseConfig::CsBuflo(_))
+        || !diagnostics.cs_buflo_application_complete
+        || !diagnostics.cs_buflo_local_termination_latched
+        || !diagnostics.cs_buflo_outgoing_termination_stop_latched
+        || !diagnostics.cs_buflo_incoming_termination_stop_latched
+        || diagnostics.scheduled_incoming_unresolved_bytes != 0
+        || controller.terminal_failure().is_some()
+        || !endpoint.pending_chaff_requests.is_empty()
+    {
+        return Err(Error::SlotInvariant(
+            "CS-BuFLO local abandonment lacks the original drained terminal latch".into(),
+        ));
+    }
+    let record = endpoint.streams.get(&stream).ok_or_else(|| {
+        Error::SlotInvariant("CS-BuFLO local abandonment targeted unknown chaff".into())
+    })?;
+    let QcsdRequestRole::Chaff {
+        resource_id,
+        request_id: Some(request_id),
+    } = record.role
+    else {
+        return Err(Error::SlotInvariant(
+            "CS-BuFLO local abandonment targeted an unqualified non-chaff identity".into(),
+        ));
+    };
+    if record.complete
+        || record.outcome != "in_flight"
+        || endpoint
+            .terminal_local_abandonments
+            .iter()
+            .any(|proof| proof["stream"].as_u64() == Some(stream.as_u64()))
+    {
+        return Err(Error::SlotInvariant(
+            "CS-BuFLO local abandonment targeted a completed or repeated response".into(),
+        ));
+    }
+    let witness = controller.cs_buflo_terminal_parser_allowance(
+        endpoint.id, neqo_csdef::QcsdStreamId(stream.as_u64()),
+    );
+    Ok(endpoint.client.qcsd_cs_terminal_chaff_readiness(stream, record.role, witness.as_ref())?)
+}
+
 fn abandon_cs_buflo_terminal_chaff(
     endpoint: &mut Endpoint,
     controller: &QcsdController,
@@ -21130,7 +21221,28 @@ fn apply_action(
                     && diagnostics.cs_buflo_local_termination_latched
             })
         {
+            let readiness = cs_terminal_chaff_readiness(endpoint, controller, stream)?;
+            if readiness != neqo_http3::QcsdCsTerminalReadiness::Ready {
+                if endpoint.pending_cs_terminal_cancellations.iter().any(|item|
+                    matches!(&item.action, QcsdAction::CancelChaff { stream: old, .. }
+                        if old.0 == stream.as_u64()))
+                {
+                    return Err(Error::SlotInvariant("duplicate pending CS terminal cancellation".into()));
+                }
+                let progress = cs_terminal_packet_progress(endpoint);
+                endpoint.pending_cs_terminal_cancellations.push_back(PendingCsTerminalCancellation {
+                    action: trace_action.clone(), deferred_packet_progress: progress,
+                });
+                traces.event(now, endpoint_id, "cs_chaff_local_abandonment", "deferred",
+                    &json!({"stream": stream.as_u64(), "readiness": format!("{readiness:?}"),
+                        "packet_rx": progress.0, "packet_tx": progress.1,
+                        "receipt_applied": false, "receive_credit_increase": 0}))?;
+                return Ok(());
+            }
             let proof = abandon_cs_buflo_terminal_chaff(endpoint, controller, stream)?;
+            controller.acknowledge_cs_terminal_chaff_cancellation(
+                endpoint.id, neqo_csdef::QcsdStreamId(stream.as_u64()), defense_elapsed,
+            )?;
             applied_action_trace_at = self::now();
             traces.event(
                 applied_action_trace_at,
@@ -62114,6 +62226,8 @@ mod tests {
         drop(server);
         fs::remove_dir_all(output).expect("remove original-refusal fixture");
     }
+    include!("cs_terminal_cleanup_pending_flow_tests.rs");
+
 }
 
 // BEGIN ROOT CS PREOUTPUT OBSERVATIONAL TESTS 001

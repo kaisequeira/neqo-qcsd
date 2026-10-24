@@ -635,6 +635,34 @@ impl RecvStream for RecvMessage {
 
 impl HttpRecvStream for RecvMessage {
     #[cfg(feature = "qcsd")]
+    fn qcsd_cs_terminal_receive_ready(&self, kind: crate::QcsdCsTerminalReceiveKind) -> Res<()> {
+        if self.stream_type != Http3StreamType::Http
+            || self.message_type != MessageType::Response
+            || !self.blocked_push_promise.is_empty()
+            || self.qpack_decoder.borrow().is_stream_blocked(self.stream_id)
+        {
+            return Err(Error::InvalidInput);
+        }
+        let allowed = match kind {
+            crate::QcsdCsTerminalReceiveKind::Drained => match &self.state {
+                RecvMessageState::WaitingForResponseHeaders { frame_reader } =>
+                    frame_reader.qcsd_partial_initial_headers(),
+                RecvMessageState::ReadingData { remaining_data_len } => *remaining_data_len > 0,
+                RecvMessageState::WaitingForData { frame_reader } => frame_reader.qcsd_at_frame_boundary(),
+                _ => false,
+            },
+            crate::QcsdCsTerminalReceiveKind::IdleInitial => matches!(&self.state,
+                RecvMessageState::WaitingForResponseHeaders { frame_reader }
+                    if frame_reader.qcsd_untouched_initial_frame()),
+            crate::QcsdCsTerminalReceiveKind::ParserAllowance => matches!(&self.state,
+                RecvMessageState::WaitingForData { frame_reader }
+                    if frame_reader.qcsd_at_frame_boundary()),
+        };
+        if !allowed { return Err(Error::InvalidInput); }
+        Ok(())
+    }
+
+    #[cfg(feature = "qcsd")]
     fn qcsd_abandon_drained_response(&mut self) -> Res<&'static str> {
         if self.stream_type != Http3StreamType::Http
             || self.message_type != MessageType::Response
