@@ -1104,7 +1104,25 @@ impl SendStream {
                 return;
             }
 
-            let (length, fill) = Self::length_and_fill(data.len(), builder.remaining() - overhead);
+            #[cfg(feature = "qcsd")]
+            let require_length = builder.qcsd_stream_length_required();
+            #[cfg(not(feature = "qcsd"))]
+            let require_length = false;
+            let space = builder.remaining() - overhead;
+            let (length, fill) = if require_length {
+                // Even an empty FIN needs the length byte. Include its actual
+                // varint width before committing any bytes to the stream.
+                let Some(payload_space) = space.checked_sub(1) else {
+                    return;
+                };
+                let mut length = min(data.len(), payload_space);
+                while Encoder::varint_len(to_u64(length)) > space - length {
+                    length -= 1;
+                }
+                (length, false)
+            } else {
+                Self::length_and_fill(data.len(), space)
+            };
             let retransmission_bytes = usize::try_from(retransmission_available)
                 .unwrap_or(usize::MAX)
                 .min(length);

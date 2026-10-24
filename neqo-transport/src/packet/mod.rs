@@ -138,6 +138,9 @@ pub struct Builder<B> {
     limit: usize,
     /// Whether to pad the packet before construction.
     padding: bool,
+    /// A temporary STREAM budget can be smaller than the final packet.
+    #[cfg(feature = "qcsd")]
+    qcsd_stream_length_required: bool,
 }
 
 impl Builder<Vec<u8>> {
@@ -257,6 +260,8 @@ impl<B: Buffer> Builder<B> {
             },
             limit,
             padding: false,
+            #[cfg(feature = "qcsd")]
+            qcsd_stream_length_required: false,
         }
     }
 
@@ -303,6 +308,8 @@ impl<B: Buffer> Builder<B> {
             },
             limit,
             padding: false,
+            #[cfg(feature = "qcsd")]
+            qcsd_stream_length_required: false,
         }
     }
 
@@ -321,6 +328,20 @@ impl<B: Buffer> Builder<B> {
     #[must_use]
     pub const fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Require an explicit STREAM length while a temporary budget is active.
+    #[cfg(feature = "qcsd")]
+    pub(crate) const fn qcsd_set_stream_length_required(&mut self, required: bool) -> bool {
+        let previous = self.qcsd_stream_length_required;
+        self.qcsd_stream_length_required = required;
+        previous
+    }
+
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub(crate) const fn qcsd_stream_length_required(&self) -> bool {
+        self.qcsd_stream_length_required
     }
 
     /// How many bytes remain against the size limit for the builder.

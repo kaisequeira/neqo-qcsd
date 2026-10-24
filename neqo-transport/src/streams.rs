@@ -405,9 +405,13 @@ impl Streams {
         let original_limit = builder.limit();
         let budget_limit = builder.len().saturating_add(*budget).min(original_limit);
         builder.set_limit(budget_limit);
+        // A LEN-less STREAM consumes the remainder of the final packet, not
+        // just this temporary budget. Keep later frames and padding outside it.
+        let previous_length_required = builder.qcsd_set_stream_length_required(true);
         let before = builder.len();
         self.send.write_frames(priority, builder, tokens, stats);
         *budget = budget.saturating_sub(builder.len().saturating_sub(before));
+        _ = builder.qcsd_set_stream_length_required(previous_length_required);
         builder.set_limit(original_limit);
     }
 
@@ -734,5 +738,222 @@ impl Streams {
     #[must_use]
     pub fn need_keep_alive(&self) -> bool {
         self.recv.need_keep_alive()
+    }
+}
+
+#[cfg(all(test, feature = "qcsd"))]
+mod qcsd_budgeted_stream_tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use neqo_common::{Decoder, Encoder, Role};
+
+    use super::Streams;
+    use crate::{
+        ConnectionEvents, StreamId,
+        frame::{Frame, FrameEncoder as _, FrameType},
+        packet, recovery,
+        send_stream::{RetransmissionPriority, SendStream, TransmissionPriority},
+        stats::FrameStats,
+        tparams::TransportParametersHandler,
+        version,
+    };
+
+    fn streams() -> Streams {
+        test_fixture::fixture_init();
+        let tps = Rc::new(RefCell::new(TransportParametersHandler::new(
+            Role::Client,
+            version::Config::default(),
+        )));
+        let mut streams = Streams::new(tps, Role::Client, ConnectionEvents::default());
+        streams.handle_max_data(1 << 20);
+        streams
+    }
+
+    fn add_stream(streams: &mut Streams, id: u64, data: &[u8], fin: bool) {
+        let id = StreamId::new(id);
+        let mut stream = SendStream::new(
+            id,
+            1 << 20,
+            Rc::clone(&streams.sender_fc),
+            streams.events.clone(),
+        );
+        stream.set_priority(TransmissionPriority::Important, RetransmissionPriority::Same);
+        if !data.is_empty() {
+            assert_eq!(stream.send(data).unwrap(), data.len());
+        }
+        if fin {
+            stream.close();
+        }
+        streams.send.insert(id, stream);
+    }
+
+    fn builder(limit: usize) -> packet::Builder<Vec<u8>> {
+        packet::Builder::short(Encoder::default(), false, None::<&[u8]>, limit)
+    }
+
+    #[test]
+    fn qcsd_budgeted_stream_preserves_later_stream_control_and_600_byte_padding() {
+        // The real wrapper must leave a decodable packet after its cap is
+        // restored. On the old writer, the first STREAM swallowed the suffix.
+        for cap in [4, 5, 63, 64, 65, 66, 67, 128, 300] {
+            let mut streams = streams();
+            add_stream(&mut streams, 0, &[0xA5; 512], false);
+            add_stream(&mut streams, 4, b"second-request", false);
+            streams
+                .get_send_stream_mut(StreamId::new(4))
+                .unwrap()
+                .set_priority(TransmissionPriority::Normal, RetransmissionPriority::Same);
+            let mut packet = builder(600);
+            let start = packet.len();
+            let mut budget = cap;
+            let mut tokens = recovery::Tokens::new();
+            let mut stats = FrameStats::default();
+            streams.write_frames_budgeted(
+                TransmissionPriority::Important,
+                &mut packet,
+                &mut tokens,
+                &mut stats,
+                &mut budget,
+            );
+            let used = packet.len() - start;
+            assert!(used <= cap);
+            assert_eq!(budget, cap - used);
+            assert_eq!(packet.limit(), 600);
+            streams.write_frames(
+                TransmissionPriority::Normal,
+                &mut packet,
+                &mut tokens,
+                &mut stats,
+            );
+            packet.encode_frame(FrameType::MaxData, |enc| {
+                enc.encode_varint(16_384_u64);
+            });
+            packet.enable_padding(true);
+            assert!(packet.pad());
+            assert_eq!(packet.len(), 600);
+
+            let mut dec = Decoder::new(&packet.as_ref()[start..]);
+            let Frame::Stream { stream_id, offset, data, fin, fill } =
+                Frame::decode(&mut dec).unwrap()
+            else {
+                panic!("first frame must be a STREAM");
+            };
+            assert_eq!(stream_id, StreamId::new(0));
+            assert_eq!(offset, 0);
+            assert!(!fin);
+            assert!(!fill, "temporary budget must not terminate the packet");
+            assert!(!data.is_empty());
+            assert!(data.iter().all(|byte| *byte == 0xA5));
+            assert_eq!(dec.offset(), used);
+            assert!(matches!(
+                Frame::decode(&mut dec).unwrap(),
+                Frame::Stream { stream_id, data: b"second-request", fill: false, .. }
+                    if stream_id == StreamId::new(4)
+            ));
+            assert_eq!(
+                Frame::decode(&mut dec).unwrap(),
+                Frame::MaxData { maximum_data: 16_384 }
+            );
+            assert!(matches!(Frame::decode(&mut dec).unwrap(), Frame::Padding(_)));
+            assert_eq!(dec.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn qcsd_budgeted_stream_varint_boundaries_and_nonzero_offsets() {
+        let payload = vec![0x5A; 20_000];
+        for cap in [
+            3, 4, 65, 66, 67, 68, 69, 70, 16_385, 16_386, 16_387, 16_388, 16_389, 16_390, 16_391,
+            16_392,
+        ] {
+            let mut streams = streams();
+            add_stream(&mut streams, 0, &payload, false);
+            let mut sent = 0;
+            for budget_size in [7, cap] {
+                let mut packet = builder(21_000);
+                let start = packet.len();
+                let mut budget = budget_size;
+                streams.write_frames_budgeted(
+                    TransmissionPriority::Important,
+                    &mut packet,
+                    &mut recovery::Tokens::new(),
+                    &mut FrameStats::default(),
+                    &mut budget,
+                );
+                let used = packet.len() - start;
+                assert!(used <= budget_size);
+                assert_eq!(budget, budget_size - used);
+                let mut dec = Decoder::new(&packet.as_ref()[start..]);
+                while dec.remaining() > 0 {
+                    let Frame::Stream { offset, data, fill, .. } =
+                        Frame::decode(&mut dec).unwrap()
+                    else {
+                        panic!("expected only explicit-length STREAM frames");
+                    };
+                    assert!(!fill);
+                    assert_eq!(offset, sent);
+                    assert!(data.iter().all(|byte| *byte == 0x5A));
+                    sent += u64::try_from(data.len()).unwrap();
+                }
+            }
+            assert!(sent > 0);
+        }
+    }
+
+    #[test]
+    fn qcsd_budgeted_stream_fin_and_zero_budget_fit_the_length_byte() {
+        for id in [0, 64] {
+            for cap in 0..=5 {
+                let mut streams = streams();
+                add_stream(&mut streams, id, &[], true);
+                let mut packet = builder(600);
+                let start = packet.len();
+                let mut budget = cap;
+                streams.write_frames_budgeted(
+                    TransmissionPriority::Important,
+                    &mut packet,
+                    &mut recovery::Tokens::new(),
+                    &mut FrameStats::default(),
+                    &mut budget,
+                );
+                let used = packet.len() - start;
+                let required = 2 + Encoder::varint_len(id);
+                assert!(used <= cap);
+                assert_eq!(budget, cap - used);
+                assert_eq!(used, if cap < required { 0 } else { required });
+                if used > 0 {
+                    let mut dec = Decoder::new(&packet.as_ref()[start..]);
+                    assert!(matches!(
+                        Frame::decode(&mut dec).unwrap(),
+                        Frame::Stream { stream_id, offset: 0, data: [], fin: true, fill: false }
+                            if stream_id == StreamId::new(id)
+                    ));
+                    assert_eq!(dec.remaining(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qcsd_budgeted_stream_unbudgeted_wire_still_uses_terminal_fill() {
+        let mut streams = streams();
+        add_stream(&mut streams, 0, &[0xAB; 1_000], false);
+        let mut packet = builder(64);
+        let start = packet.len();
+        streams.write_frames(
+            TransmissionPriority::Important,
+            &mut packet,
+            &mut recovery::Tokens::new(),
+            &mut FrameStats::default(),
+        );
+        assert_eq!(packet.len(), 64);
+        assert_eq!(packet.as_ref()[start], 0x08);
+        let mut dec = Decoder::new(&packet.as_ref()[start..]);
+        assert!(matches!(
+            Frame::decode(&mut dec).unwrap(),
+            Frame::Stream { offset: 0, data, fill: true, .. }
+                if data.len() == 64 - start - 2 && data.iter().all(|byte| *byte == 0xAB)
+        ));
+        assert_eq!(dec.remaining(), 0);
     }
 }
