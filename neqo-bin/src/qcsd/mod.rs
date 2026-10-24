@@ -62,6 +62,279 @@ mod trace_files;
 
 use trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles};
 
+// BEGIN ROOT CS PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
+// Opt-in engineering observations only. No sample is returned to a decision
+// clock, controller, transport, action, deadline or scientific predicate.
+const CS_PREOUTPUT_SAMPLE_LIMIT: usize = 256;
+const CS_PREOUTPUT_JSON_LIMIT: usize = 64 * 1024;
+const CS_PREOUTPUT_STAGES: [&str; 22] = [
+    "control_enter", "backlog_before", "backlog_after", "application_reduce_before",
+    "flush_before", "flush_after", "poll_before", "poll_after", "queued_apply_before",
+    "batch_preflight_before", "batch_preflight_after", "receive_apply_before",
+    "receive_apply_after", "queued_apply_after", "post_apply_priority_before",
+    "retry_inventory_before", "retry_inventory_after", "expiry_selected",
+    "ordinary_output_before", "pending_capture_before", "preparation_before", "preparation_after",
+];
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct CsPreoutputSample {
+    sequence: u64,
+    control: u64,
+    stage: u8,
+    control_at_process_ns: Option<u64>,
+    control_elapsed_defense_ns: Option<u64>,
+    defense_start_process_ns: Option<u64>,
+    wall_before_ns: u64,
+    thread_cpu_ns: Option<u64>,
+    wall_after_ns: u64,
+    endpoint: Option<u64>,
+    stream: Option<u64>,
+    slot: Option<u64>,
+    limit: Option<u64>,
+    target_defense_ns: Option<u64>,
+    deadline_defense_ns: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CsPreoutputIdentity {
+    endpoint: Option<u64>,
+    stream: Option<u64>,
+    slot: Option<u64>,
+    limit: Option<u64>,
+    target_defense_ns: Option<u64>,
+    deadline_defense_ns: Option<u64>,
+}
+
+struct CsPreoutputDiagnostic {
+    origin: Instant,
+    samples: Box<[Option<CsPreoutputSample>; CS_PREOUTPUT_SAMPLE_LIMIT]>,
+    next: usize,
+    len: usize,
+    sequence: u64,
+    control: u64,
+    dropped: u64,
+    unavailable_cpu: u64,
+    frozen: bool,
+    freeze_reason: Option<&'static str>,
+    // Mappings are observations of the original control/defense instants.
+    // They do not select or reset either origin.
+    control_at_process_ns: Option<u64>,
+    control_elapsed_defense_ns: Option<u64>,
+    defense_start_process_ns: Option<u64>,
+}
+
+impl CsPreoutputDiagnostic {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            samples: Box::new([None; CS_PREOUTPUT_SAMPLE_LIMIT]),
+            next: 0,
+            len: 0,
+            sequence: 0,
+            control: 0,
+            dropped: 0,
+            unavailable_cpu: 0,
+            frozen: false,
+            freeze_reason: None,
+            control_at_process_ns: None,
+            control_elapsed_defense_ns: None,
+            defense_start_process_ns: None,
+        }
+    }
+
+    fn record_sample(
+        &mut self,
+        stage: u8,
+        identity: CsPreoutputIdentity,
+        wall_before_ns: u64,
+        thread_cpu_ns: Option<u64>,
+        wall_after_ns: u64,
+    ) {
+        if self.frozen {
+            return;
+        }
+        if self.len == self.samples.len() {
+            self.dropped = self.dropped.saturating_add(1);
+        } else {
+            self.len += 1;
+        }
+        if thread_cpu_ns.is_none() {
+            self.unavailable_cpu = self.unavailable_cpu.saturating_add(1);
+        }
+        self.samples[self.next] = Some(CsPreoutputSample {
+            sequence: self.sequence,
+            control: self.control,
+            stage,
+            control_at_process_ns: self.control_at_process_ns,
+            control_elapsed_defense_ns: self.control_elapsed_defense_ns,
+            defense_start_process_ns: self.defense_start_process_ns,
+            wall_before_ns,
+            thread_cpu_ns,
+            wall_after_ns,
+            endpoint: identity.endpoint,
+            stream: identity.stream,
+            slot: identity.slot,
+            limit: identity.limit,
+            target_defense_ns: identity.target_defense_ns,
+            deadline_defense_ns: identity.deadline_defense_ns,
+        });
+        self.next = (self.next + 1) % self.samples.len();
+        self.sequence = self.sequence.saturating_add(1);
+    }
+
+    fn record(&mut self, stage: u8, identity: CsPreoutputIdentity) {
+        if self.frozen {
+            return;
+        }
+        // Independent diagnostic reads: never call the runner's injected now
+        // closure or consume a physical-handoff/test decision-clock sample.
+        let before = Instant::now();
+        #[cfg(target_os = "linux")]
+        let cpu = timed_egress::clock_thread_cpu_ns().ok();
+        #[cfg(not(target_os = "linux"))]
+        let cpu = None;
+        let after = Instant::now();
+        self.record_sample(
+            stage,
+            identity,
+            duration_as_u64_nanos(before.saturating_duration_since(self.origin)),
+            cpu,
+            duration_as_u64_nanos(after.saturating_duration_since(self.origin)),
+        );
+    }
+
+    fn freeze(&mut self, reason: &'static str) {
+        if !self.frozen {
+            self.frozen = true;
+            self.freeze_reason = Some(reason);
+        }
+    }
+
+    fn failure_value(&self) -> Option<serde_json::Value> {
+        if !self.frozen {
+            return None;
+        }
+        // Called once after the physical/control loop has ended. All JSON,
+        // allocation and size trimming here are outside the observed segment.
+        let first = (self.next + self.samples.len() - self.len) % self.samples.len();
+        let mut entries = (0..self.len)
+            .filter_map(|index| self.samples[(first + index) % self.samples.len()])
+            .collect::<Vec<_>>();
+        let mut serialized_dropped = 0_u64;
+        loop {
+            let value = json!({
+                "schema_version": 1,
+                "source": "runner-CS-preoutput-wall-threadCPU-observation-v1",
+                "observations_only": true,
+                "opt_in": "QCSD_CS_PREOUTPUT_DIAGNOSTIC=1",
+                "time_basis": "independent-Instant-brackets-relative-to-original-process_start",
+                "cpu_basis": "CLOCK_THREAD_CPUTIME_ID-or-null",
+                "current_thread_runner": true,
+                "interpretation": "adjacent retained wall and same-thread CPU intervals only; missing boundaries or dropped samples mean unknown; wall-minus-CPU does not identify descheduling",
+                "decision_clock_samples_consumed": false,
+                "scientific_credit_added": 0,
+                "max_samples": CS_PREOUTPUT_SAMPLE_LIMIT,
+                "max_json_bytes": CS_PREOUTPUT_JSON_LIMIT,
+                "dropped": self.dropped,
+                "serialized_dropped": serialized_dropped,
+                "unavailable_cpu": self.unavailable_cpu,
+                "freeze_reason": self.freeze_reason,
+                "last_control_at_process_ns": self.control_at_process_ns,
+                "last_control_elapsed_defense_ns": self.control_elapsed_defense_ns,
+                "original_defense_start_process_ns": self.defense_start_process_ns,
+                "stages": CS_PREOUTPUT_STAGES,
+                "entries": &entries,
+            });
+            let Ok(raw) = serde_json::to_vec(&value) else { return None; };
+            if raw.len() <= CS_PREOUTPUT_JSON_LIMIT {
+                return Some(value);
+            }
+            if entries.is_empty() {
+                return None;
+            }
+            entries.remove(0);
+            serialized_dropped = serialized_dropped.saturating_add(1);
+        }
+    }
+}
+
+thread_local! {
+    // execute_run_inner is explicitly a current-thread future. One owned run
+    // initializes this once; hooks never scan or clone a controller ledger.
+    static CS_PREOUTPUT_DIAGNOSTIC: RefCell<Option<CsPreoutputDiagnostic>> = const { RefCell::new(None) };
+}
+
+fn cs_preoutput_diagnostic_start(origin: Instant, defense: &DefenseConfig) {
+    let enabled = matches!(defense, DefenseConfig::CsBuflo(_))
+        && std::env::var_os("QCSD_CS_PREOUTPUT_DIAGNOSTIC").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+    CS_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        *state.borrow_mut() = enabled.then(|| CsPreoutputDiagnostic::new(origin));
+    });
+}
+
+fn cs_preoutput_diagnostic_mark(stage: u8) {
+    CS_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            diagnostic.record(stage, CsPreoutputIdentity::default());
+        }
+    });
+}
+
+fn cs_preoutput_diagnostic_control(
+    control_now: Instant,
+    elapsed: Option<Duration>,
+    defense_start: Option<Instant>,
+) {
+    CS_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            if diagnostic.frozen {
+                return;
+            }
+            diagnostic.control = diagnostic.control.saturating_add(1);
+            diagnostic.control_at_process_ns = Some(duration_as_u64_nanos(
+                control_now.saturating_duration_since(diagnostic.origin)));
+            diagnostic.control_elapsed_defense_ns = elapsed.map(duration_as_u64_nanos);
+            diagnostic.defense_start_process_ns = defense_start.map(|started|
+                duration_as_u64_nanos(started.saturating_duration_since(diagnostic.origin)));
+            diagnostic.record(0, CsPreoutputIdentity::default());
+        }
+    });
+}
+
+fn cs_preoutput_diagnostic_receive(stage: u8, action: &QcsdAction, window: Duration) {
+    CS_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            if let Some((endpoint, stream, limit)) = receive_action_target(action) {
+                let scheduled = scheduled_action(action);
+                let target = scheduled.map(|(_, packet, _)| packet.timestamp());
+                diagnostic.record(stage, CsPreoutputIdentity {
+                    endpoint: Some(endpoint.0),
+                    stream: Some(stream.0),
+                    slot: scheduled.map(|(_, _, slot)| slot.0),
+                    limit: Some(limit),
+                    target_defense_ns: target.map(duration_as_u64_nanos),
+                    deadline_defense_ns: target.and_then(|at| at.checked_add(window))
+                        .map(duration_as_u64_nanos),
+                });
+            }
+        }
+    });
+}
+
+fn cs_preoutput_diagnostic_freeze(reason: &'static str) {
+    CS_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            diagnostic.freeze(reason);
+        }
+    });
+}
+
+fn cs_preoutput_diagnostic_take_failure() -> Option<serde_json::Value> {
+    CS_PREOUTPUT_DIAGNOSTIC.with(|state| state.borrow_mut().take()?.failure_value())
+}
+// END ROOT CS PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
+
 const NEQO_BASE_COMMIT: &str = "8a04d065c2d35c8e8fd804f91c7081ab6bb60b89";
 const PUBLISHED_QCSD_COMMIT: &str = "39e293fb384dd341156eedd1e4b833d24904b1f6";
 // The local QUIC transport parameter limits what peers may send to this client.
@@ -15592,6 +15865,7 @@ fn deadline_error(
 
 fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
     if let Some(failure) = controller.terminal_failure() {
+        cs_preoutput_diagnostic_freeze("first-controller-terminal-failure");
         return Err(Error::DefenseExecution(failure.into()));
     }
     Ok(())
@@ -15747,6 +16021,7 @@ async fn execute_run_inner(
     process_scheduler: &ProcessSchedulerEvidence,
     terminal_artifact: &mut Option<StagedTerminalRunArtifact>,
 ) -> Result<Vec<ResponseResult>, Error> {
+    cs_preoutput_diagnostic_start(process_start, &spec.config.defense);
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
     if matches!(&spec.config.defense, DefenseConfig::CsBuflo(_)) {
         traces.require_cs_incoming_process_witnesses();
@@ -16368,6 +16643,7 @@ async fn execute_run_inner(
 
             let control_now = now();
             let control_elapsed = defense_elapsed_at!(control_now);
+            cs_preoutput_diagnostic_control(control_now, control_elapsed, defense_start);
             if let Some(defense_elapsed) = control_elapsed {
                 handle_all_qcsd_observations(
                     &mut endpoints,
@@ -16380,6 +16656,7 @@ async fn execute_run_inner(
                 let exclude_stopped_buflo_chaff_sends =
                     matches!(&spec.config.defense, DefenseConfig::Buflo(_))
                         && controller.defense_diagnostics().buflo_schedule_stop_latched;
+                cs_preoutput_diagnostic_mark(1);
                 let (egress_stream_backlog_pending, egress_backlog_pending) = if candidate_defense {
                     endpoints
                         .iter_mut()
@@ -16438,6 +16715,8 @@ async fn execute_run_inner(
                     traces.observation(None, &record)?;
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
+                cs_preoutput_diagnostic_mark(2);
+                cs_preoutput_diagnostic_mark(3);
                 observe_completed_application(
                     &mut controller,
                     &mut traces,
@@ -16448,7 +16727,9 @@ async fn execute_run_inner(
                     control_now,
                     defense_elapsed,
                 )?;
+                cs_preoutput_diagnostic_mark(4);
                 controller.flush_defense_observations();
+                cs_preoutput_diagnostic_mark(5);
                 ensure_defense_realizable(&controller)?;
                 yield_to_exact_boundaries!('runner, "after-control-flush-realizability");
                 if controller.has_rolling_outgoing_prearm()
@@ -16470,9 +16751,12 @@ async fn execute_run_inner(
                 #[cfg(not(target_os = "linux"))]
                 let kernel_tick_zero_pending = false;
                 if !kernel_tick_zero_pending {
+                    cs_preoutput_diagnostic_mark(6);
                     controller.poll(defense_elapsed);
+                    cs_preoutput_diagnostic_mark(7);
                     first_control_poll_complete = true;
                     ensure_defense_realizable(&controller)?;
+                    cs_preoutput_diagnostic_mark(8);
                     apply_queued_actions(
                         &mut endpoints,
                         &mut controller,
@@ -16481,11 +16765,14 @@ async fn execute_run_inner(
                         control_now,
                         defense_elapsed,
                     )?;
+                    cs_preoutput_diagnostic_mark(13);
                 }
+                cs_preoutput_diagnostic_mark(14);
                 yield_to_exact_boundaries!('runner, "after-control-poll-actions");
             }
 
             for endpoint_index in 0..endpoints.len() {
+                cs_preoutput_diagnostic_mark(18);
                 yield_to_exact_boundaries!('runner, "before-second-output-drive");
                 if let Some(boundary) = tamaraw_ordinary_work_boundary(
                     &controller,
@@ -16724,6 +17011,9 @@ async fn execute_run_inner(
         Ok(())
     }
     .await;
+    if loop_result.is_err() {
+        cs_preoutput_diagnostic_freeze("first-loop-error-before-terminal-cleanup");
+    }
 
     #[cfg(target_os = "linux")]
     let buflo_kernel_terminal_elapsed = buflo_kernel_tx
@@ -19970,8 +20260,10 @@ fn apply_action_batch(
     defense_elapsed: Duration,
     actions: Vec<QcsdAction>,
 ) -> Result<(), Error> {
+    cs_preoutput_diagnostic_mark(9);
     let incoming_fanout_slots = register_action_batch(traces, now, &actions)?;
     let preflight = preflight_receive_action_batch(endpoints, traces, now, &actions)?;
+    cs_preoutput_diagnostic_mark(10);
     let canceled_indices = cancel_rejected_receive_streams(
         endpoints,
         controller,
@@ -20657,8 +20949,10 @@ fn apply_action(
                 "receive action reached dispatch with non-live {expected:?} preflight"
             )));
         }
+        cs_preoutput_diagnostic_receive(11, &trace_action, controller.config().control_interval());
         match endpoint.client.apply_qcsd_receive_action(&trace_action) {
             Ok(Some(QcsdReceiveLimitOutcome::Applied)) => {
+                cs_preoutput_diagnostic_receive(12, &trace_action, controller.config().control_interval());
                 traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
                 return Ok(());
             }
@@ -22287,6 +22581,7 @@ async fn dispatch_due_cs_exact_incoming_retry(
     runner_wakeup_metrics: &mut RunnerWakeupMetrics,
 ) -> Result<bool, Error> {
     let current = now();
+    cs_preoutput_diagnostic_mark(15);
     let inventory = cs_exact_incoming_retry_inventory(
         defense,
         endpoints,
@@ -22295,7 +22590,9 @@ async fn dispatch_due_cs_exact_incoming_retry(
         current,
         attempted,
     )?;
+    cs_preoutput_diagnostic_mark(16);
     if inventory.earliest_expired_deadline.is_some() {
+        cs_preoutput_diagnostic_mark(17);
         expire_due_cs_exact_incoming_credit(
             endpoints,
             controller,
@@ -26970,6 +27267,7 @@ async fn process_output_once_with_clock_with_admitted_tail(
         drive_now
     };
     let cs_incoming = matches!(controller.config().defense, DefenseConfig::CsBuflo(_));
+    cs_preoutput_diagnostic_mark(19);
     let pending_receive_actions = if cs_incoming {
         endpoint.client.qcsd_pending_receive_action_identities()
     } else {
@@ -26980,7 +27278,9 @@ async fn process_output_once_with_clock_with_admitted_tail(
     } else {
         drive_now
     };
+    cs_preoutput_diagnostic_mark(20);
     let prepared_output = prepare_output_once_with_clock(endpoint, drive_now).await;
+    cs_preoutput_diagnostic_mark(21);
     let preparation_completed = if cs_incoming {
         monotonic_clock()
     } else {
@@ -27955,6 +28255,9 @@ fn render_run_json(
     // A successful run's scientific DTO stays unchanged. These optional
     // failure observations do not replace the original error or authorize it.
     if completion_status != "complete" {
+        if let Some(window) = cs_preoutput_diagnostic_take_failure() {
+            run["cs_preoutput_control_segment_observations"] = window;
+        }
         if let Some(first_causes) = http3_first_error_snapshot(endpoints) {
             run["http3_first_error_observations"] = first_causes;
         }
@@ -61812,3 +62115,97 @@ mod tests {
         fs::remove_dir_all(output).expect("remove original-refusal fixture");
     }
 }
+
+// BEGIN ROOT CS PREOUTPUT OBSERVATIONAL TESTS 001
+#[cfg(test)]
+mod cs_preoutput_control_segment_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn cs_preoutput_ring_is_fixed_and_first_terminal_freeze_preserves_order() {
+        let mut diagnostic = CsPreoutputDiagnostic::new(Instant::now());
+        for sequence in 0..300_u64 {
+            diagnostic.record_sample(6, CsPreoutputIdentity::default(), sequence * 10,
+                Some(sequence * 2), sequence * 10 + 1);
+        }
+        assert_eq!(diagnostic.len, CS_PREOUTPUT_SAMPLE_LIMIT);
+        assert_eq!(diagnostic.dropped, 44);
+        diagnostic.freeze("first-terminal");
+        diagnostic.record_sample(7, CsPreoutputIdentity::default(), 9999, Some(9999), 10000);
+        diagnostic.freeze("cleanup-must-not-replace-first");
+        assert_eq!(diagnostic.sequence, 300);
+        assert_eq!(diagnostic.freeze_reason, Some("first-terminal"));
+        let value = diagnostic.failure_value().unwrap();
+        let entries = value["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert_eq!(entries.last().unwrap()["sequence"], 299);
+        assert!(entries.windows(2).all(|pair|
+            pair[0]["sequence"].as_u64().unwrap() + 1 == pair[1]["sequence"].as_u64().unwrap()));
+        assert!(serde_json::to_vec(&value).unwrap().len() <= CS_PREOUTPUT_JSON_LIMIT);
+    }
+
+    #[test]
+    fn cs_preoutput_fake_wall_cpu_samples_do_not_consume_semantic_clock() {
+        let mut diagnostic = CsPreoutputDiagnostic::new(Instant::now());
+        let semantic_clock_samples = std::cell::Cell::new(0_u64);
+        let semantic_clock = || {
+            semantic_clock_samples.set(semantic_clock_samples.get() + 1);
+            49730600000_u64
+        };
+        let decision_before = semantic_clock();
+        diagnostic.control = 3;
+        diagnostic.control_at_process_ns = Some(49737412000);
+        diagnostic.control_elapsed_defense_ns = Some(49725580000);
+        diagnostic.record_sample(11, CsPreoutputIdentity {
+            endpoint: Some(0), stream: Some(76), slot: Some(13837), limit: Some(7931999),
+            target_defense_ns: Some(49725580000), deadline_defense_ns: Some(49730580000),
+        }, 49737412000, Some(2000000), 49737412040);
+        diagnostic.record_sample(13, CsPreoutputIdentity::default(),
+            49742412000, Some(2010000), 49742412040);
+        assert_eq!(semantic_clock_samples.get(), 1);
+        assert_eq!(decision_before, 49730600000);
+        // Deliberately different wall/CPU deltas remain raw observations;
+        // no helper turns either value into a changed deadline or acceptance.
+        let a = diagnostic.samples[0].unwrap();
+        let b = diagnostic.samples[1].unwrap();
+        assert_eq!(b.wall_before_ns - a.wall_before_ns, 5_000_000);
+        assert_eq!(b.thread_cpu_ns.unwrap() - a.thread_cpu_ns.unwrap(), 10_000);
+        assert_eq!(a.slot, Some(13837));
+        assert_eq!(a.deadline_defense_ns, Some(49730580000));
+        assert!(diagnostic.failure_value().is_none());
+    }
+
+    #[test]
+    fn cs_preoutput_missing_cpu_and_disabled_state_are_not_errors() {
+        let mut diagnostic = CsPreoutputDiagnostic::new(Instant::now());
+        diagnostic.record_sample(6, CsPreoutputIdentity::default(), 1, None, 2);
+        assert_eq!(diagnostic.unavailable_cpu, 1);
+        assert!(diagnostic.samples[0].unwrap().thread_cpu_ns.is_none());
+        assert!(diagnostic.failure_value().is_none());
+        diagnostic.freeze("explicit-fixture-failure");
+        assert!(diagnostic.failure_value().is_some());
+        CS_PREOUTPUT_DIAGNOSTIC.with(|state| *state.borrow_mut() = None);
+        cs_preoutput_diagnostic_mark(6);
+        cs_preoutput_diagnostic_freeze("disabled");
+        assert!(cs_preoutput_diagnostic_take_failure().is_none());
+    }
+
+    #[test]
+    fn cs_preoutput_failure_json_is_bounded_and_taken_once() {
+        let mut diagnostic = CsPreoutputDiagnostic::new(Instant::now());
+        for _ in 0..CS_PREOUTPUT_SAMPLE_LIMIT {
+            diagnostic.record_sample(21, CsPreoutputIdentity {
+                endpoint: Some(u64::MAX), stream: Some(u64::MAX), slot: Some(u64::MAX),
+                limit: Some(u64::MAX), target_defense_ns: Some(u64::MAX),
+                deadline_defense_ns: Some(u64::MAX),
+            }, u64::MAX, Some(u64::MAX), u64::MAX);
+        }
+        diagnostic.freeze("bounded-largest-numeric-fixture");
+        CS_PREOUTPUT_DIAGNOSTIC.with(|state| *state.borrow_mut() = Some(diagnostic));
+        let value = cs_preoutput_diagnostic_take_failure().unwrap();
+        assert!(serde_json::to_vec(&value).unwrap().len() <= CS_PREOUTPUT_JSON_LIMIT);
+        assert!(value["serialized_dropped"].as_u64().unwrap() > 0);
+        assert!(cs_preoutput_diagnostic_take_failure().is_none());
+    }
+}
+// END ROOT CS PREOUTPUT OBSERVATIONAL TESTS 001
