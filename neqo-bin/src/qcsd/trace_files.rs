@@ -281,6 +281,80 @@ const fn congestion_reason(reason: QcsdCongestionReason) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BacklogTraceKind {
+    Stream,
+    Aggregate,
+}
+
+// Only the two fixed bool/u64 backlog records at the unattributed,
+// controller-less runner snapshot boundary may postpone rendering.
+// They still retain every original production and insertion identity.
+#[derive(Clone, Copy)]
+struct DeferredBacklogTraceDetails {
+    kind: BacklogTraceKind,
+    pending: bool,
+    produced_monotonic_ns: u64,
+    production_sequence: u64,
+}
+
+impl DeferredBacklogTraceDetails {
+    fn from_record(record: &TimestampedQcsdObservation) -> Option<Self> {
+        let (kind, pending) = match record.observation() {
+            QcsdObservation::EgressStreamBacklog { pending } => {
+                (BacklogTraceKind::Stream, *pending)
+            }
+            QcsdObservation::EgressBacklog { pending } => {
+                (BacklogTraceKind::Aggregate, *pending)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            pending,
+            produced_monotonic_ns: record.produced_monotonic_ns(),
+            production_sequence: record.sequence(),
+        })
+    }
+
+    fn render(self) -> Result<String, Error> {
+        let observation = match self.kind {
+            BacklogTraceKind::Stream => QcsdObservation::EgressStreamBacklog {
+                pending: self.pending,
+            },
+            BacklogTraceKind::Aggregate => QcsdObservation::EgressBacklog {
+                pending: self.pending,
+            },
+        };
+        observation_trace_details(
+            &observation,
+            self.produced_monotonic_ns,
+            self.production_sequence,
+        )
+    }
+}
+
+// Original observation serializer and CSV quote escaping, shared by
+// immediate records and terminal rendering of fixed backlog records.
+fn observation_trace_details(
+    observation: &QcsdObservation,
+    produced_monotonic_ns: u64,
+    production_sequence: u64,
+) -> Result<String, Error> {
+    let mut details = serde_json::to_value(observation)?;
+    let Value::Object(fields) = &mut details else {
+        return Err(Error::SlotInvariant(
+            "serialized QCSD observation was not an object".into(),
+        ));
+    };
+    fields.insert(
+        "production_monotonic_ns".into(),
+        Value::from(produced_monotonic_ns),
+    );
+    fields.insert("production_sequence".into(), Value::from(production_sequence));
+    Ok(serde_json::to_string(&details)?.replace('"', "\"\""))
+}
+
 struct EventTraceRow {
     monotonic_ns: u64,
     production_sequence: Option<u64>,
@@ -289,6 +363,7 @@ struct EventTraceRow {
     event: String,
     outcome: String,
     details: String,
+    deferred_backlog_details: Option<DeferredBacklogTraceDetails>,
     qcsd: QcsdTraceColumns,
 }
 
@@ -1252,6 +1327,7 @@ impl TraceFiles {
             event: event.into(),
             outcome: outcome.into(),
             details,
+            deferred_backlog_details: None,
             qcsd,
         })
     }
@@ -1408,18 +1484,20 @@ impl TraceFiles {
                     .map(|advertised| advertised.saturating_sub(pending.action_time_us));
             }
         }
-        let mut details = serde_json::to_value(record.observation())?;
-        let Value::Object(fields) = &mut details else {
-            return Err(Error::SlotInvariant(
-                "serialized QCSD observation was not an object".into(),
-            ));
+        let deferred_backlog_details = if endpoint.is_none() && controller.is_none() {
+            DeferredBacklogTraceDetails::from_record(record)
+        } else {
+            None
         };
-        fields.insert(
-            "production_monotonic_ns".into(),
-            Value::from(record.produced_monotonic_ns()),
-        );
-        fields.insert("production_sequence".into(), Value::from(record.sequence()));
-        let details = serde_json::to_string(&details)?.replace('"', "\"\"");
+        let details = if deferred_backlog_details.is_some() {
+            String::new()
+        } else {
+            observation_trace_details(
+                record.observation(),
+                record.produced_monotonic_ns(),
+                record.sequence(),
+            )?
+        };
         self.push_event(EventTraceRow {
             monotonic_ns: record.produced_monotonic_ns(),
             production_sequence: Some(record.sequence()),
@@ -1428,6 +1506,7 @@ impl TraceFiles {
             event: "observation".into(),
             outcome: "recorded".into(),
             details,
+            deferred_backlog_details,
             qcsd,
         })?;
         if let Some(controller) = controller
@@ -1619,6 +1698,10 @@ impl TraceFiles {
             })
         });
         for row in self.event_rows.drain(..) {
+            let details = match row.deferred_backlog_details {
+                Some(backlog) => backlog.render()?,
+                None => row.details,
+            };
             writeln!(
                 self.events,
                 "{},{},{},{},\"{}\",{}",
@@ -1626,7 +1709,7 @@ impl TraceFiles {
                 row.connection,
                 row.event,
                 row.outcome,
-                row.details,
+                details,
                 row.qcsd.csv_suffix(),
             )?;
         }
@@ -3142,6 +3225,221 @@ mod incoming_terminal_process_clock_tests {
                 row.terminal_defense_elapsed_us += 1;
             }
             assert!(f.traces.schedule(&row).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod fixed_backlog_trace_deferral_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+
+    use neqo_csdef::{QcsdConfig, QcsdObservationClock, StaticSchedule, Trace};
+
+    use super::*;
+
+    struct Fixture {
+        output: PathBuf,
+        traces: TraceFiles,
+    }
+
+    impl Fixture {
+        fn new(start: Instant) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let output = std::env::temp_dir().join(format!(
+                "qcsd-fixed-backlog-trace-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&output).expect("fresh trace directory");
+            let traces = TraceFiles::new(&output, start).expect("original trace files");
+            Self { output, traces }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.output);
+        }
+    }
+
+    // Complete original immediate serializer, retained independently as
+    // the reference for the new terminal-render boundary.
+    fn original_details(record: &TimestampedQcsdObservation) -> Result<String, Error> {
+        let mut details = serde_json::to_value(record.observation())?;
+        let Value::Object(fields) = &mut details else {
+            return Err(Error::SlotInvariant(
+                "serialized QCSD observation was not an object".into(),
+            ));
+        };
+        fields.insert(
+            "production_monotonic_ns".into(),
+            Value::from(record.produced_monotonic_ns()),
+        );
+        fields.insert("production_sequence".into(), Value::from(record.sequence()));
+        Ok(serde_json::to_string(&details)?.replace('"', "\"\""))
+    }
+
+    fn observation(index: usize) -> QcsdObservation {
+        match index % 5 {
+            0 => QcsdObservation::EgressStreamBacklog { pending: false },
+            1 => QcsdObservation::EgressStreamBacklog { pending: true },
+            2 => QcsdObservation::EgressBacklog { pending: false },
+            3 => QcsdObservation::EgressBacklog { pending: true },
+            _ => QcsdObservation::ApplicationComplete,
+        }
+    }
+
+    #[test]
+    fn fixed_backlog_terminal_render_preserves_complete_original_csv_bytes() {
+        let start = Instant::now();
+        let clock = QcsdObservationClock::new(start);
+        let mut actual = Fixture::new(start);
+        let mut original = Fixture::new(start);
+        for index in 0..320 {
+            // Deliberately out-of-order production times and same-time
+            // mixed observation/action rows retain the original tie rules.
+            let at = start
+                + Duration::from_nanos(
+                    u64::try_from((index / 2) % 11).expect("bounded") * 1_000,
+                );
+            let record = clock.record_at(observation(index), at);
+            actual
+                .traces
+                .observation(None, &record)
+                .expect("true unattributed observation path");
+            original
+                .traces
+                .push_event(EventTraceRow {
+                    monotonic_ns: record.produced_monotonic_ns(),
+                    production_sequence: Some(record.sequence()),
+                    insertion_sequence: original.traces.next_event_sequence,
+                    connection: String::new(),
+                    event: "observation".into(),
+                    outcome: "recorded".into(),
+                    details: original_details(&record).expect("original serde"),
+                    deferred_backlog_details: None,
+                    qcsd: QcsdTraceColumns::default(),
+                })
+                .expect("original fully rendered row");
+            let saved = actual.traces.event_rows.last().expect("saved row");
+            assert_eq!(saved.monotonic_ns, record.produced_monotonic_ns());
+            assert_eq!(saved.production_sequence, Some(record.sequence()));
+            if index % 5 < 4 {
+                assert!(saved.details.is_empty(), "no live JSON/quote-copy");
+                let deferred = saved.deferred_backlog_details.expect("typed fixed snapshot");
+                assert_eq!(
+                    deferred.produced_monotonic_ns,
+                    record.produced_monotonic_ns(),
+                );
+                assert_eq!(deferred.production_sequence, record.sequence());
+            } else {
+                assert!(saved.deferred_backlog_details.is_none());
+                assert_eq!(saved.details, original_details(&record).expect("reference"));
+            }
+            if index % 3 == 0 {
+                let details = serde_json::json!({"index": index, "quoted": "\"value\""});
+                for traces in [&mut actual.traces, &mut original.traces] {
+                    traces
+                        .event(at, None, "action", "fixture", &details)
+                        .expect("unchanged generic event path");
+                }
+            }
+        }
+        assert_eq!(actual.traces.next_event_sequence, original.traces.next_event_sequence);
+        assert_eq!(
+            actual.traces.event_rows.iter().filter(|row| row.deferred_backlog_details.is_some()).count(),
+            256,
+        );
+        actual.traces.flush_events().expect("terminal deferred render");
+        original.traces.flush_events().expect("original reference render");
+        assert_eq!(
+            fs::read(actual.output.join("events.csv")).expect("whole actual CSV"),
+            fs::read(original.output.join("events.csv")).expect("whole original CSV"),
+        );
+        let closed_bytes = fs::read(actual.output.join("events.csv")).expect("whole CSV");
+        actual.traces.flush_events().expect("original idempotent finalization");
+        let later = clock.record_at(observation(0), start + Duration::from_micros(20));
+        assert!(actual.traces.observation(None, &later).is_err());
+        assert_eq!(
+            fs::read(actual.output.join("events.csv")).expect("unchanged whole CSV"),
+            closed_bytes,
+        );
+    }
+
+    #[test]
+    fn fixed_backlog_deferral_is_exact_scope_and_primitive_render_only() {
+        let start = Instant::now();
+        let clock = QcsdObservationClock::new(start);
+        let mut f = Fixture::new(start);
+        let controller = QcsdController::with_defense(
+            QcsdConfig::default(),
+            None,
+            Box::new(StaticSchedule::new(Trace::new(Vec::<Packet>::new()), false)),
+        )
+        .expect("original pure static controller");
+        for index in 0..4 {
+            let record = clock.record_at(observation(index), start);
+            f.traces
+                .observation(Some(QcsdEndpointId(1)), &record)
+                .expect("attributed path remains immediate");
+            assert!(
+                f.traces.event_rows.last().expect("row").deferred_backlog_details.is_none()
+            );
+            assert_eq!(
+                f.traces.event_rows.last().expect("row").details,
+                original_details(&record).expect("original reference"),
+            );
+            f.traces
+                .observation_after_controller(None, &record, &controller, None)
+                .expect("controller-aware path remains immediate");
+            assert!(
+                f.traces.event_rows.last().expect("row").deferred_backlog_details.is_none()
+            );
+            assert_eq!(
+                f.traces.event_rows.last().expect("row").details,
+                original_details(&record).expect("original reference"),
+            );
+        }
+        let other = clock.record_at(QcsdObservation::ApplicationComplete, start);
+        assert!(DeferredBacklogTraceDetails::from_record(&other).is_none());
+        f.traces.observation(None, &other).expect("other variant is immediate");
+        assert!(f.traces.event_rows.last().expect("row").deferred_backlog_details.is_none());
+
+        // Fixed bool/u64 data has no custom/fallible value to validate later.
+        // Exercise both kinds, both bools, zero and maximum unsigned fields
+        // through the same original serializer/escaping.
+        for kind in [BacklogTraceKind::Stream, BacklogTraceKind::Aggregate] {
+            for pending in [false, true] {
+                for value in [0, 1, u64::MAX] {
+                    let deferred = DeferredBacklogTraceDetails {
+                        kind,
+                        pending,
+                        produced_monotonic_ns: value,
+                        production_sequence: value,
+                    };
+                    let raw = match kind {
+                        BacklogTraceKind::Stream => {
+                            QcsdObservation::EgressStreamBacklog { pending }
+                        }
+                        BacklogTraceKind::Aggregate => QcsdObservation::EgressBacklog { pending },
+                    };
+                    let mut reference = serde_json::to_value(raw).expect("original fixed object");
+                    let fields = reference.as_object_mut().expect("original typed object");
+                    fields.insert("production_monotonic_ns".into(), Value::from(value));
+                    fields.insert("production_sequence".into(), Value::from(value));
+                    assert_eq!(
+                        deferred.render().expect("fixed primitive rendering"),
+                        serde_json::to_string(&reference)
+                            .expect("original primitive serde")
+                            .replace('"', "\"\""),
+                    );
+                }
+            }
         }
     }
 }
