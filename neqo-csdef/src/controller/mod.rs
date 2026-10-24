@@ -640,6 +640,7 @@ pub struct QcsdController {
     buflo_gross_advertised: u64,
     /// Exact CS terminal parser suffixes survive controller stream retirement.
     cs_live_chaff_header_lease_witnesses: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
+    cs_live_chaff_header_bootstrap_witnesses: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
     cs_buflo_terminal_parser_allowances:
         HashMap<(QcsdEndpointId, QcsdStreamId), CsBufloTerminalParserAllowance>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
@@ -892,6 +893,7 @@ impl QcsdController {
             buflo_fin_permission_releases: Vec::new(),
             buflo_gross_advertised: 0,
             cs_live_chaff_header_lease_witnesses: HashMap::new(),
+            cs_live_chaff_header_bootstrap_witnesses: HashMap::new(),
             cs_buflo_terminal_parser_allowances: HashMap::new(),
             incoming_credit_ledger: HashMap::new(),
             incoming_consumed_ranges: HashMap::new(),
@@ -1016,6 +1018,26 @@ impl QcsdController {
             self.cs_live_chaff_header_lease_witnesses.get(&(endpoint, stream))?;
         (limit == absolute_limit && amount == increase && amount == debt)
             .then_some((debt, prepared))
+    }
+
+    /// Exact pristine BLOCKED witness for a bounded raw-prefix permission.
+    /// The returned frontier is not an observed HTTP/3 frame/header debt.
+    #[must_use]
+    pub fn cs_live_chaff_header_bootstrap_witness(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        increase: u64,
+    ) -> Option<(u64, u64)> {
+        if !self.streams.cs_live_chaff_headers_enabled() {
+            return None;
+        }
+        let &(limit, amount, blocked_at, prepared) =
+            self.cs_live_chaff_header_bootstrap_witnesses.get(&(endpoint, stream))?;
+        (limit == absolute_limit && amount == increase && blocked_at == 16
+            && limit == 1_000 && amount == limit - blocked_at)
+            .then_some((blocked_at, prepared))
     }
 
     /// Resolved configuration used for the run.
@@ -2533,6 +2555,7 @@ impl QcsdController {
                     .streams
                     .record_pre_header_blocked(endpoint, stream, blocked_at)
                 {
+                    self.try_cs_live_chaff_header_bootstrap(endpoint, stream);
                     self.try_pre_header_bootstrap(endpoint, stream);
                 }
             }
@@ -2718,6 +2741,7 @@ impl QcsdController {
                     endpoint, stream, role, offset, bytes, fin,
                 );
                 if self.streams.cs_live_chaff_headers_enabled() {
+                    self.try_cs_live_chaff_header_bootstrap(endpoint, stream);
                     for (candidate, id, debt, pristine) in self.streams.aggregate_framing_debts() {
                         if (candidate, id) == (endpoint, stream) && !pristine {
                             self.try_cs_live_chaff_header_lease(endpoint, stream, debt);
@@ -3328,6 +3352,50 @@ impl QcsdController {
         });
         self.actions.push_back(QcsdAction::LeaseParserReceive {
             endpoint, stream, absolute_limit: lease.absolute_limit, increase: lease.increase, owner: None,
+        });
+    }
+
+    /// A pristine peer BLOCKED at16 needs a raw prefix before HTTP/3 can
+    /// report any HeaderProgress. Keep this separate from exact observed debt.
+    fn try_cs_live_chaff_header_bootstrap(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) {
+        if !self.streams.cs_live_chaff_headers_enabled()
+            || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || !self.incoming_requires_explicit_physical_ownership()
+            || self.application_complete || self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || !self.scheduler.endpoints().contains(&endpoint)
+            || self.control.credit.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self.control.claims.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self.parser_lease_ranges.get(&(endpoint, stream)).is_some_and(|r| !r.is_empty())
+        {
+            return;
+        }
+        let Some(state) = self.streams.get_mut(endpoint, stream) else { return; };
+        let QcsdRequestRole::Chaff { resource_id, request_id: Some(_) } = state.role else {
+            return;
+        };
+        let Some(manager) = self.chaff.as_ref() else { return; };
+        let expected = manager.estimate(resource_id);
+        if expected == 0 { return; }
+        let Some(lease) = self.streams.cs_live_chaff_header_bootstrap_lease(endpoint, stream, expected) else {
+            return;
+        };
+        self.cs_live_chaff_header_bootstrap_witnesses.insert(
+            (endpoint, stream), (lease.absolute_limit, lease.increase, 16, expected),
+        );
+        self.parser_lease_ranges.entry((endpoint, stream)).or_default().push(ParserLeaseRange {
+            reservation_debited: false,
+            start: lease.absolute_limit - lease.increase,
+            end: lease.absolute_limit,
+            owner: None, unowned: true, advertised: false,
+        });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint, stream, absolute_limit: lease.absolute_limit,
+            increase: lease.increase, owner: None,
         });
     }
 

@@ -265,6 +265,37 @@ impl StreamRegistry {
         )
     }
 
+    /// Break only the pristine CS HEADERS bootstrap cycle. A qualified
+    /// estimate and complete live request ACK authorize a bounded raw prefix;
+    /// scheduled capacity remains unavailable until actual matching 200 HEADERS.
+    pub(crate) fn cs_live_chaff_header_bootstrap_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        prepared_body_bytes: u64,
+    ) -> Option<ParserLease> {
+        if !self.cs_live_chaff_headers {
+            return None;
+        }
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available
+            || !matches!(state.role, QcsdRequestRole::Chaff { request_id: Some(_), .. })
+            || state.activated_chaff_request_final_size().is_none()
+            || state.observed_response_length != ObservedResponseLength::Unobserved
+            || state.status.is_some()
+            || state.expected_chaff_body_bytes == 0
+            || state.expected_chaff_body_bytes != prepared_body_bytes
+            || state.aggregate_framing_debt.is_some()
+        {
+            return None;
+        }
+        let blocked_at = state.pre_header_blocked_at?;
+        let (absolute_limit, increase) = state.receive
+            .cs_pristine_chaff_header_bootstrap_lease(blocked_at)?;
+        state.pre_header_blocked_at = None;
+        Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled: false })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "stream registration keeps all Figure-7 initialization inputs explicit"

@@ -21026,6 +21026,29 @@ fn apply_action(
                     }),
                 )?;
             }
+            if let QcsdAction::LeaseParserReceive {
+                endpoint: lease_endpoint, stream, absolute_limit, increase, owner: None,
+            } = &trace_action
+                && let Some((blocked_at, prepared_body_bytes)) = controller
+                    .cs_live_chaff_header_bootstrap_witness(*lease_endpoint, *stream, *absolute_limit, *increase)
+            {
+                traces.event(
+                    applied_action_trace_at,
+                    endpoint_id,
+                    "cs_live_chaff_header_bootstrap_permission",
+                    "adapter_accepted_pending_wire_advertisement",
+                    &json!({
+                        "policy": "cs-live-chaff-ACK-BLOCKED16-raw-prefix-parser-permission-v1",
+                        "endpoint": lease_endpoint, "stream": stream,
+                        "range_start": absolute_limit - increase, "range_end": absolute_limit,
+                        "increase": increase, "observed_blocked_at": blocked_at,
+                        "prepared_body_bytes": prepared_body_bytes,
+                        "observed_header_debt": null, "live_response_identity_observed": false,
+                        "owner": null, "scheduled_credit_issued": false,
+                        "wire_handoff_claimed": false,
+                    }),
+                )?;
+            }
             traces.event(
                 applied_action_trace_at,
                 endpoint_id,

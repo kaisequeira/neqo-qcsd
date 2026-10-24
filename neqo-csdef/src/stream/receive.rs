@@ -617,6 +617,47 @@ impl ReceiveState {
         Some((*requested_limit, increase))
     }
 
+    /// One bounded raw prefix for an ACK-authenticated, peer-blocked CS
+    /// chaff request whose initial HEADERS have not reached the parser.
+    /// The registry authenticates the chaff role and prepared extent. This
+    /// spends the original lifetime parser allowance, never a scheduled cell.
+    pub(crate) fn cs_pristine_chaff_header_bootstrap_lease(
+        &mut self,
+        blocked_at: u64,
+    ) -> Option<(u64, u64)> {
+        let Self::ReceivingHeaders {
+            advertised_limit, requested_limit, known_limit, consumed,
+            payload_floor, framing_bytes, parser_lease_capacity,
+            parser_lease_used, parser_lease_exhausted,
+            last_parser_lease_boundary, pending_parser_boundary, ..
+        } = self else {
+            return None;
+        };
+        // This is the unchanged 16-byte initial frontier, not a fabricated
+        // HeaderProgress debt or an assumed live response/body extent.
+        if blocked_at != 16
+            || *advertised_limit != blocked_at
+            || *requested_limit != blocked_at
+            || *payload_floor == 0
+            || *known_limit != (*payload_floor).max(blocked_at)
+            || *consumed != 0 || *framing_bytes != 0
+            || *parser_lease_capacity != 1_000 || *parser_lease_used != 0
+            || *parser_lease_exhausted
+            || last_parser_lease_boundary.is_some()
+            || pending_parser_boundary.is_some()
+        {
+            return None;
+        }
+        let increase = PRE_HEADER_BOOTSTRAP_TARGET.checked_sub(*requested_limit)?;
+        if increase == 0 || increase > *parser_lease_capacity {
+            return None;
+        }
+        *requested_limit = PRE_HEADER_BOOTSTRAP_TARGET;
+        *parser_lease_used = increase;
+        *parser_lease_exhausted = increase == *parser_lease_capacity;
+        Some((*requested_limit, increase))
+    }
+
     /// A peer blocked at the unchanged slotless bootstrap ceiling can retain
     /// one separate scheduling reservation while no response byte is parsed.
     /// This is demand for new permission, not a decoded HEADERS/body extent.
