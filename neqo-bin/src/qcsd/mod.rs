@@ -16998,6 +16998,11 @@ async fn execute_run_inner(
             if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
                 diagnostic.record("before-runner-reactor-wait");
             }
+            #[cfg(target_os = "linux")]
+            let runner_wait_observation = buflo_pre_selection_diagnostic.as_ref().map(|_| {
+                BufloRunnerWaitSample::begin(next_wakeup, runner_wait_policy,
+                    spec.config.buflo_retained_parser_fin_permission)
+            });
             let runner_wake_result = wait_for_runner_activity_until(
                 &endpoints,
                 next_wakeup,
@@ -17007,6 +17012,10 @@ async fn execute_run_inner(
             .await;
             #[cfg(target_os = "linux")]
             if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
+                if let Some(mut observation) = runner_wait_observation {
+                    observation.finish(&runner_wake_result);
+                    diagnostic.record_runner_wait(observation);
+                }
                 diagnostic.record("after-runner-reactor-wait");
             }
             let Some(wake) = runner_wake_result? else {
@@ -23927,6 +23936,124 @@ impl Drop for BufloPostSelectionDiagnostic {
 }
 
 
+// BEGIN ROOT Native152 failure-only runner-wait observations.
+// Raw samples only: none is a clock/deadline/phase authority or a wait input.
+// Keep two completed calls, without allocation or output on an ordinary wait.
+#[cfg(target_os = "linux")]
+const BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT: usize = 2;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BufloRunnerWaitClocks {
+    monotonic_before_ns: Option<u64>,
+    tai_before_ns: Option<u64>,
+    thread_cpu_ns: Option<u64>,
+    tai_after_ns: Option<u64>,
+    monotonic_after_ns: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloRunnerWaitClocks {
+    fn sample() -> (Instant, Self) {
+        let monotonic_before_ns = timed_egress::clock_monotonic_ns().ok();
+        let instant = now();
+        let tai_before_ns = timed_egress::clock_tai_ns().ok();
+        let thread_cpu_ns = timed_egress::clock_thread_cpu_ns().ok();
+        let tai_after_ns = timed_egress::clock_tai_ns().ok();
+        let monotonic_after_ns = timed_egress::clock_monotonic_ns().ok();
+        (instant, Self {
+            monotonic_before_ns,
+            tai_before_ns,
+            thread_cpu_ns,
+            tai_after_ns,
+            monotonic_after_ns,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BufloRunnerWaitSample {
+    // This Instant is an observation anchor only, never returned to the wait.
+    #[serde(skip)]
+    started: Instant,
+    selected_wakeup_offset_ns: Option<i64>,
+    wait_policy: &'static str,
+    admission_tai_ns: Option<u64>,
+    service_buffered_http: bool,
+    before: BufloRunnerWaitClocks,
+    after: Option<BufloRunnerWaitClocks>,
+    std_instant_elapsed_ns: Option<u64>,
+    returned: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloRunnerWaitSample {
+    fn begin_with(
+        wakeup: Instant,
+        policy: RunnerWaitPolicy,
+        service_buffered_http: bool,
+        current: Instant,
+        before: BufloRunnerWaitClocks,
+    ) -> Self {
+        // Positive means the selected hint was still in the future at this
+        // observation. A past hint remains negative, not an invented timer arm.
+        let selected_wakeup_offset_ns = if wakeup >= current {
+            i64::try_from(wakeup.duration_since(current).as_nanos()).ok()
+        } else {
+            i64::try_from(current.duration_since(wakeup).as_nanos())
+                .ok()
+                .and_then(i64::checked_neg)
+        };
+        let (wait_policy, admission_tai_ns) = match policy {
+            RunnerWaitPolicy::Ordinary => ("ordinary", None),
+            RunnerWaitPolicy::KernelBufloAdmission { admission_tai_ns } =>
+                ("kernel-buflo-admission", Some(admission_tai_ns)),
+        };
+        Self {
+            started: current,
+            selected_wakeup_offset_ns,
+            wait_policy,
+            admission_tai_ns,
+            service_buffered_http,
+            before,
+            after: None,
+            std_instant_elapsed_ns: None,
+            returned: "not-returned",
+        }
+    }
+
+    fn begin(wakeup: Instant, policy: RunnerWaitPolicy, service_buffered_http: bool) -> Self {
+        let (current, before) = BufloRunnerWaitClocks::sample();
+        Self::begin_with(wakeup, policy, service_buffered_http, current, before)
+    }
+
+    fn finish_with(
+        &mut self,
+        current: Instant,
+        after: BufloRunnerWaitClocks,
+        result: &Result<Option<ActivityWake>, Error>,
+    ) {
+        self.after = Some(after);
+        self.std_instant_elapsed_ns = current.checked_duration_since(self.started)
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok());
+        self.returned = match result {
+            Ok(Some(ActivityWake::Timer)) => "timer",
+            Ok(Some(ActivityWake::SocketReady)) => "socket-ready",
+            // The original buffered-HTTP and due-admission paths both return
+            // None. Do not infer which branch ran from this observation alone.
+            Ok(None) => "no-wake",
+            Err(_) => "error",
+        };
+    }
+
+    fn finish(&mut self, result: &Result<Option<ActivityWake>, Error>) {
+        let (current, after) = BufloRunnerWaitClocks::sample();
+        self.finish_with(current, after, result);
+    }
+}
+// END ROOT Native152 failure-only runner-wait observations.
+
 // Bounded last-phase context for a failure before protected selection.
 // The original post-confirm twelve-sample diagnostic below remains separate.
 #[cfg(target_os = "linux")]
@@ -23947,6 +24074,9 @@ struct BufloPreSelectionDiagnostic {
     len: usize,
     truncated: bool,
     emitted: bool,
+    runner_waits: [Option<BufloRunnerWaitSample>; BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT],
+    runner_wait_len: usize,
+    runner_wait_truncated: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -23957,6 +24087,9 @@ impl BufloPreSelectionDiagnostic {
             len: 0,
             truncated: false,
             emitted: false,
+            runner_waits: [None; BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT],
+            runner_wait_len: 0,
+            runner_wait_truncated: false,
         }
     }
 
@@ -23994,6 +24127,19 @@ impl BufloPreSelectionDiagnostic {
         );
     }
 
+    fn record_runner_wait(&mut self, sample: BufloRunnerWaitSample) {
+        if self.emitted {
+            return;
+        }
+        if self.runner_wait_len == self.runner_waits.len() {
+            self.runner_waits.rotate_left(1);
+            self.runner_wait_len -= 1;
+            self.runner_wait_truncated = true;
+        }
+        self.runner_waits[self.runner_wait_len] = Some(sample);
+        self.runner_wait_len += 1;
+    }
+
     fn finish_protected_check_with(
         &mut self,
         failed_slot: Option<u64>,
@@ -24022,6 +24168,13 @@ impl BufloPreSelectionDiagnostic {
         let value = json!({
             "schema_version": 1,
             "source": "buflo-pre-selection-failure-boundaries-v1",
+            "runner_wait_observation_schema_version": 1,
+            "runner_wait_clock_order": "CLOCK_MONOTONIC-before,std-Instant,CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after,CLOCK_MONOTONIC-after",
+            "runner_wait_observations": &self.runner_waits[..self.runner_wait_len],
+            "runner_wait_observation_limit": BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT,
+            "runner_wait_observations_truncated": self.runner_wait_truncated,
+            "selected_wakeup_is_actual_timer_arm": false,
+            "no_wake_branch_is_not_inferred": true,
             "diagnostic_only": true,
             "slot": slot,
             "sample_order": "CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after",
@@ -62323,3 +62476,7 @@ mod cs_preoutput_control_segment_diagnostic_tests {
     }
 }
 // END ROOT CS PREOUTPUT OBSERVATIONAL TESTS 001
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "buflo_runner_wait_failure_diagnostic_tests.rs"]
+mod buflo_runner_wait_failure_diagnostic_tests;
