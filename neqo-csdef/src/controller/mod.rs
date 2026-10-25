@@ -3320,7 +3320,7 @@ impl QcsdController {
         if !self.streams.cs_live_chaff_headers_enabled()
             || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
             || !self.incoming_requires_explicit_physical_ownership()
-            || self.application_complete
+            || self.defense.is_incoming_complete()
             || self.defense.is_complete()
             || self.defense.terminal_failure().is_some()
             || !self.scheduler.endpoints().contains(&endpoint)
@@ -3368,7 +3368,7 @@ impl QcsdController {
         if !self.streams.cs_live_chaff_headers_enabled()
             || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
             || !self.incoming_requires_explicit_physical_ownership()
-            || self.application_complete || self.defense.is_complete()
+            || self.defense.is_incoming_complete() || self.defense.is_complete()
             || self.defense.terminal_failure().is_some()
             || !self.scheduler.endpoints().contains(&endpoint)
             || self.control.credit.iter().any(|c| c.endpoint == endpoint && c.stream == stream)

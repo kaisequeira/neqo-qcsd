@@ -98,7 +98,11 @@ fn ali_live_headers_controller_owned_claim_and_terminal_state_refuse() {
                 c.control.claims.push(PendingClaim { reservation_debited: false,
                     slot: QcsdSlotId(83), packet, endpoint: EP, stream: STREAM, remaining: 501 });
             }
-            1 => c.application_complete = true,
+            1 => {
+                c.observe(QcsdObservation::ApplicationComplete, Duration::from_micros(2));
+                c.flush_defense_observations();
+                assert!(c.defense.is_incoming_complete(), "true CS incoming stop, not onLoad alone");
+            }
             2 => { c.scheduler.remove_endpoint(EP); }
             _ => { c.streams.mark_receive_unavailable(EP, STREAM); }
         }
@@ -318,7 +322,11 @@ fn cs_header_bootstrap_negative_role_ack_state_budget_and_slot_ownership() {
         if case != 1 { cs_bootstrap_ack(&mut c,0,79,true); }
         match case {
             0 | 1 => {},
-            2 => c.application_complete = true,
+            2 => {
+                c.observe(QcsdObservation::ApplicationComplete, Duration::from_micros(2));
+                c.flush_defense_observations();
+                assert!(c.defense.is_incoming_complete(), "true CS incoming stop, not onLoad alone");
+            },
             3 => { c.scheduler.remove_endpoint(EP); },
             4 => { c.streams.mark_receive_unavailable(EP,STREAM); },
             5 => {}, // Independent public-constructor extent mismatch above.
