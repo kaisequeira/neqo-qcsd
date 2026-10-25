@@ -16999,15 +16999,17 @@ async fn execute_run_inner(
                 diagnostic.record("before-runner-reactor-wait");
             }
             #[cfg(target_os = "linux")]
-            let runner_wait_observation = buflo_pre_selection_diagnostic.as_ref().map(|_| {
+            let mut runner_wait_observation = buflo_pre_selection_diagnostic.as_ref().map(|_| {
                 BufloRunnerWaitSample::begin(next_wakeup, runner_wait_policy,
                     spec.config.buflo_retained_parser_fin_permission)
             });
-            let runner_wake_result = wait_for_runner_activity_until(
+            let runner_wake_result = wait_for_runner_activity_until_observed(
                 &endpoints,
                 next_wakeup,
                 spec.config.buflo_retained_parser_fin_permission,
                 runner_wait_policy,
+                #[cfg(target_os = "linux")]
+                runner_wait_observation.as_mut(),
             )
             .await;
             #[cfg(target_os = "linux")]
@@ -23971,6 +23973,96 @@ impl BufloRunnerWaitClocks {
     }
 }
 
+// Native153: the original timer future is polled exactly once per wrapper
+// poll with the original Context. Clock reads observe userspace only; neither
+// construction nor a poll establishes a kernel arm/wake timestamp.
+#[cfg(target_os = "linux")]
+type BufloRunnerTimerPollClocks = [Option<u64>; 5];
+
+#[cfg(target_os = "linux")]
+fn buflo_runner_timer_poll_clocks() -> BufloRunnerTimerPollClocks {
+    [
+        timed_egress::clock_monotonic_ns().ok(),
+        timed_egress::clock_tai_ns().ok(),
+        timed_egress::clock_thread_cpu_ns().ok(),
+        timed_egress::clock_tai_ns().ok(),
+        timed_egress::clock_monotonic_ns().ok(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct BufloRunnerTimerPollObservation {
+    timer_constructed: Option<BufloRunnerTimerPollClocks>,
+    before_await_expression: Option<BufloRunnerTimerPollClocks>,
+    first_poll_before: Option<BufloRunnerTimerPollClocks>,
+    first_poll_after: Option<BufloRunnerTimerPollClocks>,
+    last_pending_after: Option<BufloRunnerTimerPollClocks>,
+    ready_poll_before: Option<BufloRunnerTimerPollClocks>,
+    ready_poll_after: Option<BufloRunnerTimerPollClocks>,
+    poll_count: u64,
+    pending_poll_count: u64,
+    actual_kernel_arm_observed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloRunnerTimerPollObservation {
+    fn constructed_with(clocks: BufloRunnerTimerPollClocks) -> Self {
+        Self { timer_constructed: Some(clocks), ..Self::default() }
+    }
+
+    fn before_await_with(&mut self, clocks: BufloRunnerTimerPollClocks) {
+        self.before_await_expression = Some(clocks);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_exact_runner_timer_with_clock<F: std::future::Future>(
+    future: F,
+    observation: Option<&mut BufloRunnerTimerPollObservation>,
+    mut clocks: impl FnMut() -> BufloRunnerTimerPollClocks,
+) -> F::Output {
+    let Some(observation) = observation else {
+        return future.await;
+    };
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let before = clocks();
+        let first = observation.poll_count == 0;
+        observation.poll_count = observation.poll_count.saturating_add(1);
+        if first {
+            observation.first_poll_before = Some(before);
+        }
+        // No new wake, retry, timer, loop or readiness poll. Preserve exactly
+        // one original poll and its unchanged Pending/Ready value.
+        let result = std::future::Future::poll(future.as_mut(), cx);
+        let after = clocks();
+        if first {
+            observation.first_poll_after = Some(after);
+        }
+        match &result {
+            std::task::Poll::Pending => {
+                observation.pending_poll_count = observation.pending_poll_count.saturating_add(1);
+                observation.last_pending_after = Some(after);
+            }
+            std::task::Poll::Ready(_) => {
+                observation.ready_poll_before = Some(before);
+                observation.ready_poll_after = Some(after);
+            }
+        }
+        result
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_exact_runner_timer<F: std::future::Future>(
+    future: F,
+    observation: Option<&mut BufloRunnerTimerPollObservation>,
+) -> F::Output {
+    observe_exact_runner_timer_with_clock(future, observation, buflo_runner_timer_poll_clocks).await
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Serialize)]
 struct BufloRunnerWaitSample {
@@ -23985,6 +24077,7 @@ struct BufloRunnerWaitSample {
     after: Option<BufloRunnerWaitClocks>,
     std_instant_elapsed_ns: Option<u64>,
     returned: &'static str,
+    timer_poll: Option<BufloRunnerTimerPollObservation>,
 }
 
 #[cfg(target_os = "linux")]
@@ -24020,7 +24113,14 @@ impl BufloRunnerWaitSample {
             after: None,
             std_instant_elapsed_ns: None,
             returned: "not-returned",
+            timer_poll: None,
         }
+    }
+
+    fn begin_timer_poll_observation(&mut self) -> &mut BufloRunnerTimerPollObservation {
+        self.timer_poll.insert(BufloRunnerTimerPollObservation::constructed_with(
+            buflo_runner_timer_poll_clocks(),
+        ))
     }
 
     fn begin(wakeup: Instant, policy: RunnerWaitPolicy, service_buffered_http: bool) -> Self {
@@ -24168,12 +24268,14 @@ impl BufloPreSelectionDiagnostic {
         let value = json!({
             "schema_version": 1,
             "source": "buflo-pre-selection-failure-boundaries-v1",
-            "runner_wait_observation_schema_version": 1,
+            "runner_wait_observation_schema_version": 2,
             "runner_wait_clock_order": "CLOCK_MONOTONIC-before,std-Instant,CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after,CLOCK_MONOTONIC-after",
             "runner_wait_observations": &self.runner_waits[..self.runner_wait_len],
             "runner_wait_observation_limit": BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT,
             "runner_wait_observations_truncated": self.runner_wait_truncated,
             "selected_wakeup_is_actual_timer_arm": false,
+            "runner_wait_poll_clock_order": "CLOCK_MONOTONIC-before,CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after,CLOCK_MONOTONIC-after",
+            "timer_constructor_is_not_first_poll_or_kernel_arm": true,
             "no_wake_branch_is_not_inferred": true,
             "diagnostic_only": true,
             "slot": slot,
@@ -24737,6 +24839,8 @@ async fn dispatch_buflo_kernel_release(
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<(), Error> {
     runtime.confirm_protected_selection(guard.slot.0)?;
+    let mut enqueue_gap = timed_egress::BufloEnqueueGapDiagnostic::runner(guard.slot.0);
+    enqueue_gap.record("runner-confirm-return");
     let mut preparation_diagnostic = BufloPostSelectionDiagnostic::new(guard.slot.0);
     preparation_diagnostic.record("post-confirm");
     let logical_elapsed = guard.packet.timestamp();
@@ -24775,6 +24879,7 @@ async fn dispatch_buflo_kernel_release(
         )));
     }
     let job_id = runtime.begin_job(guard)?;
+    enqueue_gap.bind_job(job_id);
     let captured_incoming_credit =
         buflo_kernel_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
     runtime.retain_credit_identities(job_id, &captured_incoming_credit)?;
@@ -24859,6 +24964,7 @@ async fn dispatch_buflo_kernel_release(
         ));
     }
     preparation_diagnostic.complete();
+    enqueue_gap.record("runner-before-exact-main");
     let (physical_time, main_item_id) = match runtime.transmit_exact_main(
         job_id,
         guard.endpoint_index,
@@ -24868,6 +24974,8 @@ async fn dispatch_buflo_kernel_release(
     ) {
         Ok(result) => result,
         Err(error) => {
+            enqueue_gap.record("runner-main-result-error");
+            enqueue_gap.emit_failure();
             return Err(retain_buflo_prepared_output_failure(
                 runtime,
                 job_id,
@@ -25302,6 +25410,20 @@ async fn wait_for_runner_activity_until(
     service_buffered_http: bool,
     wait_policy: RunnerWaitPolicy,
 ) -> Result<Option<ActivityWake>, Error> {
+    wait_for_runner_activity_until_observed(
+        endpoints, wakeup, service_buffered_http, wait_policy,
+        #[cfg(target_os = "linux")]
+        None,
+    ).await
+}
+
+async fn wait_for_runner_activity_until_observed(
+    endpoints: &[Endpoint],
+    wakeup: Instant,
+    service_buffered_http: bool,
+    wait_policy: RunnerWaitPolicy,
+    #[cfg(target_os = "linux")] observation: Option<&mut BufloRunnerWaitSample>,
+) -> Result<Option<ActivityWake>, Error> {
     if service_buffered_http
         && endpoints.iter().any(|endpoint| {
             endpoint.network_active
@@ -25310,13 +25432,15 @@ async fn wait_for_runner_activity_until(
     {
         return Ok(None);
     }
-    wait_for_activity_until_with_policy(
+    wait_for_activity_until_with_policy_observed(
         endpoints
             .iter()
             .filter(|endpoint| endpoint.network_active)
             .map(|endpoint| &endpoint.socket),
         wakeup,
         wait_policy,
+        #[cfg(target_os = "linux")]
+        observation,
     )
     .await
 }
@@ -25334,6 +25458,19 @@ async fn wait_for_activity_until_with_policy<'a>(
     sockets: impl IntoIterator<Item = &'a Socket>,
     wakeup: Instant,
     wait_policy: RunnerWaitPolicy,
+) -> Result<Option<ActivityWake>, Error> {
+    wait_for_activity_until_with_policy_observed(
+        sockets, wakeup, wait_policy,
+        #[cfg(target_os = "linux")]
+        None,
+    ).await
+}
+
+async fn wait_for_activity_until_with_policy_observed<'a>(
+    sockets: impl IntoIterator<Item = &'a Socket>,
+    wakeup: Instant,
+    wait_policy: RunnerWaitPolicy,
+    #[cfg(target_os = "linux")] mut observation: Option<&mut BufloRunnerWaitSample>,
 ) -> Result<Option<ActivityWake>, Error> {
     #[cfg(not(target_os = "linux"))]
     let _ = wait_policy;
@@ -25358,12 +25495,31 @@ async fn wait_for_activity_until_with_policy<'a>(
         .map(|socket| Box::pin(socket.readable()))
         .collect();
     let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wakeup));
+    #[cfg(target_os = "linux")]
+    let mut timer_poll = observation.as_deref_mut()
+        .map(BufloRunnerWaitSample::begin_timer_poll_observation);
     if readiness.is_empty() {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(observation) = timer_poll.as_deref_mut() {
+                observation.before_await_with(buflo_runner_timer_poll_clocks());
+            }
+            observe_exact_runner_timer(timer, timer_poll).await;
+        }
+        #[cfg(not(target_os = "linux"))]
         timer.await;
         return Ok(Some(ActivityWake::Timer));
     }
     let sockets_ready =
         select_all(readiness).map(|(result, _, _)| result.map(|()| ActivityWake::SocketReady));
+    #[cfg(target_os = "linux")]
+    let timeout_ready = {
+        if let Some(observation) = timer_poll.as_deref_mut() {
+            observation.before_await_with(buflo_runner_timer_poll_clocks());
+        }
+        Box::pin(observe_exact_runner_timer(timer, timer_poll).map(|()| Ok(ActivityWake::Timer)))
+    };
+    #[cfg(not(target_os = "linux"))]
     let timeout_ready = Box::pin(timer.map(|()| Ok(ActivityWake::Timer)));
     select(sockets_ready, timeout_ready)
         .map(|either| either.factor_first().0)

@@ -18,7 +18,8 @@
 
 use std::{
     collections::VecDeque,
-    fs, io,
+    fs,
+    io::{self, Write as _},
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
@@ -34,6 +35,113 @@ use std::{
 use neqo_common::datagram;
 use serde::Serialize;
 use thiserror::Error;
+
+// Native153 userspace-only main-enqueue gap observations. Each record is
+// fixed-size, emitted only for an actual failed main operation, and has no
+// authority over a clock, packet, deadline, phase, receipt or return value.
+const BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT: usize = 4;
+const BUFLO_ENQUEUE_GAP_JSON_LIMIT: usize = 4 * 1024;
+
+pub(super) type BufloEnqueueGapClocks = [Option<u64>; 5];
+
+pub(super) fn buflo_enqueue_gap_clocks() -> BufloEnqueueGapClocks {
+    [clock_monotonic_ns().ok(), clock_tai_ns().ok(), clock_thread_cpu_ns().ok(),
+     clock_tai_ns().ok(), clock_monotonic_ns().ok()]
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BufloEnqueueGapSample {
+    phase: &'static str,
+    clocks: BufloEnqueueGapClocks,
+}
+
+pub(super) struct BufloEnqueueGapDiagnostic {
+    side: &'static str,
+    slot: Option<u64>,
+    job_id: Option<u64>,
+    socket_index: Option<usize>,
+    txtime_tai_ns: Option<u64>,
+    latest_enqueue_tai_ns: Option<u64>,
+    runner_submit_clocks: Option<BufloEnqueueGapClocks>,
+    samples: [Option<BufloEnqueueGapSample>; BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT],
+    len: usize,
+    truncated: bool,
+    emitted: bool,
+}
+
+impl BufloEnqueueGapDiagnostic {
+    pub(super) const fn runner(slot: u64) -> Self {
+        Self { side: "runner", slot: Some(slot), job_id: None, socket_index: None,
+            txtime_tai_ns: None, latest_enqueue_tai_ns: None, runner_submit_clocks: None,
+            samples: [None; BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT], len: 0,
+            truncated: false, emitted: false }
+    }
+
+    pub(super) const fn helper(job_id: u64, socket_index: usize, txtime_tai_ns: u64,
+        latest_enqueue_tai_ns: u64, runner_submit_clocks: BufloEnqueueGapClocks) -> Self {
+        Self { side: "helper", slot: None, job_id: Some(job_id),
+            socket_index: Some(socket_index), txtime_tai_ns: Some(txtime_tai_ns),
+            latest_enqueue_tai_ns: Some(latest_enqueue_tai_ns),
+            runner_submit_clocks: Some(runner_submit_clocks),
+            samples: [None; BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT], len: 0,
+            truncated: false, emitted: false }
+    }
+
+    pub(super) fn bind_job(&mut self, job_id: u64) {
+        self.job_id = Some(job_id);
+    }
+
+    pub(super) fn record_with(&mut self, phase: &'static str, clocks: BufloEnqueueGapClocks) {
+        if self.emitted { return; }
+        if self.len == self.samples.len() {
+            self.truncated = true;
+            return;
+        }
+        self.samples[self.len] = Some(BufloEnqueueGapSample { phase, clocks });
+        self.len += 1;
+    }
+
+    pub(super) fn record(&mut self, phase: &'static str) {
+        self.record_with(phase, buflo_enqueue_gap_clocks());
+    }
+
+    pub(super) fn emit_failure_with(&mut self, failed: bool, emit: impl FnOnce(&str)) {
+        if !failed || self.emitted { return; }
+        self.emitted = true;
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "source": "buflo-two-thread-main-enqueue-gap-v1",
+            "diagnostic_only": true,
+            "side": self.side,
+            "slot": self.slot,
+            "job_id": self.job_id,
+            "socket_index": self.socket_index,
+            "txtime_tai_ns": self.txtime_tai_ns,
+            "latest_enqueue_tai_ns": self.latest_enqueue_tai_ns,
+            "clock_order": "MONOTONIC-before,TAI-before,THREAD_CPU,TAI-after,MONOTONIC-after",
+            "runner_submit_clocks": self.runner_submit_clocks,
+            "runner_submit_CPU_belongs_to_runner": true,
+            "sample_CPU_belongs_to_record_side": true,
+            "cross_thread_CPU_values_are_not_subtractable": true,
+            "samples": &self.samples[..self.len],
+            "sample_limit": BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT,
+            "truncated": self.truncated,
+            "operation_failed": true,
+            "actual_kernel_enqueue_or_wake_observed": false,
+            "phase_or_deadline_authority": false,
+        });
+        if let Ok(encoded) = serde_json::to_string(&value)
+            && encoded.len() <= BUFLO_ENQUEUE_GAP_JSON_LIMIT {
+            emit(&encoded);
+        }
+    }
+
+    pub(super) fn emit_failure(&mut self) {
+        self.emit_failure_with(true, |encoded| {
+            let _ = writeln!(io::stderr().lock(), "QCSD_BUFLO_ENQUEUE_GAP_V1 {encoded}");
+        });
+    }
+}
 
 const SCM_PRIORITY: libc::c_int = libc::SO_PRIORITY;
 const SO_EE_ORIGIN_TXTIME: u8 = 6;
@@ -1977,6 +2085,7 @@ enum HelperCommand {
         latest_enqueue_tai_ns: u64,
         report_timeout: Duration,
         response: SyncSender<Result<TimedEgressJobResult, TimedEgressError>>,
+        runner_submit_clocks: BufloEnqueueGapClocks,
     },
     TransmitImmediate {
         job_id: u64,
@@ -2067,7 +2176,13 @@ impl TimedEgressHelper {
                             latest_enqueue_tai_ns,
                             report_timeout,
                             response,
+                            runner_submit_clocks,
                         } => {
+                            let mut enqueue_gap = BufloEnqueueGapDiagnostic::helper(
+                                job_id, socket_index, txtime_tai_ns, latest_enqueue_tai_ns,
+                                runner_submit_clocks,
+                            );
+                            enqueue_gap.record("helper-command-received");
                             let result = global_poison.as_ref().map_or_else(
                                 || {
                                     if let Some(active) = active_job_id {
@@ -2081,6 +2196,7 @@ impl TimedEgressHelper {
                                             last_main_job_id.unwrap_or_default()
                                         )))
                                     } else {
+                                        enqueue_gap.record("helper-before-compound-job");
                                         execute_compound_job(
                                             &mut sockets,
                                             socket_index,
@@ -2095,6 +2211,8 @@ impl TimedEgressHelper {
                                 },
                                 |reason| Err(TimedEgressError::Poisoned(reason.clone())),
                             );
+                            enqueue_gap.record("helper-compound-result");
+                            let main_failed = result.is_err();
                             match &result {
                                 Ok(_) => {
                                     active_job_id = Some(job_id);
@@ -2125,8 +2243,11 @@ impl TimedEgressHelper {
                                     &mut global_poison,
                                     "main response channel disconnected".into(),
                                 );
+                                if main_failed { enqueue_gap.emit_failure(); }
                                 break;
                             }
+                            // Do not delay the original response with failure serialization.
+                            if main_failed { enqueue_gap.emit_failure(); }
                         }
                         HelperCommand::TransmitImmediate {
                             job_id,
@@ -2365,6 +2486,7 @@ impl TimedEgressHelper {
                 latest_enqueue_tai_ns,
                 report_timeout,
                 response,
+                runner_submit_clocks: buflo_enqueue_gap_clocks(),
             })
             .map_err(|source| TimedEgressError::Channel(source.to_string()))?;
         result
