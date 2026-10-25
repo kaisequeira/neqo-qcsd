@@ -488,6 +488,7 @@ impl PreparedTimedEgressSocket {
             pending: None,
             timestamp_feedback: TimestampFeedback::default(),
             layered_timestamp_feedback: false,
+            conservative_kernel_enqueue_witness: false,
             poison: None,
         })
     }
@@ -778,6 +779,60 @@ pub fn drop_process_privileges_permanently(
     Ok(receipt)
 }
 
+/// Prospective schema15 eligibility for a software-TX causal bound. The
+/// observed socket options are receipts, not an option-changing policy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KernelEnqueueSocketGuard {
+    pub schema_version: u32,
+    pub family: SocketFamily,
+    pub local_address: SocketAddr,
+    pub socket_type: libc::c_int,
+    pub protocol: libc::c_int,
+    pub timestamping_report_flags: libc::c_int,
+    pub so_timestamp: libc::c_int,
+    pub so_timestampns: libc::c_int,
+    pub fragment_policy: libc::c_int,
+}
+
+impl KernelEnqueueSocketGuard {
+    pub fn valid(&self) -> bool {
+        self.schema_version == 1 && self.socket_type == libc::SOCK_DGRAM
+            && self.protocol == libc::IPPROTO_UDP
+            && self.timestamping_report_flags == REPORT_FLAGS
+            && self.so_timestamp == 0 && self.so_timestampns == 0
+            && match self.family {
+                SocketFamily::Ipv4 => self.local_address.is_ipv4()
+                    && matches!(self.fragment_policy, libc::IP_PMTUDISC_DO | libc::IP_PMTUDISC_PROBE),
+                SocketFamily::Ipv6 => self.local_address.is_ipv6() && self.fragment_policy == 1,
+            }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KernelEnqueueGuardReceipt {
+    pub schema_version: u32,
+    pub before: KernelEnqueueSocketGuard,
+    pub after: KernelEnqueueSocketGuard,
+    pub datagram_sha256: String,
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub udp_payload_bytes: usize,
+    pub requested_txtime_tai_ns: u64,
+    pub latest_enqueue_tai_ns: u64,
+    pub per_message_timestamp_flags: libc::c_int,
+}
+
+impl KernelEnqueueGuardReceipt {
+    pub fn valid(&self) -> bool {
+        self.schema_version == 1 && self.before == self.after && self.before.valid()
+            && self.before.local_address == self.source && self.udp_payload_bytes == 1_200
+            && self.per_message_timestamp_flags == REQUEST_FLAGS
+            && self.datagram_sha256.len() == 64
+            && self.datagram_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            && self.latest_enqueue_tai_ns < self.requested_txtime_tai_ns
+    }
+}
+
 /// Successful timed-send enqueue evidence.
 ///
 /// The helper samples these fields in strict operation order:
@@ -798,6 +853,8 @@ pub struct TimedEnqueueReceipt {
     pub source: SocketAddr,
     pub destination: SocketAddr,
     pub tos: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_enqueue_guard: Option<KernelEnqueueGuardReceipt>,
     pub per_message_priority: Option<libc::c_int>,
     pub effective_socket_priority: libc::c_int,
     pub priority_method: TimedPriorityMethod,
@@ -1138,6 +1195,7 @@ pub struct ActiveTimedEgressSocket {
     pending: Option<PendingTransmission>,
     timestamp_feedback: TimestampFeedback,
     layered_timestamp_feedback: bool,
+    conservative_kernel_enqueue_witness: bool,
     poison: Option<String>,
 }
 
@@ -1152,6 +1210,71 @@ impl ActiveTimedEgressSocket {
         }
         self.layered_timestamp_feedback = true;
         Ok(())
+    }
+
+    /// Read-only eligibility; never enable a receive timestamp fallback or
+    /// change a packet/fragmentation/socket option for this witness.
+    fn kernel_enqueue_socket_guard(&self) -> Result<KernelEnqueueSocketGuard, TimedEgressError> {
+        let fd = self.fd.as_raw_fd();
+        let socket_type: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE,
+            "getsockopt(schema15 SO_TYPE)")?;
+        let protocol: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL,
+            "getsockopt(schema15 SO_PROTOCOL)")?;
+        let reports: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPING,
+            "getsockopt(schema15 SO_TIMESTAMPING)")?;
+        let timestamp: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMP,
+            "getsockopt(schema15 SO_TIMESTAMP)")?;
+        let timestampns: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS,
+            "getsockopt(schema15 SO_TIMESTAMPNS)")?;
+        let fragment_policy: libc::c_int = match self.family {
+            SocketFamily::Ipv4 => getsockopt(fd, libc::SOL_IP, libc::IP_MTU_DISCOVER,
+                "getsockopt(schema15 IP_MTU_DISCOVER)")?,
+            SocketFamily::Ipv6 => getsockopt(fd, libc::SOL_IPV6, libc::IPV6_DONTFRAG,
+                "getsockopt(schema15 IPV6_DONTFRAG)")?,
+        };
+        let (family, local_address) = socket_identity(fd)?;
+        let guard = KernelEnqueueSocketGuard { schema_version: 1, family, local_address,
+            socket_type, protocol, timestamping_report_flags: reports,
+            so_timestamp: timestamp, so_timestampns: timestampns, fragment_policy };
+        if !guard.valid() || family != self.family || local_address != self.local_address {
+            return Err(TimedEgressError::CapabilityMismatch(
+                "schema15 requires exact unfragmented UDP socket with receive timestamp fallbacks disabled".into()));
+        }
+        Ok(guard)
+    }
+
+    pub fn enable_conservative_kernel_enqueue_witness(&mut self) -> Result<(), TimedEgressError> {
+        self.ensure_usable()?;
+        if self.pending.is_some() || !self.timestamp_feedback.events.is_empty()
+            || !self.layered_timestamp_feedback {
+            return self.fail(TimedEgressError::Protocol(
+                "schema15 must be selected after layered feedback and before any send".into()));
+        }
+        self.kernel_enqueue_socket_guard()?;
+        self.conservative_kernel_enqueue_witness = true;
+        Ok(())
+    }
+
+    fn enqueue_exact_schema15(&mut self, batch: &datagram::Batch,
+        txtime_tai_ns: u64, latest_enqueue_tai_ns: u64)
+        -> Result<TimedEnqueueReceipt, TimedEgressError> {
+        let before = self.kernel_enqueue_socket_guard()?;
+        validate_exact_batch(batch, self.family, self.local_address)?;
+        let digest = super::sha256(batch.data()).map_err(|error|
+            TimedEgressError::Protocol(format!("schema15 helper hash failed: {error}")))?;
+        let mut result = self.enqueue_exact(batch, txtime_tai_ns, latest_enqueue_tai_ns)?;
+        let after = self.kernel_enqueue_socket_guard()?;
+        if before != after {
+            return self.fail(TimedEgressError::CapabilityMismatch(
+                "schema15 socket witness capability changed across exact send".into()));
+        }
+        result.kernel_enqueue_guard = Some(KernelEnqueueGuardReceipt {
+            schema_version: 1, before, after, datagram_sha256: digest,
+            source: batch.source(), destination: batch.destination(),
+            udp_payload_bytes: batch.data().len(), requested_txtime_tai_ns: txtime_tai_ns,
+            latest_enqueue_tai_ns, per_message_timestamp_flags: REQUEST_FLAGS,
+        });
+        Ok(result)
     }
 
     pub const fn setup_receipt(&self) -> &TimedEgressSetupReceipt {
@@ -1368,6 +1491,7 @@ impl ActiveTimedEgressSocket {
             source: batch.source(),
             destination: batch.destination(),
             tos: u8::from(batch.tos()),
+            kernel_enqueue_guard: None,
             per_message_priority: matches!(
                 self.setup_receipt.priority_method,
                 TimedPriorityMethod::PerDatagramScmPriority
@@ -2841,7 +2965,11 @@ fn execute_compound_job(
 
     let deadline_monotonic_ns = monotonic_deadline(report_timeout)?;
     let main_socket = &mut sockets[main_socket_index];
-    let enqueue = main_socket.enqueue_exact(main_batch, txtime_tai_ns, latest_enqueue_tai_ns)?;
+    let enqueue = if main_socket.conservative_kernel_enqueue_witness {
+        main_socket.enqueue_exact_schema15(main_batch, txtime_tai_ns, latest_enqueue_tai_ns)?
+    } else {
+        main_socket.enqueue_exact(main_batch, txtime_tai_ns, latest_enqueue_tai_ns)?
+    };
     let outcome_timeout = match remaining_until(deadline_monotonic_ns) {
         Ok(timeout) => timeout,
         Err(source) => {
@@ -4655,6 +4783,7 @@ mod tests {
             }),
             timestamp_feedback: TimestampFeedback::default(),
             layered_timestamp_feedback: true,
+            conservative_kernel_enqueue_witness: false,
             poison: None,
         }
     }
@@ -6646,6 +6775,7 @@ mod tests {
             source: SocketAddr::from((Ipv4Addr::LOCALHOST, 12000)),
             destination: SocketAddr::from((Ipv4Addr::LOCALHOST, 12001)),
             tos: 0,
+            kernel_enqueue_guard: None,
             per_message_priority: None,
             effective_socket_priority: 6,
             priority_method: TimedPriorityMethod::SerializedSocketSoPriority,

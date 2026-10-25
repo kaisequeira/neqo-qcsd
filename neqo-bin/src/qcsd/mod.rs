@@ -3437,6 +3437,8 @@ struct BufloKernelTxReceipt {
     schema_version: u32,
     semantics: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    enqueue_witnesses: Option<Vec<BufloKernelConservativeEnqueueWitness>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     preparation_policy: Option<serde_json::Value>,
     incoming_credit_release_window_ns: u64,
     terminal_outcome: String,
@@ -3716,6 +3718,92 @@ impl RunnerDefenseClock {
 }
 
 #[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v15; historical_schema14_unchanged=true; enqueue_event_witness=direct_userspace_or_exact_same_datagram_TX_SOFTWARE_conservative_upper_v1; observed_userspace_send_interval_retained=true; TX_SCHED_alone_insufficient=true; SO_TIMESTAMP_and_SO_TIMESTAMPNS_disabled=true; unfragmented_UDP_exact1200=true; physical_deadline_unchanged_release_plus_5ms=true; incoming_window_unchanged_32000000ns=true; original_full_layered_kernel_inventory_and_routed_post_veth_evidence_required=true; no_wire_claim_from_TX_SOFTWARE=true";
+#[cfg(target_os = "linux")]
+const BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema23_retains_schema22_non_kernel_metrics_with_explicit_kernel15_conservative_enqueue_witness=true";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BufloKernelConservativeEnqueueWitness {
+    schema_version: u32,
+    basis: &'static str,
+    item_id: u64,
+    job_id: u64,
+    event_id: u64,
+    endpoint_index: usize,
+    endpoint: u64,
+    datagram_sha256: String,
+    source_address: SocketAddr,
+    destination_address: SocketAddr,
+    udp_payload_bytes: usize,
+    release_tai_ns: u64,
+    deadline_tai_ns: u64,
+    observed_enqueue_tai_lower_ns: u64,
+    observed_enqueue_tai_upper_ns: u64,
+    kernel_timestamp_id: u32,
+    tx_sched_realtime_ns: u64,
+    tx_software_realtime_ns: u64,
+    provisional_software_tai_lower_ns: u64,
+    provisional_software_tai_upper_ns: u64,
+    enqueue_event_tai_upper_ns: u64,
+    helper_guard: timed_egress::KernelEnqueueGuardReceipt,
+}
+
+#[cfg(target_os = "linux")]
+impl BufloKernelConservativeEnqueueWitness {
+    fn valid_fields(&self) -> bool {
+        let common = self.schema_version == 1 && self.helper_guard.valid()
+            && self.helper_guard.datagram_sha256 == self.datagram_sha256
+            && self.helper_guard.source == self.source_address
+            && self.helper_guard.destination == self.destination_address
+            && self.helper_guard.udp_payload_bytes == self.udp_payload_bytes
+            && self.udp_payload_bytes == 1_200
+            && self.endpoint_index as u64 == self.endpoint
+            && self.helper_guard.latest_enqueue_tai_ns == self.deadline_tai_ns
+            && self.release_tai_ns.checked_add(10_000_000)
+                == Some(self.helper_guard.requested_txtime_tai_ns)
+            && self.release_tai_ns.checked_add(5_000_000) == Some(self.deadline_tai_ns)
+            && self.observed_enqueue_tai_lower_ns <= self.observed_enqueue_tai_upper_ns
+            && self.observed_enqueue_tai_lower_ns < self.deadline_tai_ns
+            && self.tx_sched_realtime_ns <= self.tx_software_realtime_ns
+            && self.release_tai_ns <= self.provisional_software_tai_lower_ns
+            && self.observed_enqueue_tai_lower_ns <= self.provisional_software_tai_lower_ns
+            && self.provisional_software_tai_lower_ns <= self.provisional_software_tai_upper_ns
+            && self.provisional_software_tai_upper_ns < self.deadline_tai_ns
+            && self.enqueue_event_tai_upper_ns < self.deadline_tai_ns;
+        common && match self.basis {
+            "direct-userspace-upper" => self.observed_enqueue_tai_upper_ns < self.deadline_tai_ns
+                && self.enqueue_event_tai_upper_ns == self.observed_enqueue_tai_upper_ns,
+            "same-datagram-kernel-software-upper" => self.observed_enqueue_tai_upper_ns >= self.deadline_tai_ns
+                && self.enqueue_event_tai_upper_ns == self.provisional_software_tai_upper_ns,
+            _ => false,
+        }
+    }
+
+    fn matches_final_item(&self, job_id: u64, tick: u64, release_tai_ns: u64, deadline_tai_ns: u64,
+        raw: &BufloKernelRawItem, translated_software: Option<(u64,u64)>) -> bool {
+        self.valid_fields() && self.job_id == job_id && self.item_id == raw.item_id
+            && self.event_id == raw.event_id && self.event_id == tick.saturating_mul(2)
+            && raw.role == "exact-outgoing" && raw.order_index == 0 && raw.send_path == "etf"
+            && self.endpoint_index == raw.endpoint_index && self.endpoint == raw.endpoint.0
+            && self.datagram_sha256 == raw.datagram_sha256
+            && self.source_address == raw.source_address && self.destination_address == raw.destination_address
+            && self.udp_payload_bytes == raw.udp_payload_bytes
+            && self.release_tai_ns == release_tai_ns && self.deadline_tai_ns == deadline_tai_ns
+            && raw.enqueue_tai_lower_ns == Some(self.observed_enqueue_tai_lower_ns)
+            && raw.enqueue_tai_upper_ns == Some(self.observed_enqueue_tai_upper_ns)
+            && raw.socket_timestamp_id == Some(self.kernel_timestamp_id)
+            && raw.tx_sched_realtime_ns == Some(self.tx_sched_realtime_ns)
+            && raw.tx_software_realtime_ns == Some(self.tx_software_realtime_ns)
+            && raw.provisional_tx_software_tai_lower_ns == Some(self.provisional_software_tai_lower_ns)
+            && raw.provisional_tx_software_tai_upper_ns == Some(self.provisional_software_tai_upper_ns)
+            && translated_software.is_some_and(|(lower, upper)|
+                self.provisional_software_tai_lower_ns <= lower && upper <= self.provisional_software_tai_upper_ns
+                && lower <= upper && self.release_tai_ns <= lower && upper < self.deadline_tai_ns)
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct BufloKernelTxRuntime {
     helper: Option<timed_egress::TimedEgressHelper>,
     runtime_contract: BufloKernelRuntimeContract,
@@ -3730,6 +3818,8 @@ struct BufloKernelTxRuntime {
     incoming_credit_release_window: Duration,
     cadence: Duration,
     preparation_reserve: bool,
+    conservative_kernel_enqueue_witness: bool,
+    enqueue_witnesses: Vec<BufloKernelConservativeEnqueueWitness>,
 }
 
 #[cfg(target_os = "linux")]
@@ -6188,6 +6278,10 @@ impl BufloKernelTxRuntime {
                             buflo_kernel_timed_error("layered timestamp contract", error)
                         })?;
                 }
+                if incoming_policy.period_us() == 64_000 {
+                    active.enable_conservative_kernel_enqueue_witness().map_err(|error|
+                        buflo_kernel_timed_error("schema15 conservative enqueue eligibility", error))?;
+                }
                 Ok::<_, Error>(active)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -6288,6 +6382,8 @@ impl BufloKernelTxRuntime {
             incoming_credit_release_window: incoming_policy.incoming_window(),
             cadence: Duration::from_micros(incoming_policy.period_us()),
             preparation_reserve: incoming_policy.preparation_reserve(),
+            conservative_kernel_enqueue_witness: incoming_policy.period_us() == 64_000,
+            enqueue_witnesses: Vec::new(),
         })
     }
 
@@ -7328,6 +7424,228 @@ impl BufloKernelTxRuntime {
         window.map(|(_, _, physical_time)| (physical_time, item_id))
     }
 
+    fn transmit_exact_main_schema15(
+        &mut self,
+        job_id: u64,
+        endpoint_index: usize,
+        endpoint: QcsdEndpointId,
+        event_id: u64,
+        batch: datagram::Batch,
+    ) -> Result<(BufloKernelPhysicalTxTime, u64), Error> {
+        let job = self.current_job(job_id)?;
+        if !job.items.is_empty() || event_id != job.tick.saturating_mul(2) {
+            return Err(Error::SlotInvariant(format!(
+                "BuFLO kernel job {job_id} main item order or event identity was invalid"
+            )));
+        }
+        let target_tai_ns = job.release_tai_ns;
+        let deadline_tai_ns = job.deadline_tai_ns;
+        let scm_txtime_tai_ns = target_tai_ns
+            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
+            .ok_or_else(|| Error::DefenseExecution("BuFLO SCM_TXTIME overflow".into()))?;
+        self.validate_batch_tuple(endpoint_index, &batch)?;
+        let datagram_sha256 = sha256(batch.data())?;
+        let source_address = batch.source();
+        let destination_address = batch.destination();
+        let udp_payload_bytes = batch.data().len();
+        let result = self
+            .helper
+            .as_mut()
+            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?
+            .transmit_main(
+                job_id,
+                endpoint_index,
+                batch,
+                scm_txtime_tai_ns,
+                deadline_tai_ns,
+                BUFLO_KERNEL_TX_REPORT_ALLOWANCE,
+            );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let failure = error.failure_receipt();
+                self.record_failed_attempt(
+                    job_id,
+                    0,
+                    event_id,
+                    "exact-outgoing",
+                    endpoint_index,
+                    endpoint,
+                    "etf",
+                    datagram_sha256,
+                    source_address,
+                    destination_address,
+                    udp_payload_bytes,
+                    target_tai_ns,
+                    Some(scm_txtime_tai_ns),
+                    failure,
+                )?;
+                return Err(buflo_kernel_timed_error("exact transmit", error));
+            }
+        };
+        let unexpected_post_main = !result.post_main.is_empty();
+        let phase = match sample_buflo_kernel_clock_phase() {
+            Ok(phase) => phase,
+            Err(error) => {
+                let item_id = self.next_item_id;
+                self.next_item_id = self.next_item_id.saturating_add(1);
+                let detail = format!("post-transmit clock sample failed: {error}");
+                self.current_job_mut(job_id)?
+                    .items
+                    .push(BufloKernelRawItem {
+                        item_id,
+                        job_id,
+                        order_index: 0,
+                        event_id,
+                        role: "exact-outgoing",
+                        endpoint_index,
+                        endpoint,
+                        send_path: "etf",
+                        datagram_sha256,
+                        source_address,
+                        destination_address,
+                        udp_payload_bytes,
+                        target_tai_ns,
+                        scm_txtime_tai_ns: Some(scm_txtime_tai_ns),
+                        enqueue_monotonic_ns: Some(result.enqueue.enqueue_monotonic_ns),
+                        enqueue_tai_lower_ns: Some(result.enqueue.enqueue_before_tai_ns),
+                        enqueue_tai_upper_ns: Some(result.enqueue.enqueue_after_tai_ns),
+                        socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
+                        tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
+                        tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
+                        post_tx_clock_phase: None,
+                        provisional_tx_software_tai_lower_ns: None,
+                        provisional_tx_software_tai_upper_ns: None,
+                        send_attempt: None,
+                        txtime_error: None,
+                        terminal_error: Some("clock_sample_failed".into()),
+                        terminal_error_detail: Some(detail.clone()),
+                        finalization_state: "physical-transmit-proven".into(),
+                        terminal_outcome: "timestamp-evidence-missing".into(),
+                    });
+                self.current_job_mut(job_id)?.terminal_error = Some(detail);
+                return Err(error);
+            }
+        };
+        let phase_follows_evidence = buflo_kernel_post_tx_clock_phase_follows_evidence(
+            &phase,
+            result.enqueue.enqueue_monotonic_ns,
+            result.enqueue.enqueue_after_tai_ns,
+            result.outcome.tx_software_realtime_ns,
+        );
+        let window = if phase_follows_evidence {
+            self.refine_realtime_then_validate_enqueue_order(
+                &phase,
+                result.enqueue.enqueue_monotonic_ns,
+                result.enqueue.enqueue_before_tai_ns,
+                result.enqueue.enqueue_after_tai_ns,
+                &format!(
+                    "BuFLO kernel job {job_id} enqueue and post-TX clock evidence was not ordered"
+                ),
+            )
+            .and_then(|realtime_bounds| {
+                self.check_physical_window(
+                    job_id,
+                    false,
+                    result.outcome.tx_software_realtime_ns,
+                    &phase,
+                    realtime_bounds,
+                )
+            })
+        } else {
+            Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} post-TX clock phase did not follow exact transmission evidence"
+            )))
+        };
+        // Enqueue may use the existing strict physical window. It never
+        // extends that window: the independently observed TX must still fit.
+        let witness = result.enqueue.kernel_enqueue_guard.as_ref().zip(window.as_ref().ok())
+            .and_then(|(guard, (lower, upper, _))| {
+                let user_upper = result.enqueue.enqueue_after_tai_ns;
+                let bound = if user_upper < deadline_tai_ns { user_upper } else { *upper };
+                let witness = BufloKernelConservativeEnqueueWitness {
+                    schema_version: 1,
+                    basis: if user_upper < deadline_tai_ns { "direct-userspace-upper" }
+                        else { "same-datagram-kernel-software-upper" },
+                    item_id: self.next_item_id, job_id, event_id, endpoint_index, endpoint: endpoint.0,
+                    datagram_sha256: datagram_sha256.clone(), source_address, destination_address,
+                    udp_payload_bytes, release_tai_ns: target_tai_ns, deadline_tai_ns,
+                    observed_enqueue_tai_lower_ns: result.enqueue.enqueue_before_tai_ns,
+                    observed_enqueue_tai_upper_ns: user_upper,
+                    kernel_timestamp_id: result.outcome.kernel_timestamp_id,
+                    tx_sched_realtime_ns: result.outcome.tx_sched_realtime_ns,
+                    tx_software_realtime_ns: result.outcome.tx_software_realtime_ns,
+                    provisional_software_tai_lower_ns: *lower,
+                    provisional_software_tai_upper_ns: *upper,
+                    enqueue_event_tai_upper_ns: bound, helper_guard: guard.clone(),
+                };
+                witness.valid_fields().then_some(witness)
+            });
+        let enqueued_before_deadline = witness.is_some();
+        let physical_after_enqueue = window
+            .as_ref()
+            .is_ok_and(|value| value.0 >= result.enqueue.enqueue_before_tai_ns);
+        let terminal_outcome = if enqueued_before_deadline && physical_after_enqueue {
+            "transmitted"
+        } else {
+            "window-violation"
+        };
+        let item_id = self.next_item_id;
+        self.next_item_id = self.next_item_id.saturating_add(1);
+        if let Some(witness) = witness { self.enqueue_witnesses.push(witness); }
+        self.current_job_mut(job_id)?
+            .items
+            .push(BufloKernelRawItem {
+                item_id,
+                job_id,
+                order_index: 0,
+                event_id,
+                role: "exact-outgoing",
+                endpoint_index,
+                endpoint,
+                send_path: "etf",
+                datagram_sha256,
+                source_address,
+                destination_address,
+                udp_payload_bytes,
+                target_tai_ns,
+                scm_txtime_tai_ns: Some(scm_txtime_tai_ns),
+                enqueue_monotonic_ns: Some(result.enqueue.enqueue_monotonic_ns),
+                enqueue_tai_lower_ns: Some(result.enqueue.enqueue_before_tai_ns),
+                enqueue_tai_upper_ns: Some(result.enqueue.enqueue_after_tai_ns),
+                socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
+                tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
+                tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
+                post_tx_clock_phase: Some(phase),
+                provisional_tx_software_tai_lower_ns: window.as_ref().ok().map(|value| value.0),
+                provisional_tx_software_tai_upper_ns: window.as_ref().ok().map(|value| value.1),
+                send_attempt: None,
+                txtime_error: None,
+                terminal_error: None,
+                terminal_error_detail: None,
+                finalization_state: "physical-transmit-proven".into(),
+                terminal_outcome: terminal_outcome.into(),
+            });
+        if unexpected_post_main {
+            self.current_job_mut(job_id)?.terminal_error =
+                Some("exact-only helper command returned unexpected post-main outcomes".into());
+            return Err(Error::SlotInvariant(
+                "BuFLO exact-only helper command returned post-main outcomes".into(),
+            ));
+        }
+        if !enqueued_before_deadline {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} exact datagram was not fully enqueued before its strict physical deadline"
+            )));
+        }
+        if window.is_ok() && !physical_after_enqueue {
+            return Err(Error::DefenseExecution(format!(
+                "BuFLO kernel job {job_id} physical TX lower bound preceded its enqueue TAI lower bound"
+            )));
+        }
+        window.map(|(_, _, physical_time)| (physical_time, item_id))
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the ordered credit send retains one linear, auditable failure receipt for every stage of the timed transmission"
@@ -7600,7 +7918,7 @@ impl BufloKernelTxRuntime {
         clippy::too_many_lines,
         reason = "total kernel-runtime finalisation deliberately audits every item, job, clock, helper, and cleanup condition in one receipt-producing transaction"
     )]
-    fn finish(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
+    fn finish_schema14(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
         let mut cleanup_errors = Vec::new();
         let mut terminal_errors = Vec::new();
         let epoch = self.epoch;
@@ -8215,6 +8533,7 @@ impl BufloKernelTxRuntime {
         };
         let terminal_outcome = aggregate.terminal_outcome.to_string();
         BufloKernelTxReceipt {
+            enqueue_witnesses: None,
             schema_version: if self.cadence == Duration::from_micros(64_000) {
                 14
             } else if self.preparation_reserve {
@@ -8255,6 +8574,667 @@ impl BufloKernelTxRuntime {
             terminal_errors,
         }
     }
+
+    fn finish_schema15(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
+        let enqueue_witnesses = mem::take(&mut self.enqueue_witnesses);
+        let mut cleanup_errors = Vec::new();
+        let mut terminal_errors = Vec::new();
+        let epoch = self.epoch;
+        let protected_selection_wait_entries =
+            mem::take(&mut self.protected_selection_wait_entries);
+        if epoch.is_none() {
+            cleanup_errors.push("BuFLO kernel epoch was never armed".into());
+        }
+
+        if let Some(mut helper) = self.helper.take() {
+            let lifecycle_before_shutdown = match helper.lifecycle_receipt() {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(error) => {
+                    cleanup_errors.push(format!(
+                        "BuFLO helper lifecycle snapshot before shutdown failed: {error}"
+                    ));
+                    None
+                }
+            };
+            if let Some((active_job_id, expected_failed_commands)) =
+                lifecycle_before_shutdown.as_ref().and_then(|lifecycle| {
+                    lifecycle
+                        .active_job_id
+                        .map(|active_job_id| (active_job_id, lifecycle.failed_commands))
+                })
+            {
+                let abort_reason = "runner finalisation reached an incomplete kernel-timed job";
+                let expected_unused_post_main_datagrams = self
+                    .runtime_contract
+                    .max_post_main_datagrams
+                    .saturating_sub(self.current_job(active_job_id).map_or(0, |job| {
+                        buflo_kernel_consumed_post_main_datagram_count(&job.items)
+                    }));
+                match helper.abort_job(active_job_id, abort_reason) {
+                    Ok(abort) => match self.current_job_mut(active_job_id) {
+                        Ok(job) => {
+                            let abort_valid = buflo_kernel_abort_receipt_valid(
+                                &abort,
+                                active_job_id,
+                                abort_reason,
+                                expected_unused_post_main_datagrams,
+                                expected_failed_commands,
+                            );
+                            job.helper_job_abort = Some(abort);
+                            let abort_detail = if abort_valid {
+                                "helper job aborted during runner finalisation"
+                            } else {
+                                "helper returned an invalid abort receipt during runner finalisation"
+                            };
+                            job.terminal_error
+                                .get_or_insert_with(|| abort_detail.into());
+                            job.terminal_outcome = "failed".into();
+                            if !abort_valid {
+                                cleanup_errors.push(format!(
+                                    "BuFLO helper returned an invalid abort receipt for job {active_job_id}"
+                                ));
+                            }
+                        }
+                        Err(error) => cleanup_errors.push(format!(
+                            "BuFLO helper aborted unknown raw job {active_job_id}: {error}"
+                        )),
+                    },
+                    Err(error) => cleanup_errors.push(format!(
+                        "BuFLO helper could not abort active job {active_job_id}: {error}"
+                    )),
+                }
+            }
+            match helper.lifecycle_receipt() {
+                Ok(lifecycle) => self.runtime_contract.helper_lifecycle = Some(lifecycle),
+                Err(error) => cleanup_errors.push(format!(
+                    "BuFLO helper lifecycle snapshot before join failed: {error}"
+                )),
+            }
+            let helper_shutdown = helper.shutdown();
+            cleanup_errors.extend(
+                helper_shutdown
+                    .errors
+                    .iter()
+                    .map(|error| format!("BuFLO helper shutdown: {error}")),
+            );
+            if self.runtime_contract.helper_lifecycle.is_none() {
+                self.runtime_contract
+                    .helper_lifecycle
+                    .clone_from(&helper_shutdown.lifecycle);
+            }
+            self.runtime_contract.helper_shutdown = Some(helper_shutdown);
+        } else {
+            cleanup_errors.push("BuFLO kernel helper was absent during finalisation".into());
+        }
+
+        let mut clock_end_error = None;
+        let clock_end = match sample_buflo_kernel_clock_phase() {
+            Ok(phase) => Some(phase),
+            Err(error) => {
+                let detail = format!("BuFLO final clock sample failed: {error}");
+                cleanup_errors.push(detail.clone());
+                clock_end_error = Some(detail);
+                None
+            }
+        };
+        let mut mapping_result = build_buflo_kernel_clock_mapping(
+            &self.clock_start,
+            clock_end.as_ref(),
+            epoch.as_ref().map(|epoch| &epoch.instant_anchor.receipt),
+            clock_end_error.as_deref(),
+        );
+        if let Ok(mapping) = &mut mapping_result
+            && let Err(error) = refine_buflo_kernel_clock_mapping_with_items(mapping, &self.jobs)
+        {
+            mapping_result = Err(error);
+        }
+        if let Ok(mapping) = &mapping_result {
+            let final_realtime_bounds = clock_mapping_offset_bounds(mapping, true);
+            let online_with_end = self
+                .realtime_offset_intersection
+                .zip(clock_end.as_ref())
+                .and_then(|(online, end)| {
+                    intersect_clock_offset_bounds(online, clock_offset_bounds(&end.realtime))
+                });
+            if online_with_end != Some(final_realtime_bounds) {
+                mapping_result = Err(
+                    "BuFLO final realtime offset intersection differed from online evidence".into(),
+                );
+            }
+        }
+        let (mapping, clock_mapping_error) = match mapping_result {
+            Ok(mapping) => (Some(mapping), None),
+            Err(error) => {
+                if !cleanup_errors.iter().any(|existing| existing == &error) {
+                    cleanup_errors.push(error.clone());
+                }
+                (None, Some(error))
+            }
+        };
+        let realtime_bounds = mapping
+            .as_ref()
+            .map(|mapping| clock_mapping_offset_bounds(mapping, true));
+        let mut jobs = Vec::with_capacity(self.jobs.len());
+        let endpoint_tuples = self.endpoint_tuples;
+        let mut witness_ids = BTreeSet::new();
+        if enqueue_witnesses.len() != self.jobs.iter().filter(|j| !j.items.is_empty()).count()
+            || !enqueue_witnesses.iter().all(|w| witness_ids.insert(w.item_id) && w.valid_fields()) {
+            terminal_errors.push("schema15 missing/duplicate/foreign enqueue witness inventory".into());
+        }
+        let mut expected_item_id = 0_u64;
+        for (expected_job_index, raw_job) in self.jobs.into_iter().enumerate() {
+            let expected_job_id = u64::try_from(expected_job_index).unwrap_or(u64::MAX);
+            let expected_offset = expected_job_id.checked_mul(duration_as_u64_nanos(self.cadence));
+            let job_identity_and_timing_valid =
+                expected_offset.zip(epoch).is_some_and(|(offset, epoch)| {
+                    raw_job.job_id == expected_job_id
+                        && raw_job.tick == expected_job_id
+                        && epoch.start_monotonic_ns.checked_add(offset)
+                            == Some(raw_job.release_monotonic_ns)
+                        && epoch.start_tai_ns.checked_add(offset) == Some(raw_job.release_tai_ns)
+                        && raw_job
+                            .release_monotonic_ns
+                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+                            == Some(raw_job.deadline_monotonic_ns)
+                        && raw_job
+                            .release_tai_ns
+                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+                            == Some(raw_job.deadline_tai_ns)
+                        && raw_job
+                            .release_monotonic_ns
+                            .checked_add(duration_as_u64_nanos(self.incoming_credit_release_window))
+                            == Some(raw_job.incoming_deadline_monotonic_ns)
+                        && raw_job
+                            .release_tai_ns
+                            .checked_add(duration_as_u64_nanos(self.incoming_credit_release_window))
+                            == Some(raw_job.incoming_deadline_tai_ns)
+                });
+            if !job_identity_and_timing_valid {
+                terminal_errors.push(format!(
+                    "BuFLO kernel job {} failed contiguous epoch/cadence identity validation",
+                    raw_job.job_id
+                ));
+            }
+            let mut items = Vec::with_capacity(raw_job.items.len());
+            let mut previous_tx_software_upper_ns = None;
+            let mut carrier_owners = BTreeSet::new();
+            for (expected_order_index, raw) in raw_job.items.into_iter().enumerate() {
+                let expected_order_index = u64::try_from(expected_order_index).unwrap_or(u64::MAX);
+                let item_sequence_valid = raw.item_id == expected_item_id
+                    && raw.job_id == raw_job.job_id
+                    && raw.order_index == expected_order_index;
+                expected_item_id = expected_item_id.saturating_add(1);
+                let translate = |raw_ns: Option<u64>| -> Option<(u64, u64)> {
+                    let raw_ns = raw_ns?;
+                    let bounds = realtime_bounds?;
+                    translate_clock_interval(raw_ns, bounds).ok()
+                };
+                let tx_sched = translate(raw.tx_sched_realtime_ns);
+                let tx_software = translate(raw.tx_software_realtime_ns);
+                let enqueue_interval_complete = raw
+                    .enqueue_tai_lower_ns
+                    .zip(raw.enqueue_tai_upper_ns)
+                    .is_some_and(|(lower, upper)| lower <= upper);
+                let enqueue_clock_consistent = raw
+                    .post_tx_clock_phase
+                    .as_ref()
+                    .zip(raw.enqueue_monotonic_ns)
+                    .zip(raw.enqueue_tai_lower_ns)
+                    .zip(raw.enqueue_tai_upper_ns)
+                    .is_some_and(|(((phase, monotonic), lower), upper)| {
+                        buflo_kernel_enqueue_clock_order_consistent(phase, monotonic, lower, upper)
+                    });
+                let post_tx_clock_phase_complete =
+                    raw.post_tx_clock_phase.as_ref().is_some_and(|phase| {
+                        raw.enqueue_monotonic_ns
+                            .zip(raw.enqueue_tai_upper_ns)
+                            .zip(raw.tx_software_realtime_ns)
+                            .is_some_and(|((enqueue_monotonic, enqueue_tai_upper), tx_software)| {
+                                buflo_kernel_post_tx_clock_phase_follows_evidence(
+                                    phase,
+                                    enqueue_monotonic,
+                                    enqueue_tai_upper,
+                                    tx_software,
+                                )
+                            })
+                    });
+                let timestamp_evidence_complete = raw.socket_timestamp_id.is_some()
+                    && tx_sched.is_some()
+                    && tx_software.is_some()
+                    && post_tx_clock_phase_complete;
+                let tx_order_valid = raw
+                    .tx_sched_realtime_ns
+                    .zip(raw.tx_software_realtime_ns)
+                    .is_some_and(|(scheduled, software)| scheduled <= software);
+                let physical_window_valid = tx_software.is_some_and(|(lower, upper)| {
+                    buflo_kernel_interval_within_half_open_window(
+                        lower,
+                        upper,
+                        raw_job.release_tai_ns,
+                        if raw.role == "incoming-credit" {
+                            raw_job.incoming_deadline_tai_ns
+                        } else {
+                            raw_job.deadline_tai_ns
+                        },
+                    )
+                });
+                let provisional_interval_valid = raw
+                    .provisional_tx_software_tai_lower_ns
+                    .zip(raw.provisional_tx_software_tai_upper_ns)
+                    .zip(tx_software)
+                    .is_some_and(|((provisional_lower, provisional_upper), final_interval)| {
+                        buflo_kernel_provisional_envelope_contains_final(
+                            provisional_lower,
+                            provisional_upper,
+                            final_interval.0,
+                            final_interval.1,
+                        )
+                    });
+                let endpoint_tuple_valid = u64::try_from(raw.endpoint_index)
+                    .is_ok_and(|index| index == raw.endpoint.0)
+                    && endpoint_tuples
+                        .get(raw.endpoint_index)
+                        .is_some_and(|expected| {
+                            *expected == (raw.source_address, raw.destination_address)
+                        });
+                let controller_and_trace_finalized =
+                    raw.finalization_state == "controller-and-trace-finalized";
+                let structural_and_order_valid = if expected_order_index == 0 {
+                    raw.role == "exact-outgoing"
+                        && raw.send_path == "etf"
+                        && raw.event_id == raw_job.tick.saturating_mul(2)
+                        && raw.udp_payload_bytes == 1_200
+                        && raw.target_tai_ns == raw_job.release_tai_ns
+                        && raw.scm_txtime_tai_ns
+                            == raw_job
+                                .release_tai_ns
+                                .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
+                        && enqueue_witnesses.iter().filter(|w| w.item_id == raw.item_id).count() == 1
+                        && enqueue_witnesses.iter().find(|w| w.item_id == raw.item_id).is_some_and(|w|
+                            w.matches_final_item(raw_job.job_id, raw_job.tick, raw_job.release_tai_ns,
+                                raw_job.deadline_tai_ns, &raw, tx_software))
+                        && raw
+                            .enqueue_tai_lower_ns
+                            .zip(tx_software)
+                            .is_some_and(|(enqueue_lower, (tx_lower, _))| tx_lower >= enqueue_lower)
+                } else if let Some(previous_upper) = previous_tx_software_upper_ns {
+                    let credit_intervals_valid = raw
+                        .enqueue_tai_lower_ns
+                        .zip(raw.enqueue_tai_upper_ns)
+                        .zip(tx_software)
+                        .is_some_and(|((enqueue_lower, enqueue_upper), (tx_lower, _))| {
+                            buflo_kernel_credit_intervals_are_causally_ordered(
+                                previous_upper,
+                                enqueue_lower,
+                                enqueue_upper,
+                                tx_lower,
+                                raw_job.incoming_deadline_tai_ns,
+                            )
+                        });
+                    raw.role == "incoming-credit"
+                        && raw.send_path == "ordered-after-exact"
+                        && raw.event_id == raw_job.tick.saturating_mul(2).saturating_add(1)
+                        && raw.scm_txtime_tai_ns.is_none()
+                        && (1..=1_200).contains(&raw.udp_payload_bytes)
+                        && carrier_owners.insert((raw.endpoint_index, raw.endpoint.0))
+                        && credit_intervals_valid
+                } else {
+                    terminal_errors.push(format!(
+                        "BuFLO kernel job {} item {} lacked prior conservative TX evidence",
+                        raw_job.job_id, raw.item_id
+                    ));
+                    false
+                };
+                let validation = BufloKernelItemValidation {
+                    enqueue_interval_complete,
+                    enqueue_clock_consistent,
+                    timestamp_evidence_complete,
+                    tx_order_valid,
+                    physical_window_valid,
+                    provisional_interval_valid,
+                    endpoint_tuple_valid,
+                    item_sequence_valid,
+                    job_identity_and_timing_valid,
+                    controller_and_trace_finalized,
+                    structural_and_order_valid,
+                };
+                let final_success = buflo_kernel_item_validation_complete(&raw, &validation);
+                let terminal_outcome = if final_success {
+                    "transmitted".to_string()
+                } else if raw.txtime_error.is_some() {
+                    "txtime-error".to_string()
+                } else if raw.terminal_outcome == "controller-trace-finalization-failed" {
+                    "controller-trace-finalization-failed".to_string()
+                } else if !timestamp_evidence_complete || !enqueue_interval_complete {
+                    "timestamp-evidence-missing".to_string()
+                } else {
+                    "window-violation".to_string()
+                };
+                let terminal_error = raw.terminal_error.clone().or_else(|| {
+                    (!final_success)
+                        .then(|| "final_conservative_envelope_validation_failed".to_string())
+                });
+                let terminal_error_detail = raw.terminal_error_detail.clone().or_else(|| {
+                    (!final_success).then(|| {
+                        format!(
+                            "item {} failed final mapping: enqueue_complete={enqueue_interval_complete}, enqueue_clock_consistent={enqueue_clock_consistent}, timestamp_complete={timestamp_evidence_complete}, tx_order={tx_order_valid}, physical_window={physical_window_valid}, provisional_interval={provisional_interval_valid}, endpoint_tuple={endpoint_tuple_valid}, item_sequence={item_sequence_valid}, job_identity={job_identity_and_timing_valid}, controller_trace_finalized={controller_and_trace_finalized}, structural_order={structural_and_order_valid}",
+                            raw.item_id
+                        )
+                    })
+                });
+                if let Some(detail) = &terminal_error_detail {
+                    terminal_errors.push(format!(
+                        "BuFLO kernel job {} item {}: {detail}",
+                        raw_job.job_id, raw.item_id
+                    ));
+                }
+                previous_tx_software_upper_ns = final_success
+                    .then(|| tx_software.map(|(_, upper)| upper))
+                    .flatten();
+                items.push(BufloKernelItemReceipt {
+                    schema_version: BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION,
+                    item_id: raw.item_id,
+                    job_id: raw.job_id,
+                    order_index: raw.order_index,
+                    event_id: raw.event_id,
+                    role: raw.role,
+                    endpoint_index: raw.endpoint_index,
+                    endpoint: raw.endpoint.0,
+                    send_path: raw.send_path,
+                    datagram_sha256: raw.datagram_sha256,
+                    source_address: raw.source_address.to_string(),
+                    destination_address: raw.destination_address.to_string(),
+                    socket_timestamp_id: raw.socket_timestamp_id,
+                    udp_payload_bytes: raw.udp_payload_bytes,
+                    target_tai_ns: raw.target_tai_ns,
+                    scm_txtime_tai_ns: raw.scm_txtime_tai_ns,
+                    enqueue_monotonic_ns: raw.enqueue_monotonic_ns,
+                    enqueue_tai_ns: raw
+                        .enqueue_tai_lower_ns
+                        .zip(raw.enqueue_tai_upper_ns)
+                        .map(|(lower, upper)| interval_midpoint(lower, upper)),
+                    enqueue_tai_lower_ns: raw.enqueue_tai_lower_ns,
+                    enqueue_tai_upper_ns: raw.enqueue_tai_upper_ns,
+                    tx_sched_realtime_ns: raw.tx_sched_realtime_ns,
+                    tx_sched_tai_ns: tx_sched.map(|(lower, upper)| interval_midpoint(lower, upper)),
+                    tx_sched_tai_lower_ns: tx_sched.map(|value| value.0),
+                    tx_sched_tai_upper_ns: tx_sched.map(|value| value.1),
+                    tx_software_realtime_ns: raw.tx_software_realtime_ns,
+                    post_tx_clock_phase: raw.post_tx_clock_phase,
+                    provisional_tx_software_tai_lower_ns: raw.provisional_tx_software_tai_lower_ns,
+                    provisional_tx_software_tai_upper_ns: raw.provisional_tx_software_tai_upper_ns,
+                    tx_software_tai_ns: tx_software
+                        .map(|(lower, upper)| interval_midpoint(lower, upper)),
+                    tx_software_tai_lower_ns: tx_software.map(|value| value.0),
+                    tx_software_tai_upper_ns: tx_software.map(|value| value.1),
+                    send_attempt: raw.send_attempt,
+                    txtime_error: raw.txtime_error,
+                    terminal_error,
+                    terminal_error_detail,
+                    finalization_state: raw.finalization_state,
+                    terminal_outcome,
+                });
+            }
+            let validated_carriers: Vec<_> = items
+                .iter()
+                .map(|item| BufloKernelValidatedCarrier {
+                    item_id: item.item_id,
+                    endpoint_index: item.endpoint_index,
+                    endpoint: item.endpoint,
+                    role: item.role,
+                    transmitted: item.terminal_outcome == "transmitted",
+                })
+                .collect();
+            let credit_identity_complete = buflo_kernel_credit_inventory_complete(
+                raw_job.tick,
+                &raw_job.credit_identities,
+                &validated_carriers,
+                endpoint_tuples.len(),
+            );
+            let expected_unused_post_main_datagrams = self
+                .runtime_contract
+                .max_post_main_datagrams
+                .saturating_sub(
+                    items
+                        .iter()
+                        .filter(|item| item.role == "incoming-credit")
+                        .count(),
+                );
+            let job_complete = buflo_kernel_job_validation_complete(
+                &raw_job.terminal_outcome,
+                raw_job.terminal_error.is_some(),
+                items.len(),
+                items
+                    .iter()
+                    .all(|item| item.terminal_outcome == "transmitted"),
+                credit_identity_complete,
+                raw_job.helper_job_close.as_ref(),
+                raw_job.job_id,
+                expected_unused_post_main_datagrams,
+                raw_job.prepared_output_failure.is_some(),
+                raw_job.helper_job_abort.is_some(),
+            );
+            let job_terminal_error = raw_job.terminal_error.or_else(|| {
+                (!job_complete).then(|| {
+                    "job did not retain complete conservative kernel timing evidence".to_string()
+                })
+            });
+            if let Some(error) = &job_terminal_error {
+                terminal_errors.push(format!("BuFLO kernel job {}: {error}", raw_job.job_id));
+            }
+            jobs.push(BufloKernelJobReceipt {
+                schema_version: 2,
+                job_id: raw_job.job_id,
+                tick: raw_job.tick,
+                release_monotonic_ns: raw_job.release_monotonic_ns,
+                release_tai_ns: raw_job.release_tai_ns,
+                deadline_monotonic_ns: raw_job.deadline_monotonic_ns,
+                deadline_tai_ns: raw_job.deadline_tai_ns,
+                incoming_deadline_monotonic_ns: raw_job.incoming_deadline_monotonic_ns,
+                incoming_deadline_tai_ns: raw_job.incoming_deadline_tai_ns,
+                items,
+                credit_identities: raw_job.credit_identities,
+                prepared_output_failure: raw_job.prepared_output_failure,
+                helper_job_close: raw_job.helper_job_close,
+                helper_job_abort: raw_job.helper_job_abort,
+                terminal_error: job_terminal_error,
+                terminal_outcome: if job_complete { "complete" } else { "failed" }.into(),
+            });
+        }
+        let (protected_selection_wait, protected_selection_wait_structurally_valid) =
+            if self.preparation_reserve {
+                build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
+                    protected_selection_wait_entries,
+                    epoch.map(|epoch| epoch.start_tai_ns),
+                    true,
+                    self.cadence,
+                )
+            } else {
+                build_buflo_kernel_protected_selection_wait_receipt(
+                    protected_selection_wait_entries,
+                    epoch.map(|epoch| epoch.start_tai_ns),
+                )
+            };
+        let protected_selection_wait_job_binding_valid =
+            buflo_kernel_protected_selection_job_binding_valid(
+                &protected_selection_wait,
+                &jobs,
+                epoch.is_some(),
+                primary_error.is_some(),
+            );
+        if !protected_selection_wait_structurally_valid
+            || !protected_selection_wait_job_binding_valid
+        {
+            terminal_errors.push(
+                "BuFLO protected selection-wait evidence was incomplete or inconsistent with kernel jobs"
+                    .into(),
+            );
+        }
+        let flat_items: Vec<_> = jobs.iter().flat_map(|job| job.items.iter()).collect();
+        let transmitted_item_count = flat_items
+            .iter()
+            .filter(|item| item.terminal_outcome == "transmitted")
+            .count();
+        let failed_item_count = flat_items.len().saturating_sub(transmitted_item_count);
+        let max_tx_software_lateness_ns = flat_items
+            .iter()
+            .filter_map(|item| {
+                item.tx_software_tai_upper_ns
+                    .map(|tx| tx.saturating_sub(item.target_tai_ns))
+            })
+            .max()
+            .unwrap_or(0);
+        let immediate_datagram_count = flat_items
+            .iter()
+            .filter(|item| item.send_path == "ordered-after-exact")
+            .count();
+        let helper_evidence_success = if self.preparation_reserve {
+            buflo_kernel_helper_evidence_complete_with_policy(
+                &self.runtime_contract,
+                &self.qdisc_contract,
+                &endpoint_tuples,
+                jobs.len(),
+                jobs.last().map(|job| job.job_id),
+                immediate_datagram_count,
+                true,
+            )
+        } else {
+            buflo_kernel_helper_evidence_complete(
+                &self.runtime_contract,
+                &self.qdisc_contract,
+                &endpoint_tuples,
+                jobs.len(),
+                jobs.last().map(|job| job.job_id),
+                immediate_datagram_count,
+            )
+        };
+        if !helper_evidence_success {
+            terminal_errors.push(
+                "BuFLO timed-egress helper lifecycle or shutdown evidence was not clean".into(),
+            );
+        }
+        let aggregate = BufloKernelAggregateReceipt {
+            schema_version: 1,
+            job_count: jobs.len(),
+            item_count: flat_items.len(),
+            etf_item_count: flat_items
+                .iter()
+                .filter(|item| item.send_path == "etf")
+                .count(),
+            ordered_item_count: flat_items
+                .iter()
+                .filter(|item| item.send_path == "ordered-after-exact")
+                .count(),
+            captured_credit_identity_count: jobs
+                .iter()
+                .map(|job| job.credit_identities.len())
+                .sum(),
+            prepared_output_failure_count: jobs
+                .iter()
+                .filter(|job| job.prepared_output_failure.is_some())
+                .count(),
+            main_coalesced_credit_identity_count: jobs
+                .iter()
+                .flat_map(|job| &job.credit_identities)
+                .filter(|identity| identity.resolution == "coalesced-in-main-finalized")
+                .count(),
+            carrier_credit_identity_count: jobs
+                .iter()
+                .flat_map(|job| &job.credit_identities)
+                .filter(|identity| identity.resolution == "post-main-carrier-finalized")
+                .count(),
+            unresolved_credit_identity_count: jobs
+                .iter()
+                .flat_map(|job| &job.credit_identities)
+                .filter(|identity| {
+                    !matches!(
+                        identity.resolution.as_str(),
+                        "coalesced-in-main-finalized" | "post-main-carrier-finalized"
+                    )
+                })
+                .count(),
+            transmitted_item_count,
+            failed_item_count,
+            tx_sched_timestamp_count: flat_items
+                .iter()
+                .filter(|item| item.tx_sched_tai_ns.is_some())
+                .count(),
+            tx_software_timestamp_count: flat_items
+                .iter()
+                .filter(|item| item.tx_software_tai_ns.is_some())
+                .count(),
+            txtime_error_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "txtime-error")
+                .count(),
+            timestamp_evidence_missing_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "timestamp-evidence-missing")
+                .count(),
+            window_violation_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "window-violation")
+                .count(),
+            unresolved_item_count: flat_items
+                .iter()
+                .filter(|item| item.terminal_outcome == "unresolved")
+                .count(),
+            max_tx_software_lateness_ns,
+            terminal_outcome: if buflo_kernel_aggregate_validation_complete(
+                failed_item_count,
+                jobs.len(),
+                jobs.iter().all(|job| job.terminal_outcome == "complete"),
+                helper_evidence_success,
+                mapping.is_some(),
+                primary_error.is_some(),
+                cleanup_errors.len(),
+                terminal_errors.len(),
+            ) {
+                "complete"
+            } else {
+                "failed"
+            },
+        };
+        let terminal_outcome = aggregate.terminal_outcome.to_string();
+        BufloKernelTxReceipt {
+            schema_version: 15,
+            enqueue_witnesses: Some(enqueue_witnesses),
+            semantics: BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_TX_SEMANTICS,
+            preparation_policy: self.preparation_reserve.then(|| {
+                buflo_kernel_preparation_policy_marker_for_period(
+                    duration_as_u64_nanos(self.cadence) / 1_000,
+                )
+            }),
+            incoming_credit_release_window_ns: duration_as_u64_nanos(
+                self.incoming_credit_release_window,
+            ),
+            terminal_outcome,
+            primary_error,
+            cleanup_errors,
+            defense_start_monotonic_ns: epoch.map(|epoch| epoch.start_monotonic_ns),
+            defense_start_tai_ns: epoch.map(|epoch| epoch.start_tai_ns),
+            clock_start: self.clock_start,
+            clock_end,
+            clock_mapping_valid: mapping.is_some(),
+            clock_mapping_error,
+            clock_mapping: mapping,
+            runtime_contract: self.runtime_contract,
+            qdisc_contract: self.qdisc_contract,
+            protected_selection_wait,
+            jobs,
+            aggregate,
+            terminal_errors,
+        }
+    }
+
+    fn finish(self, primary_error: Option<String>) -> BufloKernelTxReceipt {
+        if self.conservative_kernel_enqueue_witness {
+            self.finish_schema15(primary_error)
+        } else {
+            self.finish_schema14(primary_error)
+        }
+    }
+
 }
 
 fn scheduler_contract_matches(evidence: &ProcessSchedulerEvidence) -> bool {
@@ -9243,18 +10223,23 @@ impl RunnerWakeupMetrics {
         let schema = receipt
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
-        let layered_feedback = schema == Some(14);
+        let conservative_witness = schema == Some(15);
+        let layered_feedback = schema == Some(14) || conservative_witness;
         let cadence64 = schema == Some(13) || layered_feedback;
         let preparation_reserve = schema == Some(12) || cadence64;
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = if cadence64 {
+        self.schema_version = if conservative_witness {
+            23
+        } else if cadence64 {
             22
         } else if preparation_reserve {
             21
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         };
-        let retention_semantics = if layered_feedback {
+        let retention_semantics = if conservative_witness {
+            BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_RUNNER_RETENTION_SEMANTICS
+        } else if layered_feedback {
             BUFLO_KERNEL_LAYERED_RUNNER_RETENTION_SEMANTICS
         } else if cadence64 {
             BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS
@@ -9263,7 +10248,9 @@ impl RunnerWakeupMetrics {
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS
         };
-        let kernel_semantics = if layered_feedback {
+        let kernel_semantics = if conservative_witness {
+            BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_TX_SEMANTICS
+        } else if layered_feedback {
             BUFLO_KERNEL_LAYERED_TX_SEMANTICS
         } else if cadence64 {
             BUFLO_KERNEL_CADENCE64_TX_SEMANTICS
@@ -24965,13 +25952,12 @@ async fn dispatch_buflo_kernel_release(
     }
     preparation_diagnostic.complete();
     enqueue_gap.record("runner-before-exact-main");
-    let (physical_time, main_item_id) = match runtime.transmit_exact_main(
-        job_id,
-        guard.endpoint_index,
-        guard.endpoint,
-        guard.slot.0,
-        prepared.batch.clone(),
-    ) {
+    let main_result = if runtime.conservative_kernel_enqueue_witness {
+        runtime.transmit_exact_main_schema15(job_id, guard.endpoint_index, guard.endpoint, guard.slot.0, prepared.batch.clone())
+    } else {
+        runtime.transmit_exact_main(job_id, guard.endpoint_index, guard.endpoint, guard.slot.0, prepared.batch.clone())
+    };
+    let (physical_time, main_item_id) = match main_result {
         Ok(result) => result,
         Err(error) => {
             enqueue_gap.record("runner-main-result-error");
@@ -60605,6 +61591,8 @@ mod tests {
             incoming_credit_release_window: Duration::from_micros(5_000),
             cadence: Duration::from_micros(20_000),
             preparation_reserve: false,
+            conservative_kernel_enqueue_witness: false,
+            enqueue_witnesses: Vec::new(),
         }
     }
 
@@ -62636,3 +63624,116 @@ mod cs_preoutput_control_segment_diagnostic_tests {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "buflo_runner_wait_failure_diagnostic_tests.rs"]
 mod buflo_runner_wait_failure_diagnostic_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod conservative_kernel_enqueue_witness_tests {
+    use super::{timed_egress, BufloKernelConservativeEnqueueWitness, BufloKernelRawItem};
+
+    fn witness(late: bool) -> BufloKernelConservativeEnqueueWitness {
+        let source = "10.0.0.2:40001".parse().expect("fixture source");
+        let destination = "192.0.2.1:443".parse().expect("fixture destination");
+        let socket = timed_egress::KernelEnqueueSocketGuard { schema_version: 1,
+            family: timed_egress::SocketFamily::Ipv4, local_address: source,
+            socket_type: libc::SOCK_DGRAM, protocol: libc::IPPROTO_UDP,
+            timestamping_report_flags: 2192, so_timestamp: 0, so_timestampns: 0,
+            fragment_policy: libc::IP_PMTUDISC_PROBE };
+        let helper = timed_egress::KernelEnqueueGuardReceipt { schema_version: 1,
+            before: socket.clone(), after: socket, datagram_sha256: "a".repeat(64),
+            source, destination, udp_payload_bytes: 1200,
+            requested_txtime_tai_ns: 110_000_000, latest_enqueue_tai_ns: 105_000_000,
+            per_message_timestamp_flags: 258 };
+        BufloKernelConservativeEnqueueWitness { schema_version: 1,
+            basis: if late { "same-datagram-kernel-software-upper" } else { "direct-userspace-upper" },
+            item_id: 0, job_id: 0, event_id: 0, endpoint_index: 0, endpoint: 0,
+            datagram_sha256: helper.datagram_sha256.clone(), source_address: source,
+            destination_address: destination, udp_payload_bytes: 1200,
+            release_tai_ns: 100_000_000, deadline_tai_ns: 105_000_000,
+            observed_enqueue_tai_lower_ns: 99_000_000,
+            observed_enqueue_tai_upper_ns: if late { 112_000_000 } else { 99_500_000 },
+            kernel_timestamp_id: 7, tx_sched_realtime_ns: 101_000_000,
+            tx_software_realtime_ns: 102_000_000,
+            provisional_software_tai_lower_ns: 102_000_000,
+            provisional_software_tai_upper_ns: 102_000_100,
+            enqueue_event_tai_upper_ns: if late { 102_000_100 } else { 99_500_000 },
+            helper_guard: helper }
+    }
+
+    fn raw(w: &BufloKernelConservativeEnqueueWitness) -> BufloKernelRawItem {
+        BufloKernelRawItem { item_id: w.item_id, job_id: w.job_id, order_index: 0,
+            event_id: w.event_id, role: "exact-outgoing", endpoint_index: w.endpoint_index,
+            endpoint: super::QcsdEndpointId(w.endpoint), send_path: "etf",
+            datagram_sha256: w.datagram_sha256.clone(), source_address: w.source_address,
+            destination_address: w.destination_address, udp_payload_bytes: 1200,
+            target_tai_ns: w.release_tai_ns, scm_txtime_tai_ns: Some(110_000_000),
+            enqueue_monotonic_ns: Some(111_999_999),
+            enqueue_tai_lower_ns: Some(w.observed_enqueue_tai_lower_ns),
+            enqueue_tai_upper_ns: Some(w.observed_enqueue_tai_upper_ns),
+            socket_timestamp_id: Some(w.kernel_timestamp_id),
+            tx_sched_realtime_ns: Some(w.tx_sched_realtime_ns),
+            tx_software_realtime_ns: Some(w.tx_software_realtime_ns), post_tx_clock_phase: None,
+            provisional_tx_software_tai_lower_ns: Some(w.provisional_software_tai_lower_ns),
+            provisional_tx_software_tai_upper_ns: Some(w.provisional_software_tai_upper_ns),
+            send_attempt: None, txtime_error: None, terminal_error: None, terminal_error_detail: None,
+            finalization_state: "controller-and-trace-finalized".into(), terminal_outcome: "transmitted".into() }
+    }
+
+    #[test]
+    fn direct_and_kernel_witnesses_keep_the_observed_userspace_interval_literal() {
+        for late in [false, true] {
+            let w = witness(late);
+            let item = raw(&w);
+            assert!(w.valid_fields());
+            assert!(w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
+                Some((102_000_020, 102_000_080))));
+            let encoded = serde_json::to_value(&w).expect("fixture serializes");
+            assert_eq!(encoded["observed_enqueue_tai_upper_ns"],
+                w.observed_enqueue_tai_upper_ns);
+            assert_eq!(item.enqueue_tai_upper_ns, Some(if late { 112_000_000 } else { 99_500_000 }));
+        }
+    }
+
+    #[test]
+    fn sched_fallback_fragmentation_and_deadline_ambiguity_are_not_proofs() {
+        let base = witness(true);
+        let mut changed = base.clone();
+        changed.basis = "same-datagram-kernel-sched-upper";
+        assert!(!changed.valid_fields());
+        changed = base.clone();
+        changed.helper_guard.before.so_timestamp = 1;
+        changed.helper_guard.after.so_timestamp = 1;
+        assert!(!changed.valid_fields());
+        changed = base.clone();
+        changed.helper_guard.before.so_timestampns = 1;
+        changed.helper_guard.after.so_timestampns = 1;
+        assert!(!changed.valid_fields());
+        changed = base.clone();
+        changed.helper_guard.before.fragment_policy = libc::IP_PMTUDISC_WANT;
+        changed.helper_guard.after.fragment_policy = libc::IP_PMTUDISC_WANT;
+        assert!(!changed.valid_fields());
+        changed = base.clone();
+        changed.provisional_software_tai_upper_ns = changed.deadline_tai_ns;
+        assert!(!changed.valid_fields());
+        changed = base.clone();
+        changed.observed_enqueue_tai_lower_ns = changed.deadline_tai_ns;
+        assert!(!changed.valid_fields());
+    }
+
+    #[test]
+    fn final_item_identity_and_clock_refinement_cannot_be_substituted() {
+        let w = witness(true);
+        let mut item = raw(&w);
+        assert!(w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
+            Some((102_000_020, 102_000_080))));
+        item.socket_timestamp_id = Some(8);
+        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
+            Some((102_000_020, 102_000_080))));
+        item = raw(&w);
+        item.datagram_sha256 = "b".repeat(64);
+        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
+            Some((102_000_020, 102_000_080))));
+        item = raw(&w);
+        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
+            Some((101_999_999, 102_000_080))));
+        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item, None));
+    }
+}
