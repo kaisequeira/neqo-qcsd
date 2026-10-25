@@ -67,13 +67,19 @@ use trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles
 // clock, controller, transport, action, deadline or scientific predicate.
 const CS_PREOUTPUT_SAMPLE_LIMIT: usize = 256;
 const CS_PREOUTPUT_JSON_LIMIT: usize = 64 * 1024;
-const CS_PREOUTPUT_STAGES: [&str; 22] = [
+const CS_PREOUTPUT_STAGES: [&str; 34] = [
     "control_enter", "backlog_before", "backlog_after", "application_reduce_before",
     "flush_before", "flush_after", "poll_before", "poll_after", "queued_apply_before",
     "batch_preflight_before", "batch_preflight_after", "receive_apply_before",
     "receive_apply_after", "queued_apply_after", "post_apply_priority_before",
     "retry_inventory_before", "retry_inventory_after", "expiry_selected",
     "ordinary_output_before", "pending_capture_before", "preparation_before", "preparation_after",
+    "cancel_rejected_before", "cancel_rejected_after",
+    "cancel_barrier_observations_before", "cancel_barrier_observations_after",
+    "action_apply_before", "action_apply_after",
+    "queued_retry_chaff_before", "queued_retry_chaff_after",
+    "queued_reconcile_before", "queued_reconcile_after",
+    "queued_retry_terminal_before", "queued_retry_terminal_after",
 ];
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -242,7 +248,7 @@ impl CsPreoutputDiagnostic {
                 "last_control_at_process_ns": self.control_at_process_ns,
                 "last_control_elapsed_defense_ns": self.control_elapsed_defense_ns,
                 "original_defense_start_process_ns": self.defense_start_process_ns,
-                "stages": CS_PREOUTPUT_STAGES,
+                "stages": CS_PREOUTPUT_STAGES.as_slice(),
                 "entries": &entries,
             });
             let Ok(raw) = serde_json::to_vec(&value) else { return None; };
@@ -21253,9 +21259,11 @@ fn cancel_rejected_receive_streams(
 
     // Cancellation and terminal observations are a reducer barrier: no later,
     // unrelated action may reach an adapter before global ordered delivery.
+    cs_preoutput_diagnostic_mark(24);
     handle_all_qcsd_observations(endpoints, controller, traces, defense_elapsed)?;
     controller.flush_defense_observations();
     ensure_defense_realizable(controller)?;
+    cs_preoutput_diagnostic_mark(25);
     Ok(canceled_indices)
 }
 
@@ -21272,6 +21280,7 @@ fn apply_action_batch(
     let incoming_fanout_slots = register_action_batch(traces, now, &actions)?;
     let preflight = preflight_receive_action_batch(endpoints, traces, now, &actions)?;
     cs_preoutput_diagnostic_mark(10);
+    cs_preoutput_diagnostic_mark(22);
     let canceled_indices = cancel_rejected_receive_streams(
         endpoints,
         controller,
@@ -21281,6 +21290,7 @@ fn apply_action_batch(
         &actions,
         &preflight.rejected_streams,
     )?;
+    cs_preoutput_diagnostic_mark(23);
     for (index, action) in actions.into_iter().enumerate() {
         if let Some(outcome) = canceled_indices.get(&index).copied() {
             let event_outcome = format!("canceled_receive_{}", receive_limit_outcome_name(outcome));
@@ -21295,6 +21305,7 @@ fn apply_action_batch(
         }
         let may_skip_terminal_sibling = scheduled_action(&action)
             .is_some_and(|(_, _, slot)| incoming_fanout_slots.contains(&slot));
+        cs_preoutput_diagnostic_mark(26);
         apply_action(
             endpoints,
             controller,
@@ -21306,6 +21317,7 @@ fn apply_action_batch(
             may_skip_terminal_sibling,
             preflight.expected[index],
         )?;
+        cs_preoutput_diagnostic_mark(27);
     }
     Ok(())
 }
@@ -21348,10 +21360,13 @@ fn apply_queued_actions(
     now: Instant,
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
+    cs_preoutput_diagnostic_mark(32);
     retry_pending_cs_terminal_cancellations(
         endpoints, controller, chaff_manifest, traces, now, defense_elapsed,
     )?;
+    cs_preoutput_diagnostic_mark(33);
     loop {
+        cs_preoutput_diagnostic_mark(28);
         retry_pending_chaff_requests(
             endpoints,
             controller,
@@ -21360,10 +21375,13 @@ fn apply_queued_actions(
             now,
             defense_elapsed,
         )?;
+        cs_preoutput_diagnostic_mark(29);
         // FRONT's frozen schedule is reconciled before every action batch so
         // RequestChaff-created streams can immediately receive any due credit
         // before a prearmed outgoing target is eligible to flush.
+        cs_preoutput_diagnostic_mark(30);
         controller.reconcile_due_fixed(defense_elapsed);
+        cs_preoutput_diagnostic_mark(31);
         let actions: Vec<_> = controller.drain_actions().collect();
         if actions.is_empty() {
             return Ok(());

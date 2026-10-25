@@ -281,6 +281,35 @@ impl Http3Client {
         );
     }
 
+    // Called only after the original strict CS readiness operation refused.
+    // No output drive, receive read, ACK projection, credit or retry occurs.
+    fn qcsd_log_cs_terminal_readiness_refusal(
+        &self,
+        stream: StreamId,
+        role: QcsdRequestRole,
+        witness: Option<&neqo_csdef::CsBufloTerminalParserAllowance>,
+        phase: &'static str,
+        error: &Error,
+    ) {
+        use std::io::Write as _;
+        let error_kind = match error {
+            Error::InvalidInput => "InvalidInput",
+            Error::InvalidStreamId => "InvalidStreamId",
+            _ => "other",
+        };
+        // Phase and error labels are local literals; no peer text is emitted.
+        let phase = match phase {
+            "transport-parser-allowance" | "transport-idle-initial" | "http3-receive-ready" => phase,
+            _ => "unrecognized-local-phase",
+        };
+        let line = format!(
+            "QCSD_CS_TERMINAL_READINESS_REFUSAL phase={phase} stream={} error={error_kind} witness_present={}\n",
+            stream.as_u64(), witness.is_some(),
+        );
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        self.conn.qcsd_log_cs_terminal_readiness_refusal(stream, role, witness);
+    }
+
     /// Check a strict CS target before classifying global output as transient.
     /// This does not abandon a handler or relax a receive-window/FIN-ACK check.
     /// The original mutating API must still recheck all predicates when Ready.
@@ -297,16 +326,32 @@ impl Http3Client {
         let kind = if self.conn.qcsd_preview_local_chaff_abandonment(stream_id, role).is_some() {
             crate::QcsdCsTerminalReceiveKind::Drained
         } else if let Some(witness) = witness {
-            self.conn.qcsd_preview_cs_parser_allowance_chaff_abandonment(
+            if self.conn.qcsd_preview_cs_parser_allowance_chaff_abandonment(
                 stream_id, role, witness,
-            ).ok_or(Error::InvalidInput)?;
+            ).is_none() {
+                let error = Error::InvalidInput;
+                self.qcsd_log_cs_terminal_readiness_refusal(
+                    stream_id, role, Some(witness), "transport-parser-allowance", &error,
+                );
+                return Err(error);
+            }
             crate::QcsdCsTerminalReceiveKind::ParserAllowance
         } else {
-            self.conn.qcsd_preview_cs_idle_initial_chaff_abandonment(stream_id, role)
-                .ok_or(Error::InvalidInput)?;
+            if self.conn.qcsd_preview_cs_idle_initial_chaff_abandonment(stream_id, role).is_none() {
+                let error = Error::InvalidInput;
+                self.qcsd_log_cs_terminal_readiness_refusal(
+                    stream_id, role, witness, "transport-idle-initial", &error,
+                );
+                return Err(error);
+            }
             crate::QcsdCsTerminalReceiveKind::IdleInitial
         };
-        self.base_handler.qcsd_cs_terminal_receive_ready(stream_id, kind)?;
+        if let Err(error) = self.base_handler.qcsd_cs_terminal_receive_ready(stream_id, kind) {
+            self.qcsd_log_cs_terminal_readiness_refusal(
+                stream_id, role, witness, "http3-receive-ready", &error,
+            );
+            return Err(error);
+        }
         if self.base_handler.qcsd_qpack_encoder_handler_pending() {
             return Ok(QcsdCsTerminalReadiness::PendingQpackEncoder);
         }

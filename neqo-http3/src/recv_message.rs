@@ -633,6 +633,59 @@ impl RecvStream for RecvMessage {
     }
 }
 
+// This failure-only query never drives or reads the HTTP/3 parser. Fixed
+// enum labels and scalar parser/QPACK facts keep stderr bounded and payload-free.
+#[cfg(feature = "qcsd")]
+fn qcsd_log_cs_terminal_receive_refusal(
+    message: &RecvMessage,
+    kind: crate::QcsdCsTerminalReceiveKind,
+    phase: &'static str,
+) {
+    use std::io::Write as _;
+    let kind = match kind {
+        crate::QcsdCsTerminalReceiveKind::Drained => "drained",
+        crate::QcsdCsTerminalReceiveKind::IdleInitial => "idle-initial",
+        crate::QcsdCsTerminalReceiveKind::ParserAllowance => "parser-allowance",
+    };
+    let (state, at_boundary, partial_initial, untouched_initial, minimum_remaining, data_remaining) =
+        match &message.state {
+            RecvMessageState::WaitingForResponseHeaders { frame_reader } => (
+                "waiting-response-headers", frame_reader.qcsd_at_frame_boundary(),
+                frame_reader.qcsd_partial_initial_headers(), frame_reader.qcsd_untouched_initial_frame(),
+                Some(frame_reader.qcsd_min_remaining()), None,
+            ),
+            RecvMessageState::WaitingForData { frame_reader } => (
+                "waiting-data", frame_reader.qcsd_at_frame_boundary(), false, false,
+                Some(frame_reader.qcsd_min_remaining()), None,
+            ),
+            RecvMessageState::ReadingData { remaining_data_len } => (
+                "reading-data", false, false, false, None, Some(*remaining_data_len),
+            ),
+            RecvMessageState::DecodingHeaders { .. } => ("decoding-headers", false, false, false, None, None),
+            RecvMessageState::WaitingForFinAfterTrailers { .. } => ("waiting-fin-after-trailers", false, false, false, None, None),
+            RecvMessageState::ClosePending => ("close-pending", false, false, false, None, None),
+            RecvMessageState::Closed => ("closed", false, false, false, None, None),
+            RecvMessageState::ExtendedConnect => ("extended-connect", false, false, false, None, None),
+        };
+    let phase = match phase {
+        "response-or-qpack-guard" | "receive-kind-state" => phase,
+        _ => "unrecognized-local-phase",
+    };
+    let line = format!(
+        "QCSD_CS_TERMINAL_READINESS_HTTP stream={} phase={phase} kind={kind} state={state} response={} http={} blocked_push={} qpack_blocked={} at_frame_boundary={} partial_initial_headers={} untouched_initial={} minimum_remaining={minimum_remaining:?} data_remaining={data_remaining:?}\n",
+        message.stream_id.as_u64(), message.message_type == MessageType::Response,
+        message.stream_type == Http3StreamType::Http, !message.blocked_push_promise.is_empty(),
+        message.qpack_decoder.borrow().is_stream_blocked(message.stream_id),
+        at_boundary, partial_initial, untouched_initial,
+    );
+    let mut stderr = std::io::stderr().lock();
+    if line.len() <= 2_048 {
+        let _ = stderr.write_all(line.as_bytes());
+    } else {
+        let _ = stderr.write_all(b"QCSD_CS_TERMINAL_READINESS_HTTP diagnostic_bound_exceeded\n");
+    }
+}
+
 impl HttpRecvStream for RecvMessage {
     #[cfg(feature = "qcsd")]
     fn qcsd_cs_terminal_receive_ready(&self, kind: crate::QcsdCsTerminalReceiveKind) -> Res<()> {
@@ -641,6 +694,7 @@ impl HttpRecvStream for RecvMessage {
             || !self.blocked_push_promise.is_empty()
             || self.qpack_decoder.borrow().is_stream_blocked(self.stream_id)
         {
+            qcsd_log_cs_terminal_receive_refusal(self, kind, "response-or-qpack-guard");
             return Err(Error::InvalidInput);
         }
         let allowed = match kind {
@@ -658,7 +712,10 @@ impl HttpRecvStream for RecvMessage {
                 RecvMessageState::WaitingForData { frame_reader }
                     if frame_reader.qcsd_at_frame_boundary()),
         };
-        if !allowed { return Err(Error::InvalidInput); }
+        if !allowed {
+            qcsd_log_cs_terminal_receive_refusal(self, kind, "receive-kind-state");
+            return Err(Error::InvalidInput);
+        }
         Ok(())
     }
 

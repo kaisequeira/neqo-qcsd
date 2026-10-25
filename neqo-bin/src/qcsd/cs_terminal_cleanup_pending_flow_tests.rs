@@ -566,3 +566,82 @@ fn fonts_cs_after_onload_original_five_terminal_controls_remain_strict() {
     euro_cs_cleanup_actual_peer_fin_complete_receive_is_not_a_local_cancel();
     euro_cs_cleanup_real_runner_defers_control_then_applies_exact_receipt_ack();
 }
+
+
+// Prospective Native155 failure-localization components. These preserve the
+// original strict outcome; they do not replay Euro108 or authorize a retry.
+#[tokio::test(flavor = "current_thread")]
+async fn cs_terminal_failure_diagnostic_same_target_unowned_pending_stays_strict() {
+    let output = trace_output_dir("cs-terminal-diagnostic-same-target");
+    let (mut endpoint, server, target) = local_abandon_real_http3_fixture(&output);
+    let role = QcsdRequestRole::Chaff {
+        resource_id: 0, request_id: Some(QcsdChaffRequestId(7)),
+    };
+    assert_eq!(endpoint.client.qcsd_cs_terminal_chaff_readiness(target, role, None).unwrap(),
+        neqo_http3::QcsdCsTerminalReadiness::Ready);
+    let control = QcsdAction::LeaseParserReceive {
+        endpoint: endpoint.id, stream: QcsdStreamId(target.as_u64()),
+        absolute_limit: 1_764, increase: 1, owner: None,
+    };
+    assert_eq!(endpoint.client.apply_qcsd_receive_action(&control).unwrap(),
+        Some(QcsdReceiveLimitOutcome::Applied));
+    let identities = endpoint.client.qcsd_pending_receive_action_identities();
+    assert_eq!(identities, [control.receive_identity().unwrap()]);
+    let before = endpoint.client.transport_stats().frame_tx;
+    assert!(matches!(endpoint.client.qcsd_cs_terminal_chaff_readiness(target, role, None),
+        Err(neqo_http3::Error::InvalidInput)));
+    assert_eq!(endpoint.client.qcsd_pending_receive_action_identities(), identities);
+    assert!(endpoint.client.qcsd_has_pending_defense_control());
+    assert!(endpoint.terminal_local_abandonments.is_empty());
+    let after = endpoint.client.transport_stats().frame_tx;
+    assert_eq!(after.max_stream_data, before.max_stream_data);
+    assert_eq!(after.stop_sending, before.stop_sending);
+    assert_eq!(after.reset_stream, before.reset_stream);
+    assert_eq!(after.stream, before.stream);
+    drop(endpoint); drop(server); fs::remove_dir_all(output).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cs_terminal_failure_diagnostic_other_target_control_remains_pending() {
+    let output = trace_output_dir("cs-terminal-diagnostic-other-target");
+    let (mut endpoint, mut server, target) = local_abandon_real_http3_fixture(&output);
+    let now = test_fixture::now();
+    let role = QcsdRequestRole::Chaff {
+        resource_id: 0, request_id: Some(QcsdChaffRequestId(7)),
+    };
+    let other = endpoint.client.apply_qcsd_action(now, QcsdAction::RequestChaff {
+        endpoint: endpoint.id,
+        resource: Resource {
+            id: 1, url: "https://127.0.0.1:4433/protocol-control-only".into(),
+            kind: "Other".into(), content_length: Some(3_000), data_length: 3_000,
+            chaff_priority: true, known_valid: true, depends_on: Vec::new(), headers: Vec::new(),
+        },
+        request_id: QcsdChaffRequestId(8),
+    }).unwrap().unwrap();
+    endpoint.client.stream_close_send(other, now).unwrap();
+    endpoint.client.apply_qcsd_action(now, QcsdAction::ConfigureManualReceive {
+        endpoint: endpoint.id, stream: QcsdStreamId(other.as_u64()), initial_limit: 16,
+    }).unwrap();
+    test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+    endpoint.client.qcsd_prepare_stream_output(now);
+    test_fixture::exchange_packets(&mut endpoint.client, &mut server, false, None);
+    assert!(endpoint.client.qcsd_chaff_send_stream_peer_confirmed(other));
+    let control = QcsdAction::LeaseParserReceive {
+        endpoint: endpoint.id, stream: QcsdStreamId(other.as_u64()),
+        absolute_limit: 17, increase: 1, owner: None,
+    };
+    assert_eq!(endpoint.client.apply_qcsd_receive_action(&control).unwrap(),
+        Some(QcsdReceiveLimitOutcome::Applied));
+    let identities = endpoint.client.qcsd_pending_receive_action_identities();
+    let before = endpoint.client.transport_stats().frame_tx;
+    assert_eq!(endpoint.client.qcsd_cs_terminal_chaff_readiness(target, role, None).unwrap(),
+        neqo_http3::QcsdCsTerminalReadiness::PendingDefenseControl);
+    assert_eq!(endpoint.client.qcsd_pending_receive_action_identities(), identities);
+    assert!(endpoint.terminal_local_abandonments.is_empty());
+    let after = endpoint.client.transport_stats().frame_tx;
+    assert_eq!(after.max_stream_data, before.max_stream_data);
+    assert_eq!(after.stop_sending, before.stop_sending);
+    assert_eq!(after.reset_stream, before.reset_stream);
+    assert_eq!(after.stream, before.stream);
+    drop(endpoint); drop(server); fs::remove_dir_all(output).unwrap();
+}
