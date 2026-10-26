@@ -2600,7 +2600,10 @@ impl TimedEgressHelper {
         latest_enqueue_tai_ns: u64,
         report_timeout: Duration,
     ) -> Result<TimedEgressJobResult, TimedEgressError> {
+        super::buflo_preoutput_diagnostic_mark(50, Some(job_id), None);
         let (response, result) = mpsc::sync_channel(1);
+        super::buflo_preoutput_diagnostic_mark(51, Some(job_id), None);
+        super::buflo_preoutput_diagnostic_mark(52, Some(job_id), None);
         self.sender
             .send(HelperCommand::TransmitMain {
                 job_id,
@@ -2613,6 +2616,7 @@ impl TimedEgressHelper {
                 runner_submit_clocks: buflo_enqueue_gap_clocks(),
             })
             .map_err(|source| TimedEgressError::Channel(source.to_string()))?;
+        super::buflo_preoutput_diagnostic_mark(53, Some(job_id), None);
         result
             .recv()
             .map_err(|source| TimedEgressError::Channel(source.to_string()))?

@@ -341,6 +341,324 @@ fn cs_preoutput_diagnostic_take_failure() -> Option<serde_json::Value> {
 }
 // END ROOT CS PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
 
+// BEGIN ROOT BF PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
+// Opt-in engineering observations only. No sample is returned to a decision
+// clock, controller, transport, action, deadline or scientific predicate.
+const BUFLO_PREOUTPUT_SAMPLE_LIMIT: usize = 256;
+const BUFLO_PREOUTPUT_JSON_LIMIT: usize = 64 * 1024;
+const BUFLO_PREOUTPUT_STAGES: [&str; 56] = [
+    "control_enter", "backlog_before", "backlog_after", "application_reduce_before",
+    "flush_before", "flush_after", "poll_before", "poll_after", "queued_apply_before",
+    "batch_preflight_before", "batch_preflight_after", "receive_apply_before",
+    "receive_apply_after", "queued_apply_after", "post_apply_priority_before",
+    "retry_inventory_before", "retry_inventory_after", "expiry_selected",
+    "ordinary_output_before", "pending_capture_before", "preparation_before", "preparation_after",
+    "cancel_rejected_before", "cancel_rejected_after",
+    "cancel_barrier_observations_before", "cancel_barrier_observations_after",
+    "action_apply_before", "action_apply_after",
+    "queued_retry_chaff_before", "queued_retry_chaff_after",
+    "queued_reconcile_before", "queued_reconcile_after",
+    "queued_retry_terminal_before", "queued_retry_terminal_after",
+    "queued_drain_before",
+    "queued_drain_after",
+    "action_register_before",
+    "action_register_after",
+    "receive_preflight_before",
+    "receive_preflight_after",
+    "transport_apply_before",
+    "transport_apply_after",
+    "main_job_lookup_before",
+    "main_job_lookup_after",
+    "main_tuple_before",
+    "main_tuple_after",
+    "main_sha256_before",
+    "main_sha256_after",
+    "main_helper_before",
+    "main_helper_after",
+    "response_channel_before",
+    "response_channel_after",
+    "command_send_before",
+    "command_send_after",
+    "main_call_before",
+    "main_call_after",
+];
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BufloPreoutputSample {
+    sequence: u64,
+    control: u64,
+    stage: u8,
+    control_at_process_ns: Option<u64>,
+    control_elapsed_defense_ns: Option<u64>,
+    defense_start_process_ns: Option<u64>,
+    wall_before_ns: u64,
+    thread_cpu_ns: Option<u64>,
+    wall_after_ns: u64,
+    endpoint: Option<u64>,
+    stream: Option<u64>,
+    slot: Option<u64>,
+    limit: Option<u64>,
+    target_defense_ns: Option<u64>,
+    deadline_defense_ns: Option<u64>,
+    job_id: Option<u64>,
+    event_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BufloPreoutputIdentity {
+    endpoint: Option<u64>,
+    stream: Option<u64>,
+    slot: Option<u64>,
+    limit: Option<u64>,
+    target_defense_ns: Option<u64>,
+    deadline_defense_ns: Option<u64>,
+    job_id: Option<u64>,
+    event_id: Option<u64>,
+}
+
+struct BufloPreoutputDiagnostic {
+    origin: Instant,
+    samples: Box<[Option<BufloPreoutputSample>; BUFLO_PREOUTPUT_SAMPLE_LIMIT]>,
+    next: usize,
+    len: usize,
+    sequence: u64,
+    control: u64,
+    dropped: u64,
+    unavailable_cpu: u64,
+    frozen: bool,
+    freeze_reason: Option<&'static str>,
+    // Mappings are observations of the original control/defense instants.
+    // They do not select or reset either origin.
+    control_at_process_ns: Option<u64>,
+    control_elapsed_defense_ns: Option<u64>,
+    defense_start_process_ns: Option<u64>,
+}
+
+impl BufloPreoutputDiagnostic {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            samples: Box::new([None; BUFLO_PREOUTPUT_SAMPLE_LIMIT]),
+            next: 0,
+            len: 0,
+            sequence: 0,
+            control: 0,
+            dropped: 0,
+            unavailable_cpu: 0,
+            frozen: false,
+            freeze_reason: None,
+            control_at_process_ns: None,
+            control_elapsed_defense_ns: None,
+            defense_start_process_ns: None,
+        }
+    }
+
+    fn record_sample(
+        &mut self,
+        stage: u8,
+        identity: BufloPreoutputIdentity,
+        wall_before_ns: u64,
+        thread_cpu_ns: Option<u64>,
+        wall_after_ns: u64,
+    ) {
+        if self.frozen {
+            return;
+        }
+        if self.len == self.samples.len() {
+            self.dropped = self.dropped.saturating_add(1);
+        } else {
+            self.len += 1;
+        }
+        if thread_cpu_ns.is_none() {
+            self.unavailable_cpu = self.unavailable_cpu.saturating_add(1);
+        }
+        self.samples[self.next] = Some(BufloPreoutputSample {
+            sequence: self.sequence,
+            control: self.control,
+            stage,
+            control_at_process_ns: self.control_at_process_ns,
+            control_elapsed_defense_ns: self.control_elapsed_defense_ns,
+            defense_start_process_ns: self.defense_start_process_ns,
+            wall_before_ns,
+            thread_cpu_ns,
+            wall_after_ns,
+            endpoint: identity.endpoint,
+            stream: identity.stream,
+            slot: identity.slot,
+            limit: identity.limit,
+            target_defense_ns: identity.target_defense_ns,
+            deadline_defense_ns: identity.deadline_defense_ns,
+            job_id: identity.job_id,
+            event_id: identity.event_id,
+        });
+        self.next = (self.next + 1) % self.samples.len();
+        self.sequence = self.sequence.saturating_add(1);
+    }
+
+    fn record(&mut self, stage: u8, identity: BufloPreoutputIdentity) {
+        if self.frozen {
+            return;
+        }
+        // Independent diagnostic reads: never call the runner's injected now
+        // closure or consume a physical-handoff/test decision-clock sample.
+        let before = Instant::now();
+        #[cfg(target_os = "linux")]
+        let cpu = timed_egress::clock_thread_cpu_ns().ok();
+        #[cfg(not(target_os = "linux"))]
+        let cpu = None;
+        let after = Instant::now();
+        self.record_sample(
+            stage,
+            identity,
+            duration_as_u64_nanos(before.saturating_duration_since(self.origin)),
+            cpu,
+            duration_as_u64_nanos(after.saturating_duration_since(self.origin)),
+        );
+    }
+
+    fn freeze(&mut self, reason: &'static str) {
+        if !self.frozen {
+            self.frozen = true;
+            self.freeze_reason = Some(reason);
+        }
+    }
+
+    fn failure_value(&self) -> Option<serde_json::Value> {
+        if !self.frozen {
+            return None;
+        }
+        // Called once after the physical/control loop has ended. All JSON,
+        // allocation and size trimming here are outside the observed segment.
+        let first = (self.next + self.samples.len() - self.len) % self.samples.len();
+        let mut entries = (0..self.len)
+            .filter_map(|index| self.samples[(first + index) % self.samples.len()])
+            .collect::<Vec<_>>();
+        let mut serialized_dropped = 0_u64;
+        loop {
+            let value = json!({
+                "schema_version": 1,
+                "source": "runner-BF-preoutput-wall-threadCPU-observation-v1",
+                "observations_only": true,
+                "opt_in": "QCSD_BF_PREOUTPUT_DIAGNOSTIC=1",
+                "time_basis": "independent-Instant-brackets-relative-to-original-process_start",
+                "cpu_basis": "CLOCK_THREAD_CPUTIME_ID-or-null",
+                "current_thread_runner": true,
+                "interpretation": "adjacent retained wall and same-thread CPU intervals only; missing boundaries or dropped samples mean unknown; wall-minus-CPU does not identify descheduling",
+                "decision_clock_samples_consumed": false,
+                "scientific_credit_added": 0,
+                "max_samples": BUFLO_PREOUTPUT_SAMPLE_LIMIT,
+                "max_json_bytes": BUFLO_PREOUTPUT_JSON_LIMIT,
+                "dropped": self.dropped,
+                "serialized_dropped": serialized_dropped,
+                "unavailable_cpu": self.unavailable_cpu,
+                "freeze_reason": self.freeze_reason,
+                "last_control_at_process_ns": self.control_at_process_ns,
+                "last_control_elapsed_defense_ns": self.control_elapsed_defense_ns,
+                "original_defense_start_process_ns": self.defense_start_process_ns,
+                "stages": BUFLO_PREOUTPUT_STAGES.as_slice(),
+                "entries": &entries,
+            });
+            let Ok(raw) = serde_json::to_vec(&value) else { return None; };
+            if raw.len() <= BUFLO_PREOUTPUT_JSON_LIMIT {
+                return Some(value);
+            }
+            if entries.is_empty() {
+                return None;
+            }
+            entries.remove(0);
+            serialized_dropped = serialized_dropped.saturating_add(1);
+        }
+    }
+}
+
+thread_local! {
+    // execute_run_inner is explicitly a current-thread future. One owned run
+    // initializes this once; hooks never scan or clone a controller ledger.
+    static BUFLO_PREOUTPUT_DIAGNOSTIC: RefCell<Option<BufloPreoutputDiagnostic>> = const { RefCell::new(None) };
+}
+
+fn buflo_preoutput_diagnostic_enabled(
+    defense: &DefenseConfig,
+    flag: Option<&std::ffi::OsStr>,
+) -> bool {
+    matches!(defense, DefenseConfig::Buflo(_))
+        && flag == Some(std::ffi::OsStr::new("1"))
+}
+
+fn buflo_preoutput_diagnostic_start(origin: Instant, defense: &DefenseConfig) {
+    let flag = std::env::var_os("QCSD_BF_PREOUTPUT_DIAGNOSTIC");
+    let enabled = buflo_preoutput_diagnostic_enabled(defense, flag.as_deref());
+    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        *state.borrow_mut() = enabled.then(|| BufloPreoutputDiagnostic::new(origin));
+    });
+}
+
+fn buflo_preoutput_diagnostic_mark(stage: u8, job_id: Option<u64>, event_id: Option<u64>) {
+    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            diagnostic.record(stage, BufloPreoutputIdentity {
+                job_id, event_id, ..BufloPreoutputIdentity::default()
+            });
+        }
+    });
+}
+
+fn buflo_preoutput_diagnostic_control(
+    control_now: Instant,
+    elapsed: Option<Duration>,
+    defense_start: Option<Instant>,
+) {
+    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            if diagnostic.frozen {
+                return;
+            }
+            diagnostic.control = diagnostic.control.saturating_add(1);
+            diagnostic.control_at_process_ns = Some(duration_as_u64_nanos(
+                control_now.saturating_duration_since(diagnostic.origin)));
+            diagnostic.control_elapsed_defense_ns = elapsed.map(duration_as_u64_nanos);
+            diagnostic.defense_start_process_ns = defense_start.map(|started|
+                duration_as_u64_nanos(started.saturating_duration_since(diagnostic.origin)));
+            diagnostic.record(0, BufloPreoutputIdentity::default());
+        }
+    });
+}
+
+fn buflo_preoutput_diagnostic_receive(stage: u8, action: &QcsdAction, window: Duration) {
+    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            if let Some((endpoint, stream, limit)) = receive_action_target(action) {
+                let scheduled = scheduled_action(action);
+                let target = scheduled.map(|(_, packet, _)| packet.timestamp());
+                diagnostic.record(stage, BufloPreoutputIdentity {
+                    endpoint: Some(endpoint.0),
+                    stream: Some(stream.0),
+                    slot: scheduled.map(|(_, _, slot)| slot.0),
+                    limit: Some(limit),
+                    target_defense_ns: target.map(duration_as_u64_nanos),
+                    deadline_defense_ns: target.and_then(|at| at.checked_add(window))
+                        .map(duration_as_u64_nanos),
+                    job_id: None,
+                    event_id: scheduled.map(|(_, _, slot)| slot.0),
+                });
+            }
+        }
+    });
+}
+
+fn buflo_preoutput_diagnostic_freeze(reason: &'static str) {
+    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+        if let Some(diagnostic) = state.borrow_mut().as_mut() {
+            diagnostic.freeze(reason);
+        }
+    });
+}
+
+fn buflo_preoutput_diagnostic_take_failure() -> Option<serde_json::Value> {
+    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| state.borrow_mut().take()?.failure_value())
+}
+// END ROOT BF PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
+
 const NEQO_BASE_COMMIT: &str = "8a04d065c2d35c8e8fd804f91c7081ab6bb60b89";
 const PUBLISHED_QCSD_COMMIT: &str = "39e293fb384dd341156eedd1e4b833d24904b1f6";
 // The local QUIC transport parameter limits what peers may send to this client.
@@ -7438,7 +7756,9 @@ impl BufloKernelTxRuntime {
         event_id: u64,
         batch: datagram::Batch,
     ) -> Result<(BufloKernelPhysicalTxTime, u64), Error> {
+        buflo_preoutput_diagnostic_mark(42, Some(job_id), Some(event_id));
         let job = self.current_job(job_id)?;
+        buflo_preoutput_diagnostic_mark(43, Some(job_id), Some(event_id));
         if !job.items.is_empty() || event_id != job.tick.saturating_mul(2) {
             return Err(Error::SlotInvariant(format!(
                 "BuFLO kernel job {job_id} main item order or event identity was invalid"
@@ -7449,16 +7769,22 @@ impl BufloKernelTxRuntime {
         let scm_txtime_tai_ns = target_tai_ns
             .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
             .ok_or_else(|| Error::DefenseExecution("BuFLO SCM_TXTIME overflow".into()))?;
+        buflo_preoutput_diagnostic_mark(44, Some(job_id), Some(event_id));
         self.validate_batch_tuple(endpoint_index, &batch)?;
+        buflo_preoutput_diagnostic_mark(45, Some(job_id), Some(event_id));
+        buflo_preoutput_diagnostic_mark(46, Some(job_id), Some(event_id));
         let datagram_sha256 = sha256(batch.data())?;
+        buflo_preoutput_diagnostic_mark(47, Some(job_id), Some(event_id));
         let source_address = batch.source();
         let destination_address = batch.destination();
         let udp_payload_bytes = batch.data().len();
-        let result = self
+        buflo_preoutput_diagnostic_mark(48, Some(job_id), Some(event_id));
+        let helper = self
             .helper
             .as_mut()
-            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?
-            .transmit_main(
+            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?;
+        buflo_preoutput_diagnostic_mark(49, Some(job_id), Some(event_id));
+        let result = helper.transmit_main(
                 job_id,
                 endpoint_index,
                 batch,
@@ -16867,6 +17193,7 @@ fn deadline_error(
 fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
     if let Some(failure) = controller.terminal_failure() {
         cs_preoutput_diagnostic_freeze("first-controller-terminal-failure");
+        buflo_preoutput_diagnostic_freeze("first-controller-terminal-failure");
         return Err(Error::DefenseExecution(failure.into()));
     }
     Ok(())
@@ -17023,6 +17350,7 @@ async fn execute_run_inner(
     terminal_artifact: &mut Option<StagedTerminalRunArtifact>,
 ) -> Result<Vec<ResponseResult>, Error> {
     cs_preoutput_diagnostic_start(process_start, &spec.config.defense);
+    buflo_preoutput_diagnostic_start(process_start, &spec.config.defense);
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
     if matches!(&spec.config.defense, DefenseConfig::CsBuflo(_)) {
         traces.require_cs_incoming_process_witnesses();
@@ -17645,6 +17973,7 @@ async fn execute_run_inner(
             let control_now = now();
             let control_elapsed = defense_elapsed_at!(control_now);
             cs_preoutput_diagnostic_control(control_now, control_elapsed, defense_start);
+            buflo_preoutput_diagnostic_control(control_now, control_elapsed, defense_start);
             if let Some(defense_elapsed) = control_elapsed {
                 handle_all_qcsd_observations(
                     &mut endpoints,
@@ -17658,6 +17987,7 @@ async fn execute_run_inner(
                     matches!(&spec.config.defense, DefenseConfig::Buflo(_))
                         && controller.defense_diagnostics().buflo_schedule_stop_latched;
                 cs_preoutput_diagnostic_mark(1);
+                buflo_preoutput_diagnostic_mark(1, None, None);
                 let (egress_stream_backlog_pending, egress_backlog_pending) = if candidate_defense {
                     endpoints
                         .iter_mut()
@@ -17717,7 +18047,9 @@ async fn execute_run_inner(
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
                 cs_preoutput_diagnostic_mark(2);
+                buflo_preoutput_diagnostic_mark(2, None, None);
                 cs_preoutput_diagnostic_mark(3);
+                buflo_preoutput_diagnostic_mark(3, None, None);
                 observe_completed_application(
                     &mut controller,
                     &mut traces,
@@ -17729,8 +18061,10 @@ async fn execute_run_inner(
                     defense_elapsed,
                 )?;
                 cs_preoutput_diagnostic_mark(4);
+                buflo_preoutput_diagnostic_mark(4, None, None);
                 controller.flush_defense_observations();
                 cs_preoutput_diagnostic_mark(5);
+                buflo_preoutput_diagnostic_mark(5, None, None);
                 ensure_defense_realizable(&controller)?;
                 yield_to_exact_boundaries!('runner, "after-control-flush-realizability");
                 if controller.has_rolling_outgoing_prearm()
@@ -17753,11 +18087,14 @@ async fn execute_run_inner(
                 let kernel_tick_zero_pending = false;
                 if !kernel_tick_zero_pending {
                     cs_preoutput_diagnostic_mark(6);
+                    buflo_preoutput_diagnostic_mark(6, None, None);
                     controller.poll(defense_elapsed);
                     cs_preoutput_diagnostic_mark(7);
+                    buflo_preoutput_diagnostic_mark(7, None, None);
                     first_control_poll_complete = true;
                     ensure_defense_realizable(&controller)?;
                     cs_preoutput_diagnostic_mark(8);
+                    buflo_preoutput_diagnostic_mark(8, None, None);
                     apply_queued_actions(
                         &mut endpoints,
                         &mut controller,
@@ -17767,13 +18104,16 @@ async fn execute_run_inner(
                         defense_elapsed,
                     )?;
                     cs_preoutput_diagnostic_mark(13);
+                    buflo_preoutput_diagnostic_mark(13, None, None);
                 }
                 cs_preoutput_diagnostic_mark(14);
+                buflo_preoutput_diagnostic_mark(14, None, None);
                 yield_to_exact_boundaries!('runner, "after-control-poll-actions");
             }
 
             for endpoint_index in 0..endpoints.len() {
                 cs_preoutput_diagnostic_mark(18);
+                buflo_preoutput_diagnostic_mark(18, None, None);
                 yield_to_exact_boundaries!('runner, "before-second-output-drive");
                 if let Some(boundary) = tamaraw_ordinary_work_boundary(
                     &controller,
@@ -18025,6 +18365,7 @@ async fn execute_run_inner(
     .await;
     if loop_result.is_err() {
         cs_preoutput_diagnostic_freeze("first-loop-error-before-terminal-cleanup");
+        buflo_preoutput_diagnostic_freeze("first-loop-error-before-terminal-cleanup");
     }
 
     #[cfg(target_os = "linux")]
@@ -21260,10 +21601,12 @@ fn cancel_rejected_receive_streams(
     // Cancellation and terminal observations are a reducer barrier: no later,
     // unrelated action may reach an adapter before global ordered delivery.
     cs_preoutput_diagnostic_mark(24);
+    buflo_preoutput_diagnostic_mark(24, None, None);
     handle_all_qcsd_observations(endpoints, controller, traces, defense_elapsed)?;
     controller.flush_defense_observations();
     ensure_defense_realizable(controller)?;
     cs_preoutput_diagnostic_mark(25);
+    buflo_preoutput_diagnostic_mark(25, None, None);
     Ok(canceled_indices)
 }
 
@@ -21277,10 +21620,17 @@ fn apply_action_batch(
     actions: Vec<QcsdAction>,
 ) -> Result<(), Error> {
     cs_preoutput_diagnostic_mark(9);
+    buflo_preoutput_diagnostic_mark(9, None, None);
+    buflo_preoutput_diagnostic_mark(36, None, None);
     let incoming_fanout_slots = register_action_batch(traces, now, &actions)?;
+    buflo_preoutput_diagnostic_mark(37, None, None);
+    buflo_preoutput_diagnostic_mark(38, None, None);
     let preflight = preflight_receive_action_batch(endpoints, traces, now, &actions)?;
+    buflo_preoutput_diagnostic_mark(39, None, None);
     cs_preoutput_diagnostic_mark(10);
+    buflo_preoutput_diagnostic_mark(10, None, None);
     cs_preoutput_diagnostic_mark(22);
+    buflo_preoutput_diagnostic_mark(22, None, None);
     let canceled_indices = cancel_rejected_receive_streams(
         endpoints,
         controller,
@@ -21291,6 +21641,7 @@ fn apply_action_batch(
         &preflight.rejected_streams,
     )?;
     cs_preoutput_diagnostic_mark(23);
+    buflo_preoutput_diagnostic_mark(23, None, None);
     for (index, action) in actions.into_iter().enumerate() {
         if let Some(outcome) = canceled_indices.get(&index).copied() {
             let event_outcome = format!("canceled_receive_{}", receive_limit_outcome_name(outcome));
@@ -21306,6 +21657,7 @@ fn apply_action_batch(
         let may_skip_terminal_sibling = scheduled_action(&action)
             .is_some_and(|(_, _, slot)| incoming_fanout_slots.contains(&slot));
         cs_preoutput_diagnostic_mark(26);
+        buflo_preoutput_diagnostic_mark(26, None, None);
         apply_action(
             endpoints,
             controller,
@@ -21318,6 +21670,7 @@ fn apply_action_batch(
             preflight.expected[index],
         )?;
         cs_preoutput_diagnostic_mark(27);
+        buflo_preoutput_diagnostic_mark(27, None, None);
     }
     Ok(())
 }
@@ -21361,12 +21714,15 @@ fn apply_queued_actions(
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
     cs_preoutput_diagnostic_mark(32);
+    buflo_preoutput_diagnostic_mark(32, None, None);
     retry_pending_cs_terminal_cancellations(
         endpoints, controller, chaff_manifest, traces, now, defense_elapsed,
     )?;
     cs_preoutput_diagnostic_mark(33);
+    buflo_preoutput_diagnostic_mark(33, None, None);
     loop {
         cs_preoutput_diagnostic_mark(28);
+        buflo_preoutput_diagnostic_mark(28, None, None);
         retry_pending_chaff_requests(
             endpoints,
             controller,
@@ -21376,13 +21732,18 @@ fn apply_queued_actions(
             defense_elapsed,
         )?;
         cs_preoutput_diagnostic_mark(29);
+        buflo_preoutput_diagnostic_mark(29, None, None);
         // FRONT's frozen schedule is reconciled before every action batch so
         // RequestChaff-created streams can immediately receive any due credit
         // before a prearmed outgoing target is eligible to flush.
         cs_preoutput_diagnostic_mark(30);
+        buflo_preoutput_diagnostic_mark(30, None, None);
         controller.reconcile_due_fixed(defense_elapsed);
         cs_preoutput_diagnostic_mark(31);
+        buflo_preoutput_diagnostic_mark(31, None, None);
+        buflo_preoutput_diagnostic_mark(34, None, None);
         let actions: Vec<_> = controller.drain_actions().collect();
+        buflo_preoutput_diagnostic_mark(35, None, None);
         if actions.is_empty() {
             return Ok(());
         }
@@ -22057,9 +22418,11 @@ fn apply_action(
             )));
         }
         cs_preoutput_diagnostic_receive(11, &trace_action, controller.config().control_interval());
+        buflo_preoutput_diagnostic_receive(11, &trace_action, controller.config().control_interval());
         match endpoint.client.apply_qcsd_receive_action(&trace_action) {
             Ok(Some(QcsdReceiveLimitOutcome::Applied)) => {
                 cs_preoutput_diagnostic_receive(12, &trace_action, controller.config().control_interval());
+                buflo_preoutput_diagnostic_receive(12, &trace_action, controller.config().control_interval());
                 traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
                 return Ok(());
             }
@@ -22270,7 +22633,11 @@ fn apply_action(
             endpoint.terminal_local_abandonments.push(proof);
             Ok(None)
         } else {
-            endpoint.client.apply_qcsd_action(transport_at, action)
+            let event_id = self::scheduled_action(&trace_action).map(|(_, _, slot)| slot.0);
+            buflo_preoutput_diagnostic_mark(40, None, event_id);
+            let result = endpoint.client.apply_qcsd_action(transport_at, action);
+            buflo_preoutput_diagnostic_mark(41, None, event_id);
+            result
         };
     match adapter_result {
         Ok(chaff_stream) => {
@@ -23710,6 +24077,7 @@ async fn dispatch_due_cs_exact_incoming_retry(
 ) -> Result<bool, Error> {
     let current = now();
     cs_preoutput_diagnostic_mark(15);
+    buflo_preoutput_diagnostic_mark(15, None, None);
     let inventory = cs_exact_incoming_retry_inventory(
         defense,
         endpoints,
@@ -23719,8 +24087,10 @@ async fn dispatch_due_cs_exact_incoming_retry(
         attempted,
     )?;
     cs_preoutput_diagnostic_mark(16);
+    buflo_preoutput_diagnostic_mark(16, None, None);
     if inventory.earliest_expired_deadline.is_some() {
         cs_preoutput_diagnostic_mark(17);
+        buflo_preoutput_diagnostic_mark(17, None, None);
         expire_due_cs_exact_incoming_credit(
             endpoints,
             controller,
@@ -25970,11 +26340,13 @@ async fn dispatch_buflo_kernel_release(
     }
     preparation_diagnostic.complete();
     enqueue_gap.record("runner-before-exact-main");
+    buflo_preoutput_diagnostic_mark(54, Some(job_id), Some(guard.slot.0));
     let main_result = if runtime.conservative_kernel_enqueue_witness {
         runtime.transmit_exact_main_schema15(job_id, guard.endpoint_index, guard.endpoint, guard.slot.0, prepared.batch.clone())
     } else {
         runtime.transmit_exact_main(job_id, guard.endpoint_index, guard.endpoint, guard.slot.0, prepared.batch.clone())
     };
+    buflo_preoutput_diagnostic_mark(55, Some(job_id), Some(guard.slot.0));
     let (physical_time, main_item_id) = match main_result {
         Ok(result) => result,
         Err(error) => {
@@ -28693,6 +29065,7 @@ async fn process_output_once_with_clock_with_admitted_tail(
     };
     let cs_incoming = matches!(controller.config().defense, DefenseConfig::CsBuflo(_));
     cs_preoutput_diagnostic_mark(19);
+    buflo_preoutput_diagnostic_mark(19, None, None);
     let pending_receive_actions = if cs_incoming {
         endpoint.client.qcsd_pending_receive_action_identities()
     } else {
@@ -28704,8 +29077,10 @@ async fn process_output_once_with_clock_with_admitted_tail(
         drive_now
     };
     cs_preoutput_diagnostic_mark(20);
+    buflo_preoutput_diagnostic_mark(20, None, None);
     let prepared_output = prepare_output_once_with_clock(endpoint, drive_now).await;
     cs_preoutput_diagnostic_mark(21);
+    buflo_preoutput_diagnostic_mark(21, None, None);
     let preparation_completed = if cs_incoming {
         monotonic_clock()
     } else {
@@ -29682,6 +30057,9 @@ fn render_run_json(
     if completion_status != "complete" {
         if let Some(window) = cs_preoutput_diagnostic_take_failure() {
             run["cs_preoutput_control_segment_observations"] = window;
+        }
+        if let Some(window) = buflo_preoutput_diagnostic_take_failure() {
+            run["buflo_preoutput_control_segment_observations"] = window;
         }
         if let Some(first_causes) = http3_first_error_snapshot(endpoints) {
             run["http3_first_error_observations"] = first_causes;
@@ -63755,3 +64133,104 @@ mod conservative_kernel_enqueue_witness_tests {
         assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item, None));
     }
 }
+
+
+// BEGIN ROOT BF PREOUTPUT OBSERVATIONAL TEST 001
+#[cfg(test)]
+mod buflo_preoutput_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn bf_preoutput_subcall_identity_ring_freeze_and_disabled_hook_are_observational() {
+        let bf = DefenseConfig::Buflo(Default::default());
+        let cs = DefenseConfig::CsBuflo(Default::default());
+        let one = Some(std::ffi::OsStr::new("1"));
+        assert!(buflo_preoutput_diagnostic_enabled(&bf, one));
+        assert!(!buflo_preoutput_diagnostic_enabled(&bf, None));
+        assert!(!buflo_preoutput_diagnostic_enabled(&bf, Some(std::ffi::OsStr::new("0"))));
+        assert!(!buflo_preoutput_diagnostic_enabled(&cs, one));
+        assert!(!buflo_preoutput_diagnostic_enabled(&DefenseConfig::None, one));
+        assert_eq!(&BUFLO_PREOUTPUT_STAGES[..34], CS_PREOUTPUT_STAGES.as_slice());
+        assert_eq!(&BUFLO_PREOUTPUT_STAGES[34..], &[
+            "queued_drain_before", "queued_drain_after",
+            "action_register_before", "action_register_after",
+            "receive_preflight_before", "receive_preflight_after",
+            "transport_apply_before", "transport_apply_after",
+            "main_job_lookup_before", "main_job_lookup_after",
+            "main_tuple_before", "main_tuple_after",
+            "main_sha256_before", "main_sha256_after",
+            "main_helper_before", "main_helper_after",
+            "response_channel_before", "response_channel_after",
+            "command_send_before", "command_send_after",
+            "main_call_before", "main_call_after",
+        ]);
+        // A disabled hook neither constructs a ring nor returns an observation.
+        BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| *state.borrow_mut() = None);
+        buflo_preoutput_diagnostic_mark(50, Some(7), None);
+        buflo_preoutput_diagnostic_freeze("disabled");
+        assert!(buflo_preoutput_diagnostic_take_failure().is_none());
+
+        // Install only the test thread's BF ring; no process environment mutation.
+        BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+            *state.borrow_mut() = Some(BufloPreoutputDiagnostic::new(Instant::now()));
+        });
+        for stage in 50..54 {
+            buflo_preoutput_diagnostic_mark(stage, Some(7), None);
+        }
+        buflo_preoutput_diagnostic_mark(54, Some(7), Some(14));
+        assert!(BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
+            state.borrow().as_ref().unwrap().failure_value().is_none()
+        }));
+        buflo_preoutput_diagnostic_freeze("test-terminal");
+        buflo_preoutput_diagnostic_mark(55, Some(7), Some(14));
+        buflo_preoutput_diagnostic_freeze("must-not-replace-first");
+        let value = buflo_preoutput_diagnostic_take_failure().unwrap();
+        assert_eq!(value["freeze_reason"], "test-terminal");
+        let entries = value["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 5);
+        for (index, stage) in (50..54).enumerate() {
+            assert_eq!(entries[index]["stage"], stage);
+            assert_eq!(entries[index]["job_id"], 7);
+            assert!(entries[index]["event_id"].is_null());
+        }
+        assert_eq!(entries[4]["event_id"], 14);
+        assert_eq!(value["scientific_credit_added"], 0);
+        assert_eq!(value["decision_clock_samples_consumed"], false);
+        assert!(buflo_preoutput_diagnostic_take_failure().is_none());
+
+        // Deterministic samples exercise wrap/drop and worst-width JSON trimming.
+        let mut ring = BufloPreoutputDiagnostic::new(Instant::now());
+        ring.control = u64::MAX;
+        ring.control_at_process_ns = Some(u64::MAX);
+        ring.control_elapsed_defense_ns = Some(u64::MAX);
+        ring.defense_start_process_ns = Some(u64::MAX);
+        for sequence in 0..300_u64 {
+            ring.record_sample(55, BufloPreoutputIdentity {
+                endpoint: Some(u64::MAX), stream: Some(u64::MAX), slot: Some(u64::MAX),
+                limit: Some(u64::MAX), target_defense_ns: Some(u64::MAX),
+                deadline_defense_ns: Some(u64::MAX), job_id: Some(7), event_id: Some(14),
+            }, u64::MAX - 1, Some(u64::MAX - sequence), u64::MAX);
+        }
+        assert_eq!(ring.len, BUFLO_PREOUTPUT_SAMPLE_LIMIT);
+        assert_eq!(ring.dropped, 44);
+        assert!(ring.failure_value().is_none());
+        ring.freeze("bounded-test-terminal");
+        ring.record_sample(1, BufloPreoutputIdentity::default(), 1, None, 2);
+        assert_eq!(ring.sequence, 300);
+        let value = ring.failure_value().unwrap();
+        assert_eq!(value["stages"].as_array().unwrap().len(), 56);
+        assert!(value["serialized_dropped"].as_u64().unwrap() > 0);
+        let entries = value["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert_eq!(entries.last().unwrap()["sequence"], 299);
+        assert!(entries.windows(2).all(|pair|
+            pair[0]["sequence"].as_u64().unwrap() + 1 == pair[1]["sequence"].as_u64().unwrap()));
+        assert!(serde_json::to_vec(&value).unwrap().len() <= BUFLO_PREOUTPUT_JSON_LIMIT);
+
+        let mut no_cpu = BufloPreoutputDiagnostic::new(Instant::now());
+        no_cpu.record_sample(40, BufloPreoutputIdentity::default(), 1, None, 2);
+        assert_eq!(no_cpu.unavailable_cpu, 1);
+        assert!(no_cpu.samples[0].unwrap().thread_cpu_ns.is_none());
+    }
+}
+// END ROOT BF PREOUTPUT OBSERVATIONAL TEST 001
