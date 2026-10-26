@@ -17352,7 +17352,10 @@ async fn execute_run_inner(
     cs_preoutput_diagnostic_start(process_start, &spec.config.defense);
     buflo_preoutput_diagnostic_start(process_start, &spec.config.defense);
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
-    if matches!(&spec.config.defense, DefenseConfig::CsBuflo(_)) {
+    if matches!(
+        &spec.config.defense,
+        DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
+    ) {
         traces.require_cs_incoming_process_witnesses();
     }
     let observation_clock = QcsdObservationClock::new(process_start);

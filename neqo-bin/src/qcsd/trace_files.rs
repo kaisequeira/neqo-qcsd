@@ -3443,3 +3443,266 @@ mod fixed_backlog_trace_deferral_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod root_buflo_owned_terminal_process_clock_tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    use neqo_csdef::{
+        BufloConfig, DefenseConfig, QcsdAction, QcsdConfig, QcsdObservationClock,
+        QcsdRequestRole, StaticSchedule, Trace,
+    };
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct OwnedFixture {
+        controller: QcsdController,
+        traces: TraceFiles,
+        path: std::path::PathBuf,
+        endpoint: QcsdEndpointId,
+        slot: QcsdSlotId,
+        packet: Packet,
+    }
+    impl OwnedFixture {
+        fn new(consumed: u64) -> Self {
+            let start = Instant::now();
+            let path = std::env::temp_dir().join(format!(
+                "neqo-buflo-owned-process-clock-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("fresh fixture");
+            let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1200).expect("owned1200");
+            let mut controller = QcsdController::with_defense(
+                QcsdConfig {
+                    max_udp_payload_size: 1200,
+                    initial_max_stream_data: 1,
+                    defense: DefenseConfig::Buflo(BufloConfig {
+                        parameters: "fixture-only.json".into(),
+                    }),
+                    ..QcsdConfig::default()
+                },
+                None,
+                Box::new(StaticSchedule::new(Trace::new([packet]), false)),
+            )
+            .expect("controller");
+            let endpoint = QcsdEndpointId(0);
+            let stream = QcsdStreamId(4);
+            controller.observe(
+                QcsdObservation::EndpointReady {
+                    endpoint,
+                    origin: "https://clock.example".into(),
+                    max_udp_payload_size: 1200,
+                },
+                Duration::ZERO,
+            );
+            controller.observe(
+                QcsdObservation::StreamOpened {
+                    endpoint,
+                    stream,
+                    role: QcsdRequestRole::Application,
+                    expected_response_length: Some(1201),
+                },
+                Duration::ZERO,
+            );
+            // The original one-byte initial window is not scheduled credit.
+            controller.observe(
+                QcsdObservation::BytesRead {
+                    endpoint,
+                    stream,
+                    bytes: 1,
+                },
+                Duration::ZERO,
+            );
+            controller.drain_actions().for_each(drop);
+            controller.poll(Duration::ZERO);
+            let action = controller
+                .drain_actions()
+                .find(|a| matches!(a, QcsdAction::IncreaseReceiveLimit { .. }))
+                .expect("original owned receive action");
+            let QcsdAction::IncreaseReceiveLimit {
+                slot,
+                absolute_limit,
+                packet: actual,
+                ..
+            } = action
+            else {
+                unreachable!()
+            };
+            assert_eq!(actual, packet);
+            assert_eq!(absolute_limit, 1201, "one initial byte plus full1200 scheduled credit");
+            let mut traces = TraceFiles::new(&path, start).expect("traces");
+            traces.require_cs_incoming_process_witnesses();
+            let advertised = Instant::now();
+            traces
+                .register_incoming_action(
+                    advertised,
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    packet,
+                    slot,
+                )
+                .expect("register owner");
+            let clock = QcsdObservationClock::new(start);
+            let record = clock.record_at(
+                QcsdObservation::ReceiveLimitAdvertised {
+                    endpoint,
+                    stream,
+                    absolute_limit,
+                    slot: Some(slot),
+                },
+                advertised,
+            );
+            controller.observe(
+                record.observation().clone(),
+                advertised.duration_since(start),
+            );
+            traces
+                .observation_after_controller(
+                    Some(endpoint),
+                    &record,
+                    &controller,
+                    Some(advertised),
+                )
+                .expect("original physical advertisement");
+            let before_read = controller.defense_diagnostics();
+            assert_eq!(
+                (before_read.scheduled_incoming_requested_bytes,
+                 before_read.scheduled_incoming_advertised_bytes,
+                 before_read.scheduled_incoming_consumed_bytes,
+                 before_read.scheduled_incoming_retired_bytes),
+                (1200, 1200, 0, 0),
+                "the fixture must own a fully advertised1200-byte scheduled window before reads"
+            );
+            for bytes in [1, 1, 1, consumed - 3] {
+                let at = Instant::now().duration_since(start);
+                controller.observe(
+                    QcsdObservation::BytesRead {
+                        endpoint,
+                        stream,
+                        bytes,
+                    },
+                    at,
+                );
+            }
+            let after_read = controller.defense_diagnostics();
+            assert_eq!(
+                (after_read.scheduled_incoming_requested_bytes,
+                 after_read.scheduled_incoming_advertised_bytes,
+                 after_read.scheduled_incoming_consumed_bytes,
+                 after_read.scheduled_incoming_retired_bytes),
+                (1200, 1200, consumed, 0),
+                "the public ledger must record exactly the supplied1200 or1199 bytes without retirement"
+            );
+            Self {
+                controller,
+                traces,
+                path,
+                endpoint,
+                slot,
+                packet,
+            }
+        }
+        fn action(&self) -> QcsdAction {
+            QcsdAction::SlotSatisfied {
+                endpoint: Some(self.endpoint),
+                packet: self.packet,
+                slot: self.slot,
+            }
+        }
+        fn row(&self, serialized_at: Instant) -> ScheduleTraceRow<'static> {
+            ScheduleTraceRow {
+                action_time_us: self.traces.elapsed_us(serialized_at),
+                endpoint: Some(self.endpoint),
+                packet: self.packet,
+                satisfaction: "satisfied",
+                observed: None,
+                miss_reason: "",
+                slot: self.slot,
+                qcsd: QcsdTraceColumns::exact(1200, None),
+                terminal_defense_elapsed_us: u64::try_from(
+                    self.controller
+                        .terminal_slot_resolution_at(self.slot)
+                        .expect("real controller resolution")
+                        .as_micros(),
+                )
+                .expect("bounded"),
+            }
+        }
+    }
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn queued_serialization_11823us_keeps_independent_consumption_clock() {
+        let mut f = OwnedFixture::new(1200);
+        let witness = f
+            .controller
+            .incoming_terminal_process_witness(f.slot)
+            .expect("actual owned1200 witness");
+        let serialized = witness.captured_at() + Duration::from_micros(11823);
+        let action = f.action();
+        f.traces
+            .bind_cs_incoming_process_witness(&f.controller, &action, serialized)
+            .expect("bind independent witness");
+        let row = f.row(serialized);
+        f.traces.schedule(&row).expect("saved schedule");
+        f.traces.schedule.flush().expect("schedule flush");
+        let text = fs::read_to_string(f.path.join("schedule.csv")).expect("raw schedule");
+        let mut lines = text.lines();
+        let headers: Vec<_> = lines.next().expect("headers").split(',').collect();
+        let values: Vec<_> = lines.next().expect("one terminal").split(',').collect();
+        let field = |name| {
+            values[headers.iter().position(|v| *v == name).expect("column")]
+                .parse::<u64>()
+                .expect("integer")
+        };
+        let consumed = field("credit_consumed_at_us");
+        assert_eq!(consumed, f.traces.elapsed_us(witness.captured_at()));
+        let serialized_us = f.traces.elapsed_us(serialized);
+        assert_eq!(serialized_us - consumed, 11823);
+        // Original h controller-action bound remains 10000us. Only the genuine
+        // earlier clock witness passes; late serialization is still exposed.
+        assert!(consumed >= row.terminal_defense_elapsed_us);
+        assert!(consumed - row.terminal_defense_elapsed_us <= 10000);
+        assert!(serialized_us - row.terminal_defense_elapsed_us > 10000);
+        let event = f
+            .traces
+            .event_rows
+            .iter()
+            .find(|r| r.event == "incoming_terminal_process_clock")
+            .expect("separate serialization event");
+        assert_eq!(
+            event.monotonic_ns,
+            u64::try_from(serialized.duration_since(f.traces.start).as_nanos()).expect("bounded")
+        );
+        assert!(f.traces.cs_incoming_process_witnesses.is_empty());
+
+        let mut missing = OwnedFixture::new(1200);
+        let missing_witness = missing
+            .controller
+            .incoming_terminal_process_witness(missing.slot)
+            .expect("owned BF1200 witness exists before trace binding");
+        let missing_serialized = missing_witness.captured_at() + Duration::from_micros(11823);
+        let missing_row = missing.row(missing_serialized);
+        assert!(missing.traces.schedule(&missing_row).is_err(),
+            "BF trace must reject a missing owned process-clock binding");
+
+        let mut incomplete = OwnedFixture::new(1199);
+        assert!(incomplete.controller.incoming_terminal_process_witness(incomplete.slot).is_none());
+        let incomplete_action = incomplete.action();
+        assert!(incomplete.traces.bind_cs_incoming_process_witness(
+            &incomplete.controller, &incomplete_action, Instant::now()).is_err(),
+            "1199 bytes cannot fabricate a full1200 owned consumption witness");
+    }
+
+}

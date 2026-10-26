@@ -4533,7 +4533,12 @@ impl QcsdController {
             });
             EventOutcome::Missed(reason)
         };
-        if ledger.retired == 0 && matches!(&self.config.defense, DefenseConfig::CsBuflo(_)) {
+        if ledger.retired == 0
+            && matches!(
+                &self.config.defense,
+                DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
+            )
+        {
             // Independent process-clock sample at the actual owned-credit
             // terminal transition. The complete original ledger remains the
             // owner; no controller `Duration at` is projected onto this clock.
