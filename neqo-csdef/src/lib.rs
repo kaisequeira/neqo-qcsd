@@ -59,6 +59,8 @@ pub use event::{
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{
+    FtSupplementalChaffManifestV7, FtSupplementalPoolSource, FtSupplementalQualification,
+    FtSupplementalQualifiedResource, FtPoolPreparedResponse, FT_POOL_ID_MIN, FT_POOL_ID_MAX, FT_SUPPLEMENTAL_POLICY,
     ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
     QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
     ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV6, ResponseOnlyChaffQualification,

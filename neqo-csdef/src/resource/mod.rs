@@ -4,6 +4,10 @@
 // option.
 
 mod manifest;
+mod ft_supplemental;
+pub use ft_supplemental::{FtSupplementalChaffManifestV7, FtSupplementalPoolSource,
+    FtSupplementalQualification, FtSupplementalQualifiedResource, FtPoolPreparedResponse,
+    FT_POOL_ID_MIN, FT_POOL_ID_MAX, FT_SUPPLEMENTAL_POLICY};
 
 pub use manifest::{
     ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
