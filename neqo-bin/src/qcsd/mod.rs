@@ -38,6 +38,7 @@ use neqo_csdef::{
     QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
     QcsdSlotOutcome, QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
     FtSupplementalChaffManifestV7, FtSupplementalPoolSource, FT_SUPPLEMENTAL_POLICY,
+    CsSupplementalChaffManifestV8, CsSupplementalPoolSource, CS_SUPPLEMENTAL_POLICY,
     ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV6,
     ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
     ResponseOnlyChaffQualificationV6, SmallResponseAggregateCapacityContract, StaticMode,
@@ -1180,10 +1181,10 @@ impl Args {
                 let (formal, formal_hash) = load_manifest(application_manifest.as_deref().ok_or_else(|| Error::Argument("FT qualification lacks original formal resources.json".into()))?)?;
                 let (source, source_hash, _, _, _, _, _, _, _, _) = load_application_workload_source(workload)?;
                 if formal != source { return Err(Error::Argument("FT qualification changed full formal20".into())); }
-                let pool = load_ft_supplemental_pool_source(pool_path)?;
-                pool.source.validate_against(&formal, &formal_hash, &source_hash,
+                let pool = load_supplemental_pool_source(pool_path)?;
+                pool.validate_against(&formal, &formal_hash, &source_hash,
                     option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
-                if pool.source.selected()?.0.id != *selected_chaff_resource_id {
+                if pool.selected_id()? != *selected_chaff_resource_id {
                     return Err(Error::Argument("FT qualification did not select the largest prepared same-origin pool response".into()));
                 }
                 Ok(())
@@ -1193,20 +1194,27 @@ impl Args {
                 buflo_parameters, cs_buflo_parameters, morphing_matrix, wtf_pad_histograms,
                 walkie_talkie_molded, workload_id, .. } => {
                 let loaded = chaff_manifest.as_deref().map(load_chaff_manifest).transpose()?;
-                let has_new_manifest = loaded.as_ref().is_some_and(|(m, _)| matches!(m, RuntimeChaffManifest::SupplementalFtV7(_)));
+                let has_new_manifest = loaded.as_ref().is_some_and(|(m, _)| matches!(m, RuntimeChaffManifest::SupplementalFtV7(_) | RuntimeChaffManifest::SupplementalCsV8(_)));
                 if supplemental_chaff_source.is_none() && !has_new_manifest { return Ok(()); }
                 let pool_path = supplemental_chaff_source.as_deref().ok_or_else(|| Error::Argument("FT manifest lacks separate source".into()))?;
-                let Some((RuntimeChaffManifest::SupplementalFtV7(manifest), _)) = loaded else {
-                    return Err(Error::Argument("separate FT source requires new manifest schema7; old schemas cannot opt in".into()));
+                let Some((manifest, _)) = loaded else {
+                    return Err(Error::Argument("separate source requires typed FT7 or CS8 manifest".into()));
                 };
                 let (formal, formal_hash) = load_manifest(workload.as_deref().ok_or_else(|| Error::Argument("FT source requires formal resources.json".into()))?)?;
                 let (source, source_hash, _, _, _, _, _, _, _, _) = load_application_workload_source(application_workload_source.as_deref().ok_or_else(|| Error::Argument("FT source requires formal prepared source".into()))?)?;
-                let pool = load_ft_supplemental_pool_source(pool_path)?;
+                let pool = load_supplemental_pool_source(pool_path)?;
                 let resolved = resolve_run_config_with_workload(config.as_deref(), *preset, *profile, *defense,
                     schedule.as_deref(), *static_mode, buflo_parameters.as_deref(), cs_buflo_parameters.as_deref(),
                     morphing_matrix.as_deref(), wtf_pad_histograms.as_deref(), walkie_talkie_molded.as_deref(), workload_id.as_deref())?;
-                validate_ft_supplemental_binding_parts(&formal, &formal_hash, &source, &source_hash,
-                    &manifest, &pool, &resolved.defense)
+                match (&manifest, &pool) {
+                    (RuntimeChaffManifest::SupplementalFtV7(manifest), BoundSupplementalPoolSource::Ft(pool)) =>
+                        validate_ft_supplemental_binding_parts(&formal, &formal_hash, &source, &source_hash,
+                            manifest, pool, &resolved.defense),
+                    (RuntimeChaffManifest::SupplementalCsV8(manifest), BoundSupplementalPoolSource::Cs(pool)) =>
+                        validate_cs_supplemental_binding_parts(&formal, &formal_hash, &source, &source_hash,
+                            manifest, pool, &resolved.defense),
+                    _ => Err(Error::Argument("separate pool source and qualified manifest types differ".into())),
+                }
             }
             _ => Ok(()),
         }
@@ -1326,7 +1334,7 @@ impl Args {
                     .map(load_application_workload_source)
                     .transpose()?;
                 let supplemental_chaff_source = supplemental_chaff_source.as_deref()
-                    .map(load_ft_supplemental_pool_source).transpose()?;
+                    .map(load_supplemental_pool_source).transpose()?;
                 let application_response_policy = resolve_application_response_policy(
                     application_response_policy,
                     application_workload_source
@@ -1864,6 +1872,101 @@ fn load_ft_supplemental_pool_source(path: &Path) -> Result<BoundFtSupplementalPo
     Ok(BoundFtSupplementalPoolSource { source: FtSupplementalPoolSource::from_json(text)?, sha256: sha256(&raw)? })
 }
 
+#[derive(Clone, Debug)]
+struct BoundCsSupplementalPoolSource {
+    source: CsSupplementalPoolSource,
+    sha256: String,
+}
+
+/// Keep distinct parsed authorities behind the existing optional CLI input.
+#[derive(Clone, Debug)]
+enum BoundSupplementalPoolSource {
+    Ft(BoundFtSupplementalPoolSource),
+    Cs(BoundCsSupplementalPoolSource),
+}
+
+impl BoundSupplementalPoolSource {
+    fn sha256(&self) -> &str {
+        match self { Self::Ft(pool) => &pool.sha256, Self::Cs(pool) => &pool.sha256 }
+    }
+
+    const fn policy(&self) -> &'static str {
+        match self { Self::Ft(_) => FT_SUPPLEMENTAL_POLICY, Self::Cs(_) => CS_SUPPLEMENTAL_POLICY }
+    }
+
+    const fn qualification_artifact_type(&self) -> &'static str {
+        match self {
+            Self::Ft(_) => "qcsd-ft-supplemental-response-qualification",
+            Self::Cs(_) => "qcsd-cs-supplemental-response-qualification",
+        }
+    }
+
+    fn application_manifest_sha256(&self) -> &str {
+        match self { Self::Ft(pool) => &pool.source.application_manifest_sha256,
+                     Self::Cs(pool) => &pool.source.application_manifest_sha256 }
+    }
+
+    fn candidate_manifest_sha256(&self) -> &str {
+        match self { Self::Ft(pool) => &pool.source.candidate_manifest_sha256,
+                     Self::Cs(pool) => &pool.source.candidate_manifest_sha256 }
+    }
+
+    fn discovery_provenance_sha256(&self) -> &str {
+        match self { Self::Ft(pool) => &pool.source.discovery_provenance_sha256,
+                     Self::Cs(pool) => &pool.source.discovery_provenance_sha256 }
+    }
+
+    fn resource_manifest(&self) -> ResourceManifest {
+        match self { Self::Ft(pool) => ResourceManifest { resources: pool.source.resources.clone() },
+                     Self::Cs(pool) => ResourceManifest { resources: pool.source.resources.clone() } }
+    }
+
+    fn expected_responses(&self) -> BTreeMap<u32, PreparedExpectedResponse> {
+        match self {
+            Self::Ft(pool) => pool.source.expected_responses.iter().map(|row| (row.resource_id,
+                PreparedExpectedResponse { resource_id: row.resource_id, status: row.status,
+                    bytes: row.bytes, body_sha256: row.body_sha256.clone() })).collect(),
+            Self::Cs(pool) => pool.source.expected_responses.iter().map(|row| (row.resource_id,
+                PreparedExpectedResponse { resource_id: row.resource_id, status: row.status,
+                    bytes: row.bytes, body_sha256: row.body_sha256.clone() })).collect(),
+        }
+    }
+
+    fn selected_id(&self) -> Result<u32, Error> {
+        Ok(match self { Self::Ft(pool) => pool.source.selected()?.0.id,
+                        Self::Cs(pool) => pool.source.selected()?.0.id })
+    }
+
+    fn validate_against(&self, formal: &ResourceManifest, formal_hash: &str,
+                        source_hash: &str, native_commit: &str) -> Result<(), Error> {
+        match self {
+            Self::Ft(pool) => pool.source.validate_against(formal, formal_hash, source_hash, native_commit),
+            Self::Cs(pool) => pool.source.validate_against(formal, formal_hash, source_hash, native_commit),
+        }?;
+        Ok(())
+    }
+}
+
+fn load_supplemental_pool_source(path: &Path) -> Result<BoundSupplementalPoolSource, Error> {
+    let raw = fs::read(path)?;
+    if raw.is_empty() || raw.len() > 4 * 1024 * 1024 {
+        return Err(Error::Argument("bounded immutable supplemental pool source required".into()));
+    }
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| Error::Argument("supplemental pool source is not UTF8".into()))?;
+    let discriminator: serde_json::Value = serde_json::from_str(text)?;
+    match discriminator.get("artifact_type").and_then(serde_json::Value::as_str) {
+        // Preserve the original exact FT parser and whole-source hashing.
+        Some("qcsd-ft-supplemental-prepared-chaff-pool-source") =>
+            load_ft_supplemental_pool_source(path).map(BoundSupplementalPoolSource::Ft),
+        Some("qcsd-cs-supplemental-prepared-chaff-pool-source") =>
+            Ok(BoundSupplementalPoolSource::Cs(BoundCsSupplementalPoolSource {
+                source: CsSupplementalPoolSource::from_json(text)?, sha256: sha256(&raw)?,
+            })),
+        _ => Err(Error::Argument("explicit FT or CS prepared pool artifact required".into())),
+    }
+}
+
 fn validate_ft_supplemental_binding_parts(
     formal: &ResourceManifest, formal_hash: &str,
     source: &ResourceManifest, source_hash: &str,
@@ -1901,12 +2004,65 @@ fn validate_ft_supplemental_binding_parts(
     Ok(())
 }
 
+fn validate_cs_supplemental_binding_parts(
+    formal: &ResourceManifest, formal_hash: &str,
+    source: &ResourceManifest, source_hash: &str,
+    manifest: &CsSupplementalChaffManifestV8, pool: &BoundCsSupplementalPoolSource,
+    defense: &DefenseConfig,
+) -> Result<(), Error> {
+    manifest.validate()?;
+    if !matches!(defense, DefenseConfig::CsBuflo(_)) {
+        return Err(Error::Argument("separate CS pool is CS-BuFLO only".into()));
+    }
+    if formal != source || manifest.application_manifest_sha256 != formal_hash
+        || manifest.application_workload_sha256 != source_hash
+        || manifest.chaff_pool_source_sha256 != pool.sha256
+        || manifest.candidate_manifest_sha256 != pool.source.candidate_manifest_sha256
+        || manifest.discovery_provenance_sha256 != pool.source.discovery_provenance_sha256 {
+        return Err(Error::Argument("qualified CS manifest changed a whole formal or separate source binding".into()));
+    }
+    pool.source.validate_against(formal, formal_hash, source_hash,
+        option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
+    let root = &formal.resources[0];
+    validate_qualification_application_root(root, manifest.application_resource_id)?;
+    if formal.resources.iter().any(|r| r.origin() != root.origin()) {
+        return Err(Error::Argument("FT formal20 must retain the single declared HTTPS class origin".into()));
+    }
+    let (selected, response) = pool.source.selected()?;
+    let mut projection = selected.clone();
+    projection.headers = projected_ael(selected)?;
+    let qualified = &manifest.resources[0];
+    let expected = &qualified.chaff_qualification.expected_response;
+    if manifest.selected_pool_resource_id != selected.id
+        || qualified.resource != projection || expected.status != response.status
+        || expected.body_bytes != response.bytes || expected.body_sha256 != response.body_sha256 {
+        return Err(Error::Argument("qualified CS resource differs from exact deterministic prepared pool response".into()));
+    }
+    Ok(())
+}
+
 fn validate_ft_supplemental_runtime_binding(spec: &RunSpec, manifest: &FtSupplementalChaffManifestV7) -> Result<(), Error> {
     let Some((source, source_hash, _, _, _, _, _, _, _, _)) = &spec.application_workload_source else {
         return Err(Error::Argument("schema-seven FT manifest requires original application source".into()));
     };
     let pool = spec.supplemental_chaff_source.as_ref().ok_or_else(|| Error::Argument("schema-seven FT manifest requires its separate prepared pool source".into()))?;
+    let BoundSupplementalPoolSource::Ft(pool) = pool else {
+        return Err(Error::Argument("FT schema7 cannot borrow a CS pool source".into()));
+    };
     validate_ft_supplemental_binding_parts(&spec.workload, &spec.workload_hash, source, source_hash,
+        manifest, pool, &spec.config.defense)
+}
+
+fn validate_cs_supplemental_runtime_binding(spec: &RunSpec, manifest: &CsSupplementalChaffManifestV8) -> Result<(), Error> {
+    let Some((source, source_hash, _, _, _, _, _, _, _, _)) = &spec.application_workload_source else {
+        return Err(Error::Argument("schema-eight CS manifest requires original application source".into()));
+    };
+    let pool = spec.supplemental_chaff_source.as_ref()
+        .ok_or_else(|| Error::Argument("schema-eight CS manifest requires its separate prepared pool source".into()))?;
+    let BoundSupplementalPoolSource::Cs(pool) = pool else {
+        return Err(Error::Argument("CS schema8 cannot borrow a FRONT/Tamaraw pool source".into()));
+    };
+    validate_cs_supplemental_binding_parts(&spec.workload, &spec.workload_hash, source, source_hash,
         manifest, pool, &spec.config.defense)
 }
 
@@ -1916,6 +2072,7 @@ enum RuntimeChaffManifest {
     ResponseOnlyV4(ResponseOnlyChaffManifestV4),
     SmallResponseAggregateV6(ResponseOnlyChaffManifestV6),
     SupplementalFtV7(FtSupplementalChaffManifestV7),
+    SupplementalCsV8(CsSupplementalChaffManifestV8),
 }
 
 struct RuntimeChaffQualification<'a> {
@@ -1965,8 +2122,9 @@ impl RuntimeChaffManifest {
                 ResponseOnlyChaffManifestV6::from_json(input).map(Self::SmallResponseAggregateV6)
             }
             Some(7) => FtSupplementalChaffManifestV7::from_json(input).map(Self::SupplementalFtV7),
+            Some(8) => CsSupplementalChaffManifestV8::from_json(input).map(Self::SupplementalCsV8),
             _ => Err(neqo_csdef::Error::InvalidConfig(
-                "qualified chaff manifest schema_version must be2,3,4, aggregate6, or explicit separate FT7"
+                "qualified chaff manifest schema_version must be2,3,4, aggregate6, explicit FT7, or explicit CS8"
                     .into(),
             )),
         }
@@ -1978,14 +2136,15 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV3(_)
             | Self::ResponseOnlyV4(_)
             | Self::SmallResponseAggregateV6(_)
-            | Self::SupplementalFtV7(_) => None,
+            | Self::SupplementalFtV7(_)
+            | Self::SupplementalCsV8(_) => None,
         }
     }
 
     const fn is_response_only(&self) -> bool {
         matches!(
             self,
-            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) | Self::SmallResponseAggregateV6(_) | Self::SupplementalFtV7(_)
+            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) | Self::SmallResponseAggregateV6(_) | Self::SupplementalFtV7(_) | Self::SupplementalCsV8(_)
         )
     }
 
@@ -2008,6 +2167,7 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV4(manifest) => &manifest.application_workload_sha256,
             Self::SmallResponseAggregateV6(manifest) => &manifest.application_workload_sha256,
             Self::SupplementalFtV7(manifest) => &manifest.application_workload_sha256,
+            Self::SupplementalCsV8(manifest) => &manifest.application_workload_sha256,
         }
     }
 
@@ -2018,6 +2178,7 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV4(manifest) => manifest.application_resource_id,
             Self::SmallResponseAggregateV6(manifest) => manifest.application_resource_id,
             Self::SupplementalFtV7(manifest) => manifest.application_resource_id,
+            Self::SupplementalCsV8(manifest) => manifest.application_resource_id,
         }
     }
 
@@ -2028,6 +2189,7 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV4(manifest) => manifest.selected_chaff_resource_id,
             Self::SmallResponseAggregateV6(manifest) => manifest.selected_chaff_resource_id,
             Self::SupplementalFtV7(manifest) => manifest.selected_pool_resource_id,
+            Self::SupplementalCsV8(manifest) => manifest.selected_pool_resource_id,
         }
     }
 
@@ -2038,6 +2200,7 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV4(manifest) => manifest.qualified_parallel_chaff_streams,
             Self::SmallResponseAggregateV6(manifest) => manifest.qualified_parallel_chaff_streams,
             Self::SupplementalFtV7(manifest) => manifest.qualified_parallel_chaff_streams,
+            Self::SupplementalCsV8(manifest) => manifest.qualified_parallel_chaff_streams,
         }
     }
 
@@ -2048,6 +2211,7 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV4(manifest) => manifest.resource_manifest(),
             Self::SmallResponseAggregateV6(manifest) => manifest.resource_manifest(),
             Self::SupplementalFtV7(manifest) => manifest.resource_manifest(),
+            Self::SupplementalCsV8(manifest) => manifest.resource_manifest(),
         }
     }
 
@@ -2093,6 +2257,10 @@ impl RuntimeChaffManifest {
                 request_stream_bytes: qualification.request_stream_bytes,
                 expected_response: &qualification.expected_response,
             }),
+            Self::SupplementalCsV8(manifest) => manifest.qualification(resource_id).map(|qualification| RuntimeChaffQualification {
+                request_stream_bytes: qualification.request_stream_bytes,
+                expected_response: &qualification.expected_response,
+            }),
         }
     }
 }
@@ -2101,6 +2269,10 @@ fn validate_chaff_manifest_defense(
     defense: &DefenseConfig,
     chaff: &RuntimeChaffManifest,
 ) -> Result<(), Error> {
+    if matches!(chaff, RuntimeChaffManifest::SupplementalCsV8(_))
+        && !matches!(defense, DefenseConfig::CsBuflo(_)) {
+        return Err(Error::Argument("separate same-host schema-eight chaff is CS-BuFLO only".into()));
+    }
     if matches!(chaff, RuntimeChaffManifest::SupplementalFtV7(_))
         && !matches!(defense, DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_)) {
         return Err(Error::Argument("separate same-host schema-seven chaff is FRONT/Tamaraw only".into()));
@@ -2707,7 +2879,7 @@ struct RunSpec {
     defense_parameters: Option<DefenseParameterProvenance>,
     chaff_manifest: Option<RuntimeChaffManifest>,
     chaff_manifest_hash: Option<String>,
-    supplemental_chaff_source: Option<BoundFtSupplementalPoolSource>,
+    supplemental_chaff_source: Option<BoundSupplementalPoolSource>,
     request_policy: RequestPolicyArg,
     seed: u64,
     output_dir: PathBuf,
@@ -14623,20 +14795,18 @@ async fn qualify_chaff_response(
             Error::Argument("application_resource_id 0 is absent from workload".into())
         })?;
     validate_qualification_application_root(application, application_resource_id)?;
-    let supplemental = supplemental_chaff_source.map(load_ft_supplemental_pool_source).transpose()?;
-    let supplemental_expected = supplemental.as_ref().map(|p| p.source.expected_responses.iter().map(|r|
-        (r.resource_id, PreparedExpectedResponse { resource_id: r.resource_id, status: r.status, bytes: r.bytes, body_sha256: r.body_sha256.clone() })
-    ).collect::<BTreeMap<_, _>>());
-    let supplemental_workload = supplemental.as_ref().map(|p| ResourceManifest { resources: p.source.resources.clone() });
+    let supplemental = supplemental_chaff_source.map(load_supplemental_pool_source).transpose()?;
+    let supplemental_expected = supplemental.as_ref().map(BoundSupplementalPoolSource::expected_responses);
+    let supplemental_workload = supplemental.as_ref().map(BoundSupplementalPoolSource::resource_manifest);
     if let Some(pool) = &supplemental {
         if mode != ResponseQualificationMode::Legacy || parallel_requests != 5 || max_response_bytes != 16_777_216 {
             return Err(Error::Argument("separate FT qualification requires exactly5 legacy-AEL requests and16MiB cap".into()));
         }
         let (formal, formal_sha) = load_manifest(application_manifest.ok_or_else(|| Error::Argument("separate FT qualification lacks exact formal manifest".into()))?)?;
         if formal != workload { return Err(Error::Argument("separate FT qualification changed complete formal20 resources".into())); }
-        pool.source.validate_against(&formal, &formal_sha, &workload_hash,
+        pool.validate_against(&formal, &formal_sha, &workload_hash,
             option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
-        if pool.source.selected()?.0.id != selected_chaff_resource_id {
+        if pool.selected_id()? != selected_chaff_resource_id {
             return Err(Error::Argument("separate FT qualification selected a nondeterministic pool resource".into()));
         }
     } else if application_manifest.is_some() {
@@ -15124,12 +15294,12 @@ async fn qualify_chaff_response(
     };
     if let Some(pool) = &supplemental {
         receipt["schema_version"] = json!(1);
-        receipt["artifact_type"] = json!("qcsd-ft-supplemental-response-qualification");
-        receipt["supplemental_chaff_policy"] = json!(FT_SUPPLEMENTAL_POLICY);
-        receipt["application_manifest_sha256"] = json!(pool.source.application_manifest_sha256);
-        receipt["chaff_pool_source_sha256"] = json!(pool.sha256);
-        receipt["candidate_manifest_sha256"] = json!(pool.source.candidate_manifest_sha256);
-        receipt["discovery_provenance_sha256"] = json!(pool.source.discovery_provenance_sha256);
+        receipt["artifact_type"] = json!(pool.qualification_artifact_type());
+        receipt["supplemental_chaff_policy"] = json!(pool.policy());
+        receipt["application_manifest_sha256"] = json!(pool.application_manifest_sha256());
+        receipt["chaff_pool_source_sha256"] = json!(pool.sha256());
+        receipt["candidate_manifest_sha256"] = json!(pool.candidate_manifest_sha256());
+        receipt["discovery_provenance_sha256"] = json!(pool.discovery_provenance_sha256());
     }
     if small_response_aggregate {
         receipt["schema_version"] = json!(7);
@@ -17092,6 +17262,9 @@ fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
         if spec.supplemental_chaff_source.is_some() { return Err(Error::Argument("separate FT pool without qualified manifest".into())); }
         return Ok(());
     };
+    if let RuntimeChaffManifest::SupplementalCsV8(manifest) = chaff {
+        return validate_cs_supplemental_runtime_binding(spec, manifest);
+    }
     if let RuntimeChaffManifest::SupplementalFtV7(manifest) = chaff {
         return validate_ft_supplemental_runtime_binding(spec, manifest);
     }
@@ -30221,10 +30394,10 @@ fn render_run_json(
         "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _, _, _)| hash),
         "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _, _, _)| *policy).name(),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
-        "supplemental_chaff_policy": spec.supplemental_chaff_source.as_ref().map(|_| FT_SUPPLEMENTAL_POLICY),
-        "supplemental_chaff_pool_source_hash_sha256": spec.supplemental_chaff_source.as_ref().map(|p| &p.sha256),
-        "supplemental_chaff_selected_pool_resource_id": spec.chaff_manifest.as_ref().and_then(|m| if let RuntimeChaffManifest::SupplementalFtV7(v) = m { Some(v.selected_pool_resource_id) } else { None }),
-        "supplemental_chaff_qualification_evidence_sha256": spec.chaff_manifest.as_ref().and_then(|m| if let RuntimeChaffManifest::SupplementalFtV7(v) = m { Some(&v.qualification_evidence_sha256) } else { None }),
+        "supplemental_chaff_policy": spec.supplemental_chaff_source.as_ref().map(BoundSupplementalPoolSource::policy),
+        "supplemental_chaff_pool_source_hash_sha256": spec.supplemental_chaff_source.as_ref().map(BoundSupplementalPoolSource::sha256),
+        "supplemental_chaff_selected_pool_resource_id": spec.chaff_manifest.as_ref().and_then(|m| match m { RuntimeChaffManifest::SupplementalFtV7(v) => Some(v.selected_pool_resource_id), RuntimeChaffManifest::SupplementalCsV8(v) => Some(v.selected_pool_resource_id), _ => None }),
+        "supplemental_chaff_qualification_evidence_sha256": spec.chaff_manifest.as_ref().and_then(|m| match m { RuntimeChaffManifest::SupplementalFtV7(v) => Some(&v.qualification_evidence_sha256), RuntimeChaffManifest::SupplementalCsV8(v) => Some(&v.qualification_evidence_sha256), _ => None }),
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
         "started_unix_ns": started_unix_ns,
@@ -64444,3 +64617,168 @@ mod buflo_preoutput_diagnostic_tests {
     }
 }
 // END ROOT BF PREOUTPUT OBSERVATIONAL TEST 001
+
+#[cfg(test)]
+mod cs_supplemental_source_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    fn directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "neqo-cs8-synthetic-noncredit-bin-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("test clock").as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&path).expect("create-only synthetic fixture");
+        path
+    }
+
+    fn resource(known_valid: bool) -> serde_json::Value {
+        json!({"id": 2_147_483_648_u32, "url": "https://fonts.synthetic.example/padding.woff2",
+            "type": "Other", "content_length": if known_valid { Some(4096) } else { None },
+            "data_length": if known_valid { 4096 } else { 0 }, "known_valid": known_valid,
+            "chaff_priority": false, "depends_on": [], "headers": [
+                ["accept", "*/*"], ["accept-encoding", "identity"],
+                ["accept-language", "en-US,en;q=0.9"]]})
+    }
+
+    fn manifest() -> serde_json::Value {
+        json!({"schema_version": 8,
+            "artifact_type": "qcsd-cs-supplemental-same-host-qualified-chaff-manifest",
+            "policy": CS_SUPPLEMENTAL_POLICY,
+            "qualification_scope": "response-only-separate-same-host-cs-pool-v1",
+            "application_manifest_sha256": "a".repeat(64),
+            "application_workload_sha256": "b".repeat(64),
+            "chaff_pool_source_sha256": "c".repeat(64),
+            "candidate_manifest_sha256": "d".repeat(64),
+            "discovery_provenance_sha256": "e".repeat(64),
+            "qualification_evidence_sha256": "f".repeat(64),
+            "application_resource_id": 0, "selected_pool_resource_id": 2_147_483_648_u32,
+            "qualified_parallel_chaff_streams": 5, "resources": [{"resource": resource(true),
+                "chaff_qualification": {"schema_version": 8,
+                    "qualification_scope": "response-only-separate-same-host-cs-pool-v1",
+                    "method": "GET", "request_stream_bytes": 150,
+                    "qualified_parallel_chaff_streams": 5, "qualification_runs": 3,
+                    "qualified_completion_count": 15,
+                    "expected_response": {"status": 200, "content_encoding": "identity",
+                        "body_bytes": 4096, "body_sha256": "1".repeat(64)},
+                    "response_qualification_sha256": "2".repeat(64)}}]})
+    }
+
+    #[test]
+    fn cs8_runtime_dispatch_preserves_exact_five_stream_cap_and_mode_scope() {
+        let runtime = RuntimeChaffManifest::from_json(&manifest().to_string())
+            .expect("strict new CS8 runtime metadata");
+        assert!(matches!(runtime, RuntimeChaffManifest::SupplementalCsV8(_)));
+        assert_eq!(runtime.selected_chaff_resource_id(), 2_147_483_648);
+        assert_eq!(runtime.qualified_parallel_chaff_streams(), 5);
+        assert_eq!(runtime.qualification(2_147_483_648).unwrap().request_stream_bytes(), 150);
+        let cs = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
+            parameters: "synthetic-noncredit-cs-parameters.json".into(),
+        });
+        validate_chaff_manifest_defense(&cs, &runtime).expect("CS8 only for CS");
+        let mut config = QcsdConfig { defense: cs, max_chaff_streams: 5,
+                                     ..QcsdConfig::default() };
+        bind_qualified_chaff_stream_limits(&mut config, &runtime).expect("five qualified streams");
+        config.max_chaff_streams = 6;
+        assert!(bind_qualified_chaff_stream_limits(&mut config, &runtime).is_err());
+        for other in [DefenseConfig::None,
+            DefenseConfig::Front(neqo_csdef::FrontConfig::default()),
+            DefenseConfig::Tamaraw(neqo_csdef::TamarawConfig::default()),
+            DefenseConfig::Buflo(neqo_csdef::BufloConfig { parameters: "unused.json".into() })] {
+            assert!(validate_chaff_manifest_defense(&other, &runtime).is_err());
+        }
+    }
+
+    #[test]
+    fn ft7_and_cs8_are_distinct_runtime_authorities() {
+        let mut ft = manifest();
+        ft["schema_version"] = json!(7);
+        ft["artifact_type"] = json!("qcsd-ft-supplemental-same-host-qualified-chaff-manifest");
+        ft["policy"] = json!(FT_SUPPLEMENTAL_POLICY);
+        ft["qualification_scope"] = json!("response-only-separate-same-host-pool-v1");
+        ft["resources"][0]["chaff_qualification"]["schema_version"] = json!(7);
+        ft["resources"][0]["chaff_qualification"]["qualification_scope"] =
+            json!("response-only-separate-same-host-pool-v1");
+        let runtime = RuntimeChaffManifest::from_json(&ft.to_string()).expect("retained FT7");
+        assert!(matches!(runtime, RuntimeChaffManifest::SupplementalFtV7(_)));
+        let cs = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig { parameters: "unused.json".into() });
+        assert!(validate_chaff_manifest_defense(&cs, &runtime).is_err());
+        let mut relabelled = ft;
+        relabelled["schema_version"] = json!(8);
+        assert!(RuntimeChaffManifest::from_json(&relabelled.to_string()).is_err());
+    }
+
+    #[test]
+    fn original_unshaped_candidate_probe_preserves_high_id_and_unknown_body() {
+        let root = directory();
+        let workload = root.join("candidate.json");
+        fs::write(&workload, json!({"resources": [resource(false)]}).to_string())
+            .expect("synthetic declared candidate bytes");
+        let (loaded, workload_hash) = load_manifest(&workload).expect("original complete workload parser");
+        assert_eq!(loaded.resources[0].id, 2_147_483_648);
+        assert!(!loaded.resources[0].known_valid);
+        assert_eq!(loaded.resources[0].content_length, None);
+        assert_eq!(loaded.resources[0].data_length, 0);
+        let output = root.join("must-not-create");
+        let parsed = Args::try_parse_from([
+            "neqo-qcsd-client", "run", "--workload", workload.to_str().unwrap(),
+            "--profile", "research-1200", "--defense", "none", "--request-policy", "as-defined",
+            "--application-response-policy", "http-2xx-only-v1", "--seed", "0",
+            "--output-dir", output.to_str().unwrap(), "--max-response-bytes", "16777216",
+            "--timeout-seconds", "120",
+        ]).expect("actual high-ID undefended probe CLI");
+        parsed.validate_ft_supplemental_arguments().expect("no shaped pool authority on ordinary probe");
+        let mut spec = RunSpec {
+            method: "GET", workload: loaded, workload_hash,
+            application_workload_source: None,
+            application_response_policy: ApplicationResponsePolicy::Http2xxOnly,
+            config: QcsdConfig { defense: DefenseConfig::None, ..QcsdConfig::default() },
+            defense_parameters: None, chaff_manifest: None, chaff_manifest_hash: None,
+            supplemental_chaff_source: None, request_policy: RequestPolicyArg::AsDefined,
+            seed: 0, output_dir: output.clone(), max_response_bytes: 16_777_216,
+            timeout_seconds: 120,
+        };
+        // These are the same pure guards called by execute_run before output
+        // creation. Do not enter execute_run, NSS, scheduler setup or network.
+        spec.workload.validate().expect("high-ID unshaped workload survives RunSpec");
+        spec.application_response_policy.validate_workload(&spec.workload)
+            .expect("ordinary strict working-GET response contract");
+        validate_buflo_incoming_credit_release_policy(&spec).expect("no BuFLO authority");
+        validate_tamaraw_capture_policy(&spec).expect("no Tamaraw authority");
+        validate_front_capture_policy(&spec).expect("no FRONT authority");
+        validate_terminal_primary_partial_cell_policy(&spec).expect("no terminal partial-cell authority");
+        validate_workload_urls(&spec.workload).expect("same-host absolute HTTPS candidate");
+        validate_qualified_chaff_binding(&spec).expect("ordinary candidate does not require shaped pool");
+        validate_walkie_talkie_chaff_precondition(&spec).expect("no Walkie-Talkie authority");
+        assert_eq!(spec.workload.resources[0].id, 2_147_483_648);
+        assert!(!spec.workload.resources[0].known_valid);
+        assert!(!shapes_stream_sends(&spec.config.defense));
+        // Adding a shaped CS claim cannot turn this unknown-body probe into
+        // a qualified session without its distinct full application/source.
+        spec.chaff_manifest = Some(RuntimeChaffManifest::from_json(&manifest().to_string())
+            .expect("synthetic typed CS manifest"));
+        assert!(validate_qualified_chaff_binding(&spec).is_err());
+        assert!(!output.exists());
+        fs::remove_dir_all(root).expect("remove only owned synthetic fixture");
+    }
+
+    #[test]
+    fn supplemental_qualifier_rejects_wrong_parallelism_before_reading_sources_or_NSS() {
+        for parallel in ["4", "6", "20"] {
+            let parsed = Args::try_parse_from([
+                "neqo-qcsd-client", "qualify-chaff-response", "--workload", "/must-not-read/prepared.json",
+                "--application-manifest", "/must-not-read/formal.json",
+                "--supplemental-chaff-source", "/must-not-read/pool.json",
+                "--application-resource-id", "0", "--selected-chaff-resource-id", "2147483648",
+                "--parallel-requests", parallel, "--packet-size", "1200",
+                "--max-response-bytes", "16777216", "--output-dir", "/must-not-create/native159",
+            ]).expect("valid CLI syntax for semantic refusal");
+            let refusal = parsed.validate_ft_supplemental_arguments().expect_err("exactly five required");
+            assert!(refusal.to_string().contains("5 simultaneous"));
+        }
+    }
+}

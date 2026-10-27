@@ -5,6 +5,10 @@
 
 mod manifest;
 mod ft_supplemental;
+mod cs_supplemental;
+pub use cs_supplemental::{CsSupplementalChaffManifestV8, CsSupplementalPoolSource,
+    CsSupplementalQualification, CsSupplementalQualifiedResource, CsPoolPreparedResponse,
+    CS_POOL_ID_MIN, CS_POOL_ID_MAX, CS_SUPPLEMENTAL_POLICY};
 pub use ft_supplemental::{FtSupplementalChaffManifestV7, FtSupplementalPoolSource,
     FtSupplementalQualification, FtSupplementalQualifiedResource, FtPoolPreparedResponse,
     FT_POOL_ID_MIN, FT_POOL_ID_MAX, FT_SUPPLEMENTAL_POLICY};
