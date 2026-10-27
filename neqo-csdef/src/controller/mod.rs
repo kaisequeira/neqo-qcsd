@@ -3633,12 +3633,13 @@ impl QcsdController {
             return;
         };
         let tail = requested.saturating_sub(boundary);
-        // HTTP/3's smallest nonempty DATA frame is two varints (type and
-        // length) plus one body byte: three bytes. A positive tail below
-        // that floor cannot carry the next frame even for a one-byte writer.
-        // This narrow known-capacity repair makes no larger-write guarantee.
-        const MIN_NONEMPTY_H3_DATA_FRAME: u64 = 3;
-        if !(1..MIN_NONEMPTY_H3_DATA_FRAME).contains(&tail)
+        // A pristine known-body DATA end can leave exactly three old unread
+        // bytes, as well as the earlier one/two-byte tails. Retain a bounded
+        // fair-service intent for those real owned suffixes. This is not a
+        // minimum server-write claim or new parser/FIN permission: each later
+        // due cell must still advertise1200 NEW known-body offsets atomically.
+        const MAX_PRISTINE_TINY_KNOWN_DATA_TAIL: u64 = 3;
+        if !(1..=MAX_PRISTINE_TINY_KNOWN_DATA_TAIL).contains(&tail)
             || self
                 .control
                 .credit
@@ -31565,7 +31566,7 @@ mod tests {
                 }],
             );
             // Native112 already tracked stream80 before its later three-byte
-            // tail. No new three-byte tiny-tail intent is fabricated here.
+            // tail. Native160 also retains that real DATA-end service intent.
             c.buflo_known_chaff_service_ranges
                 .insert((ep, stream), vec![(raw, max)]);
             let slot = QcsdSlotId(owner);
@@ -31627,10 +31628,10 @@ mod tests {
         }
         c.drain_actions().for_each(drop);
         assert!(
-            !c.buflo_known_chaff_demands
+            c.buflo_known_chaff_demands
                 .contains_key(&(ep, QcsdStreamId(80)))
         );
-        assert_eq!(c.buflo_known_chaff_demands.len(), 4);
+        assert_eq!(c.buflo_known_chaff_demands.len(), 5);
         assert_eq!(c.buflo_known_chaff_service_ranges.len(), 5);
         c
     }
@@ -31680,9 +31681,9 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            // Stream92 is the oldest genuine 1..2-tail DATA-end candidate.
-            // Its OLD [1224,1225) remains slot583; NEW [1225,2425) is slot589.
-            assert_eq!(exact, vec![(QcsdStreamId(92), 2_425)]);
+            // Stream80 is now the oldest genuine1..3-tail DATA-end candidate.
+            // Its OLD [6489,6492) stays slot579; NEW [6492,7692) is slot589.
+            assert_eq!(exact, vec![(QcsdStreamId(80), 7_692)]);
             assert_eq!(c.advertised_incoming_credit, old_ranges);
             for (slot, ledger) in old_ledgers {
                 assert_eq!(c.incoming_credit_ledger[&slot], ledger);
@@ -31708,8 +31709,8 @@ mod tests {
             c.observe(
                 QcsdObservation::ReceiveLimitAdvertised {
                     endpoint: ep,
-                    stream: QcsdStreamId(92),
-                    absolute_limit: 2_425,
+                    stream: QcsdStreamId(80),
+                    absolute_limit: 7_692,
                     slot: Some(QcsdSlotId(589)),
                 },
                 Duration::from_micros(18_817_000),
@@ -31719,19 +31720,19 @@ mod tests {
             c.observe(
                 QcsdObservation::BytesRead {
                     endpoint: ep,
-                    stream: QcsdStreamId(92),
+                    stream: QcsdStreamId(80),
                     bytes: 3,
                 },
                 read_at,
             );
-            assert_eq!(c.incoming_credit_ledger[&QcsdSlotId(589)].consumed, 2);
+            assert_eq!(c.incoming_credit_ledger[&QcsdSlotId(589)].consumed, 0);
             assert_eq!(native113_tracked_bytes(&c), 1_205);
             c.observe(
                 QcsdObservation::DataFrame {
                     endpoint: ep,
-                    stream: QcsdStreamId(92),
+                    stream: QcsdStreamId(80),
                     frame_header_bytes: 3,
-                    data_bytes: 1_198,
+                    data_bytes: 1_200,
                 },
                 read_at,
             );
@@ -31743,8 +31744,8 @@ mod tests {
             c.observe(
                 QcsdObservation::BytesRead {
                     endpoint: ep,
-                    stream: QcsdStreamId(92),
-                    bytes: 1_197,
+                    stream: QcsdStreamId(80),
+                    bytes: 1_199,
                 },
                 read_at,
             );
@@ -31755,7 +31756,7 @@ mod tests {
             c.observe(
                 QcsdObservation::BytesRead {
                     endpoint: ep,
-                    stream: QcsdStreamId(92),
+                    stream: QcsdStreamId(80),
                     bytes: 1,
                 },
                 read_at,
@@ -31763,7 +31764,7 @@ mod tests {
             assert!(c.drain_actions().any(
                 |a| matches!(a, QcsdAction::SlotSatisfied { slot, .. } if slot == QcsdSlotId(589))
             ));
-            assert_eq!(native113_tracked_bytes(&c), 7);
+            assert_eq!(native113_tracked_bytes(&c), 5);
             assert_eq!(c.scheduled_incoming_retired_bytes, 0);
             assert!(c.buflo_fin_permission_releases.is_empty());
         }
@@ -32275,7 +32276,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(grants, vec![(QcsdStreamId(92), 2_425)]);
+        assert_eq!(grants, vec![(QcsdStreamId(80), 7_692)]);
         assert!(service.control.claims.is_empty());
     }
 
@@ -33703,7 +33704,7 @@ mod tests {
         }
 
         // Keep the existing explicit known-chaff service turn ahead of an
-        // otherwise eligible primary. Reuse its established qualified92 oracle.
+        // otherwise eligible primary. Reuse its earliest qualified80 service oracle.
         let mut c = native113_five_known_snapshot(false);
         let ep = QcsdEndpointId(1);
         let primary = QcsdStreamId(0);
@@ -33751,7 +33752,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(grants, vec![(QcsdStreamId(92), 2_425)]);
+        assert_eq!(grants, vec![(QcsdStreamId(80), 7_692)]);
         assert!(
             !actions
                 .iter()
@@ -33759,6 +33760,246 @@ mod tests {
         );
         assert!(c.control.claims.is_empty());
     }
+
+    // Explicit synthetic controller fixtures using Zero's saved raw9163/MAX9166
+    // DATA-end geometry. The existing Native113 fixture supplies unrelated
+    // competing owners. These are not network, FIN, qualification or Raw proofs.
+    fn native160_zero_three_tail_snapshot() -> QcsdController {
+        let mut c = native113_five_known_snapshot(false);
+        let ep = QcsdEndpointId(1);
+        let old = (ep, QcsdStreamId(80));
+        let cover = QcsdStreamId(120);
+        let key = (ep, cover);
+        let _ = c.streams.close(old.0, old.1);
+        c.advertised_incoming_credit.remove(&old);
+        c.buflo_known_chaff_demands.remove(&old);
+        c.buflo_known_chaff_service_ranges.remove(&old);
+        c.buflo_chaff_ack_observed_at.remove(&old);
+        c.buflo_chaff_last_read_at.remove(&old);
+        c.chaff = Some(super::ChaffManager::new(
+            ResourceManifest {
+                resources: vec![Resource {
+                    id: 4,
+                    url: "https://fixture.invalid/known-font".into(),
+                    kind: "Font".into(),
+                    content_length: Some(39_620),
+                    data_length: 39_620,
+                    chaff_priority: true,
+                    known_valid: true,
+                    depends_on: Vec::new(),
+                    headers: Vec::new(),
+                }],
+            },
+            false,
+        ));
+        let role = QcsdRequestRole::Chaff {
+            resource_id: 4,
+            request_id: Some(crate::QcsdChaffRequestId(10)),
+        };
+        for observation in [
+            QcsdObservation::StreamOpened {
+                endpoint: ep, stream: cover, role,
+                expected_response_length: Some(39_620),
+            },
+            QcsdObservation::StreamDataTransmitted {
+                endpoint: ep, stream: cover, role, offset: 0,
+                bytes: 99, fin: true, slot: None,
+            },
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint: ep, stream: cover, role, offset: 0,
+                bytes: 99, fin: true,
+            },
+            QcsdObservation::ResponseHeaders {
+                endpoint: ep, stream: cover, frame_bytes: 924,
+                status: Some(200), content_length: Some(39_620),
+            },
+        ] {
+            c.observe(observation, Duration::from_micros(125_000_000));
+        }
+        c.streams.get_mut(ep, cover).unwrap().receive =
+            crate::stream::ReceiveState::ReceivingData {
+                advertised_limit: 9_166,
+                requested_limit: 9_166,
+                known_limit: 40_570,
+                reservation_capacity: 1_000,
+                reservation_available: 1_000,
+                consumed: 9_163,
+                payload_floor: 39_620,
+                framing_bytes: 950,
+                parser_lease_capacity: 1_000,
+                parser_lease_used: 0,
+                parser_lease_exhausted: false,
+                last_parser_lease_boundary: None,
+                pending_parser_boundary: None,
+                data_length: 8_213,
+            };
+        c.advertised_incoming_credit.insert(key, vec![AdvertisedIncomingCredit {
+            slot: QcsdSlotId(579), start: 9_163, end: 9_166,
+        }]);
+        c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().consumed = 1_197;
+        c.buflo_chaff_ack_observed_at.insert(key, Duration::from_micros(125_000_000));
+        c.buflo_chaff_last_read_at.insert(key, Duration::from_micros(140_343_869));
+        c.drain_actions().for_each(drop);
+        c
+    }
+
+    fn native160_observe_pristine_zero_tail(c: &mut QcsdController) {
+        c.observe(QcsdObservation::HeaderProgress {
+            endpoint: QcsdEndpointId(1), stream: QcsdStreamId(120),
+            min_remaining: 1, awaiting_data_frame: true,
+        }, Duration::from_micros(140_343_870));
+    }
+
+    #[test]
+    fn buflo_native160_first_untracked_three_tail_gets_fresh1200_fair_service() {
+        let mut c = native160_zero_three_tail_snapshot();
+        let ep = QcsdEndpointId(1);
+        let cover = QcsdStreamId(120);
+        let key = (ep, cover);
+        let old_ranges = c.advertised_incoming_credit.clone();
+        let old_ledgers = c.incoming_credit_ledger.clone();
+        let old_requested = c.scheduled_incoming_requested_bytes;
+        assert!(!c.buflo_known_chaff_service_ranges.contains_key(&key));
+        native160_observe_pristine_zero_tail(&mut c);
+        assert_eq!(c.buflo_known_chaff_demands.get(&key), Some(&9_163));
+        assert!(c.drain_actions().next().is_none(), "intent is neither MAX nor data");
+        assert_eq!(c.advertised_incoming_credit, old_ranges);
+        let actions = native113_due(&mut c, 140_352_000, 140_352_000);
+        let grants: Vec<_> = actions.iter().filter_map(|action| match action {
+            QcsdAction::IncreaseReceiveLimit {
+                endpoint, stream, absolute_limit, packet, slot,
+            } => Some((*endpoint, *stream, *absolute_limit, packet.length(), *slot)),
+            _ => None,
+        }).collect();
+        assert_eq!(grants, vec![(ep, cover, 10_366, 1_200, QcsdSlotId(589))]);
+        assert_eq!(c.advertised_incoming_credit, old_ranges,
+            "the old unread3 remain owned; the new cell adds1200 new offsets");
+        for (slot, ledger) in old_ledgers {
+            assert_eq!(c.incoming_credit_ledger[&slot], ledger);
+        }
+        assert_eq!(c.scheduled_incoming_requested_bytes, old_requested + 1_200);
+        assert!(c.control.claims.is_empty());
+        assert!(!actions.iter().any(|a| matches!(a,
+            QcsdAction::LeaseParserReceive { .. } | QcsdAction::SlotMissed { .. })));
+        assert!(c.buflo_fin_permission_releases.is_empty());
+    }
+
+    #[test]
+    fn buflo_native160_new_three_tail_keeps_pristine_qualified_and_owner_fences() {
+        let ep = QcsdEndpointId(1);
+        let cover = QcsdStreamId(120);
+        let key = (ep, cover);
+        for case in 0..9 {
+            let mut c = native160_zero_three_tail_snapshot();
+            let mut minimum = 1;
+            let mut awaiting = true;
+            match case {
+                0 => minimum = 2,
+                1 => awaiting = false,
+                2 => { c.buflo_chaff_ack_observed_at.remove(&key); }
+                3 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().retired = 1; }
+                4 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().local_realization_emitted = false; }
+                5 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().advertised = 1_199; }
+                6 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().consumed = 0; }
+                7 => { c.advertised_incoming_credit.get_mut(&key).unwrap()[0].start = 9_164; }
+                8 => { c.chaff = None; }
+                _ => unreachable!(),
+            }
+            let before = c.streams.receive_limits(ep, cover);
+            c.observe(QcsdObservation::HeaderProgress {
+                endpoint: ep, stream: cover, min_remaining: minimum,
+                awaiting_data_frame: awaiting,
+            }, Duration::from_micros(140_343_870));
+            assert!(!c.buflo_known_chaff_demands.contains_key(&key), "case{case}");
+            assert!(!c.buflo_known_chaff_service_ranges.contains_key(&key), "case{case}");
+            assert_eq!(c.streams.receive_limits(ep, cover), before, "case{case}");
+            assert!(c.drain_actions().next().is_none(), "case{case} cannot mint MAX");
+        }
+    }
+
+    #[test]
+    fn buflo_native160_four_byte_tail_is_outside_narrow_new_admission() {
+        let mut c = native160_zero_three_tail_snapshot();
+        let ep = QcsdEndpointId(1);
+        let cover = QcsdStreamId(120);
+        if let crate::stream::ReceiveState::ReceivingData {
+            advertised_limit, requested_limit, ..
+        } = &mut c.streams.get_mut(ep, cover).unwrap().receive {
+            *advertised_limit = 9_167;
+            *requested_limit = 9_167;
+        } else { unreachable!(); }
+        c.advertised_incoming_credit.get_mut(&(ep, cover)).unwrap()[0].end = 9_167;
+        c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().consumed = 1_196;
+        c.scheduled_incoming_consumed_bytes -= 1;
+        native160_observe_pristine_zero_tail(&mut c);
+        assert!(!c.buflo_known_chaff_demands.contains_key(&(ep, cover)));
+        assert!(!c.buflo_known_chaff_service_ranges.contains_key(&(ep, cover)));
+        assert!(c.drain_actions().next().is_none());
+    }
+
+    #[test]
+    fn buflo_native160_saved64_reads_keep_old3_and_remote_reset_retires_new3() {
+        let mut c = native160_zero_three_tail_snapshot();
+        let ep = QcsdEndpointId(1);
+        let cover = QcsdStreamId(120);
+        let slot = QcsdSlotId(6_211);
+        let target = Duration::from_micros(198_720_000);
+        let packet = Packet::new(target, Direction::Incoming, 1_200).unwrap();
+        if let crate::stream::ReceiveState::ReceivingData {
+            advertised_limit, requested_limit, ..
+        } = &mut c.streams.get_mut(ep, cover).unwrap().receive {
+            *advertised_limit = 9_230;
+            *requested_limit = 9_230;
+        } else { unreachable!(); }
+        c.advertised_incoming_credit.get_mut(&(ep, cover)).unwrap()
+            .push(AdvertisedIncomingCredit { slot, start: 9_166, end: 9_230 });
+        c.pending_slots.insert(slot, packet);
+        c.incoming_credit_ledger.insert(slot, IncomingCreditLedger {
+            packet, endpoint: Some(ep), multiple_endpoints: false,
+            advertised: 1_200, local_realization_emitted: true,
+            consumed: 1_136, retired: 0,
+        });
+        // Synthetic saved post-release state, not a genuine transport FIN proof.
+        // It enables the original terminal-witness branch solely for this test.
+        c.buflo_fin_permission_releases.push(super::BufloFinPermissionRelease {
+            release_index: 6, slot, endpoint: ep, stream: QcsdStreamId(12),
+            start: 78_904, end: 78_968, final_size: 78_904,
+            fin_at_us: 198_747_548, target_us: 198_720_000,
+            deadline_us: 198_752_000,
+            replacements: vec![(ep, cover, 9_166, 9_230, 198_747_678)],
+        });
+        c.scheduled_incoming_requested_bytes += 1_200;
+        c.scheduled_incoming_advertised_bytes += 1_200;
+        c.scheduled_incoming_consumed_bytes += 1_136;
+        c.buflo_gross_advertised += 1_264;
+        let before_consumed = c.scheduled_incoming_consumed_bytes;
+        c.observe(QcsdObservation::BytesRead { endpoint: ep, stream: cover, bytes: 64 },
+            Duration::from_micros(198_873_549));
+        assert_eq!(c.streams.consumed(ep, cover), Some(9_227));
+        assert_eq!(c.scheduled_incoming_consumed_bytes, before_consumed + 64);
+        assert_eq!(c.incoming_credit_ledger[&slot].consumed, 1_197,
+            "old3 plus new61 cannot be called64 new owned bytes");
+        assert_eq!(c.incoming_credit_ledger[&slot].retired, 0);
+        assert!(!c.drain_actions().any(|a| matches!(a,
+            QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot)));
+        let releases = c.buflo_fin_permission_releases.len();
+        c.observe(QcsdObservation::StreamFinished {
+            endpoint: ep, stream: cover, finish: QcsdStreamFinish::Reset,
+        }, Duration::from_micros(268_099_716));
+        let witness = c.incoming_credit_realization_witness(slot).unwrap();
+        assert_eq!((witness.requested, witness.advertised, witness.consumed, witness.retired),
+            (1_200, 1_200, 1_197, 3));
+        assert_eq!(c.buflo_fin_permission_releases.len(), releases,
+            "a remote reset cannot authorize FIN permission replacement");
+        assert!(c.incoming_terminal_process_witness(slot).is_none());
+        let terminal: Vec<_> = c.drain_actions().collect();
+        assert!(terminal.iter().any(|a| matches!(a,
+            QcsdAction::SlotMissed { slot: observed, reason: MissedSlotReason::ReceiveCreditRetired, .. }
+                if *observed == slot)));
+        assert!(!terminal.iter().any(|a| matches!(a,
+            QcsdAction::SlotSatisfied { slot: observed, .. } if *observed == slot)));
+    }
+
     include!("mixed_known_unknown_parser_tests.rs");
 }
 
