@@ -235,6 +235,80 @@ impl StreamRegistry {
             && state.status == Some(200)
     }
 
+    fn cs_live_chaff_without_length(&self, state: &StreamState) -> bool {
+        self.cs_live_chaff_headers
+            && state.receive_actions_available
+            && matches!(state.role, QcsdRequestRole::Chaff { request_id: Some(_), .. })
+            && state.activated_chaff_request_final_size().is_some()
+            && state.expected_chaff_body_bytes > 0
+            && state.status == Some(200)
+            && matches!(state.observed_response_length,
+                ObservedResponseLength::Final { status: 200, content_length: None })
+            && !matches!(&state.receive, ReceiveState::ReceivingData { data_length, .. }
+                if *data_length > state.expected_chaff_body_bytes)
+    }
+
+    fn scheduled_exact_capacity(&self, state: &StreamState) -> u64 {
+        if self.scheduled_capacity_available(state) {
+            state.receive.available()
+        } else if self.cs_live_chaff_without_length(state) {
+            state.receive.observed_data_available()
+        } else {
+            0
+        }
+    }
+
+    /// Private allocator candidates only; these expose no forecast Capacity.
+    pub(crate) fn cs_live_chaff_owned_data_opportunities(
+        &self,
+        endpoint: QcsdEndpointId,
+    ) -> Vec<AllocationOpportunity> {
+        let mut result: Vec<_> = self.streams.iter().filter_map(|((candidate, stream), state)| {
+            (*candidate == endpoint && self.cs_live_chaff_without_length(state)
+                && state.receive.cs_owned_chaff_data_capacity(600) == 600)
+                .then_some(AllocationOpportunity {
+                    endpoint,
+                    stream: *stream,
+                    role: state.role,
+                    exact: 0,
+                    claimable: 0,
+                })
+        }).collect();
+        result.sort_unstable_by_key(|opportunity| opportunity.stream);
+        result
+    }
+
+    pub(crate) fn cs_live_chaff_owned_data_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        remaining: u64,
+    ) -> u64 {
+        self.streams.get(&(endpoint, stream)).map_or(0, |state| {
+            if self.cs_live_chaff_without_length(state) {
+                state.receive.cs_owned_chaff_data_capacity(remaining)
+            } else {
+                0
+            }
+        })
+    }
+
+    pub(crate) fn cs_live_chaff_owned_data_continuation(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        remaining: u64,
+    ) -> Option<ParserLease> {
+        if self.cs_live_chaff_owned_data_capacity(endpoint, stream, remaining) != remaining
+            || remaining == 0
+        {
+            return None;
+        }
+        let (absolute_limit, increase, scheduled) = self.get_mut(endpoint, stream)?
+            .receive.cs_owned_chaff_data_continuation(remaining)?;
+        Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled })
+    }
+
     /// Finish only a current pre-HEADERS debt. The existing aggregate wrapper
     /// authenticates exact role, FIN ACK, retained offset and lifetime budget;
     /// its receive-state leaf is unchanged. No DATA/body forecast is leased.
@@ -471,10 +545,9 @@ impl StreamRegistry {
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
                     && state.receive_actions_available
-                    && self.scheduled_capacity_available(state)
             })
             .fold(Capacity::default(), |mut capacity, (_, state)| {
-                let available = state.receive.available();
+                let available = self.scheduled_exact_capacity(state);
                 match state.role {
                     QcsdRequestRole::Application => {
                         capacity.application_incoming =
@@ -501,11 +574,9 @@ impl StreamRegistry {
     pub fn aggregate_capacity(&self) -> Capacity {
         self.streams
             .values()
-            .filter(|state| {
-                state.receive_actions_available && self.scheduled_capacity_available(state)
-            })
+            .filter(|state| state.receive_actions_available)
             .fold(Capacity::default(), |mut total, state| {
-                let available = state.receive.available();
+                let available = self.scheduled_exact_capacity(state);
                 match state.role {
                     QcsdRequestRole::Application => {
                         total.application_incoming =
@@ -533,17 +604,22 @@ impl StreamRegistry {
             .filter(|((candidate, _), state)| {
                 *candidate == endpoint
                     && state.receive_actions_available
-                    && self.scheduled_capacity_available(state)
                     && (mode == DefenseMode::ChaffAndShape
                         || matches!(state.role, QcsdRequestRole::Chaff { .. }))
-                    && (state.receive.available() > 0 || state.receive.claimable() > 0)
+                    && (self.scheduled_exact_capacity(state) > 0
+                        || (self.scheduled_capacity_available(state)
+                            && state.receive.claimable() > 0))
             })
             .map(|((_, stream), state)| AllocationOpportunity {
                 endpoint,
                 stream: *stream,
                 role: state.role,
-                exact: state.receive.available(),
-                claimable: state.receive.claimable(),
+                exact: self.scheduled_exact_capacity(state),
+                claimable: if self.scheduled_capacity_available(state) {
+                    state.receive.claimable()
+                } else {
+                    0
+                },
             })
             .collect();
         opportunities.sort_unstable_by_key(|opportunity| {
@@ -745,14 +821,20 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         amount: u64,
     ) -> Option<CreditRelease> {
-        if !self.scheduled_capacity_available(self.streams.get(&(endpoint, stream))?) {
+        let state = self.streams.get(&(endpoint, stream))?;
+        let ordinary = self.scheduled_capacity_available(state);
+        if !ordinary && !self.cs_live_chaff_without_length(state) {
             return None;
         }
         let state = self.get_mut(endpoint, stream)?;
         if !state.receive_actions_available {
             return None;
         }
-        let (absolute_limit, increase) = state.receive.release(amount)?;
+        let (absolute_limit, increase) = if ordinary {
+            state.receive.release(amount)?
+        } else {
+            state.receive.release_observed_data(amount)?
+        };
         Some(CreditRelease {
             endpoint,
             stream,
@@ -2677,3 +2759,7 @@ mod tests {
 #[cfg(test)]
 #[path = "cs_live_chaff_headers_tests.rs"]
 mod cs_live_chaff_headers_tests;
+
+#[cfg(test)]
+#[path = "cs_live_chaff_owned_data_tests.rs"]
+mod cs_live_chaff_owned_data_tests;

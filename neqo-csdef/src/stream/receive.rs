@@ -231,6 +231,73 @@ impl ReceiveState {
         }
     }
 
+    /// Current decoded framing and DATA extent, excluding the prepared hint.
+    pub(crate) const fn observed_data_available(&self) -> u64 {
+        match self {
+            Self::ReceivingData { requested_limit, framing_bytes, data_length, .. } => {
+                match framing_bytes.checked_add(*data_length) {
+                    Some(end) => end.saturating_sub(*requested_limit),
+                    None => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn release_observed_data(&mut self, amount: u64) -> Option<(u64, u64)> {
+        let increase = amount.min(self.observed_data_available());
+        if increase == 0 {
+            return None;
+        }
+        let Self::ReceivingData { requested_limit, .. } = self else {
+            return None;
+        };
+        *requested_limit = requested_limit.checked_add(increase)?;
+        Some((*requested_limit, increase))
+    }
+
+    /// A due CS cell can own its remaining raw bytes at a live DATA boundary.
+    /// The caller retains the actual 600-byte slot identity. Neither the body
+    /// hint nor the lifetime unowned parser allowance funds this permission.
+    pub(crate) fn cs_owned_chaff_data_capacity(&self, remaining: u64) -> u64 {
+        if remaining == 0 || remaining > 600 {
+            return 0;
+        }
+        match self {
+            Self::ReceivingData {
+                advertised_limit, requested_limit, consumed, framing_bytes, data_length,
+                last_parser_lease_boundary, pending_parser_boundary, ..
+            } if *data_length > 0
+                && *advertised_limit == *requested_limit
+                && *consumed == *requested_limit
+                && framing_bytes.checked_add(*data_length).is_some_and(|end| {
+                    end <= *consumed && consumed.saturating_sub(end) <= 16
+                })
+                && *pending_parser_boundary == Some(*consumed)
+                && *last_parser_lease_boundary != Some(*consumed)
+                && requested_limit.checked_add(remaining).is_some() => remaining,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn cs_owned_chaff_data_continuation(
+        &mut self,
+        remaining: u64,
+    ) -> Option<(u64, u64, bool)> {
+        if self.cs_owned_chaff_data_capacity(remaining) != remaining || remaining == 0 {
+            return None;
+        }
+        let Self::ReceivingData {
+            requested_limit, consumed, last_parser_lease_boundary, pending_parser_boundary, ..
+        } = self else {
+            return None;
+        };
+        *requested_limit = requested_limit.checked_add(remaining)?;
+        *last_parser_lease_boundary = Some(*consumed);
+        *pending_parser_boundary = None;
+        Some((*requested_limit, remaining, true))
+    }
+
     /// Whether this stream is still at its configured initial response prefix
     /// and has exact capacity for one complete terminal chaff-only slot.
     ///

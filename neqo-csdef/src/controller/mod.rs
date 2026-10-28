@@ -4029,8 +4029,12 @@ impl QcsdController {
             self.streams
                 .lease_buflo_retained_parser(endpoint, stream, boundary, backing)
         } else if claim.is_some_and(|claim| !claim.reservation_debited) {
-            self.streams
-                .owned_data_continuation(endpoint, stream, backing)
+            let cs_chaff = claim.filter(|claim| {
+                claim.packet.direction() == Direction::Incoming && claim.packet.length() == 600
+            }).and_then(|_| {
+                self.streams.cs_live_chaff_owned_data_continuation(endpoint, stream, backing)
+            });
+            cs_chaff.or_else(|| self.streams.owned_data_continuation(endpoint, stream, backing))
         } else if self.incoming_requires_explicit_physical_ownership() {
             let fresh = if self.buflo_secondary_fresh_parser_bridge_enabled(endpoint, stream) {
                 let owned_suffix = self.buflo_fresh_owned_parser_suffix(endpoint, stream);
@@ -6542,6 +6546,14 @@ impl QcsdController {
                     &self.control.receiver_continuation_reserves,
                     self.defense.base_chaff_requires_peer_acknowledgment(),
                 );
+                if incoming.packet.length() == 600
+                    && self.streams.cs_live_chaff_headers_enabled()
+                    && self.defense.terminal_failure().is_none()
+                {
+                    endpoint_opportunities.extend(
+                        self.streams.cs_live_chaff_owned_data_opportunities(endpoint),
+                    );
+                }
                 if self.terminal_primary_partial_cell_policy
                     && self.incoming_requires_explicit_physical_ownership()
                     && incoming.remaining == u64::from(incoming.packet.length())
@@ -6981,7 +6993,7 @@ impl QcsdController {
                 let bound_owned_primary = self.terminal_primary_partial_cell_policy
                     && self.terminal_primary_stream
                         == Some((opportunity.endpoint, opportunity.stream));
-                let owned_data_quantum = if bound_owned_primary
+                let primary_owned_data_quantum = if bound_owned_primary
                     && self.incoming_requires_explicit_physical_ownership()
                     && incoming.remaining == u64::from(incoming.packet.length())
                     && !self
@@ -6995,6 +7007,23 @@ impl QcsdController {
                                 && !claim.reservation_debited
                         }) {
                     self.streams.owned_data_continuation_capacity(
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        incoming.remaining,
+                    )
+                } else {
+                    0
+                };
+                let owned_data_quantum = if primary_owned_data_quantum > 0 {
+                    primary_owned_data_quantum
+                } else if incoming.packet.length() == 600
+                    && !self.control.claims.iter().chain(staged_claims.iter()).any(|claim| {
+                        claim.endpoint == opportunity.endpoint
+                            && claim.stream == opportunity.stream
+                            && !claim.reservation_debited
+                    })
+                {
+                    self.streams.cs_live_chaff_owned_data_capacity(
                         opportunity.endpoint,
                         opportunity.stream,
                         incoming.remaining,
@@ -34117,3 +34146,7 @@ mod incoming_terminal_process_clock_tests {
 #[cfg(test)]
 #[path = "cs_live_chaff_headers_tests.rs"]
 mod cs_live_chaff_headers_tests;
+
+#[cfg(test)]
+#[path = "cs_live_chaff_owned_data_tests.rs"]
+mod cs_live_chaff_owned_data_tests;

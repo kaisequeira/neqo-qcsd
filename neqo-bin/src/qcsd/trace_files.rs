@@ -381,6 +381,10 @@ pub(super) struct TraceFiles {
     schedule: BufWriter<File>,
     start: Instant,
     event_rows: Vec<EventTraceRow>,
+    /// Engineering-only allocation accounting. Disabled unless explicitly
+    /// requested; never changes an event, controller action or trace row.
+    trace_growth_diagnostics: bool,
+    event_string_capacity_bytes: usize,
     next_event_sequence: u64,
     events_flushed: bool,
     pending_slots: HashMap<QcsdSlotId, PendingSlot>,
@@ -437,6 +441,9 @@ impl TraceFiles {
             schedule,
             start,
             event_rows: Vec::new(),
+            trace_growth_diagnostics: std::env::var_os("QCSD_TRACE_GROWTH_DIAGNOSTICS")
+                .is_some_and(|value| value == "1"),
+            event_string_capacity_bytes: 0,
             next_event_sequence: 0,
             events_flushed: false,
             pending_slots: HashMap::new(),
@@ -1681,8 +1688,61 @@ impl TraceFiles {
             ));
         }
         self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+        if self.trace_growth_diagnostics {
+            let string_bytes = row
+                .connection
+                .capacity()
+                .saturating_add(row.event.capacity())
+                .saturating_add(row.outcome.capacity())
+                .saturating_add(row.details.capacity());
+            self.event_string_capacity_bytes = self
+                .event_string_capacity_bytes
+                .saturating_add(string_bytes);
+        }
         self.event_rows.push(row);
+        if self.trace_growth_diagnostics
+            && self.event_rows.len() >= 1_024
+            && self.event_rows.len().is_power_of_two()
+        {
+            self.report_trace_growth();
+        }
         Ok(())
+    }
+
+    /// Attribute retained allocations without scanning all prior events or
+    /// adding synthetic observations to the scientific trace. These figures
+    /// omit allocator overhead and map allocations; they are not process RSS.
+    fn report_trace_growth(&self) {
+        let row_storage_bytes = self
+            .event_rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<EventTraceRow>());
+        let report = serde_json::json!({
+            "record_type": "qcsd-engineering-trace-allocation-growth-v1",
+            "monotonic_ns": self.elapsed_ns(Instant::now()),
+            "event_rows": self.event_rows.len(),
+            "event_row_capacity": self.event_rows.capacity(),
+            "event_row_size_bytes": std::mem::size_of::<EventTraceRow>(),
+            "event_row_storage_bytes": row_storage_bytes,
+            "event_owned_string_capacity_bytes": self.event_string_capacity_bytes,
+            "accounted_event_allocation_bytes": row_storage_bytes
+                .saturating_add(self.event_string_capacity_bytes),
+            "csv_writer_capacity_bytes": self.packets.capacity()
+                .saturating_add(self.events.capacity())
+                .saturating_add(self.schedule.capacity()),
+            "pending_slots": self.pending_slots.len(),
+            "incoming_target_limits": self.incoming_target_limits.len(),
+            "physical_receive_advertisement_streams": self.physical_receive_advertisements.len(),
+            "terminal_slots": self.terminal_slots.len(),
+            "cs_incoming_process_witnesses": self.cs_incoming_process_witnesses.len(),
+            "buflo_fin_raw_frontiers": self.buflo_fin_raw_frontiers.len(),
+            "buflo_fin_peer_reads": self.buflo_fin_peer_reads.len(),
+            "buflo_fin_release_proofs": self.buflo_fin_release_proofs.len(),
+            "buflo_fin_pre_advertisement_slots": self.buflo_fin_pre_advertisements.len(),
+            "scientific_credit_added": 0,
+        });
+        // Diagnostic output failure must not change the run's verdict.
+        drop(writeln!(std::io::stderr(), "QCSD_TRACE_GROWTH {report}"));
     }
 
     pub(super) fn flush_events(&mut self) -> Result<(), Error> {
@@ -1713,6 +1773,7 @@ impl TraceFiles {
                 row.qcsd.csv_suffix(),
             )?;
         }
+        self.event_string_capacity_bytes = 0;
         self.events.flush()?;
         self.packets.flush()?;
         self.schedule.flush()?;
@@ -3705,4 +3766,138 @@ mod root_buflo_owned_terminal_process_clock_tests {
             "1199 bytes cannot fabricate a full1200 owned consumption witness");
     }
 
+}
+
+#[cfg(test)]
+mod trace_growth_diagnostic_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+
+    use neqo_csdef::{QcsdObservation, QcsdObservationClock};
+
+    use super::{
+        Direction, Packet, PacketTraceRow, QcsdEndpointId, QcsdSlotId, QcsdTraceColumns,
+        ScheduleTraceRow, TraceFiles,
+    };
+
+    struct OutputDirectory(PathBuf);
+
+    impl Drop for OutputDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn trace_growth_diagnostics_preserve_exact_csv_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = OutputDirectory(std::env::temp_dir().join(format!(
+            "qcsd-trace-growth-equivalence-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir(&root.0)?;
+        let disabled_path = root.0.join("disabled");
+        let enabled_path = root.0.join("enabled");
+        fs::create_dir(&disabled_path)?;
+        fs::create_dir(&enabled_path)?;
+        let start = Instant::now();
+        let mut disabled = TraceFiles::new(&disabled_path, start)?;
+        let mut enabled = TraceFiles::new(&enabled_path, start)?;
+        // Set private instance flags before any row. The test neither depends
+        // on nor mutates the process-global environment while tests run.
+        disabled.trace_growth_diagnostics = false;
+        enabled.trace_growth_diagnostics = true;
+        let clock = QcsdObservationClock::new(start);
+        let endpoint = QcsdEndpointId(7);
+
+        for index in 0..2_048_u64 {
+            let produced = start + Duration::from_nanos(index * 2);
+            let earlier = clock.record_at(
+                QcsdObservation::EgressBacklog {
+                    pending: index.is_multiple_of(2),
+                },
+                produced,
+            );
+            let later = clock.record_at(
+                QcsdObservation::EgressStreamBacklog {
+                    pending: !index.is_multiple_of(2),
+                },
+                produced,
+            );
+            for traces in [&mut disabled, &mut enabled] {
+                // Delayed harvest must retain production ordering, including
+                // the existing deferred fixed-backlog serialization path.
+                traces.observation(None, &later)?;
+                traces.observation(None, &earlier)?;
+                traces.event(
+                    produced + Duration::from_nanos(1),
+                    Some(endpoint),
+                    "growth-equivalence",
+                    "recorded",
+                    &serde_json::json!({"index": index, "text": "comma, quote\" newline\nΩ"}),
+                )?;
+            }
+        }
+
+        assert_eq!(enabled.event_rows.len(), 6_144);
+        assert_eq!(disabled.event_rows.len(), enabled.event_rows.len());
+        assert_eq!(disabled.event_string_capacity_bytes, 0);
+        let actual_string_capacity: usize = enabled
+            .event_rows
+            .iter()
+            .map(|row| {
+                row.connection.capacity()
+                    + row.event.capacity()
+                    + row.outcome.capacity()
+                    + row.details.capacity()
+            })
+            .sum();
+        assert_eq!(enabled.event_string_capacity_bytes, actual_string_capacity);
+        assert!(actual_string_capacity > 0);
+        assert!(enabled
+            .event_rows
+            .iter()
+            .any(|row| row.deferred_backlog_details.is_some()));
+
+        let packet = Packet::new(Duration::from_millis(1), Direction::Outgoing, 1_200)?;
+        for traces in [&mut disabled, &mut enabled] {
+            traces.packet(&PacketTraceRow {
+                now: start + Duration::from_millis(2),
+                endpoint,
+                direction: "outgoing",
+                observed: 1_200,
+                scheduled: Some(1_200),
+                satisfaction: "satisfied",
+                slot: Some(QcsdSlotId(1)),
+                qcsd: QcsdTraceColumns::exact(1_200, Some(1_200)),
+            })?;
+            traces.schedule(&ScheduleTraceRow {
+                action_time_us: 2_000,
+                endpoint: Some(endpoint),
+                packet,
+                satisfaction: "satisfied",
+                observed: Some(1_200),
+                miss_reason: "",
+                slot: QcsdSlotId(1),
+                qcsd: QcsdTraceColumns::exact(1_200, Some(1_200)),
+                terminal_defense_elapsed_us: 2_000,
+            })?;
+            traces.flush_events()?;
+            assert!(traces.event_rows.is_empty());
+            assert_eq!(traces.event_string_capacity_bytes, 0);
+        }
+
+        for name in ["events.csv", "packets.csv", "schedule.csv"] {
+            let expected = fs::read(disabled_path.join(name))?;
+            let actual = fs::read(enabled_path.join(name))?;
+            assert!(!actual.is_empty());
+            assert_eq!(actual, expected, "diagnostics changed {name}");
+        }
+        Ok(())
+    }
 }
