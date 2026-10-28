@@ -562,3 +562,196 @@ fn cs_owned_chaff_final_body_split_without_other_capacity_rolls_back() {
     controller.drain_observations();
     assert!(controller.defense.terminal_failure().is_some());
 }
+
+fn three_body_bytes_short_owned_prefix() -> (QcsdController, QcsdSlotId, Duration) {
+    let mut controller = final_body_controller();
+    // Recorded Native163 stream 80: the prepared body is 564884, but the
+    // consumed DATA extent is only 564881. The next three RAW bytes are not
+    // a promise that a new DATA frame and its three BODY bytes can complete.
+    controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive =
+        ReceiveState::ReceivingData {
+            advertised_limit: 569_053,
+            requested_limit: 569_053,
+            known_limit: 569_056,
+            reservation_capacity: 1_000,
+            reservation_available: 1_000,
+            consumed: 569_053,
+            payload_floor: 564_884,
+            framing_bytes: 4_172,
+            parser_lease_capacity: 1_000,
+            parser_lease_used: 984,
+            parser_lease_exhausted: false,
+            last_parser_lease_boundary: Some(568_582),
+            pending_parser_boundary: Some(569_053),
+            data_length: 564_881,
+        };
+    let at = Duration::from_micros(10_000);
+    let slot = due_incoming(&mut controller, at);
+    controller.process_incoming(10_000, at);
+    controller.retry_pending_parser_leases();
+    let actions: Vec<_> = controller.drain_actions().collect();
+    assert_eq!(actions.len(), 2);
+    assert_owned_chaff_lease(&actions, STREAMS[0], 569_056, 3, slot);
+    assert_owned_chaff_lease(&actions, STREAMS[1], 1_597, 597, slot);
+    // The framing follow-up cannot precede the original physical ownership.
+    controller.retry_pending_parser_leases();
+    assert!(controller.drain_actions().all(|a| !matches!(a,
+        QcsdAction::LeaseParserReceive { owner: None, .. })));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[0], 569_056, at);
+    assert!(!controller.incoming_slot_is_locally_realized(slot));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[1], 1_597, at);
+    assert!(controller.incoming_slot_is_locally_realized(slot));
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+    controller.drain_actions().for_each(drop);
+    (controller, slot, at)
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one real controller oracle preserves the old three-byte owner through framing, FIN and replacement"
+)]
+fn cs_owned_three_body_bytes_short_uses_remaining_unowned_framing_without_forgiving_owner() {
+    let (mut controller, slot, at) = three_body_bytes_short_owned_prefix();
+    let original = controller.incoming_credit_ledger[&slot];
+    assert_eq!(controller.streams.aggregate_capacity().chaff_incoming, 0);
+    controller.retry_pending_parser_leases();
+    let mut actions: Vec<_> = controller.drain_actions().collect();
+    // This assertion must fail on unmodified Native163. It has cleared the
+    // boundary after assigning three owned bytes and emits no follow-up.
+    assert!(matches!(&actions[..], [QcsdAction::LeaseParserReceive {
+        endpoint: ENDPOINT, stream: QcsdStreamId(80), absolute_limit: 569_072,
+        increase: 16, owner: None,
+    }]));
+    assert_eq!(controller.incoming_credit_ledger[&slot], original);
+    assert_eq!(controller.scheduled_incoming_requested_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    assert_eq!(controller.streams.aggregate_capacity().chaff_incoming, 0);
+    let ranges = &controller.parser_lease_ranges[&(ENDPOINT, STREAMS[0])];
+    assert_eq!(ranges.len(), 2);
+    assert_eq!((ranges[0].start, ranges[0].end), (569_053, 569_056));
+    assert!(ranges[0].advertised && !ranges[0].unowned && !ranges[0].reservation_debited);
+    assert_eq!(ranges[0].owner.unwrap().slot, slot);
+    assert_eq!((ranges[1].start, ranges[1].end), (569_056, 569_072));
+    assert!(ranges[1].unowned && !ranges[1].advertised && ranges[1].owner.is_none());
+    assert!(matches!(controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive,
+        ReceiveState::ReceivingData {
+            parser_lease_capacity: 1_000, parser_lease_used: 1_000,
+            parser_lease_exhausted: true, data_length: 564_881, ..
+        }));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[0], 569_072,
+        at + Duration::from_micros(1));
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    controller.retry_pending_parser_leases();
+    assert!(controller.drain_actions().all(|a| !matches!(a,
+        QcsdAction::LeaseParserReceive { .. })));
+    // A genuine small DATA frame uses two framing bytes and three body bytes.
+    // The old owner consumes exactly its first three raw bytes; only the next
+    // two body bytes and the final empty DATA/FIN use the unowned allowance.
+    for observation in [
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[0], bytes: 2 },
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[0], frame_header_bytes: 2, data_bytes: 3,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[0], bytes: 3 },
+        QcsdObservation::HeaderProgress {
+            endpoint: ENDPOINT, stream: STREAMS[0], min_remaining: 1, awaiting_data_frame: true,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[0], bytes: 2 },
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[0], frame_header_bytes: 2, data_bytes: 0,
+        },
+        QcsdObservation::PeerFinRead {
+            endpoint: ENDPOINT, stream: STREAMS[0], final_size: 569_060,
+            encoded_receive_limit: 569_072, manual_receive_limit: 569_072,
+            bytes_received: 569_060, bytes_read: 569_060, buffered_bytes: 0,
+        },
+        QcsdObservation::StreamFinished {
+            endpoint: ENDPOINT, stream: STREAMS[0], finish: crate::QcsdStreamFinish::Fin,
+        },
+    ] {
+        controller.observe(observation, at + Duration::from_micros(2));
+    }
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 3);
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    assert_eq!(controller.incoming_credit_ledger[&slot].unresolved(), 597);
+    for observation in [
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[1], frame_header_bytes: 3, data_bytes: 594,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[1], bytes: 597 },
+    ] {
+        controller.observe(observation, at + Duration::from_micros(3));
+    }
+    controller.request_chaff_if_needed(false);
+    actions.extend(controller.drain_actions());
+    assert!(controller.streams.get_mut(ENDPOINT, STREAMS[0]).is_none());
+    assert!(actions.iter().any(|a| matches!(a,
+        QcsdAction::RequestChaff { endpoint: ENDPOINT, resource, request_id }
+            if resource.id == 4 && *request_id == QcsdChaffRequestId(5))));
+    assert!(actions.iter().any(|a| matches!(a,
+        QcsdAction::SlotSatisfied { slot: satisfied, .. } if *satisfied == slot)));
+    assert!(!controller.incoming_credit_ledger.contains_key(&slot));
+    assert_eq!(controller.scheduled_incoming_requested_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    assert!(actions.iter().all(|a| !matches!(a, QcsdAction::SlotMissed { .. })));
+    assert!(controller.defense.terminal_failure().is_none());
+}
+
+#[test]
+fn cs_owned_three_byte_tail_framing_preserves_all_original_scope_and_budget_guards() {
+    for case in 0..12 {
+        let (mut controller, slot, _) = three_body_bytes_short_owned_prefix();
+        match case {
+            0 => controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().status = Some(499),
+            1 => {
+                let role = controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().role;
+                controller.streams.record_chaff_request_acknowledgment(
+                    ENDPOINT, STREAMS[0], role, 73, 1, true,
+                );
+            }
+            2 => controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap()
+                .response_headers(0, Some(200), Some(564_884)),
+            3 | 4 | 5 | 6 => {
+                if let ReceiveState::ReceivingData {
+                    parser_lease_used, parser_lease_exhausted,
+                    last_parser_lease_boundary, data_length, ..
+                } = &mut controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive {
+                    match case {
+                        3 => { *parser_lease_used = 1_000; *parser_lease_exhausted = true; }
+                        4 => *parser_lease_used = 985,
+                        5 => *last_parser_lease_boundary = None,
+                        6 => *data_length = 564_885,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            7 => controller.parser_lease_ranges.get_mut(&(ENDPOINT, STREAMS[0])).unwrap()[0]
+                .advertised = false,
+            8 => controller.parser_lease_ranges.get_mut(&(ENDPOINT, STREAMS[0])).unwrap()[0]
+                .owner = None,
+            9 => { controller.pending_slots.remove(&slot); }
+            10 => { controller.incoming_credit_ledger.remove(&slot); }
+            11 => { assert!(controller.streams.mark_receive_unavailable(ENDPOINT, STREAMS[0])); }
+            _ => unreachable!(),
+        }
+        let before = controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive.clone();
+        let counters = (controller.scheduled_incoming_requested_bytes,
+            controller.scheduled_incoming_advertised_bytes,
+            controller.scheduled_incoming_consumed_bytes,
+            controller.scheduled_incoming_retired_bytes);
+        controller.retry_pending_parser_leases();
+        assert!(controller.drain_actions().all(|a| !matches!(a,
+            QcsdAction::LeaseParserReceive { .. })), "scope case {case}");
+        assert_eq!(controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive, before);
+        assert_eq!((controller.scheduled_incoming_requested_bytes,
+            controller.scheduled_incoming_advertised_bytes,
+            controller.scheduled_incoming_consumed_bytes,
+            controller.scheduled_incoming_retired_bytes), counters);
+    }
+}

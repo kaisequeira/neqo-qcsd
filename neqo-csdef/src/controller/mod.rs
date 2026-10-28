@@ -6031,7 +6031,95 @@ impl QcsdController {
         }
     }
 
+
+    /// Service only a current, physically advertised CS chaff owner suffix.
+    /// Its existing raw bytes keep their owner; the appended framing bytes
+    /// come solely from the stream's original unowned parser allowance.
+    fn retry_cs_live_chaff_owned_tail_framing(&mut self) {
+        if !self.streams.cs_live_chaff_headers_enabled()
+            || self.defense.terminal_failure().is_some()
+        {
+            return;
+        }
+        let candidates: Vec<_> = self.parser_lease_ranges.keys().copied().collect();
+        for (endpoint, stream) in candidates {
+            if self.cs_terminal_cancellations_pending.contains(&(endpoint, stream))
+                || self.control.claims.iter().any(|claim| {
+                    claim.endpoint == endpoint && claim.stream == stream
+                })
+            {
+                continue;
+            }
+            let Some(consumed) = self.streams.consumed(endpoint, stream) else {
+                continue;
+            };
+            let Some((advertised, requested)) = self.streams.receive_limits(endpoint, stream) else {
+                continue;
+            };
+            if advertised != requested || requested <= consumed || requested - consumed > 16 {
+                continue;
+            }
+            let range = {
+                let Some(ranges) = self.parser_lease_ranges.get(&(endpoint, stream)) else {
+                    continue;
+                };
+                let mut remaining = ranges.iter().filter(|r| r.bytes() > 0);
+                let Some(range) = remaining.next().copied() else {
+                    continue;
+                };
+                if remaining.next().is_some() {
+                    continue;
+                }
+                range
+            };
+            let Some(owner) = range.owner else {
+                continue;
+            };
+            let Some(ledger) = self.incoming_credit_ledger.get(&owner.slot) else {
+                continue;
+            };
+            if range.start != consumed || range.end != requested
+                || !range.advertised || range.unowned || range.reservation_debited
+                || owner.packet.direction() != Direction::Incoming
+                || owner.packet.length() != 600
+                || self.pending_slots.get(&owner.slot) != Some(&owner.packet)
+                || ledger.packet != owner.packet
+                || ledger.action_endpoint() != Some(endpoint)
+                || !ledger.local_realization_emitted
+                || ledger.advertised != ledger.requested()
+                || ledger.retired != 0
+                || ledger.unresolved() < range.bytes()
+            {
+                continue;
+            }
+            let Some(lease) = self.streams.cs_live_chaff_owned_tail_framing_lease(
+                endpoint, stream, (consumed, requested),
+            ) else {
+                continue;
+            };
+            debug_assert!(!lease.scheduled);
+            self.parser_lease_ranges.entry((endpoint, stream)).or_default().push(
+                ParserLeaseRange {
+                    reservation_debited: false,
+                    start: requested,
+                    end: lease.absolute_limit,
+                    owner: None,
+                    unowned: true,
+                    advertised: false,
+                },
+            );
+            self.actions.push_back(QcsdAction::LeaseParserReceive {
+                endpoint,
+                stream,
+                absolute_limit: lease.absolute_limit,
+                increase: lease.increase,
+                owner: None,
+            });
+        }
+    }
+
     fn retry_pending_parser_leases(&mut self) {
+        self.retry_cs_live_chaff_owned_tail_framing();
         if self.buflo_aggregate_selected.is_some() {
             for (endpoint, stream, debt, pristine) in self.streams.aggregate_framing_debts() {
                 self.try_buflo_aggregate_prebody_framing_lease(endpoint, stream, debt, pristine);

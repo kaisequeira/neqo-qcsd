@@ -320,6 +320,61 @@ impl StreamRegistry {
         Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled })
     }
 
+
+    /// Append the original final parser allowance after an already owned short
+    /// DATA prefix. The prepared extent only narrows this framing case; it
+    /// supplies neither exact receive Capacity nor another scheduled owner.
+    pub(crate) fn cs_live_chaff_owned_tail_framing_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        owned_tail: (u64, u64),
+    ) -> Option<ParserLease> {
+        const HEADER_PREFIX: u64 = 16;
+        let state = self.streams.get(&(endpoint, stream))?;
+        if !self.cs_live_chaff_without_length(state) {
+            return None;
+        }
+        let expected = state.expected_chaff_body_bytes;
+        let ReceiveState::ReceivingData {
+            advertised_limit, requested_limit, known_limit, consumed,
+            framing_bytes, data_length, parser_lease_capacity, parser_lease_used,
+            parser_lease_exhausted, last_parser_lease_boundary,
+            pending_parser_boundary, ..
+        } = &mut self.get_mut(endpoint, stream)?.receive else {
+            return None;
+        };
+        let tail = requested_limit.checked_sub(*consumed)?;
+        let body_remaining = expected.checked_sub(*data_length)?;
+        let allowance = parser_lease_capacity.checked_sub(*parser_lease_used)?;
+        if owned_tail != (*consumed, *requested_limit)
+            || !(1..=HEADER_PREFIX).contains(&tail)
+            || body_remaining != tail
+            || *advertised_limit != *requested_limit
+            || *known_limit > *requested_limit
+            || framing_bytes.checked_add(*data_length) != Some(*consumed)
+            || *last_parser_lease_boundary != Some(*consumed)
+            || pending_parser_boundary.is_some()
+            || *parser_lease_exhausted
+            || allowance != HEADER_PREFIX
+        {
+            return None;
+        }
+        let absolute_limit = requested_limit.checked_add(HEADER_PREFIX)?;
+        *parser_lease_used = parser_lease_used.checked_add(HEADER_PREFIX)?;
+        *parser_lease_exhausted = *parser_lease_used == *parser_lease_capacity;
+        *requested_limit = absolute_limit;
+        // Keep the recorded boundary and the old owner's raw offsets. The
+        // exhausted original allowance prevents another lease at this point.
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase: HEADER_PREFIX,
+            scheduled: false,
+        })
+    }
+
     /// Finish only a current pre-HEADERS debt. The existing aggregate wrapper
     /// authenticates exact role, FIN ACK, retained offset and lifetime budget;
     /// its receive-state leaf is unchanged. No DATA/body forecast is leased.
