@@ -13,6 +13,56 @@ fn role() -> QcsdRequestRole {
     }
 }
 
+#[test]
+fn cs_owned_chaff_final_body_extent_caps_only_private_permission() {
+    let mut registry = frontier();
+    registry.get_mut(ENDPOINT, STREAM).unwrap().receive = ReceiveState::ReceivingData {
+        advertised_limit: 568_903,
+        requested_limit: 568_903,
+        known_limit: 569_057,
+        reservation_capacity: 1_000,
+        reservation_available: 1_000,
+        consumed: 568_903,
+        payload_floor: BODY_BYTES,
+        framing_bytes: 4_173,
+        parser_lease_capacity: 1_000,
+        parser_lease_used: 984,
+        parser_lease_exhausted: false,
+        last_parser_lease_boundary: Some(568_303),
+        pending_parser_boundary: Some(568_903),
+        data_length: 564_730,
+    };
+    assert_eq!(registry.aggregate_capacity().chaff_incoming, 0);
+    assert!(registry.allocation_opportunities(ENDPOINT, DefenseMode::ChaffAndShape).is_empty());
+    assert_eq!(registry.cs_live_chaff_owned_data_capacity(ENDPOINT, STREAM, 600), 154);
+    let candidates = registry.cs_live_chaff_owned_data_opportunities(ENDPOINT);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!((candidates[0].stream, candidates[0].exact, candidates[0].claimable),
+        (STREAM, 0, 0));
+    let before = registry.get_mut(ENDPOINT, STREAM).unwrap().receive.clone();
+    for too_large in [155, 600, 601, 1_200] {
+        assert!(registry.cs_live_chaff_owned_data_continuation(ENDPOINT, STREAM, too_large)
+            .is_none());
+        assert_eq!(registry.get_mut(ENDPOINT, STREAM).unwrap().receive, before);
+    }
+    let lease = registry.cs_live_chaff_owned_data_continuation(ENDPOINT, STREAM, 154)
+        .expect("only this short suffix can belong to the current cell");
+    assert_eq!((lease.absolute_limit, lease.increase, lease.scheduled), (569_057, 154, true));
+    let state = registry.get_mut(ENDPOINT, STREAM).unwrap();
+    assert!(matches!(state.receive, ReceiveState::ReceivingData {
+        parser_lease_used: 984, reservation_available: 1_000, ..
+    }));
+    state.receive.advertised(569_057);
+    state.receive.bytes_read(3);
+    state.receive.data_frame(3, 154);
+    state.receive.bytes_read(151);
+    assert_eq!(registry.aggregate_capacity().chaff_incoming, 3);
+    assert_eq!(registry.cs_live_chaff_owned_data_capacity(ENDPOINT, STREAM, 600), 0);
+    assert!(registry.cs_live_chaff_owned_data_opportunities(ENDPOINT).is_empty());
+    let release = registry.release_stream(ENDPOINT, STREAM, 600).unwrap();
+    assert_eq!((release.absolute_limit, release.increase), (569_060, 3));
+}
+
 fn frontier() -> StreamRegistry {
     let mut registry = StreamRegistry::default();
     assert!(registry.enable_cs_live_chaff_headers());

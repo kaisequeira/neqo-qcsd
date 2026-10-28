@@ -264,8 +264,8 @@ impl StreamRegistry {
         endpoint: QcsdEndpointId,
     ) -> Vec<AllocationOpportunity> {
         let mut result: Vec<_> = self.streams.iter().filter_map(|((candidate, stream), state)| {
-            (*candidate == endpoint && self.cs_live_chaff_without_length(state)
-                && state.receive.cs_owned_chaff_data_capacity(600) == 600)
+            (*candidate == endpoint
+                && self.cs_live_chaff_owned_data_capacity(endpoint, *stream, 600) > 0)
                 .then_some(AllocationOpportunity {
                     endpoint,
                     stream: *stream,
@@ -284,9 +284,20 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         remaining: u64,
     ) -> u64 {
+        if remaining == 0 || remaining > 600 {
+            return 0;
+        }
         self.streams.get(&(endpoint, stream)).map_or(0, |state| {
             if self.cs_live_chaff_without_length(state) {
-                state.receive.cs_owned_chaff_data_capacity(remaining)
+                let ReceiveState::ReceivingData { data_length, .. } = &state.receive else {
+                    return 0;
+                };
+                // The prepared body extent is only a negative ceiling on this
+                // private, due-cell-owned permission. It never supplies exact
+                // Capacity: only a decoded DATA frame can do that. A short
+                // final body leaves the rest of the same cell for other streams.
+                let body_remaining = state.expected_chaff_body_bytes.saturating_sub(*data_length);
+                state.receive.cs_owned_chaff_data_capacity(remaining.min(body_remaining))
             } else {
                 0
             }

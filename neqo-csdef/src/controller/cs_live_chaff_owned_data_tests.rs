@@ -327,3 +327,238 @@ fn cs_owned_chaff_parser_prefix_cannot_reuse_expired_fresh_owner() {
     assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
     assert_eq!(controller.scheduled_incoming_consumed_bytes, 599);
 }
+
+fn final_body_controller() -> QcsdController {
+    let mut controller = controller();
+    // Give the five retained stream identities their genuine manager-issued
+    // request IDs before installing the recorded parser frontier below.
+    let manager = controller.chaff.as_mut().unwrap();
+    let planned = manager.preprovision_to_limit(
+        0, 5, &[(ENDPOINT, "https://r.bing.com".into())],
+    );
+    assert_eq!(planned.len(), STREAMS.len());
+    for (index, request) in planned.into_iter().enumerate() {
+        assert_eq!(request.request_id, QcsdChaffRequestId(u64::try_from(index).unwrap()));
+        manager.request_opened(Some(request.request_id));
+    }
+    assert_eq!(manager.pending_count(), 0);
+    controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive =
+        ReceiveState::ReceivingData {
+            advertised_limit: 568_903,
+            requested_limit: 568_903,
+            known_limit: 569_057,
+            reservation_capacity: 1_000,
+            reservation_available: 1_000,
+            consumed: 568_903,
+            payload_floor: 564_884,
+            framing_bytes: 4_173,
+            parser_lease_capacity: 1_000,
+            parser_lease_used: 984,
+            parser_lease_exhausted: false,
+            last_parser_lease_boundary: Some(568_303),
+            pending_parser_boundary: Some(568_903),
+            data_length: 564_730,
+        };
+    // Stream 88 remains a live alternative for the intervening due cell.
+    // Streams 92/96 cannot accidentally supply the expected split capacity.
+    for stream in &STREAMS[3..] {
+        assert!(controller.streams.mark_receive_unavailable(ENDPOINT, *stream));
+    }
+    controller
+}
+
+fn assert_owned_chaff_lease(
+    actions: &[QcsdAction],
+    stream: QcsdStreamId,
+    absolute_limit: u64,
+    increase: u64,
+    slot: QcsdSlotId,
+) {
+    assert!(actions.iter().any(|action| matches!(action,
+        QcsdAction::LeaseParserReceive {
+            endpoint: ENDPOINT, stream: candidate, absolute_limit: limit,
+            increase: amount, owner: Some(owner),
+        } if *candidate == stream && *limit == absolute_limit && *amount == increase
+            && owner.slot == slot && owner.packet.length() == 600)));
+}
+
+fn advertise_owned_chaff_lease(
+    controller: &mut QcsdController,
+    stream: QcsdStreamId,
+    absolute_limit: u64,
+    at: Duration,
+) {
+    controller.observe(QcsdObservation::ReceiveLimitAdvertised {
+        endpoint: ENDPOINT, stream, absolute_limit, slot: None,
+    }, at);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the retained final-frame, three-cell and replacement lifecycle is one accounting oracle"
+)]
+fn cs_owned_chaff_final_body_split_waits_for_observed_data_then_fin_and_replacement() {
+    let mut controller = final_body_controller();
+    assert_eq!(controller.streams.aggregate_capacity().chaff_incoming, 0);
+    let at = Duration::from_micros(10_000);
+    let first = due_incoming(&mut controller, at);
+    controller.process_incoming(10_000, at);
+    controller.retry_pending_parser_leases();
+    let mut actions: Vec<_> = controller.drain_actions().collect();
+    assert_eq!(actions.len(), 2);
+    assert_owned_chaff_lease(&actions, STREAMS[0], 569_057, 154, first);
+    assert_owned_chaff_lease(&actions, STREAMS[1], 1_446, 446, first);
+    assert!(!controller.incoming_slot_is_locally_realized(first));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[0], 569_057, at);
+    assert!(!controller.incoming_slot_is_locally_realized(first));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[1], 1_446, at);
+    assert!(controller.incoming_slot_is_locally_realized(first));
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+
+    // The actual next allocation preceded stream 80's final DATA header.
+    // Do not invent future exact bytes: another real 600-byte cell goes to 88.
+    // Match poll(): deliver the actual physical-advertisement signals before
+    // asking the reactive defense for its next timer; they clear in_flight.
+    controller.drain_observations();
+    let (intervening, next_at) = next_real_incoming(&mut controller);
+    assert_eq!(controller.streams.aggregate_capacity().chaff_incoming, 0);
+    controller.process_incoming(u64::try_from(next_at.as_micros()).unwrap(), next_at);
+    controller.retry_pending_parser_leases();
+    let intervening_actions: Vec<_> = controller.drain_actions().collect();
+    assert_eq!(intervening_actions.len(), 1);
+    assert_owned_chaff_lease(&intervening_actions, STREAMS[2], 1_600, 600, intervening);
+    advertise_owned_chaff_lease(&mut controller, STREAMS[2], 1_600, next_at);
+    assert!(controller.incoming_slot_is_locally_realized(intervening));
+    actions.extend(intervening_actions);
+    let read_at = next_at + Duration::from_micros(1);
+    for observation in [
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[2], frame_header_bytes: 3, data_bytes: 597,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[2], bytes: 600 },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[0], bytes: 3 },
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[0], frame_header_bytes: 3, data_bytes: 154,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[0], bytes: 151 },
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[1], frame_header_bytes: 3, data_bytes: 443,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[1], bytes: 446 },
+        QcsdObservation::HeaderProgress {
+            endpoint: ENDPOINT, stream: STREAMS[1], min_remaining: 1, awaiting_data_frame: true,
+        },
+    ] {
+        controller.observe(observation, read_at);
+    }
+    assert_eq!(controller.streams.aggregate_capacity().chaff_incoming, 3);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 1_200);
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    assert!(controller.control.terminal_incoming.contains(&first));
+    assert!(controller.control.terminal_incoming.contains(&intervening));
+    actions.extend(controller.drain_actions());
+
+    controller.drain_observations();
+    let (last, last_at) = next_real_incoming(&mut controller);
+    controller.process_incoming(u64::try_from(last_at.as_micros()).unwrap(), last_at);
+    controller.retry_pending_parser_leases();
+    let last_actions: Vec<_> = controller.drain_actions().collect();
+    assert_eq!(last_actions.len(), 2);
+    assert!(last_actions.iter().any(|action| matches!(action,
+        QcsdAction::IncreaseReceiveLimit {
+            endpoint: ENDPOINT, stream: QcsdStreamId(80), absolute_limit: 569_060, slot, ..
+        } if *slot == last)));
+    assert_owned_chaff_lease(&last_actions, STREAMS[1], 2_043, 597, last);
+    controller.observe(QcsdObservation::ReceiveLimitAdvertised {
+        endpoint: ENDPOINT, stream: STREAMS[0], absolute_limit: 569_060, slot: Some(last),
+    }, last_at);
+    assert!(!controller.incoming_slot_is_locally_realized(last));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[1], 2_043, last_at);
+    assert!(controller.incoming_slot_is_locally_realized(last));
+    actions.extend(last_actions);
+    controller.observe(QcsdObservation::BytesRead {
+        endpoint: ENDPOINT, stream: STREAMS[0], bytes: 3,
+    }, last_at + Duration::from_micros(1));
+    controller.observe(QcsdObservation::HeaderProgress {
+        endpoint: ENDPOINT, stream: STREAMS[0], min_remaining: 1, awaiting_data_frame: true,
+    }, last_at + Duration::from_micros(2));
+    let fin_actions: Vec<_> = controller.drain_actions().collect();
+    assert!(fin_actions.iter().any(|action| matches!(action,
+        QcsdAction::LeaseParserReceive {
+            endpoint: ENDPOINT, stream: QcsdStreamId(80), absolute_limit: 569_076,
+            increase: 16, owner: None,
+        })));
+    assert!(matches!(controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive,
+        ReceiveState::ReceivingData { parser_lease_used: 1_000, data_length: 564_884, .. }));
+    advertise_owned_chaff_lease(&mut controller, STREAMS[0], 569_076,
+        last_at + Duration::from_micros(3));
+    actions.extend(fin_actions);
+    for observation in [
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[0], bytes: 2 },
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[0], frame_header_bytes: 2, data_bytes: 0,
+        },
+        QcsdObservation::PeerFinRead {
+            endpoint: ENDPOINT, stream: STREAMS[0], final_size: 569_062,
+            encoded_receive_limit: 569_076, manual_receive_limit: 569_076,
+            bytes_received: 569_062, bytes_read: 569_062, buffered_bytes: 0,
+        },
+        QcsdObservation::StreamFinished {
+            endpoint: ENDPOINT, stream: STREAMS[0], finish: crate::QcsdStreamFinish::Fin,
+        },
+        QcsdObservation::DataFrame {
+            endpoint: ENDPOINT, stream: STREAMS[1], frame_header_bytes: 3, data_bytes: 594,
+        },
+        QcsdObservation::BytesRead { endpoint: ENDPOINT, stream: STREAMS[1], bytes: 597 },
+    ] {
+        controller.observe(observation, last_at + Duration::from_micros(4));
+    }
+    controller.request_chaff_if_needed(false);
+    actions.extend(controller.drain_actions());
+    assert!(controller.streams.get_mut(ENDPOINT, STREAMS[0]).is_none());
+    assert!(actions.iter().any(|action| matches!(action,
+        QcsdAction::RequestChaff { endpoint: ENDPOINT, resource, request_id }
+            if resource.id == 4 && *request_id == QcsdChaffRequestId(5))));
+    for slot in [first, intervening, last] {
+        assert!(actions.iter().any(|action| matches!(action,
+            QcsdAction::SlotSatisfied { slot: satisfied, .. } if *satisfied == slot)));
+        assert!(!controller.incoming_credit_ledger.contains_key(&slot));
+    }
+    assert!(actions.iter().all(|action| !matches!(action, QcsdAction::SlotMissed { .. })));
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 1_800);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 1_800);
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    assert!(controller.defense.terminal_failure().is_none());
+}
+
+#[test]
+fn cs_owned_chaff_final_body_split_without_other_capacity_rolls_back() {
+    let mut controller = final_body_controller();
+    for stream in &STREAMS[1..] {
+        assert!(controller.streams.mark_receive_unavailable(ENDPOINT, *stream));
+    }
+    let before = controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive.clone();
+    let at = Duration::from_micros(10_000);
+    let slot = due_incoming(&mut controller, at);
+    controller.process_incoming(10_000, at);
+    controller.retry_pending_parser_leases();
+    let actions: Vec<_> = controller.drain_actions().collect();
+    assert!(actions.iter().any(|action| matches!(action,
+        QcsdAction::SlotMissed {
+            slot: missed, reason: crate::MissedSlotReason::InsufficientIncomingCapacity, ..
+        } if *missed == slot)));
+    assert!(actions.iter().all(|action| !matches!(action,
+        QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::LeaseParserReceive { .. })));
+    assert!(controller.control.claims.is_empty());
+    assert!(controller.parser_lease_ranges.is_empty());
+    assert_eq!(controller.streams.get_mut(ENDPOINT, STREAMS[0]).unwrap().receive, before);
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 0);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
+    // The refused unadvertised cell still terminalizes its full requested
+    // budget as retired. No byte was granted, consumed, or silently waived.
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 600);
+    controller.drain_observations();
+    assert!(controller.defense.terminal_failure().is_some());
+}
