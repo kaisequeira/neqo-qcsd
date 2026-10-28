@@ -176,3 +176,136 @@ fn cs_owned_chaff_current_response_ack_boundary_and_quantum_are_required() {
     missing_ack.record_chaff_request_acknowledgment(ENDPOINT, STREAM, role(), 73, 1, true);
     assert_eq!(missing_ack.cs_live_chaff_owned_data_capacity(ENDPOINT, STREAM, 600), 0);
 }
+
+
+fn recorded_parser_prefix(stream: QcsdStreamId) -> StreamRegistry {
+    let (requested, consumed, framing, data, last_boundary, request_id) = match stream {
+        QcsdStreamId(80) => (17_460, 17_459, 1_025, 16_434, 16_860, 0),
+        QcsdStreamId(84) => (29_800, 29_799, 1_095, 28_704, 29_200, 1),
+        _ => panic!("only the two retained current parser prefixes are fixtures"),
+    };
+    let role = QcsdRequestRole::Chaff {
+        resource_id: 4,
+        request_id: Some(QcsdChaffRequestId(request_id)),
+    };
+    let mut registry = StreamRegistry::default();
+    assert!(registry.enable_cs_live_chaff_headers());
+    registry.open(ENDPOINT, stream, role, true, 16, 1_000, BODY_BYTES);
+    // Stream 84's genuine FIN ACK preceded the ACK of the request prefix.
+    registry.record_chaff_request_acknowledgment(ENDPOINT, stream, role, 4, 69, true);
+    registry.record_chaff_request_acknowledgment(ENDPOINT, stream, role, 0, 4, false);
+    let state = registry.get_mut(ENDPOINT, stream).unwrap();
+    state.response_headers(framing, Some(200), None);
+    state.receive = ReceiveState::ReceivingData {
+        advertised_limit: requested,
+        requested_limit: requested,
+        known_limit: BODY_BYTES + framing,
+        reservation_capacity: 1_000,
+        reservation_available: 1_000,
+        consumed,
+        payload_floor: BODY_BYTES,
+        framing_bytes: framing,
+        parser_lease_capacity: 1_000,
+        parser_lease_used: 984,
+        parser_lease_exhausted: false,
+        last_parser_lease_boundary: Some(last_boundary),
+        pending_parser_boundary: Some(consumed),
+        data_length: data,
+    };
+    registry
+}
+
+#[test]
+fn cs_owned_chaff_recorded_one_byte_prefix_preserves_prior_credit() {
+    for (stream, requested, consumed) in [
+        (QcsdStreamId(80), 17_460, 17_459),
+        (QcsdStreamId(84), 29_800, 29_799),
+    ] {
+        let mut registry = recorded_parser_prefix(stream);
+        assert_eq!(registry.aggregate_capacity().chaff_incoming, 0);
+        assert!(registry
+            .allocation_opportunities(ENDPOINT, DefenseMode::ChaffAndShape)
+            .is_empty(), "prepared 200/None is still not a public forecast");
+        let before = registry.get_mut(ENDPOINT, stream).unwrap().receive.clone();
+        let lease = registry
+            .cs_live_chaff_owned_data_continuation(ENDPOINT, stream, 600)
+            .unwrap();
+        assert_eq!((lease.absolute_limit, lease.increase, lease.scheduled),
+            (requested + 600, 600, true));
+        assert_eq!(registry.consumed(ENDPOINT, stream), Some(consumed));
+        let mut expected = before.clone();
+        if let ReceiveState::ReceivingData {
+            requested_limit, last_parser_lease_boundary, pending_parser_boundary, ..
+        } = &mut expected {
+            *requested_limit += 600;
+            *last_parser_lease_boundary = Some(consumed);
+            *pending_parser_boundary = None;
+        }
+        assert_eq!(registry.get_mut(ENDPOINT, stream).unwrap().receive, expected,
+            "only fresh requested credit and the boundary marker may change");
+        assert!(registry
+            .cs_live_chaff_owned_data_continuation(ENDPOINT, stream, 600)
+            .is_none(), "the same parser boundary cannot acquire twice");
+        assert!(registry.cancel_parser_lease(ENDPOINT, stream, requested + 600, 600, false));
+        assert_eq!(registry.receive_limits(ENDPOINT, stream), Some((requested, requested)));
+        assert_eq!(registry.consumed(ENDPOINT, stream), Some(consumed));
+        assert_eq!(registry.cs_live_chaff_owned_data_capacity(ENDPOINT, stream, 600), 600);
+    }
+}
+
+#[test]
+fn cs_owned_chaff_prefix_refuses_data_inflight_large_tail_and_stale_authority() {
+    for case in 0..9 {
+        let mut registry = recorded_parser_prefix(STREAM);
+        let state = registry.get_mut(ENDPOINT, STREAM).unwrap();
+        match case {
+            0 => {
+                // A decoded but unread 50-byte DATA extent is not a header prefix.
+                if let ReceiveState::ReceivingData { data_length, .. } = &mut state.receive {
+                    *data_length += 50;
+                }
+            }
+            1 | 2 => {
+                if let ReceiveState::ReceivingData {
+                    requested_limit, advertised_limit, ..
+                } = &mut state.receive {
+                    let tail = if case == 1 { 17 } else { 597 };
+                    *requested_limit = 17_459 + tail;
+                    *advertised_limit = *requested_limit;
+                }
+            }
+            3 => {
+                if let ReceiveState::ReceivingData { pending_parser_boundary, .. } =
+                    &mut state.receive
+                {
+                    *pending_parser_boundary = Some(17_458);
+                }
+            }
+            4 => {
+                if let ReceiveState::ReceivingData { last_parser_lease_boundary, .. } =
+                    &mut state.receive
+                {
+                    *last_parser_lease_boundary = Some(17_459);
+                }
+            }
+            5 => {
+                state.request_acknowledged_ranges.clear();
+                state.request_acknowledged_final_size = None;
+            }
+            6 => state.role = QcsdRequestRole::Application,
+            7 => state.observed_response_length = ObservedResponseLength::Conflicting,
+            _ => {
+                if let ReceiveState::ReceivingData { advertised_limit, .. } = &mut state.receive {
+                    *advertised_limit -= 1;
+                }
+            }
+        }
+        let before = state.receive.clone();
+        assert_eq!(registry.cs_live_chaff_owned_data_capacity(ENDPOINT, STREAM, 600), 0,
+            "case {case} is not a current bounded parser prefix");
+        assert!(registry
+            .cs_live_chaff_owned_data_continuation(ENDPOINT, STREAM, 600)
+            .is_none());
+        assert_eq!(registry.get_mut(ENDPOINT, STREAM).unwrap().receive, before);
+    }
+}

@@ -200,3 +200,130 @@ fn cs_owned_chaff_exact_tail_and_parser_remainder_keep_one_600_byte_owner() {
     assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
     assert_eq!(controller.scheduled_incoming_consumed_bytes, 0);
 }
+
+
+fn one_byte_owned_prefix() -> (QcsdController, QcsdSlotId) {
+    let mut controller = controller();
+    // Keep the five-stream role/ACK fixture, but focus this lifecycle on one
+    // eligible stream. Other streams cannot receive actions in this fixture.
+    for stream in &STREAMS[1..] {
+        assert!(controller.streams.mark_receive_unavailable(ENDPOINT, *stream));
+    }
+    let at = Duration::from_micros(10_000);
+    let old_slot = due_incoming(&mut controller, at);
+    controller.process_incoming(10_000, at);
+    controller.retry_pending_parser_leases();
+    let actions: Vec<_> = controller.drain_actions().collect();
+    assert!(matches!(&actions[..], [QcsdAction::LeaseParserReceive {
+        stream: QcsdStreamId(80), absolute_limit: 1_600, increase: 600,
+        owner: Some(owner), ..
+    }] if owner.slot == old_slot));
+    controller.observe(QcsdObservation::ReceiveLimitAdvertised {
+        endpoint: ENDPOINT, stream: STREAMS[0], absolute_limit: 1_600, slot: None,
+    }, Duration::from_micros(10_001));
+    controller.observe(QcsdObservation::DataFrame {
+        endpoint: ENDPOINT, stream: STREAMS[0], frame_header_bytes: 2, data_bytes: 597,
+    }, Duration::from_micros(10_002));
+    controller.observe(QcsdObservation::BytesRead {
+        endpoint: ENDPOINT, stream: STREAMS[0], bytes: 599,
+    }, Duration::from_micros(10_003));
+    controller.observe(QcsdObservation::HeaderProgress {
+        endpoint: ENDPOINT, stream: STREAMS[0], min_remaining: 1, awaiting_data_frame: true,
+    }, Duration::from_micros(10_004));
+    controller.retry_pending_parser_leases();
+    assert!(controller.drain_actions().all(|action| !matches!(action,
+        QcsdAction::LeaseParserReceive { .. })));
+    assert_eq!(controller.incoming_credit_ledger[&old_slot].consumed, 599);
+    assert_eq!(controller.incoming_credit_ledger[&old_slot].unresolved(), 1);
+    assert_eq!(controller.streams.receive_limits(ENDPOINT, STREAMS[0]), Some((1_600, 1_600)));
+    assert_eq!(controller.streams.consumed(ENDPOINT, STREAMS[0]), Some(1_599));
+    (controller, old_slot)
+}
+
+fn next_real_incoming(controller: &mut QcsdController) -> (QcsdSlotId, Duration) {
+    for _ in 0..16 {
+        let at = controller.defense.next_event_at().unwrap();
+        controller.collect_due_events(at);
+        controller.drain_observations();
+        if let Some(incoming) = controller.control.incoming.first() {
+            assert_eq!(incoming.packet.length(), 600);
+            return (incoming.slot, at);
+        }
+    }
+    panic!("the unchanged CS schedule must produce another incoming cell");
+}
+
+#[test]
+fn cs_owned_chaff_one_byte_old_owner_is_not_reused_by_fresh_cell() {
+    let (mut controller, old_slot) = one_byte_owned_prefix();
+    let old_ledger = controller.incoming_credit_ledger[&old_slot];
+    let old_range = controller.parser_lease_ranges[&(ENDPOINT, STREAMS[0])][0];
+    assert_eq!((old_range.start, old_range.end), (1_599, 1_600));
+    let (new_slot, at) = next_real_incoming(&mut controller);
+    assert_ne!(new_slot, old_slot);
+    controller.process_incoming(u64::try_from(at.as_micros()).unwrap(), at);
+    controller.retry_pending_parser_leases();
+    let actions: Vec<_> = controller.drain_actions().collect();
+    assert!(matches!(&actions[..], [QcsdAction::LeaseParserReceive {
+        endpoint: ENDPOINT, stream: QcsdStreamId(80), absolute_limit: 2_200,
+        increase: 600, owner: Some(owner),
+    }] if owner.slot == new_slot && owner.packet.length() == 600));
+    assert_eq!(controller.incoming_credit_ledger[&old_slot], old_ledger);
+    let ranges = &controller.parser_lease_ranges[&(ENDPOINT, STREAMS[0])];
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0], old_range);
+    assert_eq!((ranges[1].start, ranges[1].end), (1_600, 2_200));
+    assert_eq!(ranges[1].owner.unwrap().slot, new_slot);
+    assert!(!ranges[1].reservation_debited);
+    assert_eq!(controller.scheduled_incoming_requested_bytes, 1_200);
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 599);
+    assert!(!controller.incoming_slot_is_locally_realized(new_slot));
+    controller.observe(QcsdObservation::ReceiveLimitAdvertised {
+        endpoint: ENDPOINT, stream: STREAMS[0], absolute_limit: 2_200, slot: None,
+    }, at);
+    assert!(controller.incoming_slot_is_locally_realized(new_slot));
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 1_200);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 599);
+    // The first new frame-header byte still belongs to the old cell.
+    controller.observe(QcsdObservation::BytesRead {
+        endpoint: ENDPOINT, stream: STREAMS[0], bytes: 1,
+    }, at + Duration::from_micros(1));
+    assert!(controller.control.terminal_incoming.contains(&old_slot));
+    assert!(!controller.incoming_credit_ledger.contains_key(&old_slot));
+    assert!(controller.drain_actions().any(|action| matches!(action,
+        QcsdAction::SlotSatisfied { slot, .. } if slot == old_slot)));
+    assert_eq!(controller.incoming_credit_ledger[&new_slot].consumed, 0);
+    controller.observe(QcsdObservation::DataFrame {
+        endpoint: ENDPOINT, stream: STREAMS[0], frame_header_bytes: 2, data_bytes: 599,
+    }, at + Duration::from_micros(2));
+    controller.observe(QcsdObservation::BytesRead {
+        endpoint: ENDPOINT, stream: STREAMS[0], bytes: 600,
+    }, at + Duration::from_micros(3));
+    assert!(controller.control.terminal_incoming.contains(&new_slot));
+    assert!(!controller.incoming_credit_ledger.contains_key(&new_slot));
+    assert!(controller.drain_actions().any(|action| matches!(action,
+        QcsdAction::SlotSatisfied { slot, .. } if slot == new_slot)));
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 1_200);
+    assert_eq!(controller.scheduled_incoming_retired_bytes, 0);
+    assert!(controller.defense.terminal_failure().is_none());
+}
+
+#[test]
+fn cs_owned_chaff_parser_prefix_cannot_reuse_expired_fresh_owner() {
+    let (mut controller, old_slot) = one_byte_owned_prefix();
+    let old_ledger = controller.incoming_credit_ledger[&old_slot];
+    let (new_slot, at) = next_real_incoming(&mut controller);
+    let expired = at + controller.exact_incoming_release_window();
+    controller.process_incoming(u64::try_from(at.as_micros()).unwrap(), expired);
+    controller.retry_pending_parser_leases();
+    let actions: Vec<_> = controller.drain_actions().collect();
+    assert!(actions.iter().any(|action| matches!(action,
+        QcsdAction::SlotMissed { slot, .. } if *slot == new_slot)));
+    assert!(!actions.iter().any(|action| matches!(action,
+        QcsdAction::LeaseParserReceive { .. })));
+    assert_eq!(controller.incoming_credit_ledger[&old_slot], old_ledger);
+    assert_eq!(controller.streams.receive_limits(ENDPOINT, STREAMS[0]), Some((1_600, 1_600)));
+    assert_eq!(controller.scheduled_incoming_advertised_bytes, 600);
+    assert_eq!(controller.scheduled_incoming_consumed_bytes, 599);
+}

@@ -259,6 +259,8 @@ impl ReceiveState {
     /// A due CS cell can own its remaining raw bytes at a live DATA boundary.
     /// The caller retains the actual 600-byte slot identity. Neither the body
     /// hint nor the lifetime unowned parser allowance funds this permission.
+    /// A bounded advertised next-header prefix keeps its existing owner; the
+    /// fresh cell is appended after requested_limit, never after consumed.
     pub(crate) fn cs_owned_chaff_data_capacity(&self, remaining: u64) -> u64 {
         if remaining == 0 || remaining > 600 {
             return 0;
@@ -269,7 +271,8 @@ impl ReceiveState {
                 last_parser_lease_boundary, pending_parser_boundary, ..
             } if *data_length > 0
                 && *advertised_limit == *requested_limit
-                && *consumed == *requested_limit
+                && *consumed <= *requested_limit
+                && requested_limit.saturating_sub(*consumed) <= 16
                 && framing_bytes.checked_add(*data_length).is_some_and(|end| {
                     end <= *consumed && consumed.saturating_sub(end) <= 16
                 })
