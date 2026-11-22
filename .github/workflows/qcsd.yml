@@ -2,7 +2,7 @@ name: QCSD
 on:
   push:
     branches:
-      - main
+      - study-verify/native164-qcsd
   pull_request:
   workflow_dispatch:
 
