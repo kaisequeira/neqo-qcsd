@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use super::ReceiveState;
-use crate::{Capacity, DefenseMode, QcsdEndpointId, QcsdRequestRole, QcsdStreamId};
+use crate::{
+    Capacity, DefenseMode, QcsdChaffRequestId, QcsdEndpointId, QcsdRequestRole, QcsdStreamId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObservedResponseLength {
@@ -29,6 +31,8 @@ pub struct StreamState {
     pub status: Option<u16>,
     /// Whether the adapter can still accept new receive-limit actions.
     receive_actions_available: bool,
+    cs_rbing_current_data_end: Option<u64>,
+    cs_rbing_current_data_invalid: bool,
     /// Exact transport proof retained only until HTTP/3 makes response-header
     /// progress or an exact prepared/scheduled prefix can activate the one
     /// bootstrap lease.
@@ -204,6 +208,14 @@ pub struct StreamRegistry {
     streams: HashMap<(QcsdEndpointId, QcsdStreamId), StreamState>,
     /// Prospective controller-only capability; default false, no runner opt-in.
     cs_live_chaff_headers: bool,
+    cs_rbing_current_data: bool,
+    // Inert until the separate startup-only current-DATA controller gate.
+    cs_rbing_owned_data_continuation: bool,
+    // The B813 terminal-FIN reducer is separately opt-in. Without it, the
+    // B812 finite-tail veto remains in force and no subcell chaff cell can be
+    // advertised.
+    cs_rbing_terminal_chaff_partial: bool,
+    cs_rbing_terminal_chaff_resource_id: Option<u32>,
 }
 
 impl StreamRegistry {
@@ -217,6 +229,282 @@ impl StreamRegistry {
 
     pub(crate) const fn cs_live_chaff_headers_enabled(&self) -> bool {
         self.cs_live_chaff_headers
+    }
+
+    pub(crate) fn enable_cs_rbing_current_data(&mut self) -> bool {
+        if !self.cs_live_chaff_headers || self.cs_rbing_current_data || !self.streams.is_empty() {
+            return false;
+        }
+        self.cs_rbing_current_data = true;
+        true
+    }
+
+    pub(crate) fn enable_cs_rbing_owned_data_continuation(&mut self) -> bool {
+        if !self.cs_rbing_current_data
+            || !self.cs_live_chaff_headers
+            || self.cs_rbing_owned_data_continuation
+            || !self.streams.is_empty()
+        {
+            return false;
+        }
+        self.cs_rbing_owned_data_continuation = true;
+        true
+    }
+
+    pub(crate) fn enable_cs_rbing_terminal_chaff_partial(&mut self, resource_id: u32) -> bool {
+        if !self.cs_rbing_owned_data_continuation
+            || self.cs_rbing_terminal_chaff_partial
+            || !self.streams.is_empty()
+        {
+            return false;
+        }
+        self.cs_rbing_terminal_chaff_partial = true;
+        self.cs_rbing_terminal_chaff_resource_id = Some(resource_id);
+        true
+    }
+
+    fn cs_rbing_owned_data_eligible(&self, state: &StreamState, due_quantum: u64) -> bool {
+        let known_whole_body_cell_remains = matches!(
+            &state.receive,
+            ReceiveState::ReceivingData { data_length, .. }
+                if state.expected_chaff_body_bytes.saturating_sub(*data_length) >= due_quantum
+        );
+        self.cs_rbing_owned_data_continuation
+            && due_quantum == 600
+            && self.cs_rbing_current_data_eligible(state)
+            // B812's default refuses a known finite tail. B813 lifts only
+            // that veto after the separate terminal-FIN policy has been
+            // enabled; every such cell must later pass the controller's exact
+            // activated-request/FIN/advertisement/split proof.
+            && (!self.cs_rbing_terminal_chaff_partial
+                || matches!(
+                    state.role,
+                    QcsdRequestRole::Chaff { resource_id, .. }
+                        if Some(resource_id) == self.cs_rbing_terminal_chaff_resource_id
+                )
+                || known_whole_body_cell_remains)
+            && state.receive.cs_rbing_owned_data_continuation_capacity(state.parser_blocked_at, due_quantum) == due_quantum
+    }
+
+    pub(crate) fn cs_rbing_terminal_chaff_partial_eligible(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.cs_rbing_terminal_chaff_partial
+            && self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+                self.cs_rbing_current_data_eligible(state)
+                    && matches!(
+                        &state.receive,
+                        ReceiveState::ReceivingData { data_length, .. }
+                            if *data_length == state.expected_chaff_body_bytes
+                    )
+                    && matches!(
+                        state.role,
+                        QcsdRequestRole::Chaff { resource_id, .. }
+                            if Some(resource_id) == self.cs_rbing_terminal_chaff_resource_id
+                    )
+            })
+    }
+
+    pub(crate) fn cs_rbing_owned_body_bytes_remaining(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> Option<u64> {
+        let state = self.streams.get(&(endpoint, stream))?;
+        let ReceiveState::ReceivingData { data_length, .. } = &state.receive else {
+            return None;
+        };
+        Some(state.expected_chaff_body_bytes.saturating_sub(*data_length))
+    }
+
+    pub(crate) fn cs_rbing_owned_data_opportunities(
+        &self,
+        endpoint: QcsdEndpointId,
+    ) -> Vec<AllocationOpportunity> {
+        self.streams.iter().filter_map(|(&(ep, stream), state)| {
+            let eligible = ep == endpoint && self.cs_rbing_owned_data_eligible(state, 600);
+            if std::env::var_os("QCSD_RBING_CAPACITY_TRACE").is_some()
+                && ep == endpoint && matches!(state.role, QcsdRequestRole::Chaff { .. })
+                && matches!(&state.receive, ReceiveState::ReceivingData { data_length, .. } if *data_length > 0 && *data_length < 5_000)
+            {
+                let data_length = match &state.receive {
+                    ReceiveState::ReceivingData { data_length, .. } => *data_length,
+                    _ => 0,
+                };
+                eprintln!("QCSD_RBING_ELIGIBILITY_TRACE stream={} eligible={} final_size={:?} expected_body={} status={:?} observed={:?} data_length={} invalid={} data_end={:?}",
+                    stream.0, eligible, state.activated_chaff_request_final_size(),
+                    state.expected_chaff_body_bytes, state.status, state.observed_response_length,
+                    data_length, state.cs_rbing_current_data_invalid, state.cs_rbing_current_data_end);
+            }
+            eligible.then_some(AllocationOpportunity {
+                endpoint: ep, stream, role: state.role, exact: 0, claimable: 0,
+            })
+        }).collect()
+    }
+
+    // The original production ordering reduces raw frame-header reads before
+    // DATA metadata. Retain the absolute witnessed end monotonically; never
+    // sum prepared estimates or duplicate DATA callbacks into capacity.
+    pub(crate) fn record_cs_rbing_current_data_frame(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frame_header_bytes: u64,
+        data_bytes: u64,
+    ) {
+        if !self.cs_rbing_current_data || !self.cs_live_chaff_headers {
+            return;
+        }
+        let Some(state) = self.get_mut(endpoint, stream) else {
+            return;
+        };
+        if !state.receive_actions_available
+            || !matches!(
+                state.role,
+                QcsdRequestRole::Chaff {
+                    request_id: Some(_),
+                    ..
+                }
+            )
+            || state.cs_rbing_current_data_invalid
+            || data_bytes == 0
+        {
+            return;
+        }
+        let consumed = state.receive.consumed();
+        let end = consumed.checked_add(data_bytes);
+        if frame_header_bytes == 0
+            || consumed < frame_header_bytes
+            || data_bytes > state.expected_chaff_body_bytes
+            || end.is_none()
+        {
+            state.cs_rbing_current_data_invalid = true;
+            return;
+        }
+        let end = end.expect("checked DATA end");
+        state.cs_rbing_current_data_end = Some(
+            state
+                .cs_rbing_current_data_end
+                .map_or(end, |old| old.max(end)),
+        );
+    }
+
+    fn cs_rbing_current_data_eligible(&self, state: &StreamState) -> bool {
+        self.cs_rbing_current_data
+            && self.cs_live_chaff_headers
+            && state.receive_actions_available
+            && matches!(
+                state.role,
+                QcsdRequestRole::Chaff {
+                    request_id: Some(_),
+                    ..
+                }
+            )
+            && state.activated_chaff_request_final_size().is_some()
+            && state.expected_chaff_body_bytes > 0
+            && state.status == Some(200)
+            && state.observed_response_length
+                == ObservedResponseLength::Final {
+                    status: 200,
+                    content_length: None,
+                }
+            && matches!(&state.receive, ReceiveState::ReceivingData { data_length, .. }
+                if *data_length > 0 && *data_length <= state.expected_chaff_body_bytes)
+            && !state.cs_rbing_current_data_invalid
+            && (state.cs_rbing_current_data_end.is_some()
+                || (std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                    && matches!(&state.receive, ReceiveState::ReceivingData { data_length, .. } if *data_length > 0)))
+    }
+
+    fn scheduled_exact_capacity(&self, state: &StreamState) -> u64 {
+        if self.scheduled_capacity_available(state) {
+            state.receive.available()
+        } else if self.cs_rbing_current_data_eligible(state) {
+            // Keep every byte of this verified live DATA extent available to
+            // the cell allocator. A 600-byte scheduled cell may be assembled
+            // from several streams; the allocator commits only a complete cell
+            // and rolls every staged release back on a shortfall.
+            state
+                .cs_rbing_current_data_end
+                .map_or(0, |end| state.receive.cs_rbing_decoded_data_capacity(end))
+        } else {
+            0
+        }
+    }
+
+    fn scheduled_claimable_capacity(&self, state: &StreamState) -> u64 {
+        if self.scheduled_capacity_available(state) {
+            state.receive.claimable()
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn cs_rbing_current_data_prefix_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        min_remaining: u64,
+    ) -> Option<ParserLease> {
+        if !self.cs_rbing_current_data_eligible(self.streams.get(&(endpoint, stream))?) {
+            return None;
+        }
+        let state = self.get_mut(endpoint, stream)?;
+        let (absolute_limit, increase) = state
+            .receive
+            .cs_rbing_current_data_prefix_lease(min_remaining, state.cs_rbing_current_data_end?)?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled: false,
+        })
+    }
+
+    /// B816's due-only pre-materialization gate may use one existing live
+    /// r.bing chaff frontier, never a saved estimate or a newly opened
+    /// request. The returned frontier is deliberately stronger than the
+    /// ordinary current-DATA eligibility: a current `STREAM_DATA_BLOCKED`
+    /// report and a fresh typed DATA parser boundary must agree exactly.
+    ///
+    /// This method only identifies a candidate. The controller still proves
+    /// there is no competing credit, claim, parser owner, or pending slot
+    /// before it consumes the bounded sixteen-byte lease.
+    pub(crate) fn cs_rbing_b816_preproof_prefix_candidates(
+        &self,
+        resource_id: u32,
+    ) -> Vec<(QcsdEndpointId, QcsdStreamId, u64)> {
+        let mut candidates: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|(&(endpoint, stream), state)| {
+                let QcsdRequestRole::Chaff {
+                    resource_id: observed_resource,
+                    request_id: Some(_),
+                } = state.role
+                else {
+                    return None;
+                };
+                let frontier = state.receive.consumed();
+                let mut receive = state.receive.clone();
+                (observed_resource == resource_id
+                    && state.chaff_request_activated()
+                    && self.cs_rbing_current_data_eligible(state)
+                    && state.parser_blocked_at == Some(frontier)
+                    && state.cs_rbing_current_data_end.is_some_and(|observed_end| {
+                        matches!(
+                            receive.cs_rbing_current_data_prefix_lease(1, observed_end),
+                            Some((_, increase)) if increase == 16
+                        )
+                    }))
+                .then_some((endpoint, stream, frontier))
+            })
+            .collect();
+        candidates.sort_unstable();
+        candidates
     }
 
     /// A saved estimate alone cannot fund a current chaff response. This
@@ -235,91 +523,6 @@ impl StreamRegistry {
             && state.status == Some(200)
     }
 
-    fn cs_live_chaff_without_length(&self, state: &StreamState) -> bool {
-        self.cs_live_chaff_headers
-            && state.receive_actions_available
-            && matches!(state.role, QcsdRequestRole::Chaff { request_id: Some(_), .. })
-            && state.activated_chaff_request_final_size().is_some()
-            && state.expected_chaff_body_bytes > 0
-            && state.status == Some(200)
-            && matches!(state.observed_response_length,
-                ObservedResponseLength::Final { status: 200, content_length: None })
-            && !matches!(&state.receive, ReceiveState::ReceivingData { data_length, .. }
-                if *data_length > state.expected_chaff_body_bytes)
-    }
-
-    fn scheduled_exact_capacity(&self, state: &StreamState) -> u64 {
-        if self.scheduled_capacity_available(state) {
-            state.receive.available()
-        } else if self.cs_live_chaff_without_length(state) {
-            state.receive.observed_data_available()
-        } else {
-            0
-        }
-    }
-
-    /// Private allocator candidates only; these expose no forecast Capacity.
-    pub(crate) fn cs_live_chaff_owned_data_opportunities(
-        &self,
-        endpoint: QcsdEndpointId,
-    ) -> Vec<AllocationOpportunity> {
-        let mut result: Vec<_> = self.streams.iter().filter_map(|((candidate, stream), state)| {
-            (*candidate == endpoint
-                && self.cs_live_chaff_owned_data_capacity(endpoint, *stream, 600) > 0)
-                .then_some(AllocationOpportunity {
-                    endpoint,
-                    stream: *stream,
-                    role: state.role,
-                    exact: 0,
-                    claimable: 0,
-                })
-        }).collect();
-        result.sort_unstable_by_key(|opportunity| opportunity.stream);
-        result
-    }
-
-    pub(crate) fn cs_live_chaff_owned_data_capacity(
-        &self,
-        endpoint: QcsdEndpointId,
-        stream: QcsdStreamId,
-        remaining: u64,
-    ) -> u64 {
-        if remaining == 0 || remaining > 600 {
-            return 0;
-        }
-        self.streams.get(&(endpoint, stream)).map_or(0, |state| {
-            if self.cs_live_chaff_without_length(state) {
-                let ReceiveState::ReceivingData { data_length, .. } = &state.receive else {
-                    return 0;
-                };
-                // The prepared body extent is only a negative ceiling on this
-                // private, due-cell-owned permission. It never supplies exact
-                // Capacity: only a decoded DATA frame can do that. A short
-                // final body leaves the rest of the same cell for other streams.
-                let body_remaining = state.expected_chaff_body_bytes.saturating_sub(*data_length);
-                state.receive.cs_owned_chaff_data_capacity(remaining.min(body_remaining))
-            } else {
-                0
-            }
-        })
-    }
-
-    pub(crate) fn cs_live_chaff_owned_data_continuation(
-        &mut self,
-        endpoint: QcsdEndpointId,
-        stream: QcsdStreamId,
-        remaining: u64,
-    ) -> Option<ParserLease> {
-        if self.cs_live_chaff_owned_data_capacity(endpoint, stream, remaining) != remaining
-            || remaining == 0
-        {
-            return None;
-        }
-        let (absolute_limit, increase, scheduled) = self.get_mut(endpoint, stream)?
-            .receive.cs_owned_chaff_data_continuation(remaining)?;
-        Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled })
-    }
-
     /// Finish only a current pre-HEADERS debt. The existing aggregate wrapper
     /// authenticates exact role, FIN ACK, retained offset and lifetime budget;
     /// its receive-state leaf is unchanged. No DATA/body forecast is leased.
@@ -334,7 +537,11 @@ impl StreamRegistry {
             return None;
         }
         let state = self.streams.get(&(endpoint, stream))?;
-        let QcsdRequestRole::Chaff { resource_id, request_id: Some(_) } = state.role else {
+        let QcsdRequestRole::Chaff {
+            resource_id,
+            request_id: Some(_),
+        } = state.role
+        else {
             return None;
         };
         if state.observed_response_length != ObservedResponseLength::Unobserved
@@ -346,7 +553,12 @@ impl StreamRegistry {
         }
         let expected = state.expected_chaff_body_bytes;
         self.aggregate_prebody_framing_lease(
-            endpoint, stream, resource_id, expected, min_remaining, false,
+            endpoint,
+            stream,
+            resource_id,
+            expected,
+            min_remaining,
+            false,
         )
     }
 
@@ -364,7 +576,13 @@ impl StreamRegistry {
         }
         let state = self.get_mut(endpoint, stream)?;
         if !state.receive_actions_available
-            || !matches!(state.role, QcsdRequestRole::Chaff { request_id: Some(_), .. })
+            || !matches!(
+                state.role,
+                QcsdRequestRole::Chaff {
+                    request_id: Some(_),
+                    ..
+                }
+            )
             || state.activated_chaff_request_final_size().is_none()
             || state.observed_response_length != ObservedResponseLength::Unobserved
             || state.status.is_some()
@@ -375,10 +593,17 @@ impl StreamRegistry {
             return None;
         }
         let blocked_at = state.pre_header_blocked_at?;
-        let (absolute_limit, increase) = state.receive
+        let (absolute_limit, increase) = state
+            .receive
             .cs_pristine_chaff_header_bootstrap_lease(blocked_at)?;
         state.pre_header_blocked_at = None;
-        Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled: false })
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled: false,
+        })
     }
 
     #[expect(
@@ -405,6 +630,8 @@ impl StreamRegistry {
                 receive,
                 status: None,
                 receive_actions_available: true,
+                cs_rbing_current_data_end: None,
+                cs_rbing_current_data_invalid: false,
                 pre_header_blocked_at: None,
                 parser_blocked_at: None,
                 aggregate_framing_debt: None,
@@ -423,6 +650,68 @@ impl StreamRegistry {
         stream: QcsdStreamId,
     ) -> Option<&mut StreamState> {
         self.streams.get_mut(&(endpoint, stream))
+    }
+
+    /// Return one exact activated r.bing chaff identity. B817 uses this to
+    /// bind all post-lease evidence to the request that supplied the original
+    /// physical sixteen-byte lease; it never selects another candidate.
+    pub(crate) fn activated_chaff_identity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        resource_id: u32,
+    ) -> Option<QcsdChaffRequestId> {
+        let state = self.streams.get(&(endpoint, stream))?;
+        let QcsdRequestRole::Chaff {
+            resource_id: observed_resource,
+            request_id: Some(request_id),
+        } = state.role
+        else {
+            return None;
+        };
+        (observed_resource == resource_id && state.chaff_request_activated()).then_some(request_id)
+    }
+
+    /// Create B817's one owned 600-byte successor only after the controller
+    /// has bound an event-local physical witness to this exact stream. The
+    /// existing B816 route remains unchanged and still requires its fresh
+    /// pending parser boundary.
+    pub(crate) fn b817_post_lease_live_data_successor(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        resource_id: u32,
+        request_id: QcsdChaffRequestId,
+        lease_end: u64,
+        frame_payload_end: u64,
+    ) -> Option<ParserLease> {
+        let state = self.streams.get(&(endpoint, stream))?;
+        let QcsdRequestRole::Chaff {
+            resource_id: observed_resource,
+            request_id: Some(observed_request),
+        } = state.role
+        else {
+            return None;
+        };
+        if observed_resource != resource_id
+            || observed_request != request_id
+            || !state.receive_actions_available
+            || !state.chaff_request_activated()
+            || state.cs_rbing_current_data_invalid
+        {
+            return None;
+        }
+        let state = self.get_mut(endpoint, stream)?;
+        let (absolute_limit, increase, scheduled) = state
+            .receive
+            .cs_rbing_post_lease_live_data_successor(lease_end, frame_payload_end, 600)?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
     }
 
     /// Same live response-qualified chaff request used by the allocator.
@@ -554,8 +843,7 @@ impl StreamRegistry {
         self.streams
             .iter()
             .filter(|((candidate, _), state)| {
-                *candidate == endpoint
-                    && state.receive_actions_available
+                *candidate == endpoint && state.receive_actions_available
             })
             .fold(Capacity::default(), |mut capacity, (_, state)| {
                 let available = self.scheduled_exact_capacity(state);
@@ -618,19 +906,14 @@ impl StreamRegistry {
                     && (mode == DefenseMode::ChaffAndShape
                         || matches!(state.role, QcsdRequestRole::Chaff { .. }))
                     && (self.scheduled_exact_capacity(state) > 0
-                        || (self.scheduled_capacity_available(state)
-                            && state.receive.claimable() > 0))
+                        || self.scheduled_claimable_capacity(state) > 0)
             })
             .map(|((_, stream), state)| AllocationOpportunity {
                 endpoint,
                 stream: *stream,
                 role: state.role,
                 exact: self.scheduled_exact_capacity(state),
-                claimable: if self.scheduled_capacity_available(state) {
-                    state.receive.claimable()
-                } else {
-                    0
-                },
+                claimable: self.scheduled_claimable_capacity(state),
             })
             .collect();
         opportunities.sort_unstable_by_key(|opportunity| {
@@ -683,7 +966,7 @@ impl StreamRegistry {
         Some(AllocationOpportunity {
             endpoint,
             stream,
-            role: QcsdRequestRole::Application,
+            role: self.streams.get(&(endpoint, stream))?.role,
             exact: 0,
             claimable: 0,
         })
@@ -821,7 +1104,15 @@ impl StreamRegistry {
                 self.streams
                     .get(key)
                     .filter(|state| state.receive_actions_available)
-                    .map_or(0, |state| state.receive.available()),
+                    .map_or(0, |state| {
+                        if self.cs_rbing_current_data
+                            && matches!(state.role, QcsdRequestRole::Chaff { .. })
+                        {
+                            self.scheduled_exact_capacity(state)
+                        } else {
+                            state.receive.available()
+                        }
+                    }),
             )
         })
     }
@@ -832,20 +1123,16 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         amount: u64,
     ) -> Option<CreditRelease> {
-        let state = self.streams.get(&(endpoint, stream))?;
-        let ordinary = self.scheduled_capacity_available(state);
-        if !ordinary && !self.cs_live_chaff_without_length(state) {
+        let allowed = self.scheduled_exact_capacity(self.streams.get(&(endpoint, stream))?);
+        if allowed == 0 {
             return None;
         }
+        let amount = amount.min(allowed);
         let state = self.get_mut(endpoint, stream)?;
         if !state.receive_actions_available {
             return None;
         }
-        let (absolute_limit, increase) = if ordinary {
-            state.receive.release(amount)?
-        } else {
-            state.receive.release_observed_data(amount)?
-        };
+        let (absolute_limit, increase) = state.receive.release(amount)?;
         Some(CreditRelease {
             endpoint,
             stream,
@@ -860,9 +1147,11 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         amount: u64,
     ) -> u64 {
-        if self.streams.get(&(endpoint, stream)).is_none_or(|state| {
-            !self.scheduled_capacity_available(state)
-        }) {
+        if self
+            .streams
+            .get(&(endpoint, stream))
+            .is_none_or(|state| !self.scheduled_capacity_available(state))
+        {
             return 0;
         }
         self.get_mut(endpoint, stream).map_or(0, |state| {
@@ -1071,12 +1360,21 @@ impl StreamRegistry {
         due_quantum: u64,
     ) -> u64 {
         self.streams.get(&(endpoint, stream)).map_or(0, |state| {
-            if !state.receive_actions_available || state.role != QcsdRequestRole::Application {
+            if !state.receive_actions_available
+                || (state.role != QcsdRequestRole::Application
+                    && !self.cs_rbing_owned_data_eligible(state, due_quantum))
+            {
                 return 0;
             }
-            state
-                .receive
-                .owned_data_continuation_capacity(state.parser_blocked_at, due_quantum)
+            if state.role == QcsdRequestRole::Application {
+                state
+                    .receive
+                    .owned_data_continuation_capacity(state.parser_blocked_at, due_quantum)
+            } else {
+                state
+                    .receive
+                    .cs_rbing_owned_data_continuation_capacity(state.parser_blocked_at, due_quantum)
+            }
         })
     }
 
@@ -1086,13 +1384,82 @@ impl StreamRegistry {
         stream: QcsdStreamId,
         due_quantum: u64,
     ) -> Option<ParserLease> {
+        let state = self.streams.get(&(endpoint, stream))?;
+        let allowed = state.role == QcsdRequestRole::Application
+            || self.cs_rbing_owned_data_eligible(state, due_quantum);
         let state = self.get_mut(endpoint, stream)?;
-        if !state.receive_actions_available || state.role != QcsdRequestRole::Application {
+        if !state.receive_actions_available || !allowed {
             return None;
         }
-        let (absolute_limit, increase, scheduled) = state
-            .receive
-            .owned_data_continuation(state.parser_blocked_at, due_quantum)?;
+        let (absolute_limit, increase, scheduled) = if state.role == QcsdRequestRole::Application {
+            state
+                .receive
+                .owned_data_continuation(state.parser_blocked_at, due_quantum)?
+        } else {
+            state
+                .receive
+                .cs_rbing_owned_data_continuation(state.parser_blocked_at, due_quantum)?
+        };
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
+    }
+
+    /// The controller marks this as a same-slot remainder only after staging
+    /// exact application bytes. Existing live chaff and frontier guards apply.
+    pub(crate) fn rbing_mixed_data_capacity(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        amount: u64,
+    ) -> u64 {
+        let Some(state) = self.streams.get(&(endpoint, stream)) else {
+            return 0;
+        };
+        if !self.cs_rbing_owned_data_eligible(state, 600) {
+            return 0;
+        }
+        let consumed = state.receive.consumed();
+        let diagnostic_live_prefix = std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K")
+            .is_some()
+            && state
+                .cs_rbing_current_data_end
+                .is_some_and(|end| end > consumed && end - consumed <= 32);
+        state.receive.cs_rbing_mixed_data_continuation_capacity(
+            state.parser_blocked_at,
+            amount,
+            diagnostic_live_prefix,
+        )
+    }
+
+    pub(crate) fn rbing_mixed_data_continuation(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        amount: u64,
+    ) -> Option<ParserLease> {
+        if self.rbing_mixed_data_capacity(endpoint, stream, amount) != amount
+            || !(3..600).contains(&amount)
+        {
+            return None;
+        }
+        let state = self.get_mut(endpoint, stream)?;
+        let consumed = state.receive.consumed();
+        let diagnostic_live_prefix = std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K")
+            .is_some()
+            && state
+                .cs_rbing_current_data_end
+                .is_some_and(|end| end > consumed && end - consumed <= 32);
+        let (absolute_limit, increase, scheduled) =
+            state.receive.cs_rbing_mixed_data_continuation(
+                state.parser_blocked_at,
+                amount,
+                diagnostic_live_prefix,
+            )?;
         Some(ParserLease {
             endpoint,
             stream,
@@ -1245,6 +1612,25 @@ impl StreamRegistry {
                 && state.role == QcsdRequestRole::Application
                 && matches!(state.observed_response_length,
                     ObservedResponseLength::Final { status, content_length: None }
+                        if state.status == Some(status) && (200..300).contains(&status)
+                            && !matches!(status, 204 | 205))
+        })
+    }
+
+    /// Direct post-FIN release is grounded by the actual final-size proof, so
+    /// it remains eligible for a valid final response with Content-Length.
+    /// The parser-lease policy above intentionally keeps its stricter unknown
+    /// length requirement.
+    pub(crate) fn buflo_direct_fin_response_eligible(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.streams.get(&(endpoint, stream)).is_some_and(|state| {
+            state.receive_actions_available
+                && state.role == QcsdRequestRole::Application
+                && matches!(state.observed_response_length,
+                    ObservedResponseLength::Final { status, .. }
                         if state.status == Some(status) && (200..300).contains(&status)
                             && !matches!(status, 204 | 205))
         })
@@ -1452,6 +1838,32 @@ impl StreamRegistry {
         })
     }
 
+    /// Experimental Bing small-application framing bootstrap. It still spends
+    /// only the configured parser allowance and requires real blocked evidence.
+    pub(crate) fn rbing_small_header_bootstrap_lease(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        live_scheduled_prefix: Option<(u64, u64)>,
+    ) -> Option<ParserLease> {
+        let state = self.get_mut(endpoint, stream)?;
+        if !state.receive_actions_available || state.role != QcsdRequestRole::Application {
+            return None;
+        }
+        let blocked_at = state.pre_header_blocked_at?;
+        let (absolute_limit, increase) = state
+            .receive
+            .rbing_small_header_bootstrap_lease(blocked_at, live_scheduled_prefix)?;
+        state.pre_header_blocked_at = None;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled: false,
+        })
+    }
+
     /// Retain real pristine peer demand independently of ACK arrival order.
     /// This intent cannot claim or materialize any receive permission.
     pub(crate) fn accepts_buflo_initial_headers_blocked(
@@ -1466,7 +1878,10 @@ impl StreamRegistry {
                 && !state.request_acknowledgment_invalid
                 && state.status.is_none()
                 && state.observed_response_length == ObservedResponseLength::Unobserved
-                && state.receive.buflo_initial_headers_capacity(frontier, 1_200) > 0
+                && state
+                    .receive
+                    .buflo_initial_headers_capacity(frontier, 1_200)
+                    > 0
         })
     }
 
@@ -1522,7 +1937,9 @@ impl StreamRegistry {
         let Some(state) = self.get_mut(endpoint, stream) else {
             return 0;
         };
-        state.receive.claim_buflo_initial_headers(frontier, room, amount.min(capacity))
+        state
+            .receive
+            .claim_buflo_initial_headers(frontier, room, amount.min(capacity))
     }
 
     pub(crate) fn lease_buflo_initial_headers(
@@ -1540,9 +1957,16 @@ impl StreamRegistry {
         {
             return None;
         }
-        let (absolute_limit, increase, scheduled) =
-            state.receive.lease_buflo_initial_headers(frontier, backing)?;
-        Some(ParserLease { endpoint, stream, absolute_limit, increase, scheduled })
+        let (absolute_limit, increase, scheduled) = state
+            .receive
+            .lease_buflo_initial_headers(frontier, backing)?;
+        Some(ParserLease {
+            endpoint,
+            stream,
+            absolute_limit,
+            increase,
+            scheduled,
+        })
     }
 
     /// A completely acknowledged application request permits the existing
@@ -2765,12 +3189,43 @@ mod tests {
             "Walkie-Talkie may not stage base credit on unacknowledged chaff"
         );
     }
+
+    #[test]
+    fn rbing_small_header_bootstrap_requires_application_and_retained_blocked_proof() {
+        let ep = QcsdEndpointId(1);
+        let id = QcsdStreamId(36);
+        let mut r = StreamRegistry::default();
+        r.open(ep, id, QcsdRequestRole::Application, true, 16, 1_000, 597);
+        assert_eq!(r.rbing_small_header_bootstrap_lease(ep, id, None), None);
+        assert!(r.record_pre_header_blocked(ep, id, 16));
+        r.release_stream(ep, id, 581);
+        r.get_mut(ep, id).unwrap().receive.advertised(597);
+        let p = r.rbing_small_header_bootstrap_lease(ep, id, None).unwrap();
+        assert_eq!(
+            (p.absolute_limit, p.increase, p.scheduled),
+            (1_500, 903, false)
+        );
+        assert_eq!(r.rbing_small_header_bootstrap_lease(ep, id, None), None);
+        let mut c = StreamRegistry::default();
+        c.open(
+            ep,
+            id,
+            QcsdRequestRole::Chaff {
+                resource_id: 4,
+                request_id: None,
+            },
+            true,
+            16,
+            1_000,
+            597,
+        );
+        assert!(c.record_pre_header_blocked(ep, id, 16));
+        c.release_stream(ep, id, 581);
+        c.get_mut(ep, id).unwrap().receive.advertised(597);
+        assert_eq!(c.rbing_small_header_bootstrap_lease(ep, id, None), None);
+    }
 }
 
 #[cfg(test)]
 #[path = "cs_live_chaff_headers_tests.rs"]
 mod cs_live_chaff_headers_tests;
-
-#[cfg(test)]
-#[path = "cs_live_chaff_owned_data_tests.rs"]
-mod cs_live_chaff_owned_data_tests;

@@ -714,6 +714,7 @@ impl Defense for TrafficMorphing {
             | SignalKind::IncomingCreditScheduled { .. }
             | SignalKind::IncomingCreditAdvertised { .. }
             | SignalKind::TerminalPrimaryPartial { .. }
+            | SignalKind::TerminalChaffPartial { .. }
             | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::Capacity(_) => {}
         }

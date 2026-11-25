@@ -686,6 +686,7 @@ pub struct WtfPad {
     incoming_lag_us_max: u64,
     suppressed_cover_feedback: u64,
     application_complete: bool,
+    experimental_tiny_tail_authorized: bool,
 }
 
 impl WtfPad {
@@ -762,6 +763,7 @@ impl WtfPad {
             incoming_lag_us_max: 0,
             suppressed_cover_feedback: 0,
             application_complete: false,
+            experimental_tiny_tail_authorized: false,
         })
     }
 
@@ -969,7 +971,23 @@ impl WtfPad {
             .incoming_credit_outstanding
             .saturating_add(self.prospective_incoming_credit());
         let uncovered = self.remaining_incoming_bytes().saturating_sub(covered);
-        self.queue_retry(at, retired.min(uncovered));
+        let tiny = retired.min(uncovered);
+        if self.experimental_tiny_tail_authorized
+            && self.application_complete
+            && self.incoming.is_silent()
+            && self.outgoing.is_silent()
+            && self.pending.is_empty()
+            && self.awaiting_incoming.is_empty()
+            && tiny > 0
+            && tiny <= 8
+            && self.remaining_incoming_bytes() == tiny
+            && self.incoming_credit_outstanding == 0
+        {
+            self.experimental_tiny_tail_authorized = false;
+            self.abandon_incoming_bytes(tiny);
+        } else {
+            self.queue_retry(at, tiny);
+        }
     }
 
     fn abandon_incoming_bytes(&mut self, mut bytes: u64) {
@@ -1164,6 +1182,7 @@ impl Defense for WtfPad {
             | SignalKind::IncomingCreditScheduled { .. }
             | SignalKind::IncomingCreditAdvertised { .. }
             | SignalKind::TerminalPrimaryPartial { .. }
+            | SignalKind::TerminalChaffPartial { .. }
             | SignalKind::IncomingCreditResolved { .. }
             | SignalKind::TrafficMorphingEgress { .. } => {}
         }
@@ -1209,6 +1228,27 @@ impl Defense for WtfPad {
 
     fn mode(&self) -> DefenseMode {
         DefenseMode::ChaffOnly
+    }
+
+    fn experimental_tiny_incoming_tail(&self) -> Option<u64> {
+        let remaining = self.remaining_incoming_bytes();
+        (self.application_complete
+            && !self.event_guard_triggered
+            && self.incoming.is_silent()
+            && self.outgoing.is_silent()
+            && self.pending.is_empty()
+            && self.awaiting_incoming.is_empty()
+            && (1..=8).contains(&remaining)
+            && self.incoming_credit_outstanding == remaining
+            && self
+                .incoming_desired_bytes
+                .saturating_sub(self.incoming_received_bytes)
+                == remaining)
+            .then_some(remaining)
+    }
+
+    fn authorize_experimental_tiny_tail(&mut self) {
+        self.experimental_tiny_tail_authorized = true;
     }
 
     fn diagnostics(&self) -> DefenseDiagnostics {
@@ -1803,6 +1843,35 @@ mod tests {
         assert_eq!(observed.wtf_pad_incoming_observed_events, 1);
         assert_eq!(observed.wtf_pad_incoming_lag_us_total, 4);
         assert_eq!(observed.wtf_pad_incoming_lag_us_max, 4);
+    }
+
+    #[test]
+    fn experimental_tiny_tail_requires_explicit_authorization() {
+        let (mut defense, _) = one_requested_incoming();
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2),
+            kind: SignalKind::PayloadBytes {
+                direction: Direction::Incoming,
+                bytes: 98,
+                cover: true,
+            },
+        });
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(2),
+            kind: SignalKind::ReceiveCreditConsumed { bytes: 98 },
+        });
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(3),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert_eq!(defense.experimental_tiny_incoming_tail(), Some(2));
+        defense.authorize_experimental_tiny_tail();
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(4),
+            kind: SignalKind::ReceiveCreditRetired { bytes: 2 },
+        });
+        assert!(defense.is_complete());
+        assert_eq!(defense.diagnostics().wtf_pad_incoming_shortfall_bytes, 2);
     }
 
     #[test]

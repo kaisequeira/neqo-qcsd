@@ -129,6 +129,19 @@ pub enum SignalKind {
         consumed: u64,
         retired: u64,
     },
+    /// One source-bound activated chaff request reached FIN after consuming
+    /// only part of one fully advertised owned incoming cell.
+    ///
+    /// The controller emits this only for the exact r.bing CS-BuFLO policy
+    /// after proving a unique request identity, successful nonempty response,
+    /// and an exact positive owned-credit split. The ordinary raw terminal
+    /// observation remains a receive-credit-retired miss.
+    TerminalChaffPartial {
+        slot: QcsdSlotId,
+        packet: Packet,
+        consumed: u64,
+        retired: u64,
+    },
     /// Releasable receive capacity aggregated across all endpoints.
     Capacity(Capacity),
     /// Whether any client STREAM frame remains pending across all endpoints.
@@ -610,6 +623,10 @@ pub struct DefenseDiagnostics {
     pub cs_buflo_early_termination_translation_version: u32,
     /// Client-only policy used to stop new opportunities and drain advertised credit.
     pub cs_buflo_termination_stop_policy: &'static str,
+    /// B815’s one-way post-closure stop for fresh incoming opportunities.
+    pub cs_buflo_terminal_chaff_replenishment_incoming_stop: bool,
+    /// Controller elapsed time at B815’s incoming-schedule stop latch.
+    pub cs_buflo_terminal_chaff_replenishment_incoming_stop_at_us: u64,
     /// Source-study socket write size retained only as comparison metadata.
     pub cs_buflo_reference_tcp_write_size_bytes: u64,
     /// Source-study nominal IPv4/TCP packet size retained only as metadata.
@@ -976,6 +993,16 @@ pub trait Defense: Debug {
     fn accepts_new_chaff_requests(&self) -> bool {
         true
     }
+    /// Irreversibly stop fresh incoming schedule opportunities after a
+    /// controller-proven terminal-chaff replenishment closure.
+    ///
+    /// The controller invokes this only for its versioned r.bing successor
+    /// policy before it asks for a new event. Already emitted and physically
+    /// advertised incoming credit retains its ordinary terminal lifecycle;
+    /// this hook never retracts a slot or converts a miss into success.
+    fn stop_fresh_incoming_after_terminal_chaff_replenishment(&mut self, _at: Duration) -> bool {
+        false
+    }
     /// Exact chaff receive capacity required for one more terminal-drain
     /// schedule event.
     ///
@@ -1009,6 +1036,12 @@ pub trait Defense: Debug {
     fn retain_stream_offset_provenance_after_close(&self) -> bool {
         false
     }
+    /// Whether a WTF-PAD implementation permits the explicitly bounded tiny-tail experiment.
+    fn experimental_tiny_incoming_tail(&self) -> Option<u64> {
+        None
+    }
+    /// Arm the tiny-tail disposition after the controller verifies the live ledger.
+    fn authorize_experimental_tiny_tail(&mut self) {}
     /// Defense-specific counters for reproducibility and failure auditing.
     fn diagnostics(&self) -> DefenseDiagnostics {
         DefenseDiagnostics::default()

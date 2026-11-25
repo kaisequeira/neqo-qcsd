@@ -47,6 +47,10 @@ pub struct QcsdConfig {
     /// Prospective engineering policy; explicit opt-in, never an old receipt alias.
     #[serde(default, skip_serializing_if = "is_false")]
     pub buflo_retained_parser_fin_permission: bool,
+    /// Prospective exact direct-credit reassignment after a proved secondary
+    /// application FIN. Requires the retained-FIN policy.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub buflo_direct_fin_credit_reassignment: bool,
     /// Prospective CS-only live chaff HEADERS progress; absent is the historical default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cs_live_chaff_header_progress: bool,
@@ -70,6 +74,7 @@ impl Default for QcsdConfig {
             keep_alive_lead_time_us: 100_000,
             tail_wait_us: 0,
             buflo_retained_parser_fin_permission: false,
+            buflo_direct_fin_credit_reassignment: false,
             cs_live_chaff_header_progress: false,
             defense: DefenseConfig::None,
         }
@@ -173,18 +178,26 @@ impl QcsdConfig {
                 "retained parser/FIN permission is BuFLO-only".into(),
             ));
         }
+        if self.buflo_direct_fin_credit_reassignment
+            && (!self.buflo_retained_parser_fin_permission
+                || !matches!(&self.defense, DefenseConfig::Buflo(_)))
+        {
+            return Err(Error::InvalidConfig(
+                "direct FIN credit reassignment requires the prospective BuFLO retained parser/FIN policy".into(),
+            ));
+        }
         if self.cs_live_chaff_header_progress
             && (!matches!(&self.defense, DefenseConfig::CsBuflo(_))
                 || self.control_interval_us != 5_000
                 || self.initial_max_stream_data != 16
                 || self.max_stream_data_excess != 1_000
                 || self.max_udp_payload_size != 1_200
-                || self.max_chaff_streams != 5
+                || !matches!(self.max_chaff_streams, 5 | 10 | 50)
                 || self.use_empty_resources
                 || self.drop_unsatisfied_events)
         {
             return Err(Error::InvalidConfig(
-                "live chaff HEADERS requires exact CS/5000us/16+1000/five-stream/1200 configuration".into(),
+                "live chaff HEADERS requires exact CS/5000us/16+1000/five-or-ten-stream/1200 configuration".into(),
             ));
         }
         self.defense.validate(self.max_udp_payload_size)
@@ -1338,10 +1351,21 @@ mod tests {
         let raw = r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":20000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v8-fixed-64ms-1280s-duration-budget-v1"}"#;
         let parameters = BufloParameters::from_json(raw, 1_200)
             .expect("only the explicit prospective 1280-second tuple is admitted");
-        assert_eq!(parameters.interval_us.checked_mul(parameters.max_events), Some(1_280_000_000));
-        assert_eq!(parameters.duration_budget_policy.expect("named policy").fixed_tuple(),
-            (64_000, 20_000, 1_280_000_000));
-        assert_eq!(serde_json::to_string(&parameters).expect("exact retained bytes"), raw);
+        assert_eq!(
+            parameters.interval_us.checked_mul(parameters.max_events),
+            Some(1_280_000_000)
+        );
+        assert_eq!(
+            parameters
+                .duration_budget_policy
+                .expect("named policy")
+                .fixed_tuple(),
+            (64_000, 20_000, 1_280_000_000)
+        );
+        assert_eq!(
+            serde_json::to_string(&parameters).expect("exact retained bytes"),
+            raw
+        );
         for legacy in [
             r#"{"schema_version":1,"interval_us":20000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v6-fixed-200s-duration-budget-v1"}"#,
             r#"{"schema_version":1,"interval_us":64000,"minimum_duration_us":10000000,"packet_size":1200,"max_events":10000,"implementation_scope":"client_only_quic","paper_equivalent":false,"duration_budget_policy":"rapid-v7-fixed-64ms-640s-duration-budget-v1"}"#,
@@ -1361,16 +1385,25 @@ mod tests {
             ("max_events", serde_json::json!(20_001)),
             ("max_events", serde_json::json!(true)),
             ("paper_equivalent", serde_json::json!(true)),
-            ("duration_budget_policy", serde_json::json!("rapid-v7-fixed-64ms-640s-duration-budget-v1")),
+            (
+                "duration_budget_policy",
+                serde_json::json!("rapid-v7-fixed-64ms-640s-duration-budget-v1"),
+            ),
             ("duration_budget_policy", serde_json::json!("unknown")),
             ("duration_budget_policy", serde_json::Value::Null),
         ] {
             let mut changed: serde_json::Value = serde_json::from_str(raw).expect("fixture");
             changed[key] = value;
-            assert!(BufloParameters::from_json(&changed.to_string(), 1_200).is_err(), "{key}");
+            assert!(
+                BufloParameters::from_json(&changed.to_string(), 1_200).is_err(),
+                "{key}"
+            );
         }
         let mut absent: serde_json::Value = serde_json::from_str(raw).expect("fixture");
-        absent.as_object_mut().expect("object").remove("duration_budget_policy");
+        absent
+            .as_object_mut()
+            .expect("object")
+            .remove("duration_budget_policy");
         assert!(BufloParameters::from_json(&absent.to_string(), 1_200).is_err());
         assert!(BufloParameters::from_json(raw, 1_199).is_err());
     }

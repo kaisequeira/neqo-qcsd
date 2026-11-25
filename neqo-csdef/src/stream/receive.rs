@@ -4,6 +4,16 @@
 // option.
 
 const PRE_HEADER_BOOTSTRAP_TARGET: u64 = 1_000;
+const CS_RBING_PARSER_LEASE_CAPACITY_DEFAULT: u64 = 1_000;
+const CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC: u64 = 524_288;
+
+fn cs_rbing_parser_lease_capacity() -> u64 {
+    if std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some() {
+        CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC
+    } else {
+        CS_RBING_PARSER_LEASE_CAPACITY_DEFAULT
+    }
+}
 
 /// Published QCSD receive-side stream state machine (paper Figure 7).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,7 +110,13 @@ impl ReceiveState {
                 consumed: 0,
                 payload_floor: expected,
                 framing_bytes: 0,
-                parser_lease_capacity: excess,
+                parser_lease_capacity: if controlled
+                    && excess == CS_RBING_PARSER_LEASE_CAPACITY_DEFAULT
+                {
+                    cs_rbing_parser_lease_capacity()
+                } else {
+                    excess
+                },
                 parser_lease_used: 0,
                 parser_lease_exhausted: excess == 0,
                 last_parser_lease_boundary: None,
@@ -215,6 +231,264 @@ impl ReceiveState {
         }
     }
 
+    // Only an independently retained production-order DATA end is capacity.
+    // The registry records checked consumed+declared DATA before reduction;
+    // repeated observations cannot add the prepared payload floor or bytes.
+    pub(crate) fn cs_rbing_decoded_data_capacity(&self, observed_end: u64) -> u64 {
+        match self {
+            Self::ReceivingData {
+                requested_limit,
+                consumed,
+                ..
+            } if observed_end >= *consumed => observed_end.saturating_sub(*requested_limit),
+            _ => 0,
+        }
+    }
+
+    // One genuine pristine next-DATA boundary can spend only the remaining
+    // ORIGINAL lifetime allowance. No scheduled owner, reserve, or estimate is
+    // consumed; the observed DATA frontier must be fully read and advertised.
+    pub(crate) fn cs_rbing_current_data_prefix_lease(
+        &mut self,
+        min_remaining: u64,
+        observed_end: u64,
+    ) -> Option<(u64, u64)> {
+        let end = observed_end;
+        let Self::ReceivingData {
+            advertised_limit,
+            requested_limit,
+            consumed,
+            parser_lease_capacity,
+            parser_lease_used,
+            parser_lease_exhausted,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let remaining = parser_lease_capacity.checked_sub(*parser_lease_used)?;
+        let increase = remaining.min(MAX_HTTP3_FRAME_HEADER_BYTES);
+        if end == 0
+            || min_remaining != 1
+            || *parser_lease_capacity != cs_rbing_parser_lease_capacity()
+            || *parser_lease_used != 984
+            || remaining < 16
+            || *parser_lease_exhausted
+            || increase != 16
+            || *advertised_limit != end
+            || *requested_limit != end
+            || *consumed != end
+            || *pending_parser_boundary != Some(end)
+            || *last_parser_lease_boundary == Some(end)
+        {
+            return None;
+        }
+        let target = requested_limit.checked_add(increase)?;
+        *last_parser_lease_boundary = Some(end);
+        *pending_parser_boundary = None;
+        *parser_lease_used += increase;
+        *parser_lease_exhausted |= *parser_lease_used == *parser_lease_capacity;
+        *requested_limit = target;
+        Some((target, increase))
+    }
+
+    // INERT registry prototype only. The exact current-DATA chaff registry
+    // has authenticated real200/unknown-length HEADERS, live requestFIN ACK,
+    // actual decoded DATA and a pristine blocked boundary. Prepared known_limit
+    // remains stored but cannot be promoted into decoded capacity. A future
+    // controller must back these EXACT600 parser bytes with one actual due cell.
+    pub(crate) fn cs_rbing_owned_data_continuation_capacity(
+        &self,
+        blocked_at: Option<u64>,
+        due_quantum: u64,
+    ) -> u64 {
+        if due_quantum != 600 {
+            return 0;
+        }
+        match self {
+            Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                parser_lease_capacity,
+                parser_lease_used,
+                consumed,
+                data_length,
+                parser_lease_exhausted,
+                ..
+            } => {
+                let diagnostic_live_prefix = std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                    && *parser_lease_capacity == CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC
+                    && *parser_lease_used < *parser_lease_capacity
+                    && *data_length > 0
+                    // Keep one previous 600-byte owner plus at most two
+                    // bounded parser prefixes in flight on this verified body.
+                    && requested_limit.saturating_sub(*consumed)
+                        <= CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC
+                            + 2 * MAX_HTTP3_FRAME_HEADER_BYTES;
+                let original_exhausted_lease = *parser_lease_exhausted
+                    && *parser_lease_capacity == cs_rbing_parser_lease_capacity()
+                    && *parser_lease_used == cs_rbing_parser_lease_capacity();
+                if (original_exhausted_lease || diagnostic_live_prefix)
+                    && *requested_limit == *advertised_limit
+                    && *consumed <= *requested_limit
+                    && (blocked_at == Some(*requested_limit)
+                        || *consumed == *requested_limit
+                        || diagnostic_live_prefix)
+                    && requested_limit.checked_add(due_quantum).is_some()
+                {
+                    due_quantum
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn cs_rbing_owned_data_continuation(
+        &mut self,
+        blocked_at: Option<u64>,
+        due_quantum: u64,
+    ) -> Option<(u64, u64, bool)> {
+        if self.cs_rbing_owned_data_continuation_capacity(blocked_at, due_quantum) != due_quantum
+            || due_quantum == 0
+        {
+            return None;
+        }
+        let Self::ReceivingData {
+            requested_limit,
+            consumed,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        *requested_limit = requested_limit.checked_add(due_quantum)?;
+        *last_parser_lease_boundary = Some(*consumed);
+        *pending_parser_boundary = None;
+        Some((*requested_limit, due_quantum, true))
+    }
+
+    /// B817's narrowly bound successor for the one physical post-lease DATA
+    /// witness. Unlike the ordinary B816 continuation this intentionally does
+    /// not require a fresh parser boundary: the controller has already reduced
+    /// the exact advertised lease, a matching blocked report, and a decoded
+    /// current DATA frame whose declared payload covers the successor.
+    pub(crate) fn cs_rbing_post_lease_live_data_successor(
+        &mut self,
+        lease_end: u64,
+        frame_payload_end: u64,
+        due_quantum: u64,
+    ) -> Option<(u64, u64, bool)> {
+        if due_quantum != 600 || frame_payload_end < lease_end.checked_add(due_quantum)? {
+            return None;
+        }
+        let Self::ReceivingData {
+            advertised_limit,
+            requested_limit,
+            consumed,
+            parser_lease_capacity,
+            parser_lease_used,
+            parser_lease_exhausted,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if *advertised_limit != lease_end
+            || *requested_limit != lease_end
+            || *consumed != lease_end
+            || *parser_lease_capacity != cs_rbing_parser_lease_capacity()
+            || *parser_lease_used != cs_rbing_parser_lease_capacity()
+            || !*parser_lease_exhausted
+        {
+            return None;
+        }
+        *requested_limit = requested_limit.checked_add(due_quantum)?;
+        Some((*requested_limit, due_quantum, true))
+    }
+
+    // Only the controller's marked same-slot application/chaff split may call this.
+    pub(crate) fn cs_rbing_mixed_data_continuation_capacity(
+        &self,
+        blocked_at: Option<u64>,
+        due_quantum: u64,
+        live_data_prefix: bool,
+    ) -> u64 {
+        if !(3..600).contains(&due_quantum) {
+            return 0;
+        }
+        match self {
+            Self::ReceivingData {
+                advertised_limit,
+                requested_limit,
+                parser_lease_capacity,
+                parser_lease_used,
+                consumed,
+                data_length,
+                parser_lease_exhausted,
+                last_parser_lease_boundary,
+                pending_parser_boundary,
+                ..
+            } if {
+                let diagnostic_live_prefix =
+                    std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                        && *parser_lease_capacity == CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC
+                        && *parser_lease_used < *parser_lease_capacity
+                        && *data_length > 0
+                        && live_data_prefix;
+                let exhausted_lease = *parser_lease_exhausted
+                    && *parser_lease_capacity == cs_rbing_parser_lease_capacity()
+                    && *parser_lease_used == cs_rbing_parser_lease_capacity();
+                (exhausted_lease || diagnostic_live_prefix)
+                    && *requested_limit == *advertised_limit
+                    && *consumed <= *requested_limit
+                    && (blocked_at == Some(*requested_limit)
+                        || *consumed == *requested_limit
+                        || diagnostic_live_prefix)
+                    && (diagnostic_live_prefix || *pending_parser_boundary == Some(*consumed))
+                    && *last_parser_lease_boundary != Some(*consumed)
+                    && requested_limit.checked_add(due_quantum).is_some()
+            } =>
+            {
+                due_quantum
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn cs_rbing_mixed_data_continuation(
+        &mut self,
+        blocked_at: Option<u64>,
+        due_quantum: u64,
+        live_data_prefix: bool,
+    ) -> Option<(u64, u64, bool)> {
+        if self.cs_rbing_mixed_data_continuation_capacity(blocked_at, due_quantum, live_data_prefix)
+            != due_quantum
+            || due_quantum == 0
+        {
+            return None;
+        }
+        let Self::ReceivingData {
+            requested_limit,
+            consumed,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        *requested_limit = requested_limit.checked_add(due_quantum)?;
+        *last_parser_lease_boundary = Some(*consumed);
+        *pending_parser_boundary = None;
+        Some((*requested_limit, due_quantum, true))
+    }
+
     pub const fn available(&self) -> u64 {
         match self {
             Self::ReceivingHeaders {
@@ -229,76 +503,6 @@ impl ReceiveState {
             } => known_limit.saturating_sub(*requested_limit),
             Self::Created { .. } | Self::Automatic { .. } | Self::Closed { .. } => 0,
         }
-    }
-
-    /// Current decoded framing and DATA extent, excluding the prepared hint.
-    pub(crate) const fn observed_data_available(&self) -> u64 {
-        match self {
-            Self::ReceivingData { requested_limit, framing_bytes, data_length, .. } => {
-                match framing_bytes.checked_add(*data_length) {
-                    Some(end) => end.saturating_sub(*requested_limit),
-                    None => 0,
-                }
-            }
-            _ => 0,
-        }
-    }
-
-    pub(crate) fn release_observed_data(&mut self, amount: u64) -> Option<(u64, u64)> {
-        let increase = amount.min(self.observed_data_available());
-        if increase == 0 {
-            return None;
-        }
-        let Self::ReceivingData { requested_limit, .. } = self else {
-            return None;
-        };
-        *requested_limit = requested_limit.checked_add(increase)?;
-        Some((*requested_limit, increase))
-    }
-
-    /// A due CS cell can own its remaining raw bytes at a live DATA boundary.
-    /// The caller retains the actual 600-byte slot identity. Neither the body
-    /// hint nor the lifetime unowned parser allowance funds this permission.
-    /// A bounded advertised next-header prefix keeps its existing owner; the
-    /// fresh cell is appended after requested_limit, never after consumed.
-    pub(crate) fn cs_owned_chaff_data_capacity(&self, remaining: u64) -> u64 {
-        if remaining == 0 || remaining > 600 {
-            return 0;
-        }
-        match self {
-            Self::ReceivingData {
-                advertised_limit, requested_limit, consumed, framing_bytes, data_length,
-                last_parser_lease_boundary, pending_parser_boundary, ..
-            } if *data_length > 0
-                && *advertised_limit == *requested_limit
-                && *consumed <= *requested_limit
-                && requested_limit.saturating_sub(*consumed) <= 16
-                && framing_bytes.checked_add(*data_length).is_some_and(|end| {
-                    end <= *consumed && consumed.saturating_sub(end) <= 16
-                })
-                && *pending_parser_boundary == Some(*consumed)
-                && *last_parser_lease_boundary != Some(*consumed)
-                && requested_limit.checked_add(remaining).is_some() => remaining,
-            _ => 0,
-        }
-    }
-
-    pub(crate) fn cs_owned_chaff_data_continuation(
-        &mut self,
-        remaining: u64,
-    ) -> Option<(u64, u64, bool)> {
-        if self.cs_owned_chaff_data_capacity(remaining) != remaining || remaining == 0 {
-            return None;
-        }
-        let Self::ReceivingData {
-            requested_limit, consumed, last_parser_lease_boundary, pending_parser_boundary, ..
-        } = self else {
-            return None;
-        };
-        *requested_limit = requested_limit.checked_add(remaining)?;
-        *last_parser_lease_boundary = Some(*consumed);
-        *pending_parser_boundary = None;
-        Some((*requested_limit, remaining, true))
     }
 
     /// Whether this stream is still at its configured initial response prefix
@@ -638,6 +842,29 @@ impl ReceiveState {
         blocked_at: u64,
         live_scheduled_prefix: Option<(u64, u64)>,
     ) -> Option<(u64, u64)> {
+        self.pre_header_bootstrap_lease_with_target(
+            blocked_at,
+            live_scheduled_prefix,
+            PRE_HEADER_BOOTSTRAP_TARGET,
+            false,
+        )
+    }
+
+    pub(crate) fn rbing_small_header_bootstrap_lease(
+        &mut self,
+        blocked_at: u64,
+        live_scheduled_prefix: Option<(u64, u64)>,
+    ) -> Option<(u64, u64)> {
+        self.pre_header_bootstrap_lease_with_target(blocked_at, live_scheduled_prefix, 1_500, true)
+    }
+
+    fn pre_header_bootstrap_lease_with_target(
+        &mut self,
+        blocked_at: u64,
+        live_scheduled_prefix: Option<(u64, u64)>,
+        target: u64,
+        rbing_small_only: bool,
+    ) -> Option<(u64, u64)> {
         let Self::ReceivingHeaders {
             advertised_limit,
             requested_limit,
@@ -655,6 +882,9 @@ impl ReceiveState {
         else {
             return None;
         };
+        if rbing_small_only && !matches!(*payload_floor, 597 | 655) {
+            return None;
+        }
         let exact_prepared_floor =
             *requested_limit == *known_limit && *requested_limit >= *payload_floor;
         let exact_large_floor_scheduled_prefix = *payload_floor >= PRE_HEADER_BOOTSTRAP_TARGET
@@ -663,7 +893,7 @@ impl ReceiveState {
             });
         if *requested_limit != *advertised_limit
             || (!exact_prepared_floor && !exact_large_floor_scheduled_prefix)
-            || *requested_limit >= PRE_HEADER_BOOTSTRAP_TARGET
+            || *requested_limit >= target
             || blocked_at >= PRE_HEADER_BOOTSTRAP_TARGET
             || *consumed != 0
             || *framing_bytes != 0
@@ -675,7 +905,7 @@ impl ReceiveState {
             return None;
         }
         let remaining_budget = parser_lease_capacity.saturating_sub(*parser_lease_used);
-        let increase = PRE_HEADER_BOOTSTRAP_TARGET
+        let increase = target
             .saturating_sub(*requested_limit)
             .min(remaining_budget);
         if increase == 0 {
@@ -696,11 +926,20 @@ impl ReceiveState {
         blocked_at: u64,
     ) -> Option<(u64, u64)> {
         let Self::ReceivingHeaders {
-            advertised_limit, requested_limit, known_limit, consumed,
-            payload_floor, framing_bytes, parser_lease_capacity,
-            parser_lease_used, parser_lease_exhausted,
-            last_parser_lease_boundary, pending_parser_boundary, ..
-        } = self else {
+            advertised_limit,
+            requested_limit,
+            known_limit,
+            consumed,
+            payload_floor,
+            framing_bytes,
+            parser_lease_capacity,
+            parser_lease_used,
+            parser_lease_exhausted,
+            last_parser_lease_boundary,
+            pending_parser_boundary,
+            ..
+        } = self
+        else {
             return None;
         };
         // This is the unchanged 16-byte initial frontier, not a fabricated
@@ -710,8 +949,10 @@ impl ReceiveState {
             || *requested_limit != blocked_at
             || *payload_floor == 0
             || *known_limit != (*payload_floor).max(blocked_at)
-            || *consumed != 0 || *framing_bytes != 0
-            || *parser_lease_capacity != 1_000 || *parser_lease_used != 0
+            || *consumed != 0
+            || *framing_bytes != 0
+            || *parser_lease_capacity != cs_rbing_parser_lease_capacity()
+            || *parser_lease_used != 0
             || *parser_lease_exhausted
             || last_parser_lease_boundary.is_some()
             || pending_parser_boundary.is_some()
@@ -799,7 +1040,10 @@ impl ReceiveState {
         if backing != capacity || available != 0 {
             return None;
         }
-        let Self::ReceivingHeaders { requested_limit, .. } = self else {
+        let Self::ReceivingHeaders {
+            requested_limit, ..
+        } = self
+        else {
             return None;
         };
         *requested_limit = requested_limit.checked_add(backing)?;
@@ -867,6 +1111,17 @@ impl ReceiveState {
         if !pristine_data_boundary {
             return None;
         }
+        // Diagnostic-only Bing bridge: actual decoded DATA has reached a
+        // pristine parser boundary, so permit only the next bounded frame
+        // header to be parsed. The prepared body estimate never funds body
+        // bytes or scheduled receive credit.
+        let diagnostic_live_data_boundary =
+            std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                && matches!(self, Self::ReceivingData {
+                data_length, parser_lease_capacity, parser_lease_used, ..
+            } if *data_length > 0
+                && *parser_lease_capacity == CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC
+                && *parser_lease_used < *parser_lease_capacity);
         match self {
             Self::ReceivingHeaders {
                 advertised_limit,
@@ -914,7 +1169,9 @@ impl ReceiveState {
                     && remaining_parser_allowance >= MAX_HTTP3_FRAME_HEADER_BYTES
                     && !*parser_lease_exhausted;
                 if *requested_limit != *advertised_limit
-                    || (*known_limit > *requested_limit && !terminal_exact_tail_bridge)
+                    || (*known_limit > *requested_limit
+                        && !terminal_exact_tail_bridge
+                        && !diagnostic_live_data_boundary)
                     || *pending_parser_boundary != Some(*consumed)
                     || *last_parser_lease_boundary == Some(*consumed)
                 {
@@ -1194,20 +1451,39 @@ impl ReceiveState {
                 requested_limit,
                 known_limit,
                 consumed,
+                data_length,
+                parser_lease_capacity,
+                parser_lease_used,
                 parser_lease_exhausted,
                 last_parser_lease_boundary,
                 pending_parser_boundary,
                 ..
-            } if *parser_lease_exhausted
-                && *requested_limit == *advertised_limit
-                && *known_limit <= *requested_limit
-                && *consumed <= *requested_limit
-                && (blocked_at == Some(*requested_limit) || *consumed == *requested_limit)
-                && *pending_parser_boundary == Some(*consumed)
-                && *last_parser_lease_boundary != Some(*consumed)
-                && requested_limit.checked_add(due_quantum).is_some() =>
-            {
-                due_quantum
+            } => {
+                let diagnostic_live_data =
+                    std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                        && *parser_lease_capacity == CS_RBING_PARSER_LEASE_CAPACITY_DIAGNOSTIC
+                        && *parser_lease_used < *parser_lease_capacity
+                        && *data_length > 0
+                        && requested_limit.saturating_sub(*consumed)
+                            <= due_quantum + 2 * MAX_HTTP3_FRAME_HEADER_BYTES;
+                let original_exhausted_lease = *parser_lease_exhausted
+                    && *parser_lease_capacity == cs_rbing_parser_lease_capacity()
+                    && *parser_lease_used == cs_rbing_parser_lease_capacity();
+                if (original_exhausted_lease || diagnostic_live_data)
+                    && *requested_limit == *advertised_limit
+                    && *known_limit <= *requested_limit
+                    && *consumed <= *requested_limit
+                    && (blocked_at == Some(*requested_limit)
+                        || *consumed == *requested_limit
+                        || diagnostic_live_data)
+                    && (diagnostic_live_data || *pending_parser_boundary == Some(*consumed))
+                    && *last_parser_lease_boundary != Some(*consumed)
+                    && requested_limit.checked_add(due_quantum).is_some()
+                {
+                    due_quantum
+                } else {
+                    0
+                }
             }
             _ => 0,
         }
@@ -3106,5 +3382,31 @@ mod tests {
         state.bytes_read(500);
         assert_eq!(state.claimable(), 1_000);
         assert_eq!(state.close(), (0, 0));
+    }
+
+    #[test]
+    fn rbing_small_header_bootstrap_is_bounded_and_one_shot() {
+        for floor in [597, 655] {
+            let mut state = ReceiveState::controlled(16, 1_000, floor);
+            assert_eq!(state.release(floor - 16), Some((floor, floor - 16)));
+            assert_eq!(state.rbing_small_header_bootstrap_lease(16, None), None);
+            state.advertised(floor);
+            assert_eq!(
+                state.rbing_small_header_bootstrap_lease(16, None),
+                Some((1_500, 1_500 - floor))
+            );
+            assert_eq!(state.rbing_small_header_bootstrap_lease(16, None), None);
+            assert!(
+                matches!(state, ReceiveState::ReceivingHeaders { parser_lease_capacity: 1_000, parser_lease_used, .. } if parser_lease_used == 1_500-floor)
+            );
+        }
+        let mut other = ReceiveState::controlled(16, 1_000, 596);
+        other.release(580);
+        other.advertised(596);
+        assert_eq!(other.rbing_small_header_bootstrap_lease(16, None), None);
+        assert_eq!(
+            other.pre_header_bootstrap_lease(16, None),
+            Some((1_000, 404))
+        );
     }
 }

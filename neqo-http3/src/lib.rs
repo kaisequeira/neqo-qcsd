@@ -172,7 +172,7 @@ pub use conn_params::Http3Parameters;
 pub use connection::{Http3State, SessionAcceptAction};
 pub use connection_client::Http3Client;
 #[cfg(feature = "qcsd")]
-pub use connection_client::{QcsdCsTerminalReadiness, QcsdLocalChaffAbandonment};
+pub use connection_client::QcsdLocalChaffAbandonment;
 use frames::HFrame;
 pub use neqo_common::Header;
 use neqo_common::MessageType;
@@ -508,21 +508,7 @@ trait RecvStream: Stream {
     }
 }
 
-#[cfg(feature = "qcsd")]
-#[derive(Clone, Copy)]
-pub(crate) enum QcsdCsTerminalReceiveKind {
-    Drained,
-    IdleInitial,
-    ParserAllowance,
-}
-
 trait HttpRecvStream: RecvStream {
-    /// Non-mutating target parser check; global output is classified separately.
-    #[cfg(feature = "qcsd")]
-    fn qcsd_cs_terminal_receive_ready(&self, _kind: QcsdCsTerminalReceiveKind) -> Res<()> {
-        Err(Error::InvalidInput)
-    }
-
     /// Locally abandon an already-decoded ordinary response without creating
     /// QUIC or QPACK cancellation work. Every other receive handler refuses.
     ///

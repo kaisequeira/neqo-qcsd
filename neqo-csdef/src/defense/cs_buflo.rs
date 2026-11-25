@@ -4,7 +4,7 @@
 // option.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -194,6 +194,9 @@ pub struct CsBuflo {
     event_guard_triggered: bool,
     realization_failed: bool,
     terminal_primary_partial: Option<QcsdSlotId>,
+    terminal_chaff_replenishment_incoming_stop: bool,
+    terminal_chaff_replenishment_incoming_stop_at_us: Option<u64>,
+    terminal_chaff_partials: HashSet<QcsdSlotId>,
 }
 
 impl CsBuflo {
@@ -281,6 +284,9 @@ impl CsBuflo {
             event_guard_triggered: false,
             realization_failed: false,
             terminal_primary_partial: None,
+            terminal_chaff_replenishment_incoming_stop: false,
+            terminal_chaff_replenishment_incoming_stop_at_us: None,
+            terminal_chaff_partials: HashSet::new(),
         };
         defense.next_us[OUTGOING] = defense.randomized_delay_us(Direction::Outgoing);
         defense.next_us[INCOMING] = defense.randomized_delay_us(Direction::Incoming);
@@ -520,9 +526,16 @@ impl CsBuflo {
     }
 
     fn direction_complete(&self, direction: Direction) -> bool {
+        if direction == Direction::Incoming && self.terminal_chaff_replenishment_incoming_stop {
+            return self.application_complete()
+                && !self.in_flight[INCOMING]
+                && self.pending_incoming.is_empty()
+                && self.terminal[INCOMING] == self.scheduled[INCOMING];
+        }
         if self.local_termination_latched {
             return true;
         }
+
         let index = direction_index(direction);
         self.termination_stop_active(direction) && self.terminal[index] == self.scheduled[index]
     }
@@ -888,10 +901,54 @@ impl CsBuflo {
         self.maybe_latch_local_termination();
     }
 
+    /// A chaff partial is not a generic partial-success escape hatch. The
+    /// controller has already tied it to one activated r.bing chaff request,
+    /// one physically advertised CS/600 owned cell, and its actual FIN.
+    /// Retain the raw missed schedule row while accounting only consumed bytes
+    /// as terminal progress, exactly as the existing primary lifecycle does.
+    fn record_terminal_chaff_partial(
+        &mut self,
+        at_us: u64,
+        slot: QcsdSlotId,
+        packet: Packet,
+        consumed: u64,
+        retired: u64,
+    ) {
+        let pending = self.pending_incoming.get(&slot).copied();
+        if self.terminal_chaff_partials.contains(&slot)
+            || packet.timestamp_us() > at_us
+            || !pending.is_some_and(|pending| pending.packet == packet && pending.locally_realized)
+            || !super::traits::terminal_primary_partial_split_valid(
+                packet,
+                self.parameters.packet_size,
+                consumed,
+                retired,
+            )
+        {
+            self.realization_failed = true;
+            return;
+        }
+        self.pending_incoming
+            .remove(&slot)
+            .expect("validated owned incoming slot");
+        assert!(self.terminal_chaff_partials.insert(slot));
+        self.missed_incoming = self.missed_incoming.saturating_add(1);
+        self.terminal[INCOMING] = self.terminal[INCOMING].saturating_add(1);
+        if pending.expect("checked pending").at_minimum_interval {
+            self.minimum_interval_terminal[INCOMING] =
+                self.minimum_interval_terminal[INCOMING].saturating_add(1);
+        }
+        let crossing = self.record_termination_increment(INCOMING, consumed);
+        self.realized_total[INCOMING] = self.realized_total[INCOMING].saturating_add(consumed);
+        self.maybe_latch_termination_stop(at_us, Direction::Incoming, crossing);
+        self.maybe_latch_local_termination();
+    }
+
     fn pop_direction(&mut self, elapsed_us: u64, direction: Direction) -> Option<Packet> {
         self.maybe_latch_termination_stop(elapsed_us, direction, None);
         let index = direction_index(direction);
         if self.in_flight[index]
+            || (direction == Direction::Incoming && self.terminal_chaff_replenishment_incoming_stop)
             || self.termination_stop_blocks_new_opportunities(direction)
             || self.event_guard_triggered
             || self.realization_failed
@@ -985,6 +1042,14 @@ impl Defense for CsBuflo {
             } => {
                 self.record_terminal_primary_partial(at_us, slot, packet, consumed, retired);
             }
+            SignalKind::TerminalChaffPartial {
+                slot,
+                packet,
+                consumed,
+                retired,
+            } => {
+                self.record_terminal_chaff_partial(at_us, slot, packet, consumed, retired);
+            }
             _ => {}
         }
         self.maybe_latch_local_termination();
@@ -1048,6 +1113,8 @@ impl Defense for CsBuflo {
         for direction in [Direction::Outgoing, Direction::Incoming] {
             let index = direction_index(direction);
             if !self.direction_complete(direction)
+                && !(direction == Direction::Incoming
+                    && self.terminal_chaff_replenishment_incoming_stop)
                 && !self.termination_stop_blocks_new_opportunities(direction)
             {
                 if !self.in_flight[index] {
@@ -1063,12 +1130,18 @@ impl Defense for CsBuflo {
 
     fn is_complete(&self) -> bool {
         self.event_guard_triggered
-            || self.local_termination_latched
+            || (!self.terminal_chaff_replenishment_incoming_stop && self.local_termination_latched)
             || (self.direction_complete(Direction::Outgoing)
                 && self.direction_complete(Direction::Incoming))
     }
 
     fn is_incoming_complete(&self) -> bool {
+        if self.terminal_chaff_replenishment_incoming_stop {
+            return self.application_complete()
+                && !self.in_flight[INCOMING]
+                && self.pending_incoming.is_empty()
+                && self.terminal[INCOMING] == self.scheduled[INCOMING];
+        }
         // After onLoad, a latched incoming stop forbids new opportunities,
         // even while previously advertised credit is still being consumed.
         // The controller may then grant its bounded parser-only bridge for a
@@ -1120,6 +1193,21 @@ impl Defense for CsBuflo {
             && !(self.application_complete()
                 && self.termination_stop_latched[OUTGOING]
                 && self.termination_stop_latched[INCOMING])
+    }
+
+    fn stop_fresh_incoming_after_terminal_chaff_replenishment(&mut self, at: Duration) -> bool {
+        if self.terminal_chaff_replenishment_incoming_stop {
+            return false;
+        }
+        self.terminal_chaff_replenishment_incoming_stop = true;
+        self.terminal_chaff_replenishment_incoming_stop_at_us =
+            Some(u64::try_from(at.as_micros()).unwrap_or(u64::MAX));
+        if !self.application_complete() {
+            self.local_termination_latched = false;
+            self.local_termination_latched_at_us = None;
+        }
+        self.maybe_latch_local_termination();
+        true
     }
 
     fn terminal_chaff_cancellation_reason(&self) -> Option<QcsdChaffCancellationReason> {
@@ -1189,6 +1277,11 @@ impl Defense for CsBuflo {
             cs_buflo_early_termination_semantics: EARLY_TERMINATION_SEMANTICS,
             cs_buflo_early_termination_translation_version: EARLY_TERMINATION_TRANSLATION_VERSION,
             cs_buflo_termination_stop_policy: TERMINATION_STOP_POLICY,
+            cs_buflo_terminal_chaff_replenishment_incoming_stop: self
+                .terminal_chaff_replenishment_incoming_stop,
+            cs_buflo_terminal_chaff_replenishment_incoming_stop_at_us: self
+                .terminal_chaff_replenishment_incoming_stop_at_us
+                .unwrap_or_default(),
             cs_buflo_reference_tcp_write_size_bytes: REFERENCE_TCP_WRITE_SIZE_BYTES,
             cs_buflo_reference_nominal_tcp_packet_size_bytes:
                 REFERENCE_NOMINAL_TCP_PACKET_SIZE_BYTES,
@@ -1386,6 +1479,170 @@ mod tests {
         });
         assert!(defense.is_complete());
         assert_eq!(defense.realized_total[INCOMING], 599);
+    }
+
+    #[test]
+    fn terminal_chaff_partials_are_per_slot_and_keep_exact_consumed_progress() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0x13);
+        for (slot, at_us, consumed, retired) in
+            [(QcsdSlotId(7), 0, 425, 175), (QcsdSlotId(8), 10, 417, 183)]
+        {
+            let packet = advertise_incoming(&mut defense, at_us, slot);
+            defense.observe(DefenseSignal {
+                at: Duration::from_micros(at_us + 1),
+                kind: SignalKind::TerminalChaffPartial {
+                    slot,
+                    packet,
+                    consumed,
+                    retired,
+                },
+            });
+        }
+        assert_eq!(defense.terminal_chaff_partials.len(), 2);
+        assert_eq!(defense.missed_incoming, 2);
+        assert_eq!(defense.realized_total[INCOMING], 842);
+        assert!(defense.terminal_failure().is_none());
+    }
+
+    #[test]
+    fn b815_stop_blocks_fresh_incoming_after_preserving_advertised_drain() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0xb815);
+        let first_slot = QcsdSlotId(8151);
+        let first = advertise_incoming(&mut defense, 1, first_slot);
+        let second_slot = QcsdSlotId(8152);
+        let second = advertise_incoming(&mut defense, 2, second_slot);
+        defense.next_us[INCOMING] = 10;
+        defense.next_us[OUTGOING] = 11;
+        defense.local_termination_latched = true;
+        defense.local_termination_latched_at_us = Some(2);
+        assert!(
+            defense.is_complete(),
+            "fixture injects the legacy latch bypass"
+        );
+
+        assert!(
+            defense
+                .stop_fresh_incoming_after_terminal_chaff_replenishment(Duration::from_micros(3))
+        );
+        assert!(!defense.local_termination_latched);
+        assert!(!defense.is_complete());
+        assert_eq!(
+            defense.next_event_at(),
+            Some(Duration::from_micros(11)),
+            "the post-closure scheduler exposes only the unaffected outgoing timer"
+        );
+        assert_eq!(defense.next_event(Duration::from_micros(10)), None);
+        assert_eq!(defense.scheduled[INCOMING], 2);
+        assert_eq!(defense.pending_incoming.len(), 2);
+        assert!(!defense.direction_complete(Direction::Incoming));
+        assert!(!defense.is_incoming_complete());
+        assert!(!defense.is_complete());
+
+        defense.observe_application_bytes(Duration::from_micros(4), Direction::Incoming, 37);
+        assert_eq!(defense.natural[INCOMING], 37);
+        assert!(!defense.is_incoming_complete());
+
+        defense.record_incoming_outcome(
+            5,
+            first_slot,
+            first,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert_eq!(defense.pending_incoming.len(), 1);
+        assert!(!defense.direction_complete(Direction::Incoming));
+        assert!(!defense.is_incoming_complete());
+
+        defense.record_incoming_outcome(
+            6,
+            second_slot,
+            second,
+            EventOutcome::Satisfied { observed: 600 },
+        );
+        assert!(defense.pending_incoming.is_empty());
+        assert!(!defense.direction_complete(Direction::Incoming));
+        assert!(!defense.is_incoming_complete());
+        assert!(!defense.is_complete());
+        assert_eq!(defense.next_event(Duration::from_micros(10)), None);
+        assert_eq!(defense.missed_incoming, 0);
+        assert!(defense.terminal_failure().is_none());
+
+        defense.observe(DefenseSignal {
+            at: Duration::from_micros(7),
+            kind: SignalKind::ApplicationComplete,
+        });
+        assert!(defense.direction_complete(Direction::Incoming));
+        assert!(defense.is_incoming_complete());
+        let diagnostics = defense.diagnostics();
+        assert!(diagnostics.cs_buflo_terminal_chaff_replenishment_incoming_stop);
+        assert_eq!(
+            diagnostics.cs_buflo_terminal_chaff_replenishment_incoming_stop_at_us,
+            3
+        );
+    }
+
+    #[test]
+    fn b815_stop_preserves_deadline_expiry_for_preexisting_advertised_credit() {
+        let mut defense = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0xb815_1);
+        let slot = QcsdSlotId(8153);
+        let packet = advertise_incoming(&mut defense, 1, slot);
+        assert!(
+            defense
+                .stop_fresh_incoming_after_terminal_chaff_replenishment(Duration::from_micros(2))
+        );
+
+        defense.record_incoming_outcome(
+            3,
+            slot,
+            packet,
+            EventOutcome::Missed(MissedSlotReason::DeadlineExpired),
+        );
+        assert_eq!(defense.missed_incoming, 1);
+        assert_eq!(
+            defense.terminal_failure(),
+            Some("CS-BuFLO adapter produced a non-congestion realization failure")
+        );
+    }
+
+    #[test]
+    fn terminal_chaff_partial_rejects_duplicate_slot_and_unadvertised_cell() {
+        let mut duplicate = CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0x14);
+        let slot = QcsdSlotId(9);
+        let packet = advertise_incoming(&mut duplicate, 0, slot);
+        let signal = SignalKind::TerminalChaffPartial {
+            slot,
+            packet,
+            consumed: 425,
+            retired: 175,
+        };
+        duplicate.observe(DefenseSignal {
+            at: Duration::from_micros(1),
+            kind: signal,
+        });
+        duplicate.observe(DefenseSignal {
+            at: Duration::from_micros(2),
+            kind: signal,
+        });
+        assert!(duplicate.terminal_failure().is_some());
+
+        let mut unadvertised =
+            CsBuflo::from_parameters(parameters(CsBufloPaddingMode::Total), 0x15);
+        unadvertised.next_us[OUTGOING] = u64::MAX;
+        unadvertised.next_us[INCOMING] = 0;
+        let packet = unadvertised
+            .pop_direction(0, Direction::Incoming)
+            .expect("incoming opportunity");
+        let slot = QcsdSlotId(10);
+        unadvertised.record_incoming_scheduled(slot, packet);
+        unadvertised.observe(DefenseSignal {
+            at: Duration::from_micros(1),
+            kind: SignalKind::TerminalChaffPartial {
+                slot,
+                packet,
+                consumed: 425,
+                retired: 175,
+            },
+        });
+        assert!(unadvertised.terminal_failure().is_some());
     }
 
     #[test]

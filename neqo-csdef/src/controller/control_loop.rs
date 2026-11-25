@@ -45,6 +45,8 @@ pub(super) struct PendingClaim {
     /// Legacy framing claims debit the per-stream allowance. A due-cell DATA
     /// continuation is reserved exclusively by its actual incoming slot.
     pub reservation_debited: bool,
+    /// This exact chaff remainder shares a due600 cell with staged app bytes.
+    pub mixed_rbing: bool,
 }
 
 #[derive(Debug, Default)]

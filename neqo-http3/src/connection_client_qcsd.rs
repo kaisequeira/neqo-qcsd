@@ -20,24 +20,6 @@ use neqo_transport::StreamId;
 use super::Http3Client;
 use crate::{Error, Priority, Res, connection::RequestDescription};
 
-/// Exact global output blocker after strict CS target-state validation.
-/// Pending never authorizes receive credit, handler closure or a receipt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QcsdCsTerminalReadiness {
-    /// All original target and global output preconditions currently hold.
-    Ready,
-    /// QPACK encoder handler output must cross the ordinary output boundary.
-    PendingQpackEncoder,
-    /// QPACK decoder handler output remains pending.
-    PendingQpackDecoderHandler,
-    /// QPACK decoder transport bytes remain pending.
-    PendingQpackDecoderTransport,
-    /// HTTP/3 or QUIC STREAM output remains pending.
-    PendingStreamSend,
-    /// Exact defense control remains unencoded or in flight.
-    PendingDefenseControl,
-}
-
 /// Actual terminal-only preflight facts, retained by the QCSD runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QcsdLocalChaffAbandonment {
@@ -48,6 +30,12 @@ pub struct QcsdLocalChaffAbandonment {
 }
 
 impl Http3Client {
+    /// Observe same-call transport-builder facts without driving output.
+    #[must_use]
+    pub fn qcsd_last_output_target_diagnostic(&self) -> Option<(Instant, [u64; 23])> {
+        self.conn.qcsd_last_output_target_diagnostic()
+    }
+
     /// Drive HTTP/3/QPACK send handlers into transport without constructing a
     /// QUIC datagram. The prefix qualifier uses this while send shaping is
     /// active to establish an exact post-SETTINGS transcript cutoff.
@@ -279,95 +267,6 @@ impl Http3Client {
             self.qcsd_has_pending_defense_control(),
             self.qcsd_chaff_send_stream_peer_confirmed(stream_id),
         );
-    }
-
-    // Called only after the original strict CS readiness operation refused.
-    // No output drive, receive read, ACK projection, credit or retry occurs.
-    fn qcsd_log_cs_terminal_readiness_refusal(
-        &self,
-        stream: StreamId,
-        role: QcsdRequestRole,
-        witness: Option<&neqo_csdef::CsBufloTerminalParserAllowance>,
-        phase: &'static str,
-        error: &Error,
-    ) {
-        use std::io::Write as _;
-        let error_kind = match error {
-            Error::InvalidInput => "InvalidInput",
-            Error::InvalidStreamId => "InvalidStreamId",
-            _ => "other",
-        };
-        // Phase and error labels are local literals; no peer text is emitted.
-        let phase = match phase {
-            "transport-parser-allowance" | "transport-idle-initial" | "http3-receive-ready" => phase,
-            _ => "unrecognized-local-phase",
-        };
-        let line = format!(
-            "QCSD_CS_TERMINAL_READINESS_REFUSAL phase={phase} stream={} error={error_kind} witness_present={}\n",
-            stream.as_u64(), witness.is_some(),
-        );
-        let _ = std::io::stderr().lock().write_all(line.as_bytes());
-        self.conn.qcsd_log_cs_terminal_readiness_refusal(stream, role, witness);
-    }
-
-    /// Check a strict CS target before classifying global output as transient.
-    /// This does not abandon a handler or relax a receive-window/FIN-ACK check.
-    /// The original mutating API must still recheck all predicates when Ready.
-    ///
-    /// # Errors
-    /// Any unsupported identity, ownership, terminal or HTTP receive state
-    /// remains an error, even while another stream has pending output.
-    pub fn qcsd_cs_terminal_chaff_readiness(
-        &mut self,
-        stream_id: StreamId,
-        role: QcsdRequestRole,
-        witness: Option<&neqo_csdef::CsBufloTerminalParserAllowance>,
-    ) -> Res<QcsdCsTerminalReadiness> {
-        let kind = if self.conn.qcsd_preview_local_chaff_abandonment(stream_id, role).is_some() {
-            crate::QcsdCsTerminalReceiveKind::Drained
-        } else if let Some(witness) = witness {
-            if self.conn.qcsd_preview_cs_parser_allowance_chaff_abandonment(
-                stream_id, role, witness,
-            ).is_none() {
-                let error = Error::InvalidInput;
-                self.qcsd_log_cs_terminal_readiness_refusal(
-                    stream_id, role, Some(witness), "transport-parser-allowance", &error,
-                );
-                return Err(error);
-            }
-            crate::QcsdCsTerminalReceiveKind::ParserAllowance
-        } else {
-            if self.conn.qcsd_preview_cs_idle_initial_chaff_abandonment(stream_id, role).is_none() {
-                let error = Error::InvalidInput;
-                self.qcsd_log_cs_terminal_readiness_refusal(
-                    stream_id, role, witness, "transport-idle-initial", &error,
-                );
-                return Err(error);
-            }
-            crate::QcsdCsTerminalReceiveKind::IdleInitial
-        };
-        if let Err(error) = self.base_handler.qcsd_cs_terminal_receive_ready(stream_id, kind) {
-            self.qcsd_log_cs_terminal_readiness_refusal(
-                stream_id, role, witness, "http3-receive-ready", &error,
-            );
-            return Err(error);
-        }
-        if self.base_handler.qcsd_qpack_encoder_handler_pending() {
-            return Ok(QcsdCsTerminalReadiness::PendingQpackEncoder);
-        }
-        if self.qcsd_qpack_decoder_handler_pending() {
-            return Ok(QcsdCsTerminalReadiness::PendingQpackDecoderHandler);
-        }
-        if self.qcsd_qpack_decoder_transport_pending() {
-            return Ok(QcsdCsTerminalReadiness::PendingQpackDecoderTransport);
-        }
-        if self.qcsd_has_pending_stream_send() {
-            return Ok(QcsdCsTerminalReadiness::PendingStreamSend);
-        }
-        if self.qcsd_has_pending_defense_control() {
-            return Ok(QcsdCsTerminalReadiness::PendingDefenseControl);
-        }
-        Ok(QcsdCsTerminalReadiness::Ready)
     }
 
     /// Separate CS terminal cleanup. The runner must prove the original CS
@@ -841,6 +740,12 @@ impl Http3Client {
                 strict_advance,
             )
             .map(Some)
+    }
+
+    /// Count pending receive actions without collecting their identities.
+    #[must_use]
+    pub fn qcsd_pending_receive_action_count(&self) -> usize {
+        self.conn.qcsd_pending_receive_action_count()
     }
 
     /// Exact typed receive actions accepted but not yet encoded by transport.

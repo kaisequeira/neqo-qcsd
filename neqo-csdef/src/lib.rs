@@ -35,7 +35,8 @@ pub use config::{
 };
 pub use controller::{
     CsBufloTerminalParserAllowance, QcsdController, QcsdReceiveCancellation,
-    QcsdReceiveCancellationPlan, TerminalPrimaryPartialCellDiagnostics,
+    QcsdReceiveCancellationPlan, TerminalChaffPartialCellDiagnostics,
+    TerminalPrimaryPartialCellDiagnostics,
 };
 pub use defense::{
     Buflo, BufloAggregateIncomingStartupDiagnostics, BufloAggregateStartupMember,
@@ -59,10 +60,6 @@ pub use event::{
 };
 pub use profile::{DefenseKind, QcsdProfile, StaticMode};
 pub use resource::{
-    CsSupplementalChaffManifestV8, CsSupplementalPoolSource, CsSupplementalQualification,
-    CsSupplementalQualifiedResource, CsPoolPreparedResponse, CS_POOL_ID_MIN, CS_POOL_ID_MAX, CS_SUPPLEMENTAL_POLICY,
-    FtSupplementalChaffManifestV7, FtSupplementalPoolSource, FtSupplementalQualification,
-    FtSupplementalQualifiedResource, FtPoolPreparedResponse, FT_POOL_ID_MIN, FT_POOL_ID_MAX, FT_SUPPLEMENTAL_POLICY,
     ChaffManifest, ChaffQualification, ExpectedChaffResponse, IdentityChaffRequestHeaderPrimitive,
     QualifiedChaffResource, Resource, ResourceManifest, ResponseOnlyChaffManifest,
     ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV6, ResponseOnlyChaffQualification,

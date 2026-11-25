@@ -777,7 +777,10 @@ mod qcsd_budgeted_stream_tests {
             Rc::clone(&streams.sender_fc),
             streams.events.clone(),
         );
-        stream.set_priority(TransmissionPriority::Important, RetransmissionPriority::Same);
+        stream.set_priority(
+            TransmissionPriority::Important,
+            RetransmissionPriority::Same,
+        );
         if !data.is_empty() {
             assert_eq!(stream.send(data).unwrap(), data.len());
         }
@@ -833,8 +836,13 @@ mod qcsd_budgeted_stream_tests {
             assert_eq!(packet.len(), 600);
 
             let mut dec = Decoder::new(&packet.as_ref()[start..]);
-            let Frame::Stream { stream_id, offset, data, fin, fill } =
-                Frame::decode(&mut dec).unwrap()
+            let Frame::Stream {
+                stream_id,
+                offset,
+                data,
+                fin,
+                fill,
+            } = Frame::decode(&mut dec).unwrap()
             else {
                 panic!("first frame must be a STREAM");
             };
@@ -852,9 +860,14 @@ mod qcsd_budgeted_stream_tests {
             ));
             assert_eq!(
                 Frame::decode(&mut dec).unwrap(),
-                Frame::MaxData { maximum_data: 16_384 }
+                Frame::MaxData {
+                    maximum_data: 16_384
+                }
             );
-            assert!(matches!(Frame::decode(&mut dec).unwrap(), Frame::Padding(_)));
+            assert!(matches!(
+                Frame::decode(&mut dec).unwrap(),
+                Frame::Padding(_)
+            ));
             assert_eq!(dec.remaining(), 0);
         }
     }
@@ -885,8 +898,9 @@ mod qcsd_budgeted_stream_tests {
                 assert_eq!(budget, budget_size - used);
                 let mut dec = Decoder::new(&packet.as_ref()[start..]);
                 while dec.remaining() > 0 {
-                    let Frame::Stream { offset, data, fill, .. } =
-                        Frame::decode(&mut dec).unwrap()
+                    let Frame::Stream {
+                        offset, data, fill, ..
+                    } = Frame::decode(&mut dec).unwrap()
                     else {
                         panic!("expected only explicit-length STREAM frames");
                     };

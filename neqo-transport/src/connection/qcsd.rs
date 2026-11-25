@@ -193,7 +193,64 @@ pub(super) struct PendingReceiveAction {
     pub previous_frame_pending: bool,
 }
 
+// Signed same-call offsets are encoded as bitwise u64 values so the
+// existing fixed-size snapshot remains allocation-free.
+fn output_target_signed_offset_ns(a: Instant, b: Instant) -> i64 {
+    if a >= b {
+        i64::try_from(a.duration_since(b).as_nanos()).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(b.duration_since(a).as_nanos()).unwrap_or(i64::MAX)
+    }
+}
+
+// Failure-only fixed-size metadata from the original builder decision.
+// This pure projection never selects a target or authorizes output.
+pub(super) fn output_target_diagnostic(
+    front: Option<PacketTarget>,
+    eligible: Option<PacketTarget>,
+    active: Option<PacketTarget>,
+    now: Instant,
+    facts: [u64; 9],
+) -> [u64; 23] {
+    [
+        facts[0],
+        u64::from(front.is_some()),
+        front.map_or(0, |target| target.slot.0),
+        u64::from(front.is_some_and(|target| target.committed)),
+        u64::from(
+            front.is_some_and(|target| target.not_before.is_some_and(|release| now < release)),
+        ),
+        u64::from(front.is_some_and(|target| now >= target.deadline)),
+        u64::from(eligible.is_some()),
+        eligible.map_or(0, |target| target.slot.0),
+        eligible.map_or(0, |target| u64::from(target.udp_payload_size)),
+        facts[1],
+        facts[2],
+        facts[3],
+        facts[4],
+        u64::from(active.is_some()),
+        active.map_or(0, |target| target.slot.0),
+        facts[5],
+        facts[6],
+        facts[7],
+        facts[8],
+        u64::from(front.is_some_and(|target| target.send_policy == QcsdSendPolicy::Exact)),
+        front.map_or(0, |target| u64::from_ne_bytes(
+            output_target_signed_offset_ns(now, target.deadline).to_ne_bytes())),
+        front.and_then(|target| target.not_before).map_or(0, |not_before| u64::from_ne_bytes(
+            output_target_signed_offset_ns(now, not_before).to_ne_bytes())),
+        u64::from(front.is_some_and(|target| target.not_before.is_some())),
+    ]
+}
+
 impl Connection {
+    /// Actual last builder facts in this output call; diagnostic only.
+    /// A cleared value means this output call did not reach the builder.
+    #[must_use]
+    pub const fn qcsd_last_output_target_diagnostic(&self) -> Option<(Instant, [u64; 23])> {
+        self.qcsd_last_output_target_diagnostic
+    }
+
     pub(super) fn qcsd_stream_priority_is_budgeted(&self, priority: TransmissionPriority) -> bool {
         if self.qcsd_active_target.is_none() {
             if self.qcsd_chaff_send_released && priority == TransmissionPriority::Normal {
@@ -353,52 +410,6 @@ impl Connection {
             self.qcsd_stream_roles.get(&stream_id),
             Some(QcsdRequestRole::Chaff { .. })
         ) && self.streams.qcsd_send_stream_peer_confirmed(stream_id)
-    }
-
-    /// Failure-only CS readiness facts. Every query is read-only and the
-    /// original preview/receive/ACK predicates and their result stay unchanged.
-    /// The fixed scalar fields are bounded; no payload, header or peer string
-    /// is formatted, and a failed stderr write cannot replace the refusal.
-    pub fn qcsd_log_cs_terminal_readiness_refusal(
-        &self,
-        stream: StreamId,
-        role: QcsdRequestRole,
-        witness: Option<&neqo_csdef::CsBufloTerminalParserAllowance>,
-    ) {
-        use std::io::Write as _;
-        let receive = self.streams.qcsd_get_recv_stream(stream);
-        let drained = receive
-            .and_then(|value| value.qcsd_drained_manual_receive())
-            .is_some();
-        let idle_initial = receive
-            .and_then(|value| value.qcsd_idle_initial_manual_receive())
-            .is_some();
-        let unused_parser = witness.is_some_and(|proof| {
-            receive
-                .and_then(|value| value.qcsd_unused_parser_manual_receive(proof))
-                .is_some()
-        });
-        let pending_actions = self.qcsd_pending_receive_actions.iter()
-            .filter(|value| value.identity.stream().0 == stream.as_u64()).count();
-        let pending_credit = self.qcsd_pending_receive_credit.iter()
-            .filter(|value| value.stream == stream).count();
-        let line = format!(
-            "QCSD_CS_TERMINAL_READINESS_TRANSPORT stream={} role_matches={} request_fin_peer_confirmed={} pending_receive_actions={} pending_scheduled_credit={} unacked_receive_limit={:?} receive_control_pending_or_in_flight={} local_cancel_controls={:?} receive_exists={} manual_frame_pending={:?} drained_manual={} idle_initial_manual={} unused_parser_manual={} witness_present={}\n",
-            stream.as_u64(), self.qcsd_stream_roles.get(&stream) == Some(&role),
-            self.streams.qcsd_send_stream_fin_peer_confirmed(stream),
-            pending_actions, pending_credit,
-            self.qcsd_unacked_defense_receive_limits.get(&stream).copied(),
-            self.streams.qcsd_receive_limit_pending_or_in_flight(stream),
-            self.streams.qcsd_local_et_cancellation_controls(stream),
-            receive.is_some(), receive.and_then(|value| value.qcsd_manual_frame_pending()),
-            drained, idle_initial, unused_parser, witness.is_some(),
-        );
-        let mut stderr = std::io::stderr().lock();
-        if line.len() <= 2_048 {
-            let _ = stderr.write_all(line.as_bytes());
-        } else {
-            let _ = stderr.write_all(b"QCSD_CS_TERMINAL_READINESS_TRANSPORT diagnostic_bound_exceeded\n");
-        }
     }
 
     /// Preview local application abandonment of one exact chaff response.
@@ -1542,5 +1553,19 @@ mod tests {
             classify_outgoing_evidence(true, [QcsdDatagramClass::DefenseCover]),
             QcsdDatagramClass::DefenseCover
         );
+    }
+}
+
+#[cfg(test)]
+mod buflo_signed_offset_tests {
+    use super::output_target_signed_offset_ns;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn signed_offsets_preserve_direction_and_zero() {
+        let first = Instant::now();
+        let second = first + Duration::from_nanos(7_000);
+        assert_eq!(output_target_signed_offset_ns(second, first), 7_000);
+        assert_eq!(output_target_signed_offset_ns(first, second), -7_000);
+        assert_eq!(output_target_signed_offset_ns(first, first), 0);
     }
 }

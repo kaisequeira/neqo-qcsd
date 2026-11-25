@@ -37,8 +37,6 @@ use neqo_csdef::{
     QcsdReceiveActionIdentity, QcsdReceiveLimitError, QcsdReceiveLimitFatal,
     QcsdReceiveLimitOutcome, QcsdRequestRole, QcsdSendPolicy, QcsdSlotComposition, QcsdSlotId,
     QcsdSlotOutcome, QcsdStreamTransmission, Resource, ResourceManifest, ResourceRunState,
-    FtSupplementalChaffManifestV7, FtSupplementalPoolSource, FT_SUPPLEMENTAL_POLICY,
-    CsSupplementalChaffManifestV8, CsSupplementalPoolSource, CS_SUPPLEMENTAL_POLICY,
     ResponseOnlyChaffManifest, ResponseOnlyChaffManifestV4, ResponseOnlyChaffManifestV6,
     ResponseOnlyChaffQualification, ResponseOnlyChaffQualificationV4,
     ResponseOnlyChaffQualificationV6, SmallResponseAggregateCapacityContract, StaticMode,
@@ -69,19 +67,29 @@ use trace_files::{PacketTraceRow, QcsdTraceColumns, ScheduleTraceRow, TraceFiles
 // clock, controller, transport, action, deadline or scientific predicate.
 const CS_PREOUTPUT_SAMPLE_LIMIT: usize = 256;
 const CS_PREOUTPUT_JSON_LIMIT: usize = 64 * 1024;
-const CS_PREOUTPUT_STAGES: [&str; 34] = [
-    "control_enter", "backlog_before", "backlog_after", "application_reduce_before",
-    "flush_before", "flush_after", "poll_before", "poll_after", "queued_apply_before",
-    "batch_preflight_before", "batch_preflight_after", "receive_apply_before",
-    "receive_apply_after", "queued_apply_after", "post_apply_priority_before",
-    "retry_inventory_before", "retry_inventory_after", "expiry_selected",
-    "ordinary_output_before", "pending_capture_before", "preparation_before", "preparation_after",
-    "cancel_rejected_before", "cancel_rejected_after",
-    "cancel_barrier_observations_before", "cancel_barrier_observations_after",
-    "action_apply_before", "action_apply_after",
-    "queued_retry_chaff_before", "queued_retry_chaff_after",
-    "queued_reconcile_before", "queued_reconcile_after",
-    "queued_retry_terminal_before", "queued_retry_terminal_after",
+const CS_PREOUTPUT_STAGES: [&str; 22] = [
+    "control_enter",
+    "backlog_before",
+    "backlog_after",
+    "application_reduce_before",
+    "flush_before",
+    "flush_after",
+    "poll_before",
+    "poll_after",
+    "queued_apply_before",
+    "batch_preflight_before",
+    "batch_preflight_after",
+    "receive_apply_before",
+    "receive_apply_after",
+    "queued_apply_after",
+    "post_apply_priority_before",
+    "retry_inventory_before",
+    "retry_inventory_after",
+    "expiry_selected",
+    "ordinary_output_before",
+    "pending_capture_before",
+    "preparation_before",
+    "preparation_after",
 ];
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -250,10 +258,12 @@ impl CsPreoutputDiagnostic {
                 "last_control_at_process_ns": self.control_at_process_ns,
                 "last_control_elapsed_defense_ns": self.control_elapsed_defense_ns,
                 "original_defense_start_process_ns": self.defense_start_process_ns,
-                "stages": CS_PREOUTPUT_STAGES.as_slice(),
+                "stages": CS_PREOUTPUT_STAGES,
                 "entries": &entries,
             });
-            let Ok(raw) = serde_json::to_vec(&value) else { return None; };
+            let Ok(raw) = serde_json::to_vec(&value) else {
+                return None;
+            };
             if raw.len() <= CS_PREOUTPUT_JSON_LIMIT {
                 return Some(value);
             }
@@ -301,10 +311,12 @@ fn cs_preoutput_diagnostic_control(
             }
             diagnostic.control = diagnostic.control.saturating_add(1);
             diagnostic.control_at_process_ns = Some(duration_as_u64_nanos(
-                control_now.saturating_duration_since(diagnostic.origin)));
+                control_now.saturating_duration_since(diagnostic.origin),
+            ));
             diagnostic.control_elapsed_defense_ns = elapsed.map(duration_as_u64_nanos);
-            diagnostic.defense_start_process_ns = defense_start.map(|started|
-                duration_as_u64_nanos(started.saturating_duration_since(diagnostic.origin)));
+            diagnostic.defense_start_process_ns = defense_start.map(|started| {
+                duration_as_u64_nanos(started.saturating_duration_since(diagnostic.origin))
+            });
             diagnostic.record(0, CsPreoutputIdentity::default());
         }
     });
@@ -316,15 +328,19 @@ fn cs_preoutput_diagnostic_receive(stage: u8, action: &QcsdAction, window: Durat
             if let Some((endpoint, stream, limit)) = receive_action_target(action) {
                 let scheduled = scheduled_action(action);
                 let target = scheduled.map(|(_, packet, _)| packet.timestamp());
-                diagnostic.record(stage, CsPreoutputIdentity {
-                    endpoint: Some(endpoint.0),
-                    stream: Some(stream.0),
-                    slot: scheduled.map(|(_, _, slot)| slot.0),
-                    limit: Some(limit),
-                    target_defense_ns: target.map(duration_as_u64_nanos),
-                    deadline_defense_ns: target.and_then(|at| at.checked_add(window))
-                        .map(duration_as_u64_nanos),
-                });
+                diagnostic.record(
+                    stage,
+                    CsPreoutputIdentity {
+                        endpoint: Some(endpoint.0),
+                        stream: Some(stream.0),
+                        slot: scheduled.map(|(_, _, slot)| slot.0),
+                        limit: Some(limit),
+                        target_defense_ns: target.map(duration_as_u64_nanos),
+                        deadline_defense_ns: target
+                            .and_then(|at| at.checked_add(window))
+                            .map(duration_as_u64_nanos),
+                    },
+                );
             }
         }
     });
@@ -342,324 +358,6 @@ fn cs_preoutput_diagnostic_take_failure() -> Option<serde_json::Value> {
     CS_PREOUTPUT_DIAGNOSTIC.with(|state| state.borrow_mut().take()?.failure_value())
 }
 // END ROOT CS PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
-
-// BEGIN ROOT BF PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
-// Opt-in engineering observations only. No sample is returned to a decision
-// clock, controller, transport, action, deadline or scientific predicate.
-const BUFLO_PREOUTPUT_SAMPLE_LIMIT: usize = 256;
-const BUFLO_PREOUTPUT_JSON_LIMIT: usize = 64 * 1024;
-const BUFLO_PREOUTPUT_STAGES: [&str; 56] = [
-    "control_enter", "backlog_before", "backlog_after", "application_reduce_before",
-    "flush_before", "flush_after", "poll_before", "poll_after", "queued_apply_before",
-    "batch_preflight_before", "batch_preflight_after", "receive_apply_before",
-    "receive_apply_after", "queued_apply_after", "post_apply_priority_before",
-    "retry_inventory_before", "retry_inventory_after", "expiry_selected",
-    "ordinary_output_before", "pending_capture_before", "preparation_before", "preparation_after",
-    "cancel_rejected_before", "cancel_rejected_after",
-    "cancel_barrier_observations_before", "cancel_barrier_observations_after",
-    "action_apply_before", "action_apply_after",
-    "queued_retry_chaff_before", "queued_retry_chaff_after",
-    "queued_reconcile_before", "queued_reconcile_after",
-    "queued_retry_terminal_before", "queued_retry_terminal_after",
-    "queued_drain_before",
-    "queued_drain_after",
-    "action_register_before",
-    "action_register_after",
-    "receive_preflight_before",
-    "receive_preflight_after",
-    "transport_apply_before",
-    "transport_apply_after",
-    "main_job_lookup_before",
-    "main_job_lookup_after",
-    "main_tuple_before",
-    "main_tuple_after",
-    "main_sha256_before",
-    "main_sha256_after",
-    "main_helper_before",
-    "main_helper_after",
-    "response_channel_before",
-    "response_channel_after",
-    "command_send_before",
-    "command_send_after",
-    "main_call_before",
-    "main_call_after",
-];
-
-#[derive(Clone, Copy, Debug, Serialize)]
-struct BufloPreoutputSample {
-    sequence: u64,
-    control: u64,
-    stage: u8,
-    control_at_process_ns: Option<u64>,
-    control_elapsed_defense_ns: Option<u64>,
-    defense_start_process_ns: Option<u64>,
-    wall_before_ns: u64,
-    thread_cpu_ns: Option<u64>,
-    wall_after_ns: u64,
-    endpoint: Option<u64>,
-    stream: Option<u64>,
-    slot: Option<u64>,
-    limit: Option<u64>,
-    target_defense_ns: Option<u64>,
-    deadline_defense_ns: Option<u64>,
-    job_id: Option<u64>,
-    event_id: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct BufloPreoutputIdentity {
-    endpoint: Option<u64>,
-    stream: Option<u64>,
-    slot: Option<u64>,
-    limit: Option<u64>,
-    target_defense_ns: Option<u64>,
-    deadline_defense_ns: Option<u64>,
-    job_id: Option<u64>,
-    event_id: Option<u64>,
-}
-
-struct BufloPreoutputDiagnostic {
-    origin: Instant,
-    samples: Box<[Option<BufloPreoutputSample>; BUFLO_PREOUTPUT_SAMPLE_LIMIT]>,
-    next: usize,
-    len: usize,
-    sequence: u64,
-    control: u64,
-    dropped: u64,
-    unavailable_cpu: u64,
-    frozen: bool,
-    freeze_reason: Option<&'static str>,
-    // Mappings are observations of the original control/defense instants.
-    // They do not select or reset either origin.
-    control_at_process_ns: Option<u64>,
-    control_elapsed_defense_ns: Option<u64>,
-    defense_start_process_ns: Option<u64>,
-}
-
-impl BufloPreoutputDiagnostic {
-    fn new(origin: Instant) -> Self {
-        Self {
-            origin,
-            samples: Box::new([None; BUFLO_PREOUTPUT_SAMPLE_LIMIT]),
-            next: 0,
-            len: 0,
-            sequence: 0,
-            control: 0,
-            dropped: 0,
-            unavailable_cpu: 0,
-            frozen: false,
-            freeze_reason: None,
-            control_at_process_ns: None,
-            control_elapsed_defense_ns: None,
-            defense_start_process_ns: None,
-        }
-    }
-
-    fn record_sample(
-        &mut self,
-        stage: u8,
-        identity: BufloPreoutputIdentity,
-        wall_before_ns: u64,
-        thread_cpu_ns: Option<u64>,
-        wall_after_ns: u64,
-    ) {
-        if self.frozen {
-            return;
-        }
-        if self.len == self.samples.len() {
-            self.dropped = self.dropped.saturating_add(1);
-        } else {
-            self.len += 1;
-        }
-        if thread_cpu_ns.is_none() {
-            self.unavailable_cpu = self.unavailable_cpu.saturating_add(1);
-        }
-        self.samples[self.next] = Some(BufloPreoutputSample {
-            sequence: self.sequence,
-            control: self.control,
-            stage,
-            control_at_process_ns: self.control_at_process_ns,
-            control_elapsed_defense_ns: self.control_elapsed_defense_ns,
-            defense_start_process_ns: self.defense_start_process_ns,
-            wall_before_ns,
-            thread_cpu_ns,
-            wall_after_ns,
-            endpoint: identity.endpoint,
-            stream: identity.stream,
-            slot: identity.slot,
-            limit: identity.limit,
-            target_defense_ns: identity.target_defense_ns,
-            deadline_defense_ns: identity.deadline_defense_ns,
-            job_id: identity.job_id,
-            event_id: identity.event_id,
-        });
-        self.next = (self.next + 1) % self.samples.len();
-        self.sequence = self.sequence.saturating_add(1);
-    }
-
-    fn record(&mut self, stage: u8, identity: BufloPreoutputIdentity) {
-        if self.frozen {
-            return;
-        }
-        // Independent diagnostic reads: never call the runner's injected now
-        // closure or consume a physical-handoff/test decision-clock sample.
-        let before = Instant::now();
-        #[cfg(target_os = "linux")]
-        let cpu = timed_egress::clock_thread_cpu_ns().ok();
-        #[cfg(not(target_os = "linux"))]
-        let cpu = None;
-        let after = Instant::now();
-        self.record_sample(
-            stage,
-            identity,
-            duration_as_u64_nanos(before.saturating_duration_since(self.origin)),
-            cpu,
-            duration_as_u64_nanos(after.saturating_duration_since(self.origin)),
-        );
-    }
-
-    fn freeze(&mut self, reason: &'static str) {
-        if !self.frozen {
-            self.frozen = true;
-            self.freeze_reason = Some(reason);
-        }
-    }
-
-    fn failure_value(&self) -> Option<serde_json::Value> {
-        if !self.frozen {
-            return None;
-        }
-        // Called once after the physical/control loop has ended. All JSON,
-        // allocation and size trimming here are outside the observed segment.
-        let first = (self.next + self.samples.len() - self.len) % self.samples.len();
-        let mut entries = (0..self.len)
-            .filter_map(|index| self.samples[(first + index) % self.samples.len()])
-            .collect::<Vec<_>>();
-        let mut serialized_dropped = 0_u64;
-        loop {
-            let value = json!({
-                "schema_version": 1,
-                "source": "runner-BF-preoutput-wall-threadCPU-observation-v1",
-                "observations_only": true,
-                "opt_in": "QCSD_BF_PREOUTPUT_DIAGNOSTIC=1",
-                "time_basis": "independent-Instant-brackets-relative-to-original-process_start",
-                "cpu_basis": "CLOCK_THREAD_CPUTIME_ID-or-null",
-                "current_thread_runner": true,
-                "interpretation": "adjacent retained wall and same-thread CPU intervals only; missing boundaries or dropped samples mean unknown; wall-minus-CPU does not identify descheduling",
-                "decision_clock_samples_consumed": false,
-                "scientific_credit_added": 0,
-                "max_samples": BUFLO_PREOUTPUT_SAMPLE_LIMIT,
-                "max_json_bytes": BUFLO_PREOUTPUT_JSON_LIMIT,
-                "dropped": self.dropped,
-                "serialized_dropped": serialized_dropped,
-                "unavailable_cpu": self.unavailable_cpu,
-                "freeze_reason": self.freeze_reason,
-                "last_control_at_process_ns": self.control_at_process_ns,
-                "last_control_elapsed_defense_ns": self.control_elapsed_defense_ns,
-                "original_defense_start_process_ns": self.defense_start_process_ns,
-                "stages": BUFLO_PREOUTPUT_STAGES.as_slice(),
-                "entries": &entries,
-            });
-            let Ok(raw) = serde_json::to_vec(&value) else { return None; };
-            if raw.len() <= BUFLO_PREOUTPUT_JSON_LIMIT {
-                return Some(value);
-            }
-            if entries.is_empty() {
-                return None;
-            }
-            entries.remove(0);
-            serialized_dropped = serialized_dropped.saturating_add(1);
-        }
-    }
-}
-
-thread_local! {
-    // execute_run_inner is explicitly a current-thread future. One owned run
-    // initializes this once; hooks never scan or clone a controller ledger.
-    static BUFLO_PREOUTPUT_DIAGNOSTIC: RefCell<Option<BufloPreoutputDiagnostic>> = const { RefCell::new(None) };
-}
-
-fn buflo_preoutput_diagnostic_enabled(
-    defense: &DefenseConfig,
-    flag: Option<&std::ffi::OsStr>,
-) -> bool {
-    matches!(defense, DefenseConfig::Buflo(_))
-        && flag == Some(std::ffi::OsStr::new("1"))
-}
-
-fn buflo_preoutput_diagnostic_start(origin: Instant, defense: &DefenseConfig) {
-    let flag = std::env::var_os("QCSD_BF_PREOUTPUT_DIAGNOSTIC");
-    let enabled = buflo_preoutput_diagnostic_enabled(defense, flag.as_deref());
-    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-        *state.borrow_mut() = enabled.then(|| BufloPreoutputDiagnostic::new(origin));
-    });
-}
-
-fn buflo_preoutput_diagnostic_mark(stage: u8, job_id: Option<u64>, event_id: Option<u64>) {
-    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-        if let Some(diagnostic) = state.borrow_mut().as_mut() {
-            diagnostic.record(stage, BufloPreoutputIdentity {
-                job_id, event_id, ..BufloPreoutputIdentity::default()
-            });
-        }
-    });
-}
-
-fn buflo_preoutput_diagnostic_control(
-    control_now: Instant,
-    elapsed: Option<Duration>,
-    defense_start: Option<Instant>,
-) {
-    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-        if let Some(diagnostic) = state.borrow_mut().as_mut() {
-            if diagnostic.frozen {
-                return;
-            }
-            diagnostic.control = diagnostic.control.saturating_add(1);
-            diagnostic.control_at_process_ns = Some(duration_as_u64_nanos(
-                control_now.saturating_duration_since(diagnostic.origin)));
-            diagnostic.control_elapsed_defense_ns = elapsed.map(duration_as_u64_nanos);
-            diagnostic.defense_start_process_ns = defense_start.map(|started|
-                duration_as_u64_nanos(started.saturating_duration_since(diagnostic.origin)));
-            diagnostic.record(0, BufloPreoutputIdentity::default());
-        }
-    });
-}
-
-fn buflo_preoutput_diagnostic_receive(stage: u8, action: &QcsdAction, window: Duration) {
-    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-        if let Some(diagnostic) = state.borrow_mut().as_mut() {
-            if let Some((endpoint, stream, limit)) = receive_action_target(action) {
-                let scheduled = scheduled_action(action);
-                let target = scheduled.map(|(_, packet, _)| packet.timestamp());
-                diagnostic.record(stage, BufloPreoutputIdentity {
-                    endpoint: Some(endpoint.0),
-                    stream: Some(stream.0),
-                    slot: scheduled.map(|(_, _, slot)| slot.0),
-                    limit: Some(limit),
-                    target_defense_ns: target.map(duration_as_u64_nanos),
-                    deadline_defense_ns: target.and_then(|at| at.checked_add(window))
-                        .map(duration_as_u64_nanos),
-                    job_id: None,
-                    event_id: scheduled.map(|(_, _, slot)| slot.0),
-                });
-            }
-        }
-    });
-}
-
-fn buflo_preoutput_diagnostic_freeze(reason: &'static str) {
-    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-        if let Some(diagnostic) = state.borrow_mut().as_mut() {
-            diagnostic.freeze(reason);
-        }
-    });
-}
-
-fn buflo_preoutput_diagnostic_take_failure() -> Option<serde_json::Value> {
-    BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| state.borrow_mut().take()?.failure_value())
-}
-// END ROOT BF PREOUTPUT OBSERVATIONAL DIAGNOSTIC 001
 
 const NEQO_BASE_COMMIT: &str = "8a04d065c2d35c8e8fd804f91c7081ab6bb60b89";
 const PUBLISHED_QCSD_COMMIT: &str = "39e293fb384dd341156eedd1e4b833d24904b1f6";
@@ -943,7 +641,7 @@ fn response_qualification_mode(
     request_header_mode: Option<ChaffRequestHeaderModeArg>,
 ) -> Result<ResponseQualificationMode, Error> {
     match (total_requests, request_header_mode) {
-        (None, None) if (5..=20).contains(&parallel_requests) => {
+        (None, None) if (5..=20).contains(&parallel_requests) || parallel_requests == 50 => {
             Ok(ResponseQualificationMode::Legacy)
         }
         (
@@ -954,7 +652,7 @@ fn response_qualification_mode(
             Ok(ResponseQualificationMode::SustainedIdentity)
         }
         (None, None) => Err(Error::Argument(
-            "legacy response qualification requires 5..=20 parallel_requests".into(),
+            "legacy response qualification requires 5..=20 or experimental 50 parallel_requests".into(),
         )),
         _ => Err(Error::Argument(
             "sustained response qualification requires the exact paired flags --total-requests 40 --parallel-requests 5 --request-header-mode identity-chaff-v1"
@@ -1019,12 +717,6 @@ enum Command {
         /// Exact frozen prepared source; response identities select and verify the live resource.
         #[arg(long)]
         workload: PathBuf,
-        /// Separate declared FT padding source. Never changes the application workload.
-        #[arg(long, requires = "application_manifest")]
-        supplemental_chaff_source: Option<PathBuf>,
-        /// Exact formal resources.json, paired with --supplemental-chaff-source.
-        #[arg(long, requires = "supplemental_chaff_source")]
-        application_manifest: Option<PathBuf>,
         /// Application navigation root identity; current qualification requires zero.
         #[arg(long)]
         application_resource_id: u32,
@@ -1083,15 +775,16 @@ enum Command {
         /// Exact frozen prepared source whose raw bytes bind qualified chaff.
         #[arg(long, requires = "workload")]
         application_workload_source: Option<PathBuf>,
-        /// Explicit FT-only separate prepared chaff pool; never application resources.
-        #[arg(long, requires = "application_workload_source")]
-        supplemental_chaff_source: Option<PathBuf>,
         /// Explicit response completion policy for a pre-prepared stability or baseline run.
         #[arg(long, value_enum, requires = "workload", conflicts_with = "urls")]
         application_response_policy: Option<ApplicationResponsePolicy>,
         /// Explicit prospective BuFLO retained-demand/genuine-FIN engineering policy.
         #[arg(long)]
         buflo_retained_parser_fin_permission: bool,
+        /// Separately versioned reassignment of exact direct receive credit
+        /// made unusable by a proved secondary application FIN.
+        #[arg(long, requires = "buflo_retained_parser_fin_permission")]
+        buflo_direct_fin_credit_reassignment: bool,
         /// Complete custom configuration for thesis defenses and imported runs.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1161,65 +854,6 @@ enum Command {
 }
 
 impl Args {
-    // Source-only preflight for the new policy, before NSS/output/network.
-    // The existing execute path repeats the same exact checks before use.
-    fn validate_ft_supplemental_arguments(&self) -> Result<(), Error> {
-        match &self.command {
-            Command::QualifyChaffResponse { workload, supplemental_chaff_source, application_manifest,
-                application_resource_id, selected_chaff_resource_id, parallel_requests,
-                total_requests, request_header_mode, small_response_aggregate,
-                max_response_bytes, packet_size, .. } => {
-                let Some(pool_path) = supplemental_chaff_source else {
-                    if application_manifest.is_some() { return Err(Error::Argument("FT formal manifest option lacks a separate pool".into())); }
-                    return Ok(());
-                };
-                if *application_resource_id != 0 || *parallel_requests != 5 || total_requests.is_some()
-                    || request_header_mode.is_some() || *small_response_aggregate
-                    || *max_response_bytes != 16_777_216 || *packet_size != 1_200 {
-                    return Err(Error::Argument("FT qualification requires exact3-run producer inputs and5 simultaneous1200-byte-profile GETs".into()));
-                }
-                let (formal, formal_hash) = load_manifest(application_manifest.as_deref().ok_or_else(|| Error::Argument("FT qualification lacks original formal resources.json".into()))?)?;
-                let (source, source_hash, _, _, _, _, _, _, _, _) = load_application_workload_source(workload)?;
-                if formal != source { return Err(Error::Argument("FT qualification changed full formal20".into())); }
-                let pool = load_supplemental_pool_source(pool_path)?;
-                pool.validate_against(&formal, &formal_hash, &source_hash,
-                    option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
-                if pool.selected_id()? != *selected_chaff_resource_id {
-                    return Err(Error::Argument("FT qualification did not select the largest prepared same-origin pool response".into()));
-                }
-                Ok(())
-            }
-            Command::Run { workload, application_workload_source, supplemental_chaff_source,
-                chaff_manifest, config, preset, profile, defense, schedule, static_mode,
-                buflo_parameters, cs_buflo_parameters, morphing_matrix, wtf_pad_histograms,
-                walkie_talkie_molded, workload_id, .. } => {
-                let loaded = chaff_manifest.as_deref().map(load_chaff_manifest).transpose()?;
-                let has_new_manifest = loaded.as_ref().is_some_and(|(m, _)| matches!(m, RuntimeChaffManifest::SupplementalFtV7(_) | RuntimeChaffManifest::SupplementalCsV8(_)));
-                if supplemental_chaff_source.is_none() && !has_new_manifest { return Ok(()); }
-                let pool_path = supplemental_chaff_source.as_deref().ok_or_else(|| Error::Argument("FT manifest lacks separate source".into()))?;
-                let Some((manifest, _)) = loaded else {
-                    return Err(Error::Argument("separate source requires typed FT7 or CS8 manifest".into()));
-                };
-                let (formal, formal_hash) = load_manifest(workload.as_deref().ok_or_else(|| Error::Argument("FT source requires formal resources.json".into()))?)?;
-                let (source, source_hash, _, _, _, _, _, _, _, _) = load_application_workload_source(application_workload_source.as_deref().ok_or_else(|| Error::Argument("FT source requires formal prepared source".into()))?)?;
-                let pool = load_supplemental_pool_source(pool_path)?;
-                let resolved = resolve_run_config_with_workload(config.as_deref(), *preset, *profile, *defense,
-                    schedule.as_deref(), *static_mode, buflo_parameters.as_deref(), cs_buflo_parameters.as_deref(),
-                    morphing_matrix.as_deref(), wtf_pad_histograms.as_deref(), walkie_talkie_molded.as_deref(), workload_id.as_deref())?;
-                match (&manifest, &pool) {
-                    (RuntimeChaffManifest::SupplementalFtV7(manifest), BoundSupplementalPoolSource::Ft(pool)) =>
-                        validate_ft_supplemental_binding_parts(&formal, &formal_hash, &source, &source_hash,
-                            manifest, pool, &resolved.defense),
-                    (RuntimeChaffManifest::SupplementalCsV8(manifest), BoundSupplementalPoolSource::Cs(pool)) =>
-                        validate_cs_supplemental_binding_parts(&formal, &formal_hash, &source, &source_hash,
-                            manifest, pool, &resolved.defense),
-                    _ => Err(Error::Argument("separate pool source and qualified manifest types differ".into())),
-                }
-            }
-            _ => Ok(()),
-        }
-    }
-
     // Shared with the public execute path, before logging, NSS, files, or network.
     fn validate_response_qualification_arguments(&self) -> Result<(), Error> {
         if let Command::QualifyChaffResponse {
@@ -1253,7 +887,6 @@ impl Args {
     )]
     pub async fn execute(self) -> Result<(), Error> {
         self.validate_response_qualification_arguments()?;
-        self.validate_ft_supplemental_arguments()?;
         neqo_common::log::init(None);
         nss::init()?;
         match self.command {
@@ -1277,9 +910,9 @@ impl Args {
                 urls,
                 workload,
                 application_workload_source,
-                supplemental_chaff_source,
                 application_response_policy,
                 buflo_retained_parser_fin_permission,
+                buflo_direct_fin_credit_reassignment,
                 config,
                 preset,
                 profile,
@@ -1316,6 +949,9 @@ impl Args {
                 if buflo_retained_parser_fin_permission {
                     config.buflo_retained_parser_fin_permission = true;
                 }
+                if buflo_direct_fin_credit_reassignment {
+                    config.buflo_direct_fin_credit_reassignment = true;
+                }
                 config.validate()?;
                 if urls.is_empty() == workload.is_none() {
                     return Err(Error::Argument(
@@ -1333,13 +969,11 @@ impl Args {
                     .as_deref()
                     .map(load_application_workload_source)
                     .transpose()?;
-                let supplemental_chaff_source = supplemental_chaff_source.as_deref()
-                    .map(load_supplemental_pool_source).transpose()?;
                 let application_response_policy = resolve_application_response_policy(
                     application_response_policy,
                     application_workload_source
                         .as_ref()
-                        .map(|(_, _, _, policy, _, _, _, _, _, _)| *policy),
+                        .map(|(_, _, _, policy, _, _, _, _, _, _, _)| *policy),
                 )?;
                 let (chaff_manifest, chaff_manifest_hash) = if let Some(path) = chaff_manifest {
                     let (manifest, raw_hash) = load_chaff_manifest(&path)?;
@@ -1380,7 +1014,7 @@ impl Args {
                         "undefended runs must not supply --application-workload-source".into(),
                     ));
                 }
-                let spec = RunSpec {
+                let mut spec = RunSpec {
                     method: "GET",
                     workload,
                     workload_hash,
@@ -1390,19 +1024,27 @@ impl Args {
                     defense_parameters,
                     chaff_manifest,
                     chaff_manifest_hash,
-                    supplemental_chaff_source,
                     request_policy,
                     seed,
                     output_dir,
                     max_response_bytes,
                     timeout_seconds,
                 };
+                let qualified = spec
+                    .chaff_manifest
+                    .as_ref()
+                    .map(RuntimeChaffManifest::qualified_parallel_chaff_streams);
+                spec.config.max_chaff_streams = rbing_ten_chaff_stream_count(
+                    rbing_same_window_retry_scope(&spec),
+                    spec.config.cs_live_chaff_header_progress,
+                    spec.config.max_chaff_streams,
+                    qualified,
+                )?;
+                spec.config.validate()?;
                 execute_run(spec).await.map(|_| ())
             }
             Command::QualifyChaffResponse {
                 workload,
-                supplemental_chaff_source,
-                application_manifest,
                 application_resource_id,
                 selected_chaff_resource_id,
                 output_dir,
@@ -1426,8 +1068,6 @@ impl Args {
                     max_response_bytes,
                     packet_size,
                     timeout_seconds,
-                    supplemental_chaff_source.as_deref(),
-                    application_manifest.as_deref(),
                 )
                 .await
             }
@@ -1857,222 +1497,11 @@ fn defense_parameter_provenance(
     }))
 }
 
-#[derive(Clone, Debug)]
-struct BoundFtSupplementalPoolSource {
-    source: FtSupplementalPoolSource,
-    sha256: String,
-}
-
-fn load_ft_supplemental_pool_source(path: &Path) -> Result<BoundFtSupplementalPoolSource, Error> {
-    let raw = fs::read(path)?;
-    if raw.is_empty() || raw.len() > 4 * 1024 * 1024 {
-        return Err(Error::Argument("bounded immutable FT pool source required".into()));
-    }
-    let text = std::str::from_utf8(&raw).map_err(|_| Error::Argument("FT pool source is not UTF8".into()))?;
-    Ok(BoundFtSupplementalPoolSource { source: FtSupplementalPoolSource::from_json(text)?, sha256: sha256(&raw)? })
-}
-
-#[derive(Clone, Debug)]
-struct BoundCsSupplementalPoolSource {
-    source: CsSupplementalPoolSource,
-    sha256: String,
-}
-
-/// Keep distinct parsed authorities behind the existing optional CLI input.
-#[derive(Clone, Debug)]
-enum BoundSupplementalPoolSource {
-    Ft(BoundFtSupplementalPoolSource),
-    Cs(BoundCsSupplementalPoolSource),
-}
-
-impl BoundSupplementalPoolSource {
-    fn sha256(&self) -> &str {
-        match self { Self::Ft(pool) => &pool.sha256, Self::Cs(pool) => &pool.sha256 }
-    }
-
-    const fn policy(&self) -> &'static str {
-        match self { Self::Ft(_) => FT_SUPPLEMENTAL_POLICY, Self::Cs(_) => CS_SUPPLEMENTAL_POLICY }
-    }
-
-    const fn qualification_artifact_type(&self) -> &'static str {
-        match self {
-            Self::Ft(_) => "qcsd-ft-supplemental-response-qualification",
-            Self::Cs(_) => "qcsd-cs-supplemental-response-qualification",
-        }
-    }
-
-    fn application_manifest_sha256(&self) -> &str {
-        match self { Self::Ft(pool) => &pool.source.application_manifest_sha256,
-                     Self::Cs(pool) => &pool.source.application_manifest_sha256 }
-    }
-
-    fn candidate_manifest_sha256(&self) -> &str {
-        match self { Self::Ft(pool) => &pool.source.candidate_manifest_sha256,
-                     Self::Cs(pool) => &pool.source.candidate_manifest_sha256 }
-    }
-
-    fn discovery_provenance_sha256(&self) -> &str {
-        match self { Self::Ft(pool) => &pool.source.discovery_provenance_sha256,
-                     Self::Cs(pool) => &pool.source.discovery_provenance_sha256 }
-    }
-
-    fn resource_manifest(&self) -> ResourceManifest {
-        match self { Self::Ft(pool) => ResourceManifest { resources: pool.source.resources.clone() },
-                     Self::Cs(pool) => ResourceManifest { resources: pool.source.resources.clone() } }
-    }
-
-    fn expected_responses(&self) -> BTreeMap<u32, PreparedExpectedResponse> {
-        match self {
-            Self::Ft(pool) => pool.source.expected_responses.iter().map(|row| (row.resource_id,
-                PreparedExpectedResponse { resource_id: row.resource_id, status: row.status,
-                    bytes: row.bytes, body_sha256: row.body_sha256.clone() })).collect(),
-            Self::Cs(pool) => pool.source.expected_responses.iter().map(|row| (row.resource_id,
-                PreparedExpectedResponse { resource_id: row.resource_id, status: row.status,
-                    bytes: row.bytes, body_sha256: row.body_sha256.clone() })).collect(),
-        }
-    }
-
-    fn selected_id(&self) -> Result<u32, Error> {
-        Ok(match self { Self::Ft(pool) => pool.source.selected()?.0.id,
-                        Self::Cs(pool) => pool.source.selected()?.0.id })
-    }
-
-    fn validate_against(&self, formal: &ResourceManifest, formal_hash: &str,
-                        source_hash: &str, native_commit: &str) -> Result<(), Error> {
-        match self {
-            Self::Ft(pool) => pool.source.validate_against(formal, formal_hash, source_hash, native_commit),
-            Self::Cs(pool) => pool.source.validate_against(formal, formal_hash, source_hash, native_commit),
-        }?;
-        Ok(())
-    }
-}
-
-fn load_supplemental_pool_source(path: &Path) -> Result<BoundSupplementalPoolSource, Error> {
-    let raw = fs::read(path)?;
-    if raw.is_empty() || raw.len() > 4 * 1024 * 1024 {
-        return Err(Error::Argument("bounded immutable supplemental pool source required".into()));
-    }
-    let text = std::str::from_utf8(&raw)
-        .map_err(|_| Error::Argument("supplemental pool source is not UTF8".into()))?;
-    let discriminator: serde_json::Value = serde_json::from_str(text)?;
-    match discriminator.get("artifact_type").and_then(serde_json::Value::as_str) {
-        // Preserve the original exact FT parser and whole-source hashing.
-        Some("qcsd-ft-supplemental-prepared-chaff-pool-source") =>
-            load_ft_supplemental_pool_source(path).map(BoundSupplementalPoolSource::Ft),
-        Some("qcsd-cs-supplemental-prepared-chaff-pool-source") =>
-            Ok(BoundSupplementalPoolSource::Cs(BoundCsSupplementalPoolSource {
-                source: CsSupplementalPoolSource::from_json(text)?, sha256: sha256(&raw)?,
-            })),
-        _ => Err(Error::Argument("explicit FT or CS prepared pool artifact required".into())),
-    }
-}
-
-fn validate_ft_supplemental_binding_parts(
-    formal: &ResourceManifest, formal_hash: &str,
-    source: &ResourceManifest, source_hash: &str,
-    manifest: &FtSupplementalChaffManifestV7, pool: &BoundFtSupplementalPoolSource,
-    defense: &DefenseConfig,
-) -> Result<(), Error> {
-    manifest.validate()?;
-    if !matches!(defense, DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_)) {
-        return Err(Error::Argument("separate FT pool is FRONT/Tamaraw only".into()));
-    }
-    if formal != source || manifest.application_manifest_sha256 != formal_hash
-        || manifest.application_workload_sha256 != source_hash
-        || manifest.chaff_pool_source_sha256 != pool.sha256
-        || manifest.candidate_manifest_sha256 != pool.source.candidate_manifest_sha256
-        || manifest.discovery_provenance_sha256 != pool.source.discovery_provenance_sha256 {
-        return Err(Error::Argument("qualified FT manifest changed a whole formal or separate source binding".into()));
-    }
-    pool.source.validate_against(formal, formal_hash, source_hash,
-        option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
-    let root = &formal.resources[0];
-    validate_qualification_application_root(root, manifest.application_resource_id)?;
-    if formal.resources.iter().any(|r| r.origin() != root.origin()) {
-        return Err(Error::Argument("FT formal20 must retain the single declared HTTPS class origin".into()));
-    }
-    let (selected, response) = pool.source.selected()?;
-    let mut projection = selected.clone();
-    projection.headers = projected_ael(selected)?;
-    let qualified = &manifest.resources[0];
-    let expected = &qualified.chaff_qualification.expected_response;
-    if manifest.selected_pool_resource_id != selected.id
-        || qualified.resource != projection || expected.status != response.status
-        || expected.body_bytes != response.bytes || expected.body_sha256 != response.body_sha256 {
-        return Err(Error::Argument("qualified FT resource differs from exact deterministic prepared pool response".into()));
-    }
-    Ok(())
-}
-
-fn validate_cs_supplemental_binding_parts(
-    formal: &ResourceManifest, formal_hash: &str,
-    source: &ResourceManifest, source_hash: &str,
-    manifest: &CsSupplementalChaffManifestV8, pool: &BoundCsSupplementalPoolSource,
-    defense: &DefenseConfig,
-) -> Result<(), Error> {
-    manifest.validate()?;
-    if !matches!(defense, DefenseConfig::CsBuflo(_)) {
-        return Err(Error::Argument("separate CS pool is CS-BuFLO only".into()));
-    }
-    if formal != source || manifest.application_manifest_sha256 != formal_hash
-        || manifest.application_workload_sha256 != source_hash
-        || manifest.chaff_pool_source_sha256 != pool.sha256
-        || manifest.candidate_manifest_sha256 != pool.source.candidate_manifest_sha256
-        || manifest.discovery_provenance_sha256 != pool.source.discovery_provenance_sha256 {
-        return Err(Error::Argument("qualified CS manifest changed a whole formal or separate source binding".into()));
-    }
-    pool.source.validate_against(formal, formal_hash, source_hash,
-        option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
-    let root = &formal.resources[0];
-    validate_qualification_application_root(root, manifest.application_resource_id)?;
-    if formal.resources.iter().any(|r| r.origin() != root.origin()) {
-        return Err(Error::Argument("FT formal20 must retain the single declared HTTPS class origin".into()));
-    }
-    let (selected, response) = pool.source.selected()?;
-    let mut projection = selected.clone();
-    projection.headers = projected_ael(selected)?;
-    let qualified = &manifest.resources[0];
-    let expected = &qualified.chaff_qualification.expected_response;
-    if manifest.selected_pool_resource_id != selected.id
-        || qualified.resource != projection || expected.status != response.status
-        || expected.body_bytes != response.bytes || expected.body_sha256 != response.body_sha256 {
-        return Err(Error::Argument("qualified CS resource differs from exact deterministic prepared pool response".into()));
-    }
-    Ok(())
-}
-
-fn validate_ft_supplemental_runtime_binding(spec: &RunSpec, manifest: &FtSupplementalChaffManifestV7) -> Result<(), Error> {
-    let Some((source, source_hash, _, _, _, _, _, _, _, _)) = &spec.application_workload_source else {
-        return Err(Error::Argument("schema-seven FT manifest requires original application source".into()));
-    };
-    let pool = spec.supplemental_chaff_source.as_ref().ok_or_else(|| Error::Argument("schema-seven FT manifest requires its separate prepared pool source".into()))?;
-    let BoundSupplementalPoolSource::Ft(pool) = pool else {
-        return Err(Error::Argument("FT schema7 cannot borrow a CS pool source".into()));
-    };
-    validate_ft_supplemental_binding_parts(&spec.workload, &spec.workload_hash, source, source_hash,
-        manifest, pool, &spec.config.defense)
-}
-
-fn validate_cs_supplemental_runtime_binding(spec: &RunSpec, manifest: &CsSupplementalChaffManifestV8) -> Result<(), Error> {
-    let Some((source, source_hash, _, _, _, _, _, _, _, _)) = &spec.application_workload_source else {
-        return Err(Error::Argument("schema-eight CS manifest requires original application source".into()));
-    };
-    let pool = spec.supplemental_chaff_source.as_ref()
-        .ok_or_else(|| Error::Argument("schema-eight CS manifest requires its separate prepared pool source".into()))?;
-    let BoundSupplementalPoolSource::Cs(pool) = pool else {
-        return Err(Error::Argument("CS schema8 cannot borrow a FRONT/Tamaraw pool source".into()));
-    };
-    validate_cs_supplemental_binding_parts(&spec.workload, &spec.workload_hash, source, source_hash,
-        manifest, pool, &spec.config.defense)
-}
-
 enum RuntimeChaffManifest {
     SchemaTwo(ChaffManifest),
     ResponseOnlyV3(ResponseOnlyChaffManifest),
     ResponseOnlyV4(ResponseOnlyChaffManifestV4),
     SmallResponseAggregateV6(ResponseOnlyChaffManifestV6),
-    SupplementalFtV7(FtSupplementalChaffManifestV7),
-    SupplementalCsV8(CsSupplementalChaffManifestV8),
 }
 
 struct RuntimeChaffQualification<'a> {
@@ -2121,10 +1550,8 @@ impl RuntimeChaffManifest {
             Some(6) => {
                 ResponseOnlyChaffManifestV6::from_json(input).map(Self::SmallResponseAggregateV6)
             }
-            Some(7) => FtSupplementalChaffManifestV7::from_json(input).map(Self::SupplementalFtV7),
-            Some(8) => CsSupplementalChaffManifestV8::from_json(input).map(Self::SupplementalCsV8),
             _ => Err(neqo_csdef::Error::InvalidConfig(
-                "qualified chaff manifest schema_version must be2,3,4, aggregate6, explicit FT7, or explicit CS8"
+                "qualified chaff manifest schema_version must be 2, 3, 4, or explicit aggregate6"
                     .into(),
             )),
         }
@@ -2135,16 +1562,14 @@ impl RuntimeChaffManifest {
             Self::SchemaTwo(manifest) => Some(manifest),
             Self::ResponseOnlyV3(_)
             | Self::ResponseOnlyV4(_)
-            | Self::SmallResponseAggregateV6(_)
-            | Self::SupplementalFtV7(_)
-            | Self::SupplementalCsV8(_) => None,
+            | Self::SmallResponseAggregateV6(_) => None,
         }
     }
 
     const fn is_response_only(&self) -> bool {
         matches!(
             self,
-            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) | Self::SmallResponseAggregateV6(_) | Self::SupplementalFtV7(_) | Self::SupplementalCsV8(_)
+            Self::ResponseOnlyV3(_) | Self::ResponseOnlyV4(_) | Self::SmallResponseAggregateV6(_)
         )
     }
 
@@ -2166,8 +1591,6 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV3(manifest) => &manifest.application_workload_sha256,
             Self::ResponseOnlyV4(manifest) => &manifest.application_workload_sha256,
             Self::SmallResponseAggregateV6(manifest) => &manifest.application_workload_sha256,
-            Self::SupplementalFtV7(manifest) => &manifest.application_workload_sha256,
-            Self::SupplementalCsV8(manifest) => &manifest.application_workload_sha256,
         }
     }
 
@@ -2177,8 +1600,6 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV3(manifest) => manifest.application_resource_id,
             Self::ResponseOnlyV4(manifest) => manifest.application_resource_id,
             Self::SmallResponseAggregateV6(manifest) => manifest.application_resource_id,
-            Self::SupplementalFtV7(manifest) => manifest.application_resource_id,
-            Self::SupplementalCsV8(manifest) => manifest.application_resource_id,
         }
     }
 
@@ -2188,8 +1609,6 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV3(manifest) => manifest.selected_chaff_resource_id,
             Self::ResponseOnlyV4(manifest) => manifest.selected_chaff_resource_id,
             Self::SmallResponseAggregateV6(manifest) => manifest.selected_chaff_resource_id,
-            Self::SupplementalFtV7(manifest) => manifest.selected_pool_resource_id,
-            Self::SupplementalCsV8(manifest) => manifest.selected_pool_resource_id,
         }
     }
 
@@ -2199,8 +1618,6 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV3(manifest) => manifest.qualified_parallel_chaff_streams,
             Self::ResponseOnlyV4(manifest) => manifest.qualified_parallel_chaff_streams,
             Self::SmallResponseAggregateV6(manifest) => manifest.qualified_parallel_chaff_streams,
-            Self::SupplementalFtV7(manifest) => manifest.qualified_parallel_chaff_streams,
-            Self::SupplementalCsV8(manifest) => manifest.qualified_parallel_chaff_streams,
         }
     }
 
@@ -2210,8 +1627,6 @@ impl RuntimeChaffManifest {
             Self::ResponseOnlyV3(manifest) => manifest.resource_manifest(),
             Self::ResponseOnlyV4(manifest) => manifest.resource_manifest(),
             Self::SmallResponseAggregateV6(manifest) => manifest.resource_manifest(),
-            Self::SupplementalFtV7(manifest) => manifest.resource_manifest(),
-            Self::SupplementalCsV8(manifest) => manifest.resource_manifest(),
         }
     }
 
@@ -2253,14 +1668,6 @@ impl RuntimeChaffManifest {
                     expected_response: &qualification.expected_response,
                 },
             ),
-            Self::SupplementalFtV7(manifest) => manifest.qualification(resource_id).map(|qualification| RuntimeChaffQualification {
-                request_stream_bytes: qualification.request_stream_bytes,
-                expected_response: &qualification.expected_response,
-            }),
-            Self::SupplementalCsV8(manifest) => manifest.qualification(resource_id).map(|qualification| RuntimeChaffQualification {
-                request_stream_bytes: qualification.request_stream_bytes,
-                expected_response: &qualification.expected_response,
-            }),
         }
     }
 }
@@ -2269,14 +1676,6 @@ fn validate_chaff_manifest_defense(
     defense: &DefenseConfig,
     chaff: &RuntimeChaffManifest,
 ) -> Result<(), Error> {
-    if matches!(chaff, RuntimeChaffManifest::SupplementalCsV8(_))
-        && !matches!(defense, DefenseConfig::CsBuflo(_)) {
-        return Err(Error::Argument("separate same-host schema-eight chaff is CS-BuFLO only".into()));
-    }
-    if matches!(chaff, RuntimeChaffManifest::SupplementalFtV7(_))
-        && !matches!(defense, DefenseConfig::Front(_) | DefenseConfig::Tamaraw(_)) {
-        return Err(Error::Argument("separate same-host schema-seven chaff is FRONT/Tamaraw only".into()));
-    }
     if chaff.is_small_response_aggregate() && !matches!(defense, DefenseConfig::Buflo(_)) {
         return Err(Error::Argument(
             "schema-six aggregate cover is fixed64ms BuFLO only".into(),
@@ -2289,6 +1688,7 @@ fn validate_chaff_manifest_defense(
                 | DefenseConfig::Tamaraw(_)
                 | DefenseConfig::Buflo(_)
                 | DefenseConfig::CsBuflo(_)
+                | DefenseConfig::WtfPad(_)
         )
     {
         return Err(Error::Argument(
@@ -2675,11 +2075,11 @@ impl BufloIncomingCreditReleasePolicy {
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_CADENCE64_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v13; historical_schema11_and12_unchanged=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=64000000; packet_bytes=1200; incoming_window=bound_half_period_32000000ns; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CADENCE64_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; nominal_selection=release_minus_5ms; rolling_preparation_deadline=release_plus_4ms; tick_zero_preparation_deadline=release; completed_and_confirmed_before_recorded_preparation_deadline=true; preparation_reserve_ns=1000000; physical_deadline_unchanged_release_plus_5ms=true; exact_read_counts_and_failure_evidence=true; no_omissions_or_catch_up=true; cadence_ns=64000000_bound_to_exact_prospective_parameters";
+const BUFLO_KERNEL_CADENCE64_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_authoritative; admission=release_minus_10ms; nominal_selection=release_minus_5ms; rolling_preparation_deadline=release_plus_19ms; tick_zero_preparation_deadline=release; completed_and_confirmed_before_recorded_preparation_deadline=true; preparation_reserve_ns=1000000; prospective_physical_deadline_release_plus_20ms=true; exact_read_counts_and_failure_evidence=true; no_omissions_or_catch_up=true; cadence_ns=64000000_bound_to_exact_prospective_parameters";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema22_retains_schema21_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema13=true";
-const BUFLO_KERNEL_LAYERED_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v14; historical_schema13_unchanged=true; layered_tx_feedback=bounded_complete_inventory_v1; required_first_TX_SCHED_and_TX_SOFTWARE_pair_unchanged=true; unknown_reused_wrapped_ids_and_timestamp_reversals_fatal=true; shutdown_socket_schema2_required=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=64000000; packet_bytes=1200; incoming_window=bound_half_period_32000000ns; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
-const BUFLO_KERNEL_LAYERED_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema22_retains_schema21_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema14_with_socket_schema2=true";
+const BUFLO_KERNEL_LAYERED_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v16_prospective_20ms; historical_schema13_unchanged=true; layered_tx_feedback=bounded_complete_inventory_v1; required_first_TX_SCHED_and_TX_SOFTWARE_pair_unchanged=true; unknown_reused_wrapped_ids_and_timestamp_reversals_fatal=true; shutdown_socket_schema2_required=true; rolling_selection_and_dispatch_deadline=release_plus_19ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_20ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=64000000; packet_bytes=1200; incoming_window=bound_half_period_32000000ns; truthful_main_construction_lateness_us_lt_20000=true; enqueue_cutoff=release_plus_20ms; scm_txtime=release_plus_25ms; etf_delta=25ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
+const BUFLO_KERNEL_LAYERED_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema24_retains_schema21_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema16_with_socket_schema2=true";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RESERVE_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v12; historical_schema11_default_unchanged=true; rolling_selection_and_dispatch_deadline=release_plus_4ms; preparation_reserve_ns=1000000; physical_deadline=release_plus_5ms; tick_zero_selection_and_dispatch_deadline=release; admission=release_minus_10ms; nominal_selection=release_minus_5ms; period_ns=20000000; packet_bytes=1200; incoming_window=unchanged_bound_preparation; truthful_main_construction_lateness_us_lt_5000=true; enqueue_cutoff=release_plus_5ms; scm_txtime=release_plus_10ms; etf_delta=10ms; deadline_mode=false; no_catch_up=true; omission_allowance=false; clock_regression_fatal=true; exact_kernel_TX_and_post_veth_required=true; paper_equivalent=false";
 #[cfg(target_os = "linux")]
@@ -2687,7 +2087,7 @@ const BUFLO_KERNEL_RESERVE_SELECTION_WAIT_SEMANTICS: &str = "CLOCK_TAI_is_author
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RESERVE_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema21_retains_schema20_layout_for_non_kernel_metrics_and_requires_opted_in_kernel_schema12=true";
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS: &str = "CLOCK_TAI_selection_readiness_enters_during_release_minus_10ms_to_recorded_preparation_deadline; application_and_transport_state_selected_for_nominal_release; nominal_selection_boundary=release_minus_5ms; rolling_selection_and_fresh_dispatch_confirmation_before_release_plus_4ms; tick_zero_selection_staging_and_dispatch_before_release; late_entry_records_actual_zero_wait; preparation_reserve_ns=1000000_before_unchanged_release_plus_5ms_physical_deadline; truthful_construction_lateness_retained; runner_freezes_until_kernel_tx_software_receipt; preparation_expiry_and_clock_failure_fail_closed; client_only_adaptation; paper_equivalent=false";
+const BUFLO_KERNEL_RESERVE_PREBUILD_SELECTION_SEMANTICS: &str = "CLOCK_TAI_selection_readiness_enters_during_release_minus_10ms_to_recorded_preparation_deadline; application_and_transport_state_selected_for_nominal_release; nominal_selection_boundary=release_minus_5ms; rolling_selection_and_fresh_dispatch_confirmation_before_bound_release_plus_4ms_or_prospective_64ms_plus_19ms; tick_zero_selection_staging_and_dispatch_before_release; late_entry_records_actual_zero_wait; preparation_reserve_ns=1000000_before_legacy_release_plus_5ms_or_prospective_64ms_release_plus_20ms_physical_deadline; truthful_construction_lateness_retained; runner_freezes_until_kernel_tx_software_receipt; preparation_expiry_and_clock_failure_fail_closed; client_only_adaptation; paper_equivalent=false";
 
 fn buflo_kernel_preparation_policy_marker() -> serde_json::Value {
     json!({"schema_version": 1, "source": "bound-preparation-v1",
@@ -2705,6 +2105,9 @@ fn buflo_kernel_preparation_policy_marker_for_period(period_us: u64) -> serde_js
         marker["policy"] =
             json!(BufloIncomingCreditReleasePolicy::CADENCE64_PREPARATION_RESERVE_NAME);
         marker["period_us"] = json!(period_us);
+        marker["rolling_preparation_after_release_us"] = json!(19_000);
+        marker["outgoing_physical_window_us"] = json!(20_000);
+        marker["prospective_variant"] = json!("buflo-outgoing-20ms-prospective-v1");
     }
     marker
 }
@@ -2858,6 +2261,74 @@ impl TerminalPrimaryPartialCellPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TerminalChaffPartialCellPolicy {
+    #[default]
+    Legacy,
+    RbingCs600OneOwnedFinPartial,
+    RbingCs600FirstProvenFinClosesReplenishment,
+    RbingCs600B815FirstProvenFinClosesReplenishmentAndStopsFreshIncoming,
+    RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming,
+    RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming,
+}
+
+const RBING_TERMINAL_CHAFF_RESOURCE_ID: u32 = 4;
+const RBING_TERMINAL_CHAFF_BODY_BYTES: u64 = 564_884;
+
+impl TerminalChaffPartialCellPolicy {
+    const RBING_CS600_NAME: &'static str =
+        "r-bing-cs600-one-owned-terminal-chaff-partial-incoming-cell-v1";
+    const RBING_CS600_B814_NAME: &'static str =
+        "r-bing-cs600-first-proven-terminal-chaff-fin-closes-replenishment-v1";
+    const RBING_CS600_B815_NAME: &'static str = "r-bing-cs600-b815-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1";
+    const RBING_CS600_B816_NAME: &'static str = "r-bing-cs600-b816-due-only-preproof-active-r4-parser-capacity-then-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1";
+    const RBING_CS600_B817_NAME: &'static str = "r-bing-cs600-b817-post-lease-live-data-frame-same-stream-600-successor-then-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1";
+
+    fn from_preparation(
+        preparation: &serde_json::Value,
+        application: ApplicationResponsePolicy,
+        primary: PrimaryDocumentIdentityPolicy,
+        origin: &QualifiedChaffOriginPolicy,
+    ) -> Result<Self, Error> {
+        match preparation.get("terminal_chaff_partial_cell_policy") {
+            None => Ok(Self::Legacy),
+            Some(serde_json::Value::String(policy))
+                if policy == Self::RBING_CS600_NAME
+                    || policy == Self::RBING_CS600_B814_NAME
+                    || policy == Self::RBING_CS600_B815_NAME
+                    || policy == Self::RBING_CS600_B816_NAME
+                    || policy == Self::RBING_CS600_B817_NAME =>
+            {
+                if application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+                    || primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+                    || !matches!(
+                        origin,
+                        QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_)
+                    )
+                {
+                    return Err(Error::Argument(
+                        "terminal-chaff partial cell requires bound variable-primary, terminal-HTTP, and prepared-approved-origin policies".into(),
+                    ));
+                }
+                Ok(if policy == Self::RBING_CS600_NAME {
+                    Self::RbingCs600OneOwnedFinPartial
+                } else if policy == Self::RBING_CS600_B814_NAME {
+                    Self::RbingCs600FirstProvenFinClosesReplenishment
+                } else if policy == Self::RBING_CS600_B815_NAME {
+                    Self::RbingCs600B815FirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+                } else if policy == Self::RBING_CS600_B816_NAME {
+                    Self::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+                } else {
+                    Self::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+                })
+            }
+            Some(_) => Err(Error::Argument(
+                "prepared terminal-chaff partial-cell policy is invalid".into(),
+            )),
+        }
+    }
+}
+
 struct RunSpec {
     method: &'static str,
     workload: ResourceManifest,
@@ -2873,13 +2344,13 @@ struct RunSpec {
         TamarawCapturePolicy,
         FrontCapturePolicy,
         TerminalPrimaryPartialCellPolicy,
+        TerminalChaffPartialCellPolicy,
     )>,
     application_response_policy: ApplicationResponsePolicy,
     config: QcsdConfig,
     defense_parameters: Option<DefenseParameterProvenance>,
     chaff_manifest: Option<RuntimeChaffManifest>,
     chaff_manifest_hash: Option<String>,
-    supplemental_chaff_source: Option<BoundSupplementalPoolSource>,
     request_policy: RequestPolicyArg,
     seed: u64,
     output_dir: PathBuf,
@@ -2923,6 +2394,7 @@ fn validate_buflo_incoming_credit_release_policy(spec: &RunSpec) -> Result<(), E
         chaff_origin,
         primary,
         policy,
+        _,
         _,
         _,
         _,
@@ -2986,7 +2458,7 @@ fn buflo_incoming_credit_release_receipt(spec: &RunSpec) -> Option<serde_json::V
         || !spec
             .application_workload_source
             .as_ref()
-            .is_some_and(|(_, _, _, _, _, _, policy, _, _, _)| policy.name().is_some())
+            .is_some_and(|(_, _, _, _, _, _, policy, _, _, _, _)| policy.name().is_some())
         || validate_buflo_incoming_credit_release_policy(spec).is_err()
     {
         return None;
@@ -3035,7 +2507,7 @@ fn buflo_kernel_preparation_policy_receipt(spec: &RunSpec) -> Option<serde_json:
 }
 
 fn validate_tamaraw_capture_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, hash, _, application, origin, primary, _, policy, _, _)) =
+    let Some((source, hash, _, application, origin, primary, _, policy, _, _, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -3102,7 +2574,7 @@ fn tamaraw_capture_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
 }
 
 fn validate_front_capture_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, hash, _, application, origin, primary, _, _, policy, _)) =
+    let Some((source, hash, _, application, origin, primary, _, _, policy, _, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -3284,7 +2756,7 @@ fn terminal_primary_partial_cell_size(spec: &RunSpec) -> Option<u16> {
 }
 
 fn validate_terminal_primary_partial_cell_policy(spec: &RunSpec) -> Result<(), Error> {
-    let Some((source, hash, _, application, origin, primary, _, tamaraw, _, policy)) =
+    let Some((source, hash, _, application, origin, primary, _, tamaraw, _, policy, _)) =
         &spec.application_workload_source
     else {
         return Ok(());
@@ -3398,6 +2870,261 @@ fn terminal_primary_partial_cell_policy_receipt(spec: &RunSpec) -> Option<serde_
     }))
 }
 
+fn validate_terminal_chaff_partial_cell_policy(spec: &RunSpec) -> Result<(), Error> {
+    let Some((source, hash, expected_responses, application, origin, primary, _, _, _, _, policy)) =
+        &spec.application_workload_source
+    else {
+        return Ok(());
+    };
+    if *policy == TerminalChaffPartialCellPolicy::Legacy {
+        return Ok(());
+    }
+    let valid_parameters = match &spec.config.defense {
+        DefenseConfig::CsBuflo(config) => spec.defense_parameters.as_ref().is_some_and(|proof| {
+            proof.kind == "cs_buflo"
+                && proof.path == config.parameters
+                && lower_hex_sha256(&proof.sha256)
+                && proof
+                    .cs_buflo_parameters
+                    .as_ref()
+                    .is_some_and(|parameters| {
+                        parameters.packet_size == 600
+                            && parameters.initial_interval_us == 8_192
+                            && parameters.minimum_interval_us == 4_096
+                            && parameters.maximum_interval_us == 32_768
+                    })
+        }),
+        _ => false,
+    };
+    if !matches!(
+        *policy,
+        TerminalChaffPartialCellPolicy::RbingCs600OneOwnedFinPartial
+            | TerminalChaffPartialCellPolicy::RbingCs600FirstProvenFinClosesReplenishment
+            | TerminalChaffPartialCellPolicy::RbingCs600B815FirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+            | TerminalChaffPartialCellPolicy::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+            | TerminalChaffPartialCellPolicy::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+    )
+        || !lower_hex_sha256(hash)
+        || *application != ApplicationResponsePolicy::CompletedTerminalHttpErrors
+        || spec.application_response_policy != *application
+        || *primary != PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
+        || !matches!(origin, QualifiedChaffOriginPolicy::PreparedApprovedOrigins(_))
+    {
+        return Err(Error::Argument(
+            "terminal-chaff partial cell is not bound to the frozen prepared application policies".into(),
+        ));
+    }
+    spec.application_response_policy
+        .validate_source_binding(&spec.workload, source)?;
+    let Some(chaff) = spec.chaff_manifest.as_ref() else {
+        return Err(Error::Argument(
+            "terminal-chaff partial cell requires the frozen qualified r.bing chaff manifest"
+                .into(),
+        ));
+    };
+    let Some(manifest_hash) = spec
+        .chaff_manifest_hash
+        .as_deref()
+        .filter(|hash| lower_hex_sha256(hash))
+    else {
+        return Err(Error::Argument(
+            "terminal-chaff partial cell requires a valid qualified chaff manifest SHA-256".into(),
+        ));
+    };
+    let Some(prepared) = expected_responses.get(&RBING_TERMINAL_CHAFF_RESOURCE_ID) else {
+        return Err(Error::Argument(
+            "terminal-chaff partial cell lacks frozen r.bing chaff response identity".into(),
+        ));
+    };
+    let source_resource = source
+        .resources
+        .iter()
+        .find(|resource| resource.id == RBING_TERMINAL_CHAFF_RESOURCE_ID);
+    let runtime_resource = spec
+        .workload
+        .resources
+        .iter()
+        .find(|resource| resource.id == RBING_TERMINAL_CHAFF_RESOURCE_ID);
+    let qualified_resource = chaff.selected_resource();
+    let qualification = chaff.qualification(RBING_TERMINAL_CHAFF_RESOURCE_ID);
+    if chaff.selected_chaff_resource_id() != RBING_TERMINAL_CHAFF_RESOURCE_ID
+        || !lower_hex_sha256(manifest_hash)
+        || prepared.status != 200
+        || prepared.bytes != RBING_TERMINAL_CHAFF_BODY_BYTES
+        || source_resource.is_none_or(|resource| {
+            resource.content_length != Some(RBING_TERMINAL_CHAFF_BODY_BYTES)
+                || resource.data_length != RBING_TERMINAL_CHAFF_BODY_BYTES
+        })
+        || runtime_resource.is_none_or(|resource| {
+            resource.content_length != Some(RBING_TERMINAL_CHAFF_BODY_BYTES)
+                || resource.data_length != RBING_TERMINAL_CHAFF_BODY_BYTES
+        })
+        || qualified_resource.id != RBING_TERMINAL_CHAFF_RESOURCE_ID
+        || qualified_resource.content_length != Some(RBING_TERMINAL_CHAFF_BODY_BYTES)
+        || qualified_resource.data_length != RBING_TERMINAL_CHAFF_BODY_BYTES
+        || qualification.is_none_or(|qualification| {
+            qualification.expected_response().status != 200
+                || qualification.expected_response().body_bytes != RBING_TERMINAL_CHAFF_BODY_BYTES
+        })
+    {
+        return Err(Error::Argument(
+            "terminal-chaff partial cell is not bound to the exact r.bing resource4/564884 qualified response".into(),
+        ));
+    }
+    if !CS_RBING_SAME_WINDOW_CAPACITY_RETRY_ENABLED
+        || !CS_RBING_CURRENT_DATA_ENABLED
+        || !CS_RBING_OWNED_DATA_CONTINUATION_ENABLED
+        || !rbing_same_window_retry_scope(spec)
+        || !matches!(spec.config.defense, DefenseConfig::CsBuflo(_))
+        || spec.config.control_interval_us != 5_000
+        || spec.config.initial_max_stream_data != 16
+        || spec.config.max_stream_data_excess != 1_000
+        || spec.config.max_udp_payload_size != 1_200
+        || spec.config.max_chaff_streams != 5
+        || spec.config.use_empty_resources
+        || spec.config.drop_unsatisfied_events
+        || !valid_parameters
+    {
+        return Err(Error::Argument(
+            "terminal-chaff partial cell requires the exact frozen r.bing CS600/5000us/five-stream configuration".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Receipt for the versioned r.bing CS/600 terminal-chaff lifecycle.
+///
+/// B813 deliberately leaves ordinary bounded replenishment intact. B814 adds
+/// a one-way closure after its first fully proved terminal partial. B815 is a
+/// strict successor that also ends fresh incoming opportunities after closure.
+fn terminal_chaff_partial_cell_policy_receipt(spec: &RunSpec) -> Option<serde_json::Value> {
+    let policy = spec
+        .application_workload_source
+        .as_ref()
+        .map(|source| source.10)
+        .filter(|policy| {
+            matches!(
+                *policy,
+                TerminalChaffPartialCellPolicy::RbingCs600OneOwnedFinPartial
+                    | TerminalChaffPartialCellPolicy::RbingCs600FirstProvenFinClosesReplenishment
+                    | TerminalChaffPartialCellPolicy::RbingCs600B815FirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+                    | TerminalChaffPartialCellPolicy::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+                    | TerminalChaffPartialCellPolicy::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+            )
+        })?;
+    if validate_terminal_chaff_partial_cell_policy(spec).is_err() {
+        return None;
+    }
+    let closes_replenishment =
+        policy != TerminalChaffPartialCellPolicy::RbingCs600OneOwnedFinPartial;
+    let stops_fresh_incoming = matches!(
+        policy,
+        TerminalChaffPartialCellPolicy::RbingCs600B815FirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+            | TerminalChaffPartialCellPolicy::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+            | TerminalChaffPartialCellPolicy::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+    );
+    let policy_name = if policy == TerminalChaffPartialCellPolicy::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming {
+        TerminalChaffPartialCellPolicy::RBING_CS600_B817_NAME
+    } else if policy == TerminalChaffPartialCellPolicy::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming {
+        TerminalChaffPartialCellPolicy::RBING_CS600_B816_NAME
+    } else if stops_fresh_incoming {
+        TerminalChaffPartialCellPolicy::RBING_CS600_B815_NAME
+    } else if closes_replenishment {
+        TerminalChaffPartialCellPolicy::RBING_CS600_B814_NAME
+    } else {
+        TerminalChaffPartialCellPolicy::RBING_CS600_NAME
+    };
+    let mut receipt = json!({
+        "schema_version": 1,
+        "source": "bound-preparation-v1",
+        "policy": policy_name,
+        "cell_size": 600,
+        "per_activated_request_maximum": 1,
+        "require_unique_request_ids": true,
+        "require_unique_slots": true,
+        "require_activated_qualified_chaff": true,
+        "require_fin": true,
+        "require_nonempty_successful_chaff": true,
+        "require_full_advertisement": true,
+        "require_exact_positive_split": true,
+        "retired_credit_reassignment": false,
+        "qualified_chaff_resource_id": RBING_TERMINAL_CHAFF_RESOURCE_ID,
+        "qualified_chaff_body_bytes": RBING_TERMINAL_CHAFF_BODY_BYTES,
+        "qualified_chaff_status": 200,
+        "qualified_chaff_manifest_sha256": spec.chaff_manifest_hash,
+    });
+    if closes_replenishment {
+        let object = receipt.as_object_mut().expect("JSON object");
+        object.insert(
+            "replenishment_closure_after_first_proven_partial".into(),
+            json!(true),
+        );
+        object.insert(
+            "future_replenishment_after_closure".into(),
+            json!("rejected"),
+        );
+        object.insert("preserve_already_active_chaff_streams".into(), json!(true));
+    }
+    if stops_fresh_incoming {
+        let object = receipt.as_object_mut().expect("JSON object");
+        object.insert("fresh_incoming_after_closure".into(), json!("stopped"));
+        object.insert(
+            "preserve_preclosure_advertised_incoming_credit".into(),
+            json!(true),
+        );
+        object.insert(
+            "application_complete_required_before_incoming_completion".into(),
+            json!(true),
+        );
+    }
+    if policy == TerminalChaffPartialCellPolicy::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming {
+        let object = receipt.as_object_mut().expect("JSON object");
+        object.insert(
+            "preproof_capacity_preparation".into(),
+            json!({
+                "due_incoming_exact_cell_bytes": 600,
+                "application_complete_required": true,
+                "require_active_acknowledged_r4_chaff": true,
+                "require_current_parser_blocked_headers_data_frontier": true,
+                "parser_lease_bytes": 16,
+                "scheduled_credit_issued": false,
+                "request_or_stream_created": false,
+                "original_deadline_extended": false,
+                "preproof_closure_or_fin_created": false,
+                "later_owned_data_same_stream_only": true,
+                "generic_deadline_expiry_preserved": true,
+            }),
+        );
+    }
+    if policy == TerminalChaffPartialCellPolicy::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming {
+        let object = receipt.as_object_mut().expect("JSON object");
+        object.insert(
+            "post_lease_live_data_successor".into(),
+            json!({
+                "due_incoming_exact_cell_bytes": 600,
+                "application_complete_required": true,
+                "require_active_acknowledged_r4_chaff": true,
+                "parser_lease_bytes": 16,
+                "require_physical_lease_advertisement": true,
+                "require_new_same_stream_blocked_at_lease_end": true,
+                "require_production_sequence_and_monotonic_time": true,
+                "required_decoded_data_frame_header_bytes": 5,
+                "require_decoded_data_frame_header_starts_in_lease": true,
+                "require_declared_payload_end_covers_next_600": true,
+                "require_contiguous_full_exact_lease_consumption": true,
+                "require_frame_before_final_lease_read": true,
+                "handoff_original_held_slot_same_stream_only": true,
+                "immediate_owned_receive_action_after_final_lease_read": true,
+                "request_or_stream_created": false,
+                "synthetic_credit_or_parser_boundary": false,
+                "original_deadline_extended": false,
+                "generic_deadline_expiry_preserved": true,
+            }),
+        );
+    }
+    Some(receipt)
+}
+
 struct RunCompletion<'a> {
     ended_unix_ns: Option<u128>,
     status: &'a str,
@@ -3408,6 +3135,9 @@ struct RunCompletion<'a> {
     defense_diagnostics: Option<DefenseDiagnostics>,
     runner_wakeup_metrics: Option<RunnerWakeupMetrics>,
     terminal_primary_partial_cell: Option<serde_json::Value>,
+    terminal_chaff_partial_cells: Option<serde_json::Value>,
+    terminal_chaff_replenishment_closure: Option<serde_json::Value>,
+    terminal_chaff_postlease_live_data: Option<serde_json::Value>,
     buflo_fin_permission: Option<serde_json::Value>,
 }
 
@@ -3624,9 +3354,28 @@ const BUFLO_KERNEL_TX_ARM_LEAD: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_SELECTION_CUTOFF: Duration = Duration::from_millis(5);
 #[cfg(target_os = "linux")]
+fn buflo_kernel_physical_window(cadence: Duration) -> Duration {
+    if cadence == Duration::from_millis(64) { Duration::from_millis(20) }
+    else { BUFLO_KERNEL_TX_SELECTION_CUTOFF }
+}
+#[cfg(target_os = "linux")]
+fn buflo_kernel_preparation_after_release(cadence: Duration) -> u64 {
+    if cadence == Duration::from_millis(64) { 19_000_000 } else { 4_000_000 }
+}
+#[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_ETF_DELTA: Duration = Duration::from_millis(10);
 #[cfg(target_os = "linux")]
+fn buflo_kernel_etf_delta(cadence: Duration) -> Duration {
+    if cadence == Duration::from_millis(64) { Duration::from_millis(25) }
+    else { BUFLO_KERNEL_TX_ETF_DELTA }
+}
+#[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_REPORT_ALLOWANCE: Duration = Duration::from_millis(20);
+#[cfg(target_os = "linux")]
+fn buflo_kernel_report_allowance(cadence: Duration) -> Duration {
+    if cadence == Duration::from_millis(64) { Duration::from_millis(40) }
+    else { BUFLO_KERNEL_TX_REPORT_ALLOWANCE }
+}
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_TX_MAX_CLOCK_BRACKET: Duration = Duration::from_micros(250);
 #[cfg(target_os = "linux")]
@@ -4082,8 +3831,6 @@ struct BufloKernelTxReceipt {
     schema_version: u32,
     semantics: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    enqueue_witnesses: Option<Vec<BufloKernelConservativeEnqueueWitness>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     preparation_policy: Option<serde_json::Value>,
     incoming_credit_release_window_ns: u64,
     terminal_outcome: String,
@@ -4363,92 +4110,6 @@ impl RunnerDefenseClock {
 }
 
 #[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_TX_SEMANTICS: &str = "client_only_buflo_kernel_timed_egress_v15; historical_schema14_unchanged=true; enqueue_event_witness=direct_userspace_or_exact_same_datagram_TX_SOFTWARE_conservative_upper_v1; observed_userspace_send_interval_retained=true; TX_SCHED_alone_insufficient=true; SO_TIMESTAMP_and_SO_TIMESTAMPNS_disabled=true; unfragmented_UDP_exact1200=true; physical_deadline_unchanged_release_plus_5ms=true; incoming_window_unchanged_32000000ns=true; original_full_layered_kernel_inventory_and_routed_post_veth_evidence_required=true; no_wire_claim_from_TX_SOFTWARE=true";
-#[cfg(target_os = "linux")]
-const BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_RUNNER_RETENTION_SEMANTICS: &str = "runner_schema23_retains_schema22_non_kernel_metrics_with_explicit_kernel15_conservative_enqueue_witness=true";
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct BufloKernelConservativeEnqueueWitness {
-    schema_version: u32,
-    basis: &'static str,
-    item_id: u64,
-    job_id: u64,
-    event_id: u64,
-    endpoint_index: usize,
-    endpoint: u64,
-    datagram_sha256: String,
-    source_address: SocketAddr,
-    destination_address: SocketAddr,
-    udp_payload_bytes: usize,
-    release_tai_ns: u64,
-    deadline_tai_ns: u64,
-    observed_enqueue_tai_lower_ns: u64,
-    observed_enqueue_tai_upper_ns: u64,
-    kernel_timestamp_id: u32,
-    tx_sched_realtime_ns: u64,
-    tx_software_realtime_ns: u64,
-    provisional_software_tai_lower_ns: u64,
-    provisional_software_tai_upper_ns: u64,
-    enqueue_event_tai_upper_ns: u64,
-    helper_guard: timed_egress::KernelEnqueueGuardReceipt,
-}
-
-#[cfg(target_os = "linux")]
-impl BufloKernelConservativeEnqueueWitness {
-    fn valid_fields(&self) -> bool {
-        let common = self.schema_version == 1 && self.helper_guard.valid()
-            && self.helper_guard.datagram_sha256 == self.datagram_sha256
-            && self.helper_guard.source == self.source_address
-            && self.helper_guard.destination == self.destination_address
-            && self.helper_guard.udp_payload_bytes == self.udp_payload_bytes
-            && self.udp_payload_bytes == 1_200
-            && self.endpoint_index as u64 == self.endpoint
-            && self.helper_guard.latest_enqueue_tai_ns == self.deadline_tai_ns
-            && self.release_tai_ns.checked_add(10_000_000)
-                == Some(self.helper_guard.requested_txtime_tai_ns)
-            && self.release_tai_ns.checked_add(5_000_000) == Some(self.deadline_tai_ns)
-            && self.observed_enqueue_tai_lower_ns <= self.observed_enqueue_tai_upper_ns
-            && self.observed_enqueue_tai_lower_ns < self.deadline_tai_ns
-            && self.tx_sched_realtime_ns <= self.tx_software_realtime_ns
-            && self.release_tai_ns <= self.provisional_software_tai_lower_ns
-            && self.observed_enqueue_tai_lower_ns <= self.provisional_software_tai_lower_ns
-            && self.provisional_software_tai_lower_ns <= self.provisional_software_tai_upper_ns
-            && self.provisional_software_tai_upper_ns < self.deadline_tai_ns
-            && self.enqueue_event_tai_upper_ns < self.deadline_tai_ns;
-        common && match self.basis {
-            "direct-userspace-upper" => self.observed_enqueue_tai_upper_ns < self.deadline_tai_ns
-                && self.enqueue_event_tai_upper_ns == self.observed_enqueue_tai_upper_ns,
-            "same-datagram-kernel-software-upper" => self.observed_enqueue_tai_upper_ns >= self.deadline_tai_ns
-                && self.enqueue_event_tai_upper_ns == self.provisional_software_tai_upper_ns,
-            _ => false,
-        }
-    }
-
-    fn matches_final_item(&self, job_id: u64, tick: u64, release_tai_ns: u64, deadline_tai_ns: u64,
-        raw: &BufloKernelRawItem, translated_software: Option<(u64,u64)>) -> bool {
-        self.valid_fields() && self.job_id == job_id && self.item_id == raw.item_id
-            && self.event_id == raw.event_id && self.event_id == tick.saturating_mul(2)
-            && raw.role == "exact-outgoing" && raw.order_index == 0 && raw.send_path == "etf"
-            && self.endpoint_index == raw.endpoint_index && self.endpoint == raw.endpoint.0
-            && self.datagram_sha256 == raw.datagram_sha256
-            && self.source_address == raw.source_address && self.destination_address == raw.destination_address
-            && self.udp_payload_bytes == raw.udp_payload_bytes
-            && self.release_tai_ns == release_tai_ns && self.deadline_tai_ns == deadline_tai_ns
-            && raw.enqueue_tai_lower_ns == Some(self.observed_enqueue_tai_lower_ns)
-            && raw.enqueue_tai_upper_ns == Some(self.observed_enqueue_tai_upper_ns)
-            && raw.socket_timestamp_id == Some(self.kernel_timestamp_id)
-            && raw.tx_sched_realtime_ns == Some(self.tx_sched_realtime_ns)
-            && raw.tx_software_realtime_ns == Some(self.tx_software_realtime_ns)
-            && raw.provisional_tx_software_tai_lower_ns == Some(self.provisional_software_tai_lower_ns)
-            && raw.provisional_tx_software_tai_upper_ns == Some(self.provisional_software_tai_upper_ns)
-            && translated_software.is_some_and(|(lower, upper)|
-                self.provisional_software_tai_lower_ns <= lower && upper <= self.provisional_software_tai_upper_ns
-                && lower <= upper && self.release_tai_ns <= lower && upper < self.deadline_tai_ns)
-    }
-}
-
-#[cfg(target_os = "linux")]
 struct BufloKernelTxRuntime {
     helper: Option<timed_egress::TimedEgressHelper>,
     runtime_contract: BufloKernelRuntimeContract,
@@ -4463,8 +4124,6 @@ struct BufloKernelTxRuntime {
     incoming_credit_release_window: Duration,
     cadence: Duration,
     preparation_reserve: bool,
-    conservative_kernel_enqueue_witness: bool,
-    enqueue_witnesses: Vec<BufloKernelConservativeEnqueueWitness>,
 }
 
 #[cfg(target_os = "linux")]
@@ -4804,7 +4463,7 @@ fn buflo_kernel_socket_setup_complete(
         && qdisc.ordinary_parent == "1:2"
         && qdisc.ordinary_handle == "10:"
         && qdisc.clock_id == "CLOCK_TAI"
-        && qdisc.delta_ns == duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA)
+        && matches!(qdisc.delta_ns, 10_000_000 | 15_000_000 | 25_000_000)
         && !qdisc.deadline_mode
         && !qdisc.offload
         && !qdisc.skip_socket_check
@@ -6156,7 +5815,7 @@ fn build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
                 if entry.tick_zero {
                     Some(entry.release_tai_ns)
                 } else {
-                    entry.release_tai_ns.checked_add(4_000_000)
+                    entry.release_tai_ns.checked_add(buflo_kernel_preparation_after_release(cadence))
                 }
             } else {
                 None
@@ -6447,16 +6106,28 @@ fn build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 fn buflo_kernel_protected_selection_job_binding_valid(
     receipt: &BufloKernelProtectedSelectionWaitReceipt,
     jobs: &[BufloKernelJobReceipt],
     epoch_present: bool,
     primary_error_present: bool,
 ) -> bool {
+    buflo_kernel_protected_selection_job_binding_valid_with_window(receipt, jobs, epoch_present, primary_error_present, BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+}
+
+#[cfg(target_os = "linux")]
+fn buflo_kernel_protected_selection_job_binding_valid_with_window(
+    receipt: &BufloKernelProtectedSelectionWaitReceipt,
+    jobs: &[BufloKernelJobReceipt],
+    epoch_present: bool,
+    primary_error_present: bool,
+    outgoing_window: Duration,
+) -> bool {
     if !epoch_present {
         return receipt.entries.is_empty() && jobs.is_empty();
     }
-    let window_ns = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
+    let window_ns = duration_as_u64_nanos(outgoing_window);
     let jobs_bound = jobs.iter().enumerate().all(|(index, job)| {
         receipt.entries.get(index).is_some_and(|entry| {
             entry.slot == job.tick.saturating_mul(2)
@@ -6923,10 +6594,6 @@ impl BufloKernelTxRuntime {
                             buflo_kernel_timed_error("layered timestamp contract", error)
                         })?;
                 }
-                if incoming_policy.period_us() == 64_000 {
-                    active.enable_conservative_kernel_enqueue_witness().map_err(|error|
-                        buflo_kernel_timed_error("schema15 conservative enqueue eligibility", error))?;
-                }
                 Ok::<_, Error>(active)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -6968,7 +6635,7 @@ impl BufloKernelTxRuntime {
             ordinary_parent: "1:2",
             ordinary_handle: "10:",
             clock_id: "CLOCK_TAI",
-            delta_ns: duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA),
+            delta_ns: duration_as_u64_nanos(buflo_kernel_etf_delta(Duration::from_micros(incoming_policy.period_us()))),
             deadline_mode: false,
             offload: false,
             skip_socket_check: false,
@@ -7027,8 +6694,6 @@ impl BufloKernelTxRuntime {
             incoming_credit_release_window: incoming_policy.incoming_window(),
             cadence: Duration::from_micros(incoming_policy.period_us()),
             preparation_reserve: incoming_policy.preparation_reserve(),
-            conservative_kernel_enqueue_witness: incoming_policy.period_us() == 64_000,
-            enqueue_witnesses: Vec::new(),
         })
     }
 
@@ -7130,7 +6795,7 @@ impl BufloKernelTxRuntime {
             .checked_sub(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
             .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI selection underflow".into()))?;
         let deadline_tai_ns = release_tai_ns
-            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+            .checked_add(duration_as_u64_nanos(buflo_kernel_physical_window(self.cadence)))
             .ok_or_else(|| Error::DefenseExecution("BuFLO guard TAI deadline overflow".into()))?;
         Ok((selection_tai_ns, release_tai_ns, deadline_tai_ns))
     }
@@ -7156,7 +6821,7 @@ impl BufloKernelTxRuntime {
                 Some(if guard.slot.0 == 0 && guard.packet.timestamp().is_zero() {
                     release_tai_ns
                 } else {
-                    release_tai_ns.checked_add(4_000_000).ok_or_else(|| {
+                    release_tai_ns.checked_add(buflo_kernel_preparation_after_release(self.cadence)).ok_or_else(|| {
                         Error::DefenseExecution("BuFLO V12 preparation deadline overflow".into())
                     })?
                 })
@@ -7330,7 +6995,7 @@ impl BufloKernelTxRuntime {
             .start_tai_ns
             .checked_add(offset)
             .ok_or_else(|| Error::DefenseExecution("BuFLO release TAI overflow".into()))?;
-        let window = duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF);
+        let window = duration_as_u64_nanos(buflo_kernel_physical_window(self.cadence));
         Ok((
             release_monotonic_ns,
             release_tai_ns,
@@ -7885,7 +7550,7 @@ impl BufloKernelTxRuntime {
         let target_tai_ns = job.release_tai_ns;
         let deadline_tai_ns = job.deadline_tai_ns;
         let scm_txtime_tai_ns = target_tai_ns
-            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
+            .checked_add(duration_as_u64_nanos(buflo_kernel_etf_delta(self.cadence)))
             .ok_or_else(|| Error::DefenseExecution("BuFLO SCM_TXTIME overflow".into()))?;
         self.validate_batch_tuple(endpoint_index, &batch)?;
         let datagram_sha256 = sha256(batch.data())?;
@@ -7902,7 +7567,7 @@ impl BufloKernelTxRuntime {
                 batch,
                 scm_txtime_tai_ns,
                 deadline_tai_ns,
-                BUFLO_KERNEL_TX_REPORT_ALLOWANCE,
+                buflo_kernel_report_allowance(self.cadence),
             );
         let result = match result {
             Ok(result) => result,
@@ -8016,236 +7681,6 @@ impl BufloKernelTxRuntime {
         };
         let item_id = self.next_item_id;
         self.next_item_id = self.next_item_id.saturating_add(1);
-        self.current_job_mut(job_id)?
-            .items
-            .push(BufloKernelRawItem {
-                item_id,
-                job_id,
-                order_index: 0,
-                event_id,
-                role: "exact-outgoing",
-                endpoint_index,
-                endpoint,
-                send_path: "etf",
-                datagram_sha256,
-                source_address,
-                destination_address,
-                udp_payload_bytes,
-                target_tai_ns,
-                scm_txtime_tai_ns: Some(scm_txtime_tai_ns),
-                enqueue_monotonic_ns: Some(result.enqueue.enqueue_monotonic_ns),
-                enqueue_tai_lower_ns: Some(result.enqueue.enqueue_before_tai_ns),
-                enqueue_tai_upper_ns: Some(result.enqueue.enqueue_after_tai_ns),
-                socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
-                tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
-                tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
-                post_tx_clock_phase: Some(phase),
-                provisional_tx_software_tai_lower_ns: window.as_ref().ok().map(|value| value.0),
-                provisional_tx_software_tai_upper_ns: window.as_ref().ok().map(|value| value.1),
-                send_attempt: None,
-                txtime_error: None,
-                terminal_error: None,
-                terminal_error_detail: None,
-                finalization_state: "physical-transmit-proven".into(),
-                terminal_outcome: terminal_outcome.into(),
-            });
-        if unexpected_post_main {
-            self.current_job_mut(job_id)?.terminal_error =
-                Some("exact-only helper command returned unexpected post-main outcomes".into());
-            return Err(Error::SlotInvariant(
-                "BuFLO exact-only helper command returned post-main outcomes".into(),
-            ));
-        }
-        if !enqueued_before_deadline {
-            return Err(Error::DefenseExecution(format!(
-                "BuFLO kernel job {job_id} exact datagram was not fully enqueued before its strict physical deadline"
-            )));
-        }
-        if window.is_ok() && !physical_after_enqueue {
-            return Err(Error::DefenseExecution(format!(
-                "BuFLO kernel job {job_id} physical TX lower bound preceded its enqueue TAI lower bound"
-            )));
-        }
-        window.map(|(_, _, physical_time)| (physical_time, item_id))
-    }
-
-    fn transmit_exact_main_schema15(
-        &mut self,
-        job_id: u64,
-        endpoint_index: usize,
-        endpoint: QcsdEndpointId,
-        event_id: u64,
-        batch: datagram::Batch,
-    ) -> Result<(BufloKernelPhysicalTxTime, u64), Error> {
-        buflo_preoutput_diagnostic_mark(42, Some(job_id), Some(event_id));
-        let job = self.current_job(job_id)?;
-        buflo_preoutput_diagnostic_mark(43, Some(job_id), Some(event_id));
-        if !job.items.is_empty() || event_id != job.tick.saturating_mul(2) {
-            return Err(Error::SlotInvariant(format!(
-                "BuFLO kernel job {job_id} main item order or event identity was invalid"
-            )));
-        }
-        let target_tai_ns = job.release_tai_ns;
-        let deadline_tai_ns = job.deadline_tai_ns;
-        let scm_txtime_tai_ns = target_tai_ns
-            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
-            .ok_or_else(|| Error::DefenseExecution("BuFLO SCM_TXTIME overflow".into()))?;
-        buflo_preoutput_diagnostic_mark(44, Some(job_id), Some(event_id));
-        self.validate_batch_tuple(endpoint_index, &batch)?;
-        buflo_preoutput_diagnostic_mark(45, Some(job_id), Some(event_id));
-        buflo_preoutput_diagnostic_mark(46, Some(job_id), Some(event_id));
-        let datagram_sha256 = sha256(batch.data())?;
-        buflo_preoutput_diagnostic_mark(47, Some(job_id), Some(event_id));
-        let source_address = batch.source();
-        let destination_address = batch.destination();
-        let udp_payload_bytes = batch.data().len();
-        buflo_preoutput_diagnostic_mark(48, Some(job_id), Some(event_id));
-        let helper = self
-            .helper
-            .as_mut()
-            .ok_or_else(|| Error::SlotInvariant("BuFLO helper was already shut down".into()))?;
-        buflo_preoutput_diagnostic_mark(49, Some(job_id), Some(event_id));
-        let result = helper.transmit_main(
-                job_id,
-                endpoint_index,
-                batch,
-                scm_txtime_tai_ns,
-                deadline_tai_ns,
-                BUFLO_KERNEL_TX_REPORT_ALLOWANCE,
-            );
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                let failure = error.failure_receipt();
-                self.record_failed_attempt(
-                    job_id,
-                    0,
-                    event_id,
-                    "exact-outgoing",
-                    endpoint_index,
-                    endpoint,
-                    "etf",
-                    datagram_sha256,
-                    source_address,
-                    destination_address,
-                    udp_payload_bytes,
-                    target_tai_ns,
-                    Some(scm_txtime_tai_ns),
-                    failure,
-                )?;
-                return Err(buflo_kernel_timed_error("exact transmit", error));
-            }
-        };
-        let unexpected_post_main = !result.post_main.is_empty();
-        let phase = match sample_buflo_kernel_clock_phase() {
-            Ok(phase) => phase,
-            Err(error) => {
-                let item_id = self.next_item_id;
-                self.next_item_id = self.next_item_id.saturating_add(1);
-                let detail = format!("post-transmit clock sample failed: {error}");
-                self.current_job_mut(job_id)?
-                    .items
-                    .push(BufloKernelRawItem {
-                        item_id,
-                        job_id,
-                        order_index: 0,
-                        event_id,
-                        role: "exact-outgoing",
-                        endpoint_index,
-                        endpoint,
-                        send_path: "etf",
-                        datagram_sha256,
-                        source_address,
-                        destination_address,
-                        udp_payload_bytes,
-                        target_tai_ns,
-                        scm_txtime_tai_ns: Some(scm_txtime_tai_ns),
-                        enqueue_monotonic_ns: Some(result.enqueue.enqueue_monotonic_ns),
-                        enqueue_tai_lower_ns: Some(result.enqueue.enqueue_before_tai_ns),
-                        enqueue_tai_upper_ns: Some(result.enqueue.enqueue_after_tai_ns),
-                        socket_timestamp_id: Some(result.outcome.kernel_timestamp_id),
-                        tx_sched_realtime_ns: Some(result.outcome.tx_sched_realtime_ns),
-                        tx_software_realtime_ns: Some(result.outcome.tx_software_realtime_ns),
-                        post_tx_clock_phase: None,
-                        provisional_tx_software_tai_lower_ns: None,
-                        provisional_tx_software_tai_upper_ns: None,
-                        send_attempt: None,
-                        txtime_error: None,
-                        terminal_error: Some("clock_sample_failed".into()),
-                        terminal_error_detail: Some(detail.clone()),
-                        finalization_state: "physical-transmit-proven".into(),
-                        terminal_outcome: "timestamp-evidence-missing".into(),
-                    });
-                self.current_job_mut(job_id)?.terminal_error = Some(detail);
-                return Err(error);
-            }
-        };
-        let phase_follows_evidence = buflo_kernel_post_tx_clock_phase_follows_evidence(
-            &phase,
-            result.enqueue.enqueue_monotonic_ns,
-            result.enqueue.enqueue_after_tai_ns,
-            result.outcome.tx_software_realtime_ns,
-        );
-        let window = if phase_follows_evidence {
-            self.refine_realtime_then_validate_enqueue_order(
-                &phase,
-                result.enqueue.enqueue_monotonic_ns,
-                result.enqueue.enqueue_before_tai_ns,
-                result.enqueue.enqueue_after_tai_ns,
-                &format!(
-                    "BuFLO kernel job {job_id} enqueue and post-TX clock evidence was not ordered"
-                ),
-            )
-            .and_then(|realtime_bounds| {
-                self.check_physical_window(
-                    job_id,
-                    false,
-                    result.outcome.tx_software_realtime_ns,
-                    &phase,
-                    realtime_bounds,
-                )
-            })
-        } else {
-            Err(Error::DefenseExecution(format!(
-                "BuFLO kernel job {job_id} post-TX clock phase did not follow exact transmission evidence"
-            )))
-        };
-        // Enqueue may use the existing strict physical window. It never
-        // extends that window: the independently observed TX must still fit.
-        let witness = result.enqueue.kernel_enqueue_guard.as_ref().zip(window.as_ref().ok())
-            .and_then(|(guard, (lower, upper, _))| {
-                let user_upper = result.enqueue.enqueue_after_tai_ns;
-                let bound = if user_upper < deadline_tai_ns { user_upper } else { *upper };
-                let witness = BufloKernelConservativeEnqueueWitness {
-                    schema_version: 1,
-                    basis: if user_upper < deadline_tai_ns { "direct-userspace-upper" }
-                        else { "same-datagram-kernel-software-upper" },
-                    item_id: self.next_item_id, job_id, event_id, endpoint_index, endpoint: endpoint.0,
-                    datagram_sha256: datagram_sha256.clone(), source_address, destination_address,
-                    udp_payload_bytes, release_tai_ns: target_tai_ns, deadline_tai_ns,
-                    observed_enqueue_tai_lower_ns: result.enqueue.enqueue_before_tai_ns,
-                    observed_enqueue_tai_upper_ns: user_upper,
-                    kernel_timestamp_id: result.outcome.kernel_timestamp_id,
-                    tx_sched_realtime_ns: result.outcome.tx_sched_realtime_ns,
-                    tx_software_realtime_ns: result.outcome.tx_software_realtime_ns,
-                    provisional_software_tai_lower_ns: *lower,
-                    provisional_software_tai_upper_ns: *upper,
-                    enqueue_event_tai_upper_ns: bound, helper_guard: guard.clone(),
-                };
-                witness.valid_fields().then_some(witness)
-            });
-        let enqueued_before_deadline = witness.is_some();
-        let physical_after_enqueue = window
-            .as_ref()
-            .is_ok_and(|value| value.0 >= result.enqueue.enqueue_before_tai_ns);
-        let terminal_outcome = if enqueued_before_deadline && physical_after_enqueue {
-            "transmitted"
-        } else {
-            "window-violation"
-        };
-        let item_id = self.next_item_id;
-        self.next_item_id = self.next_item_id.saturating_add(1);
-        if let Some(witness) = witness { self.enqueue_witnesses.push(witness); }
         self.current_job_mut(job_id)?
             .items
             .push(BufloKernelRawItem {
@@ -8571,7 +8006,7 @@ impl BufloKernelTxRuntime {
         clippy::too_many_lines,
         reason = "total kernel-runtime finalisation deliberately audits every item, job, clock, helper, and cleanup condition in one receipt-producing transaction"
     )]
-    fn finish_schema14(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
+    fn finish(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
         let mut cleanup_errors = Vec::new();
         let mut terminal_errors = Vec::new();
         let epoch = self.epoch;
@@ -8724,11 +8159,11 @@ impl BufloKernelTxRuntime {
                         && epoch.start_tai_ns.checked_add(offset) == Some(raw_job.release_tai_ns)
                         && raw_job
                             .release_monotonic_ns
-                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+                            .checked_add(duration_as_u64_nanos(buflo_kernel_physical_window(self.cadence)))
                             == Some(raw_job.deadline_monotonic_ns)
                         && raw_job
                             .release_tai_ns
-                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
+                            .checked_add(duration_as_u64_nanos(buflo_kernel_physical_window(self.cadence)))
                             == Some(raw_job.deadline_tai_ns)
                         && raw_job
                             .release_monotonic_ns
@@ -8838,7 +8273,7 @@ impl BufloKernelTxRuntime {
                         && raw.scm_txtime_tai_ns
                             == raw_job
                                 .release_tai_ns
-                                .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
+                                .checked_add(duration_as_u64_nanos(buflo_kernel_etf_delta(self.cadence)))
                         && raw
                             .enqueue_tai_upper_ns
                             .is_some_and(|upper| upper < raw_job.deadline_tai_ns)
@@ -9045,11 +8480,12 @@ impl BufloKernelTxRuntime {
                 )
             };
         let protected_selection_wait_job_binding_valid =
-            buflo_kernel_protected_selection_job_binding_valid(
+            buflo_kernel_protected_selection_job_binding_valid_with_window(
                 &protected_selection_wait,
                 &jobs,
                 epoch.is_some(),
                 primary_error.is_some(),
+                buflo_kernel_physical_window(self.cadence),
             );
         if !protected_selection_wait_structurally_valid
             || !protected_selection_wait_job_binding_valid
@@ -9077,7 +8513,7 @@ impl BufloKernelTxRuntime {
             .iter()
             .filter(|item| item.send_path == "ordered-after-exact")
             .count();
-        let helper_evidence_success = if self.preparation_reserve {
+        let helper_evidence_success = self.qdisc_contract.delta_ns == duration_as_u64_nanos(buflo_kernel_etf_delta(self.cadence)) && if self.preparation_reserve {
             buflo_kernel_helper_evidence_complete_with_policy(
                 &self.runtime_contract,
                 &self.qdisc_contract,
@@ -9186,9 +8622,8 @@ impl BufloKernelTxRuntime {
         };
         let terminal_outcome = aggregate.terminal_outcome.to_string();
         BufloKernelTxReceipt {
-            enqueue_witnesses: None,
             schema_version: if self.cadence == Duration::from_micros(64_000) {
-                14
+                16
             } else if self.preparation_reserve {
                 12
             } else {
@@ -9227,667 +8662,6 @@ impl BufloKernelTxRuntime {
             terminal_errors,
         }
     }
-
-    fn finish_schema15(mut self, primary_error: Option<String>) -> BufloKernelTxReceipt {
-        let enqueue_witnesses = mem::take(&mut self.enqueue_witnesses);
-        let mut cleanup_errors = Vec::new();
-        let mut terminal_errors = Vec::new();
-        let epoch = self.epoch;
-        let protected_selection_wait_entries =
-            mem::take(&mut self.protected_selection_wait_entries);
-        if epoch.is_none() {
-            cleanup_errors.push("BuFLO kernel epoch was never armed".into());
-        }
-
-        if let Some(mut helper) = self.helper.take() {
-            let lifecycle_before_shutdown = match helper.lifecycle_receipt() {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(error) => {
-                    cleanup_errors.push(format!(
-                        "BuFLO helper lifecycle snapshot before shutdown failed: {error}"
-                    ));
-                    None
-                }
-            };
-            if let Some((active_job_id, expected_failed_commands)) =
-                lifecycle_before_shutdown.as_ref().and_then(|lifecycle| {
-                    lifecycle
-                        .active_job_id
-                        .map(|active_job_id| (active_job_id, lifecycle.failed_commands))
-                })
-            {
-                let abort_reason = "runner finalisation reached an incomplete kernel-timed job";
-                let expected_unused_post_main_datagrams = self
-                    .runtime_contract
-                    .max_post_main_datagrams
-                    .saturating_sub(self.current_job(active_job_id).map_or(0, |job| {
-                        buflo_kernel_consumed_post_main_datagram_count(&job.items)
-                    }));
-                match helper.abort_job(active_job_id, abort_reason) {
-                    Ok(abort) => match self.current_job_mut(active_job_id) {
-                        Ok(job) => {
-                            let abort_valid = buflo_kernel_abort_receipt_valid(
-                                &abort,
-                                active_job_id,
-                                abort_reason,
-                                expected_unused_post_main_datagrams,
-                                expected_failed_commands,
-                            );
-                            job.helper_job_abort = Some(abort);
-                            let abort_detail = if abort_valid {
-                                "helper job aborted during runner finalisation"
-                            } else {
-                                "helper returned an invalid abort receipt during runner finalisation"
-                            };
-                            job.terminal_error
-                                .get_or_insert_with(|| abort_detail.into());
-                            job.terminal_outcome = "failed".into();
-                            if !abort_valid {
-                                cleanup_errors.push(format!(
-                                    "BuFLO helper returned an invalid abort receipt for job {active_job_id}"
-                                ));
-                            }
-                        }
-                        Err(error) => cleanup_errors.push(format!(
-                            "BuFLO helper aborted unknown raw job {active_job_id}: {error}"
-                        )),
-                    },
-                    Err(error) => cleanup_errors.push(format!(
-                        "BuFLO helper could not abort active job {active_job_id}: {error}"
-                    )),
-                }
-            }
-            match helper.lifecycle_receipt() {
-                Ok(lifecycle) => self.runtime_contract.helper_lifecycle = Some(lifecycle),
-                Err(error) => cleanup_errors.push(format!(
-                    "BuFLO helper lifecycle snapshot before join failed: {error}"
-                )),
-            }
-            let helper_shutdown = helper.shutdown();
-            cleanup_errors.extend(
-                helper_shutdown
-                    .errors
-                    .iter()
-                    .map(|error| format!("BuFLO helper shutdown: {error}")),
-            );
-            if self.runtime_contract.helper_lifecycle.is_none() {
-                self.runtime_contract
-                    .helper_lifecycle
-                    .clone_from(&helper_shutdown.lifecycle);
-            }
-            self.runtime_contract.helper_shutdown = Some(helper_shutdown);
-        } else {
-            cleanup_errors.push("BuFLO kernel helper was absent during finalisation".into());
-        }
-
-        let mut clock_end_error = None;
-        let clock_end = match sample_buflo_kernel_clock_phase() {
-            Ok(phase) => Some(phase),
-            Err(error) => {
-                let detail = format!("BuFLO final clock sample failed: {error}");
-                cleanup_errors.push(detail.clone());
-                clock_end_error = Some(detail);
-                None
-            }
-        };
-        let mut mapping_result = build_buflo_kernel_clock_mapping(
-            &self.clock_start,
-            clock_end.as_ref(),
-            epoch.as_ref().map(|epoch| &epoch.instant_anchor.receipt),
-            clock_end_error.as_deref(),
-        );
-        if let Ok(mapping) = &mut mapping_result
-            && let Err(error) = refine_buflo_kernel_clock_mapping_with_items(mapping, &self.jobs)
-        {
-            mapping_result = Err(error);
-        }
-        if let Ok(mapping) = &mapping_result {
-            let final_realtime_bounds = clock_mapping_offset_bounds(mapping, true);
-            let online_with_end = self
-                .realtime_offset_intersection
-                .zip(clock_end.as_ref())
-                .and_then(|(online, end)| {
-                    intersect_clock_offset_bounds(online, clock_offset_bounds(&end.realtime))
-                });
-            if online_with_end != Some(final_realtime_bounds) {
-                mapping_result = Err(
-                    "BuFLO final realtime offset intersection differed from online evidence".into(),
-                );
-            }
-        }
-        let (mapping, clock_mapping_error) = match mapping_result {
-            Ok(mapping) => (Some(mapping), None),
-            Err(error) => {
-                if !cleanup_errors.iter().any(|existing| existing == &error) {
-                    cleanup_errors.push(error.clone());
-                }
-                (None, Some(error))
-            }
-        };
-        let realtime_bounds = mapping
-            .as_ref()
-            .map(|mapping| clock_mapping_offset_bounds(mapping, true));
-        let mut jobs = Vec::with_capacity(self.jobs.len());
-        let endpoint_tuples = self.endpoint_tuples;
-        let mut witness_ids = BTreeSet::new();
-        if enqueue_witnesses.len() != self.jobs.iter().filter(|j| !j.items.is_empty()).count()
-            || !enqueue_witnesses.iter().all(|w| witness_ids.insert(w.item_id) && w.valid_fields()) {
-            terminal_errors.push("schema15 missing/duplicate/foreign enqueue witness inventory".into());
-        }
-        let mut expected_item_id = 0_u64;
-        for (expected_job_index, raw_job) in self.jobs.into_iter().enumerate() {
-            let expected_job_id = u64::try_from(expected_job_index).unwrap_or(u64::MAX);
-            let expected_offset = expected_job_id.checked_mul(duration_as_u64_nanos(self.cadence));
-            let job_identity_and_timing_valid =
-                expected_offset.zip(epoch).is_some_and(|(offset, epoch)| {
-                    raw_job.job_id == expected_job_id
-                        && raw_job.tick == expected_job_id
-                        && epoch.start_monotonic_ns.checked_add(offset)
-                            == Some(raw_job.release_monotonic_ns)
-                        && epoch.start_tai_ns.checked_add(offset) == Some(raw_job.release_tai_ns)
-                        && raw_job
-                            .release_monotonic_ns
-                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
-                            == Some(raw_job.deadline_monotonic_ns)
-                        && raw_job
-                            .release_tai_ns
-                            .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_SELECTION_CUTOFF))
-                            == Some(raw_job.deadline_tai_ns)
-                        && raw_job
-                            .release_monotonic_ns
-                            .checked_add(duration_as_u64_nanos(self.incoming_credit_release_window))
-                            == Some(raw_job.incoming_deadline_monotonic_ns)
-                        && raw_job
-                            .release_tai_ns
-                            .checked_add(duration_as_u64_nanos(self.incoming_credit_release_window))
-                            == Some(raw_job.incoming_deadline_tai_ns)
-                });
-            if !job_identity_and_timing_valid {
-                terminal_errors.push(format!(
-                    "BuFLO kernel job {} failed contiguous epoch/cadence identity validation",
-                    raw_job.job_id
-                ));
-            }
-            let mut items = Vec::with_capacity(raw_job.items.len());
-            let mut previous_tx_software_upper_ns = None;
-            let mut carrier_owners = BTreeSet::new();
-            for (expected_order_index, raw) in raw_job.items.into_iter().enumerate() {
-                let expected_order_index = u64::try_from(expected_order_index).unwrap_or(u64::MAX);
-                let item_sequence_valid = raw.item_id == expected_item_id
-                    && raw.job_id == raw_job.job_id
-                    && raw.order_index == expected_order_index;
-                expected_item_id = expected_item_id.saturating_add(1);
-                let translate = |raw_ns: Option<u64>| -> Option<(u64, u64)> {
-                    let raw_ns = raw_ns?;
-                    let bounds = realtime_bounds?;
-                    translate_clock_interval(raw_ns, bounds).ok()
-                };
-                let tx_sched = translate(raw.tx_sched_realtime_ns);
-                let tx_software = translate(raw.tx_software_realtime_ns);
-                let enqueue_interval_complete = raw
-                    .enqueue_tai_lower_ns
-                    .zip(raw.enqueue_tai_upper_ns)
-                    .is_some_and(|(lower, upper)| lower <= upper);
-                let enqueue_clock_consistent = raw
-                    .post_tx_clock_phase
-                    .as_ref()
-                    .zip(raw.enqueue_monotonic_ns)
-                    .zip(raw.enqueue_tai_lower_ns)
-                    .zip(raw.enqueue_tai_upper_ns)
-                    .is_some_and(|(((phase, monotonic), lower), upper)| {
-                        buflo_kernel_enqueue_clock_order_consistent(phase, monotonic, lower, upper)
-                    });
-                let post_tx_clock_phase_complete =
-                    raw.post_tx_clock_phase.as_ref().is_some_and(|phase| {
-                        raw.enqueue_monotonic_ns
-                            .zip(raw.enqueue_tai_upper_ns)
-                            .zip(raw.tx_software_realtime_ns)
-                            .is_some_and(|((enqueue_monotonic, enqueue_tai_upper), tx_software)| {
-                                buflo_kernel_post_tx_clock_phase_follows_evidence(
-                                    phase,
-                                    enqueue_monotonic,
-                                    enqueue_tai_upper,
-                                    tx_software,
-                                )
-                            })
-                    });
-                let timestamp_evidence_complete = raw.socket_timestamp_id.is_some()
-                    && tx_sched.is_some()
-                    && tx_software.is_some()
-                    && post_tx_clock_phase_complete;
-                let tx_order_valid = raw
-                    .tx_sched_realtime_ns
-                    .zip(raw.tx_software_realtime_ns)
-                    .is_some_and(|(scheduled, software)| scheduled <= software);
-                let physical_window_valid = tx_software.is_some_and(|(lower, upper)| {
-                    buflo_kernel_interval_within_half_open_window(
-                        lower,
-                        upper,
-                        raw_job.release_tai_ns,
-                        if raw.role == "incoming-credit" {
-                            raw_job.incoming_deadline_tai_ns
-                        } else {
-                            raw_job.deadline_tai_ns
-                        },
-                    )
-                });
-                let provisional_interval_valid = raw
-                    .provisional_tx_software_tai_lower_ns
-                    .zip(raw.provisional_tx_software_tai_upper_ns)
-                    .zip(tx_software)
-                    .is_some_and(|((provisional_lower, provisional_upper), final_interval)| {
-                        buflo_kernel_provisional_envelope_contains_final(
-                            provisional_lower,
-                            provisional_upper,
-                            final_interval.0,
-                            final_interval.1,
-                        )
-                    });
-                let endpoint_tuple_valid = u64::try_from(raw.endpoint_index)
-                    .is_ok_and(|index| index == raw.endpoint.0)
-                    && endpoint_tuples
-                        .get(raw.endpoint_index)
-                        .is_some_and(|expected| {
-                            *expected == (raw.source_address, raw.destination_address)
-                        });
-                let controller_and_trace_finalized =
-                    raw.finalization_state == "controller-and-trace-finalized";
-                let structural_and_order_valid = if expected_order_index == 0 {
-                    raw.role == "exact-outgoing"
-                        && raw.send_path == "etf"
-                        && raw.event_id == raw_job.tick.saturating_mul(2)
-                        && raw.udp_payload_bytes == 1_200
-                        && raw.target_tai_ns == raw_job.release_tai_ns
-                        && raw.scm_txtime_tai_ns
-                            == raw_job
-                                .release_tai_ns
-                                .checked_add(duration_as_u64_nanos(BUFLO_KERNEL_TX_ETF_DELTA))
-                        && enqueue_witnesses.iter().filter(|w| w.item_id == raw.item_id).count() == 1
-                        && enqueue_witnesses.iter().find(|w| w.item_id == raw.item_id).is_some_and(|w|
-                            w.matches_final_item(raw_job.job_id, raw_job.tick, raw_job.release_tai_ns,
-                                raw_job.deadline_tai_ns, &raw, tx_software))
-                        && raw
-                            .enqueue_tai_lower_ns
-                            .zip(tx_software)
-                            .is_some_and(|(enqueue_lower, (tx_lower, _))| tx_lower >= enqueue_lower)
-                } else if let Some(previous_upper) = previous_tx_software_upper_ns {
-                    let credit_intervals_valid = raw
-                        .enqueue_tai_lower_ns
-                        .zip(raw.enqueue_tai_upper_ns)
-                        .zip(tx_software)
-                        .is_some_and(|((enqueue_lower, enqueue_upper), (tx_lower, _))| {
-                            buflo_kernel_credit_intervals_are_causally_ordered(
-                                previous_upper,
-                                enqueue_lower,
-                                enqueue_upper,
-                                tx_lower,
-                                raw_job.incoming_deadline_tai_ns,
-                            )
-                        });
-                    raw.role == "incoming-credit"
-                        && raw.send_path == "ordered-after-exact"
-                        && raw.event_id == raw_job.tick.saturating_mul(2).saturating_add(1)
-                        && raw.scm_txtime_tai_ns.is_none()
-                        && (1..=1_200).contains(&raw.udp_payload_bytes)
-                        && carrier_owners.insert((raw.endpoint_index, raw.endpoint.0))
-                        && credit_intervals_valid
-                } else {
-                    terminal_errors.push(format!(
-                        "BuFLO kernel job {} item {} lacked prior conservative TX evidence",
-                        raw_job.job_id, raw.item_id
-                    ));
-                    false
-                };
-                let validation = BufloKernelItemValidation {
-                    enqueue_interval_complete,
-                    enqueue_clock_consistent,
-                    timestamp_evidence_complete,
-                    tx_order_valid,
-                    physical_window_valid,
-                    provisional_interval_valid,
-                    endpoint_tuple_valid,
-                    item_sequence_valid,
-                    job_identity_and_timing_valid,
-                    controller_and_trace_finalized,
-                    structural_and_order_valid,
-                };
-                let final_success = buflo_kernel_item_validation_complete(&raw, &validation);
-                let terminal_outcome = if final_success {
-                    "transmitted".to_string()
-                } else if raw.txtime_error.is_some() {
-                    "txtime-error".to_string()
-                } else if raw.terminal_outcome == "controller-trace-finalization-failed" {
-                    "controller-trace-finalization-failed".to_string()
-                } else if !timestamp_evidence_complete || !enqueue_interval_complete {
-                    "timestamp-evidence-missing".to_string()
-                } else {
-                    "window-violation".to_string()
-                };
-                let terminal_error = raw.terminal_error.clone().or_else(|| {
-                    (!final_success)
-                        .then(|| "final_conservative_envelope_validation_failed".to_string())
-                });
-                let terminal_error_detail = raw.terminal_error_detail.clone().or_else(|| {
-                    (!final_success).then(|| {
-                        format!(
-                            "item {} failed final mapping: enqueue_complete={enqueue_interval_complete}, enqueue_clock_consistent={enqueue_clock_consistent}, timestamp_complete={timestamp_evidence_complete}, tx_order={tx_order_valid}, physical_window={physical_window_valid}, provisional_interval={provisional_interval_valid}, endpoint_tuple={endpoint_tuple_valid}, item_sequence={item_sequence_valid}, job_identity={job_identity_and_timing_valid}, controller_trace_finalized={controller_and_trace_finalized}, structural_order={structural_and_order_valid}",
-                            raw.item_id
-                        )
-                    })
-                });
-                if let Some(detail) = &terminal_error_detail {
-                    terminal_errors.push(format!(
-                        "BuFLO kernel job {} item {}: {detail}",
-                        raw_job.job_id, raw.item_id
-                    ));
-                }
-                previous_tx_software_upper_ns = final_success
-                    .then(|| tx_software.map(|(_, upper)| upper))
-                    .flatten();
-                items.push(BufloKernelItemReceipt {
-                    schema_version: BUFLO_KERNEL_ITEM_RECEIPT_SCHEMA_VERSION,
-                    item_id: raw.item_id,
-                    job_id: raw.job_id,
-                    order_index: raw.order_index,
-                    event_id: raw.event_id,
-                    role: raw.role,
-                    endpoint_index: raw.endpoint_index,
-                    endpoint: raw.endpoint.0,
-                    send_path: raw.send_path,
-                    datagram_sha256: raw.datagram_sha256,
-                    source_address: raw.source_address.to_string(),
-                    destination_address: raw.destination_address.to_string(),
-                    socket_timestamp_id: raw.socket_timestamp_id,
-                    udp_payload_bytes: raw.udp_payload_bytes,
-                    target_tai_ns: raw.target_tai_ns,
-                    scm_txtime_tai_ns: raw.scm_txtime_tai_ns,
-                    enqueue_monotonic_ns: raw.enqueue_monotonic_ns,
-                    enqueue_tai_ns: raw
-                        .enqueue_tai_lower_ns
-                        .zip(raw.enqueue_tai_upper_ns)
-                        .map(|(lower, upper)| interval_midpoint(lower, upper)),
-                    enqueue_tai_lower_ns: raw.enqueue_tai_lower_ns,
-                    enqueue_tai_upper_ns: raw.enqueue_tai_upper_ns,
-                    tx_sched_realtime_ns: raw.tx_sched_realtime_ns,
-                    tx_sched_tai_ns: tx_sched.map(|(lower, upper)| interval_midpoint(lower, upper)),
-                    tx_sched_tai_lower_ns: tx_sched.map(|value| value.0),
-                    tx_sched_tai_upper_ns: tx_sched.map(|value| value.1),
-                    tx_software_realtime_ns: raw.tx_software_realtime_ns,
-                    post_tx_clock_phase: raw.post_tx_clock_phase,
-                    provisional_tx_software_tai_lower_ns: raw.provisional_tx_software_tai_lower_ns,
-                    provisional_tx_software_tai_upper_ns: raw.provisional_tx_software_tai_upper_ns,
-                    tx_software_tai_ns: tx_software
-                        .map(|(lower, upper)| interval_midpoint(lower, upper)),
-                    tx_software_tai_lower_ns: tx_software.map(|value| value.0),
-                    tx_software_tai_upper_ns: tx_software.map(|value| value.1),
-                    send_attempt: raw.send_attempt,
-                    txtime_error: raw.txtime_error,
-                    terminal_error,
-                    terminal_error_detail,
-                    finalization_state: raw.finalization_state,
-                    terminal_outcome,
-                });
-            }
-            let validated_carriers: Vec<_> = items
-                .iter()
-                .map(|item| BufloKernelValidatedCarrier {
-                    item_id: item.item_id,
-                    endpoint_index: item.endpoint_index,
-                    endpoint: item.endpoint,
-                    role: item.role,
-                    transmitted: item.terminal_outcome == "transmitted",
-                })
-                .collect();
-            let credit_identity_complete = buflo_kernel_credit_inventory_complete(
-                raw_job.tick,
-                &raw_job.credit_identities,
-                &validated_carriers,
-                endpoint_tuples.len(),
-            );
-            let expected_unused_post_main_datagrams = self
-                .runtime_contract
-                .max_post_main_datagrams
-                .saturating_sub(
-                    items
-                        .iter()
-                        .filter(|item| item.role == "incoming-credit")
-                        .count(),
-                );
-            let job_complete = buflo_kernel_job_validation_complete(
-                &raw_job.terminal_outcome,
-                raw_job.terminal_error.is_some(),
-                items.len(),
-                items
-                    .iter()
-                    .all(|item| item.terminal_outcome == "transmitted"),
-                credit_identity_complete,
-                raw_job.helper_job_close.as_ref(),
-                raw_job.job_id,
-                expected_unused_post_main_datagrams,
-                raw_job.prepared_output_failure.is_some(),
-                raw_job.helper_job_abort.is_some(),
-            );
-            let job_terminal_error = raw_job.terminal_error.or_else(|| {
-                (!job_complete).then(|| {
-                    "job did not retain complete conservative kernel timing evidence".to_string()
-                })
-            });
-            if let Some(error) = &job_terminal_error {
-                terminal_errors.push(format!("BuFLO kernel job {}: {error}", raw_job.job_id));
-            }
-            jobs.push(BufloKernelJobReceipt {
-                schema_version: 2,
-                job_id: raw_job.job_id,
-                tick: raw_job.tick,
-                release_monotonic_ns: raw_job.release_monotonic_ns,
-                release_tai_ns: raw_job.release_tai_ns,
-                deadline_monotonic_ns: raw_job.deadline_monotonic_ns,
-                deadline_tai_ns: raw_job.deadline_tai_ns,
-                incoming_deadline_monotonic_ns: raw_job.incoming_deadline_monotonic_ns,
-                incoming_deadline_tai_ns: raw_job.incoming_deadline_tai_ns,
-                items,
-                credit_identities: raw_job.credit_identities,
-                prepared_output_failure: raw_job.prepared_output_failure,
-                helper_job_close: raw_job.helper_job_close,
-                helper_job_abort: raw_job.helper_job_abort,
-                terminal_error: job_terminal_error,
-                terminal_outcome: if job_complete { "complete" } else { "failed" }.into(),
-            });
-        }
-        let (protected_selection_wait, protected_selection_wait_structurally_valid) =
-            if self.preparation_reserve {
-                build_buflo_kernel_protected_selection_wait_receipt_with_cadence(
-                    protected_selection_wait_entries,
-                    epoch.map(|epoch| epoch.start_tai_ns),
-                    true,
-                    self.cadence,
-                )
-            } else {
-                build_buflo_kernel_protected_selection_wait_receipt(
-                    protected_selection_wait_entries,
-                    epoch.map(|epoch| epoch.start_tai_ns),
-                )
-            };
-        let protected_selection_wait_job_binding_valid =
-            buflo_kernel_protected_selection_job_binding_valid(
-                &protected_selection_wait,
-                &jobs,
-                epoch.is_some(),
-                primary_error.is_some(),
-            );
-        if !protected_selection_wait_structurally_valid
-            || !protected_selection_wait_job_binding_valid
-        {
-            terminal_errors.push(
-                "BuFLO protected selection-wait evidence was incomplete or inconsistent with kernel jobs"
-                    .into(),
-            );
-        }
-        let flat_items: Vec<_> = jobs.iter().flat_map(|job| job.items.iter()).collect();
-        let transmitted_item_count = flat_items
-            .iter()
-            .filter(|item| item.terminal_outcome == "transmitted")
-            .count();
-        let failed_item_count = flat_items.len().saturating_sub(transmitted_item_count);
-        let max_tx_software_lateness_ns = flat_items
-            .iter()
-            .filter_map(|item| {
-                item.tx_software_tai_upper_ns
-                    .map(|tx| tx.saturating_sub(item.target_tai_ns))
-            })
-            .max()
-            .unwrap_or(0);
-        let immediate_datagram_count = flat_items
-            .iter()
-            .filter(|item| item.send_path == "ordered-after-exact")
-            .count();
-        let helper_evidence_success = if self.preparation_reserve {
-            buflo_kernel_helper_evidence_complete_with_policy(
-                &self.runtime_contract,
-                &self.qdisc_contract,
-                &endpoint_tuples,
-                jobs.len(),
-                jobs.last().map(|job| job.job_id),
-                immediate_datagram_count,
-                true,
-            )
-        } else {
-            buflo_kernel_helper_evidence_complete(
-                &self.runtime_contract,
-                &self.qdisc_contract,
-                &endpoint_tuples,
-                jobs.len(),
-                jobs.last().map(|job| job.job_id),
-                immediate_datagram_count,
-            )
-        };
-        if !helper_evidence_success {
-            terminal_errors.push(
-                "BuFLO timed-egress helper lifecycle or shutdown evidence was not clean".into(),
-            );
-        }
-        let aggregate = BufloKernelAggregateReceipt {
-            schema_version: 1,
-            job_count: jobs.len(),
-            item_count: flat_items.len(),
-            etf_item_count: flat_items
-                .iter()
-                .filter(|item| item.send_path == "etf")
-                .count(),
-            ordered_item_count: flat_items
-                .iter()
-                .filter(|item| item.send_path == "ordered-after-exact")
-                .count(),
-            captured_credit_identity_count: jobs
-                .iter()
-                .map(|job| job.credit_identities.len())
-                .sum(),
-            prepared_output_failure_count: jobs
-                .iter()
-                .filter(|job| job.prepared_output_failure.is_some())
-                .count(),
-            main_coalesced_credit_identity_count: jobs
-                .iter()
-                .flat_map(|job| &job.credit_identities)
-                .filter(|identity| identity.resolution == "coalesced-in-main-finalized")
-                .count(),
-            carrier_credit_identity_count: jobs
-                .iter()
-                .flat_map(|job| &job.credit_identities)
-                .filter(|identity| identity.resolution == "post-main-carrier-finalized")
-                .count(),
-            unresolved_credit_identity_count: jobs
-                .iter()
-                .flat_map(|job| &job.credit_identities)
-                .filter(|identity| {
-                    !matches!(
-                        identity.resolution.as_str(),
-                        "coalesced-in-main-finalized" | "post-main-carrier-finalized"
-                    )
-                })
-                .count(),
-            transmitted_item_count,
-            failed_item_count,
-            tx_sched_timestamp_count: flat_items
-                .iter()
-                .filter(|item| item.tx_sched_tai_ns.is_some())
-                .count(),
-            tx_software_timestamp_count: flat_items
-                .iter()
-                .filter(|item| item.tx_software_tai_ns.is_some())
-                .count(),
-            txtime_error_count: flat_items
-                .iter()
-                .filter(|item| item.terminal_outcome == "txtime-error")
-                .count(),
-            timestamp_evidence_missing_count: flat_items
-                .iter()
-                .filter(|item| item.terminal_outcome == "timestamp-evidence-missing")
-                .count(),
-            window_violation_count: flat_items
-                .iter()
-                .filter(|item| item.terminal_outcome == "window-violation")
-                .count(),
-            unresolved_item_count: flat_items
-                .iter()
-                .filter(|item| item.terminal_outcome == "unresolved")
-                .count(),
-            max_tx_software_lateness_ns,
-            terminal_outcome: if buflo_kernel_aggregate_validation_complete(
-                failed_item_count,
-                jobs.len(),
-                jobs.iter().all(|job| job.terminal_outcome == "complete"),
-                helper_evidence_success,
-                mapping.is_some(),
-                primary_error.is_some(),
-                cleanup_errors.len(),
-                terminal_errors.len(),
-            ) {
-                "complete"
-            } else {
-                "failed"
-            },
-        };
-        let terminal_outcome = aggregate.terminal_outcome.to_string();
-        BufloKernelTxReceipt {
-            schema_version: 15,
-            enqueue_witnesses: Some(enqueue_witnesses),
-            semantics: BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_TX_SEMANTICS,
-            preparation_policy: self.preparation_reserve.then(|| {
-                buflo_kernel_preparation_policy_marker_for_period(
-                    duration_as_u64_nanos(self.cadence) / 1_000,
-                )
-            }),
-            incoming_credit_release_window_ns: duration_as_u64_nanos(
-                self.incoming_credit_release_window,
-            ),
-            terminal_outcome,
-            primary_error,
-            cleanup_errors,
-            defense_start_monotonic_ns: epoch.map(|epoch| epoch.start_monotonic_ns),
-            defense_start_tai_ns: epoch.map(|epoch| epoch.start_tai_ns),
-            clock_start: self.clock_start,
-            clock_end,
-            clock_mapping_valid: mapping.is_some(),
-            clock_mapping_error,
-            clock_mapping: mapping,
-            runtime_contract: self.runtime_contract,
-            qdisc_contract: self.qdisc_contract,
-            protected_selection_wait,
-            jobs,
-            aggregate,
-            terminal_errors,
-        }
-    }
-
-    fn finish(self, primary_error: Option<String>) -> BufloKernelTxReceipt {
-        if self.conservative_kernel_enqueue_witness {
-            self.finish_schema15(primary_error)
-        } else {
-            self.finish_schema14(primary_error)
-        }
-    }
-
 }
 
 fn scheduler_contract_matches(evidence: &ProcessSchedulerEvidence) -> bool {
@@ -10071,7 +8845,7 @@ fn process_scheduler_evidence() -> Result<ProcessSchedulerEvidence, Error> {
 }
 
 const RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 10;
-const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=5000; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guard_coincides_with_output_admission=false; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_exact_release_schema10_passive_wait_unreachable=true; buflo_exact_release_guard_wait_equals_active_wait=true; buflo_exact_release_max_passive_wake_lateness_equals_max_guard_entry_lateness=true; buflo_exact_release_aggregate_entry_lateness_reachable=max_retained_failure_entry_or_5000000_plus_max_dispatch_lateness; buflo_exact_release_aggregate_active_wait_reachable=retained_success_plus_retained_failure_plus_bounded_unretained_successes_with_hidden_entry_max_subtraction_saturating; buflo_exact_release_active_derived_maxima_reachable=retained_per_metric_or_unretained_success_5000000_plus_dispatch; buflo_exact_release_deadline_count_reachable=outside_zero_or_max_dispatch_lateness_at_least_4999000; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_one_actual_adapter_window_before_release=true; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_wait_iterations=counter_read_attempts_including_ordered_and_unavailable_or_fallback_authoritative_polls; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard_entry; buflo_exact_release_dispatch_lateness_histogram_counts_one_dispatch_ready_guard; buflo_exact_release_guard_entries=dispatch_ready_guards+failed_guards; buflo_exact_release_failed_guards=sum_typed_failure_guards; buflo_exact_release_failed_guards_max=1; buflo_exact_release_last_failure_present_iff_failed_guards=1; buflo_exact_release_failure_dispatch_at_is_null=true; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=actual_adapter_window_ns; buflo_exact_release_configured_output_admission_lead_us=10000; buflo_exact_release_configured_guard_and_active_wait_lead_us=5000; buflo_exact_release_active_wait_poll=linux_aarch64_cntvct_el0_predictive_authoritative_watchdog_else_instant_authoritative_fallback; buflo_exact_release_counter_target_rounding=ceil; buflo_exact_release_counter_calibration=counter_instant_counter; buflo_exact_release_counter_is_predictive_with_periodic_authoritative_watchdog=true; buflo_exact_release_authoritative_watchdog_interval_successful_relaxed_reads=64; buflo_exact_release_authoritative_watchdog_dispatch_preserves_strict_half_open_transport_check=true; buflo_exact_release_authoritative_watchdog_cadence_validated_guards=count_dispatch_ready_production_guards_passing_exact_per_guard_cadence; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_reads=active_wait_iterations-2*counter_calibrations; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_bound=counter_calibrations=guards+early_confirmation_retries_and_64*checks<=remainder<64*(checks+guards)_and_remainder>=early_confirmation_retries; buflo_exact_release_zero_failure_empty_partition=zero_iterations_calibrations_checks_retries_dispatches; buflo_exact_release_remaining_success_guard_projection=subtract_worst_and_exact_retained_failure_then_same_remainder_bounds; buflo_exact_release_zero_failure_watchdog_dispatch_residue=dispatches<=checks_and_remainder-64*checks<=63*(guards-dispatches); buflo_exact_release_max_authoritative_sample_gap=consecutive_calibration_watchdog_or_final_authoritative_samples; buflo_exact_release_authoritative_counter_lag=max_authoritative_elapsed_minus_counter_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_authoritative_lead=max_counter_elapsed_minus_authoritative_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_frequency_hz_range_inclusive=1000000..4294967295; buflo_exact_release_counter_target_error=defensive_unreachable_for_valid_live_guard_and_frequency; buflo_exact_release_first_calibration_target_error=exactly_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_zero_calibration_counter_unavailable=one_or_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_counter_unavailable=scripted_trait_failure_not_architectural_trap_receipt; buflo_exact_release_production_counter_access=target_gated_live_smoke_test; buflo_exact_release_counter_frequency_change=hard_failure_before_transport_dispatch_and_before_success_metrics_mutation; buflo_exact_release_cross_guard_frequency_precedence=typed_wait_failure_preserved_dispatch_ready_retyped; buflo_exact_release_dispatch_confirmation=authoritative_instant; buflo_exact_release_transport_and_socket_clock=authoritative_instant; buflo_exact_release_counter_regression=hard_failure; buflo_exact_release_guard_metrics_recorded_before_result_propagation=true; buflo_exact_release_transport_dispatch_result_precedes_guard_metrics=true; buflo_exact_release_failure_authoritative_watchdog_cadence=successful_relaxed_reads_R_checks_floor_R_div_64; buflo_exact_release_failure_terminal_counter_reads=target_or_frequency_change_0_unavailable_or_nonmonotonic_1_or_2_C_eq_confirmations_plus_1_requires_1; buflo_exact_release_failure_retry_requires_successful_relaxed_read=true; buflo_exact_release_early_confirmation_retry_requires_positive_counter_nanoseconds=true; buflo_exact_release_failure_counter_comparison_absence=zero_watchdog_and_zero_confirmation_implies_zero_lag_and_lead; buflo_exact_release_sole_success_failure_projection=exact_saturating_sums_chronology_and_maxima; buflo_exact_release_retained_failure_exact_fields=iterations_active_duration_interruptions_interruption_nanoseconds_and_max_gap; buflo_exact_release_nullable_chronology_duration=adapter_window_exists_in_4999000_or_5000000_nanoseconds; buflo_exact_release_structural_count_partitions=checked_u64_exact_no_saturation; buflo_exact_release_histogram_integrity=max_bucket_and_coupled_G_plus_A_minus_H_times_50001; buflo_exact_release_remaining_histograms=subtract_exact_worst_and_failure; buflo_exact_release_remaining_success_duration=dispatch_bucket_floor_with_4999000ns_window; buflo_exact_incoming_retry_zero_drives_implies_zero_max_lateness=true; buflo_exact_release_predictive_interruptions=count_le_iterations_minus_anchor_and_nonmonotonic_or_calibrated_unavailable_failed_read_and_nanoseconds_le_counter";
+const RUNNER_WAKEUP_METRICS_SEMANTICS: &str = "actual_select_return_source; socket_wins_simultaneous_readiness; controller_subset_is_effective_earliest_deadline; scheduled_cells_are_not_wakeups; buflo_ordinary_output_admission_lead_us=10000; buflo_exact_release_guard_reserves_candidate_window; buflo_exact_release_guard_lead_us=5000; buflo_exact_release_active_wait_tail_us=5000; buflo_exact_release_guard_coincides_with_output_admission=false; buflo_exact_release_guards_are_separately_receipted_active_waits; buflo_exact_release_schema10_passive_wait_unreachable=true; buflo_exact_release_guard_wait_equals_active_wait=true; buflo_exact_release_max_passive_wake_lateness_equals_max_guard_entry_lateness=true; buflo_exact_release_aggregate_entry_lateness_reachable=max_retained_failure_entry_or_5000000_plus_max_dispatch_lateness; buflo_exact_release_aggregate_active_wait_reachable=retained_success_plus_retained_failure_plus_bounded_unretained_successes_with_hidden_entry_max_subtraction_saturating; buflo_exact_release_active_derived_maxima_reachable=retained_per_metric_or_unretained_success_5000000_plus_dispatch; buflo_exact_release_deadline_count_reachable=outside_zero_or_max_dispatch_lateness_at_least_4999000; buflo_active_defense_socket_drains_are_single_batch; buflo_active_defense_http_drains_are_single_event; buflo_ordinary_output_stops_at_admission; buflo_exact_release_guard_begins_one_actual_adapter_window_before_release=true; cs_exact_incoming_retry_phases=1/4,1/2,3/4; buflo_exact_incoming_retry_wakeups=transport_callback_or_1/4,1/2,3/4,deadline; buflo_exact_incoming_retry_drives=count_owner_endpoint_output_drive_invocations_including_immediate_and_error; buflo_exact_incoming_retry_resolutions=count_drive_invocations_clearing_at_least_one_captured_identity; buflo_exact_incoming_retry_max_wake_lateness_includes_terminal_deadline=true; buflo_exact_incoming_inventory=all_unrealized_slot_owned_adapter_identities_with_same_tick_refresh; buflo_exact_incoming_expiry=one_logical_slot_one_deadline_miss; buflo_exact_release_timing_histogram_upper_bounds_ns=50000,100000,250000,500000,1000000,2000000,5000000,overflow; buflo_exact_release_active_spin_interruption_threshold_ns=50000; buflo_exact_release_active_wait_iterations=counter_read_attempts_including_ordered_and_unavailable_or_fallback_authoritative_polls; buflo_exact_release_active_spin_gap_histogram_counts_one_max_gap_per_guard_entry; buflo_exact_release_dispatch_lateness_histogram_counts_one_dispatch_ready_guard; buflo_exact_release_guard_entries=dispatch_ready_guards+failed_guards; buflo_exact_release_failed_guards=sum_typed_failure_guards; buflo_exact_release_failed_guards_max=1; buflo_exact_release_last_failure_present_iff_failed_guards=1; buflo_exact_release_failure_dispatch_at_is_null=true; buflo_exact_release_dispatch_at_or_after_deadline_uses_half_open_window=true; buflo_exact_release_worst_guard_is_max_dispatch_lateness_first_on_tie; buflo_exact_release_worst_guard_times_are_relative_to_defense_start_or_null; buflo_rolling_prearm_not_before_relative_us_rounding=ceil; buflo_rolling_prearm_deadline_relative_us_rounding=floor; buflo_exact_release_packet_timestamp_us_semantics=nominal_defense_release; buflo_exact_release_worst_guard_release_and_deadline_semantics=actual_adapter_instants; buflo_exact_release_actual_adapter_window_ns=nominal_control_interval_ns_or_nominal_minus_1000; buflo_exact_release_actual_guard_and_active_wait_lead_ns=actual_adapter_window_ns; buflo_exact_release_configured_output_admission_lead_us=10000; buflo_exact_release_configured_guard_and_active_wait_lead_us=5000; buflo_exact_release_active_wait_poll=linux_aarch64_cntvct_el0_predictive_authoritative_watchdog_else_instant_authoritative_fallback; buflo_exact_release_counter_target_rounding=ceil; buflo_exact_release_counter_calibration=counter_instant_counter; buflo_exact_release_counter_is_predictive_with_periodic_authoritative_watchdog=true; buflo_exact_release_authoritative_watchdog_interval_successful_relaxed_reads=64; buflo_exact_release_authoritative_watchdog_dispatch_preserves_strict_half_open_transport_check=true; buflo_exact_release_authoritative_watchdog_cadence_validated_guards=count_dispatch_ready_production_guards_passing_exact_per_guard_cadence; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_reads=active_wait_iterations-2*counter_calibrations; buflo_exact_release_zero_failure_authoritative_watchdog_remainder_bound=counter_calibrations=guards+early_confirmation_retries_and_64*checks<=remainder<64*(checks+guards)_and_remainder>=early_confirmation_retries; buflo_exact_release_zero_failure_empty_partition=zero_iterations_calibrations_checks_retries_dispatches; buflo_exact_release_remaining_success_guard_projection=subtract_worst_and_exact_retained_failure_then_same_remainder_bounds; buflo_exact_release_zero_failure_watchdog_dispatch_residue=dispatches<=checks_and_remainder-64*checks<=63*(guards-dispatches); buflo_exact_release_max_authoritative_sample_gap=consecutive_calibration_watchdog_or_final_authoritative_samples; buflo_exact_release_authoritative_counter_lag=max_authoritative_elapsed_minus_counter_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_authoritative_lead=max_counter_elapsed_minus_authoritative_elapsed_from_current_calibration_anchor; buflo_exact_release_counter_frequency_hz_range_inclusive=1000000..4294967295; buflo_exact_release_counter_target_error=defensive_unreachable_for_valid_live_guard_and_frequency; buflo_exact_release_first_calibration_target_error=exactly_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_zero_calibration_counter_unavailable=one_or_two_ordered_reads_and_zero_relaxed_reads; buflo_exact_release_counter_unavailable=scripted_trait_failure_not_architectural_trap_receipt; buflo_exact_release_production_counter_access=target_gated_live_smoke_test; buflo_exact_release_counter_frequency_change=hard_failure_before_transport_dispatch_and_before_success_metrics_mutation; buflo_exact_release_cross_guard_frequency_precedence=typed_wait_failure_preserved_dispatch_ready_retyped; buflo_exact_release_dispatch_confirmation=authoritative_instant; buflo_exact_release_transport_and_socket_clock=authoritative_instant; buflo_exact_release_counter_regression=hard_failure; buflo_exact_release_guard_metrics_recorded_before_result_propagation=true; buflo_exact_release_transport_dispatch_result_precedes_guard_metrics=true; buflo_exact_release_failure_authoritative_watchdog_cadence=successful_relaxed_reads_R_checks_floor_R_div_64; buflo_exact_release_failure_terminal_counter_reads=target_or_frequency_change_0_unavailable_or_nonmonotonic_1_or_2_C_eq_confirmations_plus_1_requires_1; buflo_exact_release_failure_retry_requires_successful_relaxed_read=true; buflo_exact_release_early_confirmation_retry_requires_positive_counter_nanoseconds=true; buflo_exact_release_failure_counter_comparison_absence=zero_watchdog_and_zero_confirmation_implies_zero_lag_and_lead; buflo_exact_release_sole_success_failure_projection=exact_saturating_sums_chronology_and_maxima; buflo_exact_release_retained_failure_exact_fields=iterations_active_duration_interruptions_interruption_nanoseconds_and_max_gap; buflo_exact_release_nullable_chronology_duration=adapter_window_exists_in_4999000_or_5000000_or_9999000_or_10000000_or_19999000_or_20000000_nanoseconds; buflo_exact_release_structural_count_partitions=checked_u64_exact_no_saturation; buflo_exact_release_histogram_integrity=max_bucket_and_coupled_G_plus_A_minus_H_times_50001; buflo_exact_release_remaining_histograms=subtract_exact_worst_and_failure; buflo_exact_release_remaining_success_duration=dispatch_bucket_floor_with_4999000ns_window; buflo_exact_incoming_retry_zero_drives_implies_zero_max_lateness=true; buflo_exact_release_predictive_interruptions=count_le_iterations_minus_anchor_and_nonmonotonic_or_calibrated_unavailable_failed_read_and_nanoseconds_le_counter";
 #[cfg(target_os = "linux")]
 const BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION: u32 = 20;
 #[cfg(target_os = "linux")]
@@ -10612,20 +9386,42 @@ fn buflo_exact_release_normalized_adapter_window(
 ) -> Option<u64> {
     let nominal_release = packet_timestamp_us.checked_mul(1_000)?;
     let release_skew = release.checked_sub(nominal_release)?;
-    let nominal_deadline = nominal_release.checked_add(5_000_000)?;
-    let deadline_skew = nominal_deadline.checked_sub(deadline)?;
-    let normalization_skew = release_skew.checked_add(deadline_skew)?;
     let actual_window = deadline.checked_sub(release)?;
-    (release_skew <= 999
-        && deadline_skew <= 999
-        && matches!(normalization_skew, 0 | 1_000)
-        && 5_000_000_u64.checked_sub(normalization_skew) == Some(actual_window)
-        && matches!(actual_window, 4_999_000 | 5_000_000))
-    .then_some(actual_window)
+    [5_000_000_u64, 10_000_000_u64, 20_000_000_u64].into_iter().find_map(|nominal_window| {
+        let nominal_deadline = nominal_release.checked_add(nominal_window)?;
+        let deadline_skew = nominal_deadline.checked_sub(deadline)?;
+        let normalization_skew = release_skew.checked_add(deadline_skew)?;
+        (release_skew <= 999
+            && deadline_skew <= 999
+            && matches!(normalization_skew, 0 | 1_000)
+            && nominal_window.checked_sub(normalization_skew) == Some(actual_window)
+            && matches!(actual_window, 4_999_000 | 5_000_000 | 9_999_000 | 10_000_000 | 19_999_000 | 20_000_000))
+        .then_some(actual_window)
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn prospective_buflo_twenty_ms_half_open_boundaries_are_independent_of_selection() {
+    assert_eq!(buflo_kernel_physical_window(Duration::from_millis(64)), Duration::from_millis(20));
+    assert_eq!(buflo_kernel_physical_window(Duration::from_millis(20)), Duration::from_millis(5));
+    assert_eq!(buflo_kernel_etf_delta(Duration::from_millis(64)), Duration::from_millis(25));
+    assert_eq!(buflo_kernel_etf_delta(Duration::from_millis(20)), Duration::from_millis(10));
+    assert!(buflo_kernel_etf_delta(Duration::from_millis(64)) > buflo_kernel_physical_window(Duration::from_millis(64)));
+    assert_eq!(buflo_kernel_preparation_after_release(Duration::from_millis(64)), 19_000_000);
+    assert_eq!(buflo_kernel_preparation_after_release(Duration::from_millis(20)), 4_000_000);
+    let release = 100_000_000_u64;
+    assert!(buflo_kernel_interval_within_half_open_window(release, release + 19_999_999, release, release + 20_000_000));
+    assert!(!buflo_kernel_interval_within_half_open_window(release, release + 20_000_000, release, release + 20_000_000));
+    assert!(!buflo_kernel_interval_within_half_open_window(release - 1, release, release, release + 20_000_000));
+    assert_eq!(buflo_kernel_tai_window_state(release + 18_999_999, release, release + 19_000_000), BufloKernelTaiWindowState::Open);
+    assert_eq!(buflo_kernel_tai_window_state(release + 19_000_000, release, release + 19_000_000), BufloKernelTaiWindowState::Expired);
+    assert_eq!(buflo_exact_release_normalized_adapter_window(100_000, release, release + 20_000_000), Some(20_000_000));
+    assert_eq!(buflo_exact_release_normalized_adapter_window(100_000, release, release + 19_000_000), None);
 }
 
 fn buflo_exact_release_worst_chronology_valid(worst: &BufloExactReleaseWorstGuard) -> bool {
-    let scalar_geometry_valid = [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+    let scalar_geometry_valid = [4_999_000_u64, 5_000_000_u64, 9_999_000_u64, 10_000_000_u64, 19_999_000_u64, 20_000_000_u64].into_iter().any(|window| {
         window
             .checked_add(worst.dispatch_lateness_nanoseconds)
             .and_then(|value| value.checked_sub(worst.guard_entry_lateness_nanoseconds))
@@ -10685,7 +9481,7 @@ fn buflo_exact_release_failure_chronology_valid(failure: &BufloExactReleaseLastF
     else {
         return false;
     };
-    let scalar_geometry_valid = [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+    let scalar_geometry_valid = [4_999_000_u64, 5_000_000_u64, 9_999_000_u64, 10_000_000_u64, 19_999_000_u64, 20_000_000_u64].into_iter().any(|window| {
         failure.exit_before_release_nanoseconds == window.saturating_sub(elapsed_from_guard)
             && failure.exit_at_or_after_deadline == (elapsed_from_guard >= window.saturating_mul(2))
     });
@@ -10876,12 +9672,13 @@ impl RunnerWakeupMetrics {
         let schema = receipt
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
-        let conservative_witness = schema == Some(15);
-        let layered_feedback = schema == Some(14) || conservative_witness;
+        let layered_feedback = schema == Some(14) || schema == Some(15) || schema == Some(16);
         let cadence64 = schema == Some(13) || layered_feedback;
         let preparation_reserve = schema == Some(12) || cadence64;
         self.buflo_kernel_tx = Some(receipt);
-        self.schema_version = if conservative_witness {
+        self.schema_version = if schema == Some(16) {
+            24
+        } else if schema == Some(15) {
             23
         } else if cadence64 {
             22
@@ -10890,9 +9687,7 @@ impl RunnerWakeupMetrics {
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_METRICS_SCHEMA_VERSION
         };
-        let retention_semantics = if conservative_witness {
-            BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_RUNNER_RETENTION_SEMANTICS
-        } else if layered_feedback {
+        let retention_semantics = if layered_feedback {
             BUFLO_KERNEL_LAYERED_RUNNER_RETENTION_SEMANTICS
         } else if cadence64 {
             BUFLO_KERNEL_CADENCE64_RUNNER_RETENTION_SEMANTICS
@@ -10901,9 +9696,7 @@ impl RunnerWakeupMetrics {
         } else {
             BUFLO_KERNEL_RUNNER_WAKEUP_RETENTION_SEMANTICS
         };
-        let kernel_semantics = if conservative_witness {
-            BUFLO_KERNEL_CONSERVATIVE_ENQUEUE_TX_SEMANTICS
-        } else if layered_feedback {
+        let kernel_semantics = if layered_feedback {
             BUFLO_KERNEL_LAYERED_TX_SEMANTICS
         } else if cadence64 {
             BUFLO_KERNEL_CADENCE64_TX_SEMANTICS
@@ -11019,7 +9812,7 @@ impl RunnerWakeupMetrics {
         let realization_window_nanoseconds = duration_as_u64_nanos(realization_window);
         if guard.guard_at != guard.active_wait_at
             || guard_lead != realization_window
-            || !matches!(realization_window_nanoseconds, 4_999_000 | 5_000_000)
+            || !matches!(realization_window_nanoseconds, 4_999_000 | 5_000_000 | 9_999_000 | 10_000_000 | 19_999_000 | 20_000_000)
         {
             return Err(Error::DefenseExecution(
                 "BuFLO exact-release guard did not reserve one canonical actual adapter window"
@@ -12984,7 +11777,7 @@ impl RunnerWakeupMetrics {
                     && self.buflo_exact_release_max_active_wait_counter_gap_nanoseconds == 0
                     && self.buflo_exact_release_max_counter_calibration_span_nanoseconds == 0))
             && self.buflo_exact_release_worst_guard.is_none_or(|worst| {
-                [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+                [4_999_000_u64, 5_000_000_u64, 9_999_000_u64, 10_000_000_u64, 19_999_000_u64, 20_000_000_u64].into_iter().any(|window| {
                     window
                         .checked_add(worst.dispatch_lateness_nanoseconds)
                         .and_then(|value| value.checked_sub(worst.guard_entry_lateness_nanoseconds))
@@ -13087,7 +11880,7 @@ impl RunnerWakeupMetrics {
                     .guard_entry_lateness_nanoseconds
                     .checked_add(failure.active_wait_monotonic_nanoseconds)
                     .is_some_and(|elapsed_from_guard| {
-                        [4_999_000_u64, 5_000_000_u64].into_iter().any(|window| {
+                        [4_999_000_u64, 5_000_000_u64, 9_999_000_u64, 10_000_000_u64, 19_999_000_u64, 20_000_000_u64].into_iter().any(|window| {
                             failure.exit_before_release_nanoseconds
                                 == window.saturating_sub(elapsed_from_guard)
                                 && failure.exit_at_or_after_deadline
@@ -13720,25 +12513,29 @@ fn http3_first_error_snapshot(endpoints: &[Endpoint]) -> Option<serde_json::Valu
             omitted = omitted.saturating_add(1);
             continue;
         }
-        let first_http3_error = retained.first_http3_error.as_ref().map(|error| json!({
-            "processing_monotonic_ns": error.processing_monotonic_ns,
-            "connection_sequence": error.connection_sequence,
-            "phase": &error.phase,
-            "error_debug": &error.error_debug,
-            "error_display": &error.error_display,
-            "mapped_close_code": error.close_code,
-            "transport_state_debug": &error.transport_state_debug,
-            "text_truncated": error.text_truncated,
-        }));
-        let first_peer_close = retained.first_peer_close.as_ref().map(|close| json!({
-            "processing_monotonic_ns": close.processing_monotonic_ns,
-            "connection_sequence": close.connection_sequence,
-            "frame_kind": if close.application { "application" } else { "transport" },
-            "error_code": close.error_code,
-            "triggering_frame_type": close.triggering_frame_type,
-            "reason_phrase": &close.reason_phrase,
-            "reason_truncated": close.reason_truncated,
-        }));
+        let first_http3_error = retained.first_http3_error.as_ref().map(|error| {
+            json!({
+                "processing_monotonic_ns": error.processing_monotonic_ns,
+                "connection_sequence": error.connection_sequence,
+                "phase": &error.phase,
+                "error_debug": &error.error_debug,
+                "error_display": &error.error_display,
+                "mapped_close_code": error.close_code,
+                "transport_state_debug": &error.transport_state_debug,
+                "text_truncated": error.text_truncated,
+            })
+        });
+        let first_peer_close = retained.first_peer_close.as_ref().map(|close| {
+            json!({
+                "processing_monotonic_ns": close.processing_monotonic_ns,
+                "connection_sequence": close.connection_sequence,
+                "frame_kind": if close.application { "application" } else { "transport" },
+                "error_code": close.error_code,
+                "triggering_frame_type": close.triggering_frame_type,
+                "reason_phrase": &close.reason_phrase,
+                "reason_truncated": close.reason_truncated,
+            })
+        });
         entries.push(json!({
             "endpoint_id": endpoint.id.0,
             "first_http3_error": first_http3_error,
@@ -13759,7 +12556,9 @@ fn http3_first_error_snapshot(endpoints: &[Endpoint]) -> Option<serde_json::Valu
             "omitted_endpoints": omitted,
             "entries": &entries,
         });
-        let Ok(raw) = serde_json::to_vec(&value) else { return None; };
+        let Ok(raw) = serde_json::to_vec(&value) else {
+            return None;
+        };
         if raw.len() <= HTTP3_TERMINAL_STATE_MAX_JSON_BYTES {
             return Some(value);
         }
@@ -14088,13 +12887,6 @@ struct DeferredEndpointReady {
     production_monotonic_ns: u64,
 }
 
-struct PendingCsTerminalCancellation {
-    action: QcsdAction,
-    // Actual encoded/received packet progress, not clock advancement. A
-    // repeated action drain cannot immediately retry the same blocked call.
-    deferred_packet_progress: (usize, usize),
-}
-
 struct Endpoint {
     id: QcsdEndpointId,
     origin: Uri,
@@ -14121,6 +12913,9 @@ struct Endpoint {
     buflo_ack_start_enabled: bool,
     terminal_primary_partial_enabled: bool,
     terminal_primary_partial_recorded: bool,
+    terminal_chaff_partial_enabled: bool,
+    terminal_chaff_partial_recorded_slots: HashSet<QcsdSlotId>,
+    terminal_chaff_replenishment_closure_recorded: bool,
     /// Greatest Instant supplied to Neqo for this endpoint. Kernel `BuFLO` may
     /// prepare one packet at a short-lived future physical projection; clamp
     /// later contemporaneous samples so transport time never regresses when
@@ -14133,7 +12928,6 @@ struct Endpoint {
     /// Chaff and application requests share the peer's request-stream quota.
     /// Retain controller-reserved chaff identities until real peer credit.
     pending_chaff_requests: VecDeque<QcsdAction>,
-    pending_cs_terminal_cancellations: VecDeque<PendingCsTerminalCancellation>,
     chaff_stream_limit_blocked: bool,
     streams: HashMap<StreamId, StreamRecord>,
     /// Every application request send half opened on this endpoint. Entries
@@ -14234,7 +13028,6 @@ async fn probe(
         defense_parameters: None,
         chaff_manifest: None,
         chaff_manifest_hash: None,
-        supplemental_chaff_source: None,
         request_policy: RequestPolicyArg::AsDefined,
         seed: 0,
         output_dir: head_dir,
@@ -14273,7 +13066,6 @@ async fn probe(
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: parent.join(format!("{stem}.probe-get")),
@@ -14754,8 +13546,6 @@ async fn qualify_chaff_response(
     max_response_bytes: u64,
     packet_size: u16,
     timeout_seconds: u64,
-    supplemental_chaff_source: Option<&Path>,
-    application_manifest: Option<&Path>,
 ) -> Result<(), Error> {
     let mode = response_qualification_mode_with_aggregate(
         parallel_requests,
@@ -14785,7 +13575,7 @@ async fn qualify_chaff_response(
                 .into(),
         ));
     }
-    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _, _, _) =
+    let (workload, workload_hash, expected_responses, _, origin_policy, _, _, _, _, _, _) =
         load_application_workload_source(workload_path)?;
     let application = workload
         .resources
@@ -14795,29 +13585,10 @@ async fn qualify_chaff_response(
             Error::Argument("application_resource_id 0 is absent from workload".into())
         })?;
     validate_qualification_application_root(application, application_resource_id)?;
-    let supplemental = supplemental_chaff_source.map(load_supplemental_pool_source).transpose()?;
-    let supplemental_expected = supplemental.as_ref().map(BoundSupplementalPoolSource::expected_responses);
-    let supplemental_workload = supplemental.as_ref().map(BoundSupplementalPoolSource::resource_manifest);
-    if let Some(pool) = &supplemental {
-        if mode != ResponseQualificationMode::Legacy || parallel_requests != 5 || max_response_bytes != 16_777_216 {
-            return Err(Error::Argument("separate FT qualification requires exactly5 legacy-AEL requests and16MiB cap".into()));
-        }
-        let (formal, formal_sha) = load_manifest(application_manifest.ok_or_else(|| Error::Argument("separate FT qualification lacks exact formal manifest".into()))?)?;
-        if formal != workload { return Err(Error::Argument("separate FT qualification changed complete formal20 resources".into())); }
-        pool.validate_against(&formal, &formal_sha, &workload_hash,
-            option_env!("NEQO_QCSD_GIT_COMMIT").unwrap_or("working-tree"))?;
-        if pool.selected_id()? != selected_chaff_resource_id {
-            return Err(Error::Argument("separate FT qualification selected a nondeterministic pool resource".into()));
-        }
-    } else if application_manifest.is_some() {
-        return Err(Error::Argument("formal-manifest qualification option requires separate FT pool".into()));
-    }
-    let selection_workload = supplemental_workload.as_ref().unwrap_or(&workload);
-    let selection_expected = supplemental_expected.as_ref().unwrap_or(&expected_responses);
     let (resource, prepared_selected) = match mode {
         ResponseQualificationMode::Legacy => {
             let (deterministic, prepared) =
-                deterministic_selected_chaff_resource(selection_workload, selection_expected, application)?;
+                deterministic_selected_chaff_resource(&workload, &expected_responses, application)?;
             if deterministic.id != selected_chaff_resource_id {
                 return Err(Error::Argument(format!(
                     "selected_chaff_resource_id {selected_chaff_resource_id} is not deterministic source {}",
@@ -15292,15 +14063,6 @@ async fn qualify_chaff_response(
             "passed": sustained_passed,
         }),
     };
-    if let Some(pool) = &supplemental {
-        receipt["schema_version"] = json!(1);
-        receipt["artifact_type"] = json!(pool.qualification_artifact_type());
-        receipt["supplemental_chaff_policy"] = json!(pool.policy());
-        receipt["application_manifest_sha256"] = json!(pool.application_manifest_sha256());
-        receipt["chaff_pool_source_sha256"] = json!(pool.sha256());
-        receipt["candidate_manifest_sha256"] = json!(pool.candidate_manifest_sha256());
-        receipt["discovery_provenance_sha256"] = json!(pool.discovery_provenance_sha256());
-    }
     if small_response_aggregate {
         receipt["schema_version"] = json!(7);
         receipt["capacity_policy"] = json!("same-endpoint-eight-acked-known-capacity-v1");
@@ -15656,6 +14418,7 @@ async fn qualify_chaff_prefix(
         application_source,
         application_source_sha256,
         prepared_expected_responses,
+        _,
         _,
         _,
         _,
@@ -16364,6 +15127,7 @@ fn load_application_workload_source(
         TamarawCapturePolicy,
         FrontCapturePolicy,
         TerminalPrimaryPartialCellPolicy,
+        TerminalChaffPartialCellPolicy,
     ),
     Error,
 > {
@@ -16459,6 +15223,12 @@ fn load_application_workload_source(
         primary_policy,
         &origin_policy,
     )?;
+    let terminal_chaff_partial_policy = TerminalChaffPartialCellPolicy::from_preparation(
+        &source.preparation,
+        policy,
+        primary_policy,
+        &origin_policy,
+    )?;
     Ok((
         manifest,
         sha256(&bytes)?,
@@ -16470,6 +15240,7 @@ fn load_application_workload_source(
         tamaraw_policy,
         front_policy,
         terminal_primary_partial_policy,
+        terminal_chaff_partial_policy,
     ))
 }
 
@@ -17045,13 +15816,13 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     spec.application_response_policy
         .validate_workload(&spec.workload)?;
     if spec.application_workload_source.as_ref().is_some_and(
-        |(_, _, _, policy, _, _, _, _, _, _)| *policy != spec.application_response_policy,
+        |(_, _, _, policy, _, _, _, _, _, _, _)| *policy != spec.application_response_policy,
     ) {
         return Err(Error::Argument(
             "run application response policy differs from its frozen prepared source".into(),
         ));
     }
-    if let Some((source, _, _, _, _, _, _, _, _, _)) = &spec.application_workload_source {
+    if let Some((source, _, _, _, _, _, _, _, _, _, _)) = &spec.application_workload_source {
         spec.application_response_policy
             .validate_source_binding(&spec.workload, source)?;
     }
@@ -17059,6 +15830,7 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
     validate_tamaraw_capture_policy(&spec)?;
     validate_front_capture_policy(&spec)?;
     validate_terminal_primary_partial_cell_policy(&spec)?;
+    validate_terminal_chaff_partial_cell_policy(&spec)?;
     validate_workload_urls(&spec.workload)?;
     if let Some(chaff) = &spec.chaff_manifest {
         validate_chaff_manifest_defense(&spec.config.defense, chaff)?;
@@ -17097,6 +15869,9 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
             buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
+            terminal_chaff_partial_cells: None,
+            terminal_chaff_replenishment_closure: None,
+            terminal_chaff_postlease_live_data: None,
         },
     );
     atomic_write(&spec.output_dir.join("run.json"), &running_bytes)?;
@@ -17147,6 +15922,9 @@ async fn execute_run(spec: RunSpec) -> Result<Vec<ResponseResult>, Error> {
                 buflo_fin_permission: None,
                 runner_wakeup_metrics: None,
                 terminal_primary_partial_cell: None,
+                terminal_chaff_partial_cells: None,
+                terminal_chaff_replenishment_closure: None,
+                terminal_chaff_postlease_live_data: None,
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -17259,17 +16037,9 @@ fn walkie_talkie_qualification_binding_matches(
 )]
 fn validate_qualified_chaff_binding(spec: &RunSpec) -> Result<(), Error> {
     let Some(chaff) = &spec.chaff_manifest else {
-        if spec.supplemental_chaff_source.is_some() { return Err(Error::Argument("separate FT pool without qualified manifest".into())); }
         return Ok(());
     };
-    if let RuntimeChaffManifest::SupplementalCsV8(manifest) = chaff {
-        return validate_cs_supplemental_runtime_binding(spec, manifest);
-    }
-    if let RuntimeChaffManifest::SupplementalFtV7(manifest) = chaff {
-        return validate_ft_supplemental_runtime_binding(spec, manifest);
-    }
-    if spec.supplemental_chaff_source.is_some() { return Err(Error::Argument("legacy chaff manifest cannot claim a separate FT source".into())); }
-    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _, _, _)) =
+    let Some((source, source_hash, expected_responses, _, origin_policy, _, _, _, _, _, _)) =
         &spec.application_workload_source
     else {
         return Err(Error::Argument(
@@ -17554,7 +16324,6 @@ fn deadline_error(
 fn ensure_defense_realizable(controller: &QcsdController) -> Result<(), Error> {
     if let Some(failure) = controller.terminal_failure() {
         cs_preoutput_diagnostic_freeze("first-controller-terminal-failure");
-        buflo_preoutput_diagnostic_freeze("first-controller-terminal-failure");
         return Err(Error::DefenseExecution(failure.into()));
     }
     Ok(())
@@ -17697,6 +16466,55 @@ fn observe_completed_application(
     Ok(())
 }
 
+// Separate prospective behavioral candidate. Engineering only until a new
+// actual build/roles/readiness/pilot proves this exact source. Never CLI enabled.
+const CS_RBING_SAME_WINDOW_CAPACITY_RETRY_ENABLED: bool = true;
+// Unbuilt prospective current-DATA candidate; never CLI enabled.
+const CS_RBING_CURRENT_DATA_ENABLED: bool = true;
+// NEW engineering candidate, not deployed or qualified; no CLI opt-in.
+const CS_RBING_OWNED_DATA_CONTINUATION_ENABLED: bool = true;
+
+// The ten-stream exception is selected only by the frozen Bing workload,
+// its original CS settings, and an actual ten-stream response-qualified manifest.
+// It changes chaff concurrency only; scheduling and deadlines stay unchanged.
+fn rbing_ten_chaff_stream_count(
+    scope: bool,
+    enabled: bool,
+    current: usize,
+    qualified: Option<usize>,
+) -> Result<usize, Error> {
+    if enabled && matches!(current, 10 | 50) {
+        return Err(Error::Argument(
+            "explicit ten-stream CS configuration is not admitted".into(),
+        ));
+    }
+    if scope && enabled && current == 5 && matches!(qualified, Some(10 | 50)) {
+        Ok(qualified.expect("checked qualified concurrency"))
+    } else {
+        Ok(current)
+    }
+}
+
+fn rbing_same_window_retry_scope(spec: &RunSpec) -> bool {
+    spec.workload_hash == "39e2298fe250eb58212f5142549f7fa884d450d0862a8a393c5b30102c396ea7"
+        && spec.method == "GET"
+        && spec.timeout_seconds == 160
+        && spec.max_response_bytes == 16 * 1024 * 1024
+        && spec.workload.resources.len() == 20
+        && spec.workload.resources.iter().all(|resource| {
+            resource.url.parse::<Uri>().is_ok_and(|uri| {
+                uri.scheme_str() == Some("https")
+                    && uri
+                        .authority()
+                        .is_some_and(|authority| authority.host() == "r.bing.com")
+            })
+        })
+        && spec.defense_parameters.as_ref().is_some_and(|parameters| {
+            parameters.sha256 == "e46036e50bcdef0f10b6711e8a730f9a452e56728da3f1f19288fcfb177839a7"
+                && parameters.cs_buflo_parameters.is_some()
+        })
+}
+
 #[expect(
     clippy::cognitive_complexity,
     clippy::future_not_send,
@@ -17711,12 +16529,8 @@ async fn execute_run_inner(
     terminal_artifact: &mut Option<StagedTerminalRunArtifact>,
 ) -> Result<Vec<ResponseResult>, Error> {
     cs_preoutput_diagnostic_start(process_start, &spec.config.defense);
-    buflo_preoutput_diagnostic_start(process_start, &spec.config.defense);
     let mut traces = TraceFiles::new(&spec.output_dir, process_start)?;
-    if matches!(
-        &spec.config.defense,
-        DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
-    ) {
+    if matches!(&spec.config.defense, DefenseConfig::CsBuflo(_)) {
         traces.require_cs_incoming_process_witnesses();
     }
     let observation_clock = QcsdObservationClock::new(process_start);
@@ -17731,6 +16545,12 @@ async fn execute_run_inner(
             .as_ref()
             .map(RuntimeChaffManifest::resource_manifest),
     )?;
+    if CS_RBING_SAME_WINDOW_CAPACITY_RETRY_ENABLED && rbing_same_window_retry_scope(spec) {
+        controller.enable_cs_rbing_same_window_capacity_retry("r.bing.com")?;
+        traces.event(self::now(), None, "cs_rbing_same_window_capacity_retry_policy", "enabled_before_controller_work",
+            &json!({"policy":"prospective-rbing-unallocated600-same5000us-window-v1", "retry_wake_us":250,
+                "deadline_extended":false,"scheduled_credit_issued":false,"wire_handoff_claimed":false}))?;
+    }
     if controller.configure_cs_live_chaff_header_progress()? {
         traces.event(
             self::now(),
@@ -17745,10 +16565,80 @@ async fn execute_run_inner(
             }),
         )?;
     }
+    if CS_RBING_CURRENT_DATA_ENABLED && rbing_same_window_retry_scope(spec) {
+        controller.enable_cs_rbing_current_data("r.bing.com")?;
+        traces.event(self::now(), None, "cs_rbing_current_data_policy", "enabled_before_controller_work",
+            &json!({"policy":"prospective-rbing-current-DATA-only-v1", "lifetime_parser_budget_bytes":1000,
+                "remaining_prefix_bytes":16,"deadline_extended":false,"prepared_extent_is_capacity":false}))?;
+    }
+    if CS_RBING_OWNED_DATA_CONTINUATION_ENABLED && rbing_same_window_retry_scope(spec) {
+        controller.enable_cs_rbing_owned_data_continuation("r.bing.com")?;
+        traces.event(
+            self::now(),
+            None,
+            "cs_rbing_owned_data_continuation_policy",
+            "enabled_before_controller_work",
+            &json!({"policy":"prospective-rbing-owned-DATA-continuation-v1",
+                "due_cell_bytes":600,"unowned_lifetime_bytes":1000,
+                "deadline_extended":false,"prepared_extent_is_capacity":false}),
+        )?;
+    }
+    if let Some(receipt) = terminal_chaff_partial_cell_policy_receipt(spec) {
+        let policy = spec
+            .application_workload_source
+            .as_ref()
+            .map(|source| source.10)
+            .expect("terminal chaff policy receipt requires prepared policy");
+        if policy
+            == TerminalChaffPartialCellPolicy::RbingCs600B817PostLeaseLiveDataFrameSameStreamSuccessorThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+        {
+            controller.enable_cs_rbing_terminal_chaff_partial_replenishment_b817(
+                "r.bing.com",
+                RBING_TERMINAL_CHAFF_RESOURCE_ID,
+            )?;
+        } else if policy
+            == TerminalChaffPartialCellPolicy::RbingCs600B816DueOnlyPreproofActiveR4ParserCapacityThenFirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+        {
+            controller.enable_cs_rbing_terminal_chaff_partial_replenishment_b816(
+                "r.bing.com",
+                RBING_TERMINAL_CHAFF_RESOURCE_ID,
+            )?;
+        } else if policy
+            == TerminalChaffPartialCellPolicy::RbingCs600B815FirstProvenFinClosesReplenishmentAndStopsFreshIncoming
+        {
+            controller.enable_cs_rbing_terminal_chaff_partial_replenishment_b815(
+                "r.bing.com",
+                RBING_TERMINAL_CHAFF_RESOURCE_ID,
+            )?;
+        } else if policy
+            == TerminalChaffPartialCellPolicy::RbingCs600FirstProvenFinClosesReplenishment
+        {
+            controller.enable_cs_rbing_terminal_chaff_partial_replenishment_closure(
+                "r.bing.com",
+                RBING_TERMINAL_CHAFF_RESOURCE_ID,
+            )?;
+        } else {
+            controller.enable_cs_rbing_terminal_chaff_partial(
+                "r.bing.com",
+                RBING_TERMINAL_CHAFF_RESOURCE_ID,
+            )?;
+        }
+        traces.event(
+            self::now(),
+            None,
+            "terminal_chaff_partial_cell_policy",
+            "enabled_before_controller_work",
+            &receipt,
+        )?;
+    }
     let incoming_policy = bound_buflo_incoming_credit_release_policy(spec)?;
     if incoming_policy != BufloIncomingCreditReleasePolicy::LegacyControlInterval {
         controller
             .enable_buflo_half_period_incoming_window_for_interval(incoming_policy.period_us())?;
+        if incoming_policy.period_us() == 64_000 {
+            controller.enable_buflo_outgoing_20ms_variant()?;
+            traces.event(self::now(), None, "buflo_outgoing_window_variant", "enabled_before_controller_work", &json!({"policy":"buflo-outgoing-20ms-prospective-v1", "cadence_us":64000,"window_us":20000,"cell_bytes":1200,"no_catch_up":true}))?;
+        }
     }
     if matches!(spec.config.defense, DefenseConfig::Buflo(_))
         && spec
@@ -17796,6 +16686,9 @@ async fn execute_run_inner(
     if spec.config.buflo_retained_parser_fin_permission {
         controller.enable_buflo_retained_parser_fin_permission_policy()?;
     }
+    if spec.config.buflo_direct_fin_credit_reassignment {
+        controller.enable_buflo_direct_fin_credit_reassignment()?;
+    }
     if front_v5_light_enabled(spec) {
         controller.enable_front_v5_light_padding_window()?;
     } else if front_v3_padding_window_enabled(spec) || front_v4_preparation_reserve_enabled(spec) {
@@ -17837,8 +16730,9 @@ async fn execute_run_inner(
         ));
     }
     #[cfg(target_os = "linux")]
-    let mut buflo_pre_selection_diagnostic =
-        buflo_kernel_tx.as_ref().map(|_| BufloPreSelectionDiagnostic::new());
+    let mut buflo_pre_selection_diagnostic = buflo_kernel_tx
+        .as_ref()
+        .map(|_| BufloPreSelectionDiagnostic::new());
     let mut defense_start = None;
     let mut application_completion = None;
     let mut application_complete_observed = false;
@@ -18337,7 +17231,6 @@ async fn execute_run_inner(
             let control_now = now();
             let control_elapsed = defense_elapsed_at!(control_now);
             cs_preoutput_diagnostic_control(control_now, control_elapsed, defense_start);
-            buflo_preoutput_diagnostic_control(control_now, control_elapsed, defense_start);
             if let Some(defense_elapsed) = control_elapsed {
                 handle_all_qcsd_observations(
                     &mut endpoints,
@@ -18351,7 +17244,6 @@ async fn execute_run_inner(
                     matches!(&spec.config.defense, DefenseConfig::Buflo(_))
                         && controller.defense_diagnostics().buflo_schedule_stop_latched;
                 cs_preoutput_diagnostic_mark(1);
-                buflo_preoutput_diagnostic_mark(1, None, None);
                 let (egress_stream_backlog_pending, egress_backlog_pending) = if candidate_defense {
                     endpoints
                         .iter_mut()
@@ -18411,9 +17303,7 @@ async fn execute_run_inner(
                     controller.observe(record.into_observation(), defense_elapsed);
                 }
                 cs_preoutput_diagnostic_mark(2);
-                buflo_preoutput_diagnostic_mark(2, None, None);
                 cs_preoutput_diagnostic_mark(3);
-                buflo_preoutput_diagnostic_mark(3, None, None);
                 observe_completed_application(
                     &mut controller,
                     &mut traces,
@@ -18425,10 +17315,8 @@ async fn execute_run_inner(
                     defense_elapsed,
                 )?;
                 cs_preoutput_diagnostic_mark(4);
-                buflo_preoutput_diagnostic_mark(4, None, None);
                 controller.flush_defense_observations();
                 cs_preoutput_diagnostic_mark(5);
-                buflo_preoutput_diagnostic_mark(5, None, None);
                 ensure_defense_realizable(&controller)?;
                 yield_to_exact_boundaries!('runner, "after-control-flush-realizability");
                 if controller.has_rolling_outgoing_prearm()
@@ -18451,14 +17339,11 @@ async fn execute_run_inner(
                 let kernel_tick_zero_pending = false;
                 if !kernel_tick_zero_pending {
                     cs_preoutput_diagnostic_mark(6);
-                    buflo_preoutput_diagnostic_mark(6, None, None);
                     controller.poll(defense_elapsed);
                     cs_preoutput_diagnostic_mark(7);
-                    buflo_preoutput_diagnostic_mark(7, None, None);
                     first_control_poll_complete = true;
                     ensure_defense_realizable(&controller)?;
                     cs_preoutput_diagnostic_mark(8);
-                    buflo_preoutput_diagnostic_mark(8, None, None);
                     apply_queued_actions(
                         &mut endpoints,
                         &mut controller,
@@ -18468,16 +17353,13 @@ async fn execute_run_inner(
                         defense_elapsed,
                     )?;
                     cs_preoutput_diagnostic_mark(13);
-                    buflo_preoutput_diagnostic_mark(13, None, None);
                 }
                 cs_preoutput_diagnostic_mark(14);
-                buflo_preoutput_diagnostic_mark(14, None, None);
                 yield_to_exact_boundaries!('runner, "after-control-poll-actions");
             }
 
             for endpoint_index in 0..endpoints.len() {
                 cs_preoutput_diagnostic_mark(18);
-                buflo_preoutput_diagnostic_mark(18, None, None);
                 yield_to_exact_boundaries!('runner, "before-second-output-drive");
                 if let Some(boundary) = tamaraw_ordinary_work_boundary(
                     &controller,
@@ -18579,6 +17461,27 @@ async fn execute_run_inner(
                 now(),
                 &mut buflo_incoming_startup_recorded,
             )?;
+            if application_complete_observed && matches!(spec.config.defense, DefenseConfig::WtfPad(_)) {
+                if let Some(start) = defense_start {
+                    let current = now();
+                    let elapsed = current.saturating_duration_since(start);
+                    {
+                        if let Some((bytes, quiet_us)) = controller.experimental_retire_wtf_pad_tiny_tail(elapsed) {
+                            traces.event(current, None, "wtf_pad_experimental_tiny_tail", "retired", &json!({
+                                "retired_bytes": bytes, "maximum_bytes": 8, "minimum_quiet_seconds": 2,
+                                "quiet_since_last_defense_observation_us": quiet_us,
+                                "semantics": "experimental abbreviated incoming cover tail; retired bytes remain shortfall"
+                            }))?;
+                            record_queued_terminal_actions(&mut controller, &mut traces, current,
+                                TerminalActionSemantics::ExplicitCancellation(MissedSlotReason::DeadlineExpired))?;
+                            next_wakeup = current;
+                        }
+                    }
+                    // Recheck quiet terminal state even when no other deadline remains.
+                    let recheck = current.checked_add(Duration::from_secs(1)).unwrap_or(deadline);
+                    if recheck < next_wakeup { next_wakeup = recheck; }
+                }
+            }
             if application_complete_observed
                 && controller.is_complete()
                 && endpoints.iter_mut().all(|endpoint| {
@@ -18695,26 +17598,15 @@ async fn execute_run_inner(
             if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
                 diagnostic.record("before-runner-reactor-wait");
             }
-            #[cfg(target_os = "linux")]
-            let mut runner_wait_observation = buflo_pre_selection_diagnostic.as_ref().map(|_| {
-                BufloRunnerWaitSample::begin(next_wakeup, runner_wait_policy,
-                    spec.config.buflo_retained_parser_fin_permission)
-            });
-            let runner_wake_result = wait_for_runner_activity_until_observed(
+            let runner_wake_result = wait_for_runner_activity_until(
                 &endpoints,
                 next_wakeup,
                 spec.config.buflo_retained_parser_fin_permission,
                 runner_wait_policy,
-                #[cfg(target_os = "linux")]
-                runner_wait_observation.as_mut(),
             )
             .await;
             #[cfg(target_os = "linux")]
             if let Some(diagnostic) = buflo_pre_selection_diagnostic.as_mut() {
-                if let Some(mut observation) = runner_wait_observation {
-                    observation.finish(&runner_wake_result);
-                    diagnostic.record_runner_wait(observation);
-                }
                 diagnostic.record("after-runner-reactor-wait");
             }
             let Some(wake) = runner_wake_result? else {
@@ -18729,7 +17621,11 @@ async fn execute_run_inner(
     .await;
     if loop_result.is_err() {
         cs_preoutput_diagnostic_freeze("first-loop-error-before-terminal-cleanup");
-        buflo_preoutput_diagnostic_freeze("first-loop-error-before-terminal-cleanup");
+        if matches!(spec.config.defense, DefenseConfig::CsBuflo(_))
+            && let Err(error) = &loop_result
+        {
+            emit_cs_failed_output_builder_state(&endpoints, error);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -18906,6 +17802,10 @@ async fn execute_run_inner(
                 terminal_primary_partial_cell: controller
                     .terminal_primary_partial_cell()
                     .map(|proof| json!(proof)),
+                terminal_chaff_partial_cells: Some(json!(controller.terminal_chaff_partial_cells())),
+                terminal_chaff_replenishment_closure: controller.terminal_chaff_replenishment_closure().map(|closure| json!(closure)),
+                terminal_chaff_postlease_live_data: controller
+                    .terminal_chaff_postlease_live_data().map(|record| json!(record)),
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -18961,6 +17861,10 @@ async fn execute_run_inner(
                 terminal_primary_partial_cell: controller
                     .terminal_primary_partial_cell()
                     .map(|proof| json!(proof)),
+                terminal_chaff_partial_cells: Some(json!(controller.terminal_chaff_partial_cells())),
+                terminal_chaff_replenishment_closure: controller.terminal_chaff_replenishment_closure().map(|closure| json!(closure)),
+                terminal_chaff_postlease_live_data: controller
+                    .terminal_chaff_postlease_live_data().map(|record| json!(record)),
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -18999,6 +17903,10 @@ async fn execute_run_inner(
             terminal_primary_partial_cell: controller
                 .terminal_primary_partial_cell()
                 .map(|proof| json!(proof)),
+            terminal_chaff_partial_cells: Some(json!(controller.terminal_chaff_partial_cells())),
+            terminal_chaff_replenishment_closure: controller.terminal_chaff_replenishment_closure().map(|closure| json!(closure)),
+            terminal_chaff_postlease_live_data: controller
+                .terminal_chaff_postlease_live_data().map(|record| json!(record)),
         },
     );
     let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -19048,6 +17956,10 @@ async fn execute_run_inner(
                 terminal_primary_partial_cell: controller
                     .terminal_primary_partial_cell()
                     .map(|proof| json!(proof)),
+                terminal_chaff_partial_cells: Some(json!(controller.terminal_chaff_partial_cells())),
+                terminal_chaff_replenishment_closure: controller.terminal_chaff_replenishment_closure().map(|closure| json!(closure)),
+                terminal_chaff_postlease_live_data: controller
+                    .terminal_chaff_postlease_live_data().map(|record| json!(record)),
             },
         );
         let mut writer = |path: &Path, bytes: &[u8]| atomic_write(path, bytes);
@@ -19113,14 +18025,14 @@ fn expected_application_response_length(
 fn application_response_length_hint(spec: &RunSpec, resource: &Resource) -> Option<u64> {
     let variable_primary = resource.id == 0
         && spec.application_workload_source.as_ref().is_some_and(
-            |(_, _, _, _, _, policy, _, _, _, _)| {
+            |(_, _, _, _, _, policy, _, _, _, _, _)| {
                 *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
             },
         );
     let current_buflo_observed_extent =
         matches!(spec.config.defense, DefenseConfig::Buflo(_))
             && spec.application_workload_source.as_ref().is_some_and(
-                |(_, _, _, _, _, _, policy, _, _, _)| {
+                |(_, _, _, _, _, _, policy, _, _, _, _)| {
                     *policy
                         == BufloIncomingCreditReleasePolicy::RapidV7Cadence64msAckStartPreparationReserve
                 },
@@ -19319,11 +18231,14 @@ fn create_endpoint_inventory(
                 )
                 .is_some(),
                 terminal_primary_partial_recorded: false,
+                terminal_chaff_partial_enabled: terminal_chaff_partial_cell_policy_receipt(spec)
+                    .is_some(),
+                terminal_chaff_partial_recorded_slots: HashSet::new(),
+                terminal_chaff_replenishment_closure_recorded: false,
                 transport_instant_floor: start,
                 pending,
                 application_stream_limit_blocked: false,
                 pending_chaff_requests: VecDeque::new(),
-                pending_cs_terminal_cancellations: VecDeque::new(),
                 chaff_stream_limit_blocked: false,
                 streams: HashMap::new(),
                 application_send_streams: BTreeSet::new(),
@@ -19736,7 +18651,6 @@ fn candidate_aggregate_snapshot_should_emit(
 
 fn endpoint_send_terminal(endpoint: &mut Endpoint, candidate_defense: bool) -> bool {
     endpoint.pending_chaff_requests.is_empty()
-        && endpoint.pending_cs_terminal_cancellations.is_empty()
         && (!candidate_defense
             || (!endpoint_egress_backlog_pending(endpoint, true)
                 && application_send_halves_peer_confirmed(endpoint)
@@ -20167,7 +19081,7 @@ fn finish_application_record(
         && record.resource_id == 0
         && spec.is_some_and(|spec| {
             spec.application_workload_source.as_ref().is_some_and(
-                |(_, _, _, _, _, policy, _, _, _, _)| {
+                |(_, _, _, _, _, policy, _, _, _, _, _)| {
                     *policy == PrimaryDocumentIdentityPolicy::VariablePrimaryDocumentBody
                 },
             )
@@ -20372,11 +19286,77 @@ fn forward_qcsd_observation(
             QcsdObservation::ClassifiedDatagram { .. }
         )
     {
-        controller.observe(
+        controller.observe_with_production_metadata(
             observation.observation().clone(),
             defense_elapsed.unwrap_or(Duration::ZERO),
+            observation.sequence(),
+            observation.produced_monotonic_ns(),
         );
     }
+}
+
+/// Emit B817's physical completion witness only after the timestamped
+/// transport callback has been reduced and joined to the original owner range.
+///
+/// An adapter-applied receive action is deliberately not this proof: it can
+/// still be pending output. Parser leases are slotless at this callback
+/// boundary, so the receipt identifies the original slot through the
+/// controller's live owner range instead of inventing a transport slot.
+fn trace_b817_owned_lease_advertisement(
+    endpoint: &Endpoint,
+    controller: &QcsdController,
+    traces: &mut TraceFiles,
+    observation: &TimestampedQcsdObservation,
+) -> Result<(), Error> {
+    let QcsdObservation::ReceiveLimitAdvertised {
+        endpoint: observed_endpoint,
+        stream,
+        absolute_limit,
+        slot,
+    } = observation.observation()
+    else {
+        return Ok(());
+    };
+    let Some(receipt) = controller.terminal_chaff_postlease_live_data() else {
+        return Ok(());
+    };
+    let physically_realized = *observed_endpoint == endpoint.id
+        && slot.is_none()
+        && receipt.endpoint == observed_endpoint.0
+        && receipt.stream == stream.0
+        && receipt.owned_lease_end == *absolute_limit
+        && receipt.owned_advertised_predeadline_verified
+        && receipt.owned_advertised_at_ns.is_some()
+        && receipt.owned_advertised_production_sequence == Some(observation.sequence())
+        && receipt.owned_advertised_production_monotonic_ns
+            == Some(observation.produced_monotonic_ns());
+    if !physically_realized {
+        return Ok(());
+    }
+    traces.event(
+        now(),
+        Some(endpoint.id),
+        "b817_post_lease_live_data_successor",
+        "owned_receive_limit_advertised",
+        &json!({
+            "schema_version": receipt.schema_version,
+            "source": receipt.source,
+            "policy": receipt.policy,
+            "receipt": receipt,
+            "transport_observation_slot": slot.map(|slot| slot.0),
+            "matched_original_owner_slot": receipt.slot,
+            "matched_owned_lease_start": receipt.owned_lease_start,
+            "matched_owned_lease_end": receipt.owned_lease_end,
+            "production_sequence": observation.sequence(),
+            "production_monotonic_ns": observation.produced_monotonic_ns(),
+            "original_deadline_us": receipt.original_deadline_us,
+            "original_deadline_ns": receipt.original_deadline_ns,
+            "owned_advertised_at_ns": receipt.owned_advertised_at_ns,
+            "advertised_before_original_deadline": receipt.owned_advertised_predeadline_verified,
+            "adapter_action_application_is_not_physical_advertisement": true,
+        }),
+    )?;
+    Ok(())
 }
 
 fn reduce_connected_endpoint_readiness(
@@ -20396,7 +19376,12 @@ fn reduce_connected_endpoint_readiness(
     };
     let reduced_at = defense_elapsed.unwrap_or(Duration::ZERO);
     let reduced_process_at = now();
-    controller.observe(record.observation.clone(), reduced_at);
+    controller.observe_with_production_metadata(
+        record.observation.clone(),
+        reduced_at,
+        record.production_sequence,
+        record.production_monotonic_ns,
+    );
     endpoint.connected_readiness_reduced = true;
     traces.event(
         reduced_process_at,
@@ -20454,6 +19439,7 @@ fn forward_endpoint_qcsd_observation(
     }
     traces.prepare_buflo_fin_permission_observation(controller, record)?;
     forward_qcsd_observation(controller, record, defense_elapsed);
+    trace_b817_owned_lease_advertisement(endpoint, controller, traces, record)?;
     Ok(())
 }
 
@@ -20909,6 +19895,101 @@ fn record_qcsd_observation(
             proof,
         )?;
         endpoint.terminal_primary_partial_recorded = true;
+    }
+    if endpoint.terminal_chaff_partial_enabled
+        && let QcsdObservation::StreamFinished {
+            stream,
+            finish: neqo_csdef::QcsdStreamFinish::Fin,
+            ..
+        } = observation
+        && let Some(proof) = controller
+            .terminal_chaff_partial_cells()
+            .iter()
+            .find(|proof| {
+                proof.endpoint == endpoint.id.0
+                    && proof.stream == stream.0
+                    && !endpoint
+                        .terminal_chaff_partial_recorded_slots
+                        .contains(&QcsdSlotId(proof.slot))
+            })
+    {
+        let reduced_at = controller_defense_elapsed.ok_or_else(|| {
+            Error::SlotInvariant(
+                "terminal-chaff FIN lacks its actual controller reduction clock".into(),
+            )
+        })?;
+        let reduced_us = duration_as_trace_micros(reduced_at);
+        if reduced_us != proof.fin_at_us {
+            return Err(Error::SlotInvariant(
+                "terminal-chaff FIN reduction clock differs from its actual ledger".into(),
+            ));
+        }
+        let produced_at = endpoint
+            .receive_loop
+            .origin
+            .checked_add(Duration::from_nanos(record.produced_monotonic_ns()))
+            .ok_or_else(|| {
+                Error::SlotInvariant("terminal-chaff FIN production timestamp overflow".into())
+            })?;
+        traces.event(
+            produced_at,
+            Some(endpoint.id),
+            "terminal_chaff_fin_reduction",
+            "controller_reduced",
+            &json!({
+                "schema_version": 1,
+                "source": "native-controller-defense-elapsed-us-v1",
+                "production_sequence": record.sequence(),
+                "production_monotonic_ns": record.produced_monotonic_ns(),
+                "controller_defense_elapsed_us": reduced_us,
+                "observation": observation,
+            }),
+        )?;
+        traces.event(
+            produced_at,
+            Some(endpoint.id),
+            "terminal_chaff_partial_cell",
+            "partial",
+            proof,
+        )?;
+        if !endpoint.terminal_chaff_replenishment_closure_recorded
+            && let Some(closure) = controller.terminal_chaff_replenishment_closure()
+            && closure.endpoint == proof.endpoint
+            && closure.stream == proof.stream
+            && closure.slot == proof.slot
+        {
+            traces.event(
+                produced_at,
+                Some(endpoint.id),
+                "terminal_chaff_replenishment_closure",
+                "closed_after_first_proven_partial",
+                &json!({
+                    "schema_version": closure.schema_version,
+                    "source": "native-controller-defense-elapsed-us-v1",
+                    "policy": closure.policy,
+                    "resource_id": closure.resource_id,
+                    "request_id": closure.request_id,
+                    "endpoint": closure.endpoint,
+                    "stream": closure.stream,
+                    "slot": closure.slot,
+                    "proof_count": closure.proof_count,
+                    "future_replenishment": closure.future_replenishment,
+                    "active_streams": closure.active_streams,
+                    "production_sequence": record.sequence(),
+                    "production_monotonic_ns": record.produced_monotonic_ns(),
+                    "controller_defense_elapsed_us": reduced_us,
+                }),
+            )?;
+            endpoint.terminal_chaff_replenishment_closure_recorded = true;
+        }
+        if !endpoint
+            .terminal_chaff_partial_recorded_slots
+            .insert(QcsdSlotId(proof.slot))
+        {
+            return Err(Error::SlotInvariant(
+                "terminal-chaff partial proof was recorded twice".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -21964,13 +21045,9 @@ fn cancel_rejected_receive_streams(
 
     // Cancellation and terminal observations are a reducer barrier: no later,
     // unrelated action may reach an adapter before global ordered delivery.
-    cs_preoutput_diagnostic_mark(24);
-    buflo_preoutput_diagnostic_mark(24, None, None);
     handle_all_qcsd_observations(endpoints, controller, traces, defense_elapsed)?;
     controller.flush_defense_observations();
     ensure_defense_realizable(controller)?;
-    cs_preoutput_diagnostic_mark(25);
-    buflo_preoutput_diagnostic_mark(25, None, None);
     Ok(canceled_indices)
 }
 
@@ -21984,17 +21061,9 @@ fn apply_action_batch(
     actions: Vec<QcsdAction>,
 ) -> Result<(), Error> {
     cs_preoutput_diagnostic_mark(9);
-    buflo_preoutput_diagnostic_mark(9, None, None);
-    buflo_preoutput_diagnostic_mark(36, None, None);
     let incoming_fanout_slots = register_action_batch(traces, now, &actions)?;
-    buflo_preoutput_diagnostic_mark(37, None, None);
-    buflo_preoutput_diagnostic_mark(38, None, None);
     let preflight = preflight_receive_action_batch(endpoints, traces, now, &actions)?;
-    buflo_preoutput_diagnostic_mark(39, None, None);
     cs_preoutput_diagnostic_mark(10);
-    buflo_preoutput_diagnostic_mark(10, None, None);
-    cs_preoutput_diagnostic_mark(22);
-    buflo_preoutput_diagnostic_mark(22, None, None);
     let canceled_indices = cancel_rejected_receive_streams(
         endpoints,
         controller,
@@ -22004,8 +21073,6 @@ fn apply_action_batch(
         &actions,
         &preflight.rejected_streams,
     )?;
-    cs_preoutput_diagnostic_mark(23);
-    buflo_preoutput_diagnostic_mark(23, None, None);
     for (index, action) in actions.into_iter().enumerate() {
         if let Some(outcome) = canceled_indices.get(&index).copied() {
             let event_outcome = format!("canceled_receive_{}", receive_limit_outcome_name(outcome));
@@ -22020,8 +21087,6 @@ fn apply_action_batch(
         }
         let may_skip_terminal_sibling = scheduled_action(&action)
             .is_some_and(|(_, _, slot)| incoming_fanout_slots.contains(&slot));
-        cs_preoutput_diagnostic_mark(26);
-        buflo_preoutput_diagnostic_mark(26, None, None);
         apply_action(
             endpoints,
             controller,
@@ -22033,38 +21098,6 @@ fn apply_action_batch(
             may_skip_terminal_sibling,
             preflight.expected[index],
         )?;
-        cs_preoutput_diagnostic_mark(27);
-        buflo_preoutput_diagnostic_mark(27, None, None);
-    }
-    Ok(())
-}
-
-fn cs_terminal_packet_progress(endpoint: &Endpoint) -> (usize, usize) {
-    let stats = endpoint.client.transport_stats();
-    (stats.packets_rx, stats.packets_tx)
-}
-
-fn retry_pending_cs_terminal_cancellations(
-    endpoints: &mut [Endpoint],
-    controller: &mut QcsdController,
-    chaff_manifest: Option<&RuntimeChaffManifest>,
-    traces: &mut TraceFiles,
-    now: Instant,
-    defense_elapsed: Duration,
-) -> Result<(), Error> {
-    for index in 0..endpoints.len() {
-        let progress = cs_terminal_packet_progress(&endpoints[index]);
-        let pending = std::mem::take(&mut endpoints[index].pending_cs_terminal_cancellations);
-        for item in pending {
-            if item.deferred_packet_progress == progress {
-                endpoints[index].pending_cs_terminal_cancellations.push_back(item);
-                continue;
-            }
-            // Apply once after genuine protocol I/O progress. If still busy,
-            // apply_action requeues with this new exact packet fingerprint.
-            apply_action(endpoints, controller, chaff_manifest, traces, now,
-                defense_elapsed, item.action, false, None)?;
-        }
     }
     Ok(())
 }
@@ -22077,16 +21110,7 @@ fn apply_queued_actions(
     now: Instant,
     defense_elapsed: Duration,
 ) -> Result<(), Error> {
-    cs_preoutput_diagnostic_mark(32);
-    buflo_preoutput_diagnostic_mark(32, None, None);
-    retry_pending_cs_terminal_cancellations(
-        endpoints, controller, chaff_manifest, traces, now, defense_elapsed,
-    )?;
-    cs_preoutput_diagnostic_mark(33);
-    buflo_preoutput_diagnostic_mark(33, None, None);
     loop {
-        cs_preoutput_diagnostic_mark(28);
-        buflo_preoutput_diagnostic_mark(28, None, None);
         retry_pending_chaff_requests(
             endpoints,
             controller,
@@ -22095,19 +21119,20 @@ fn apply_queued_actions(
             now,
             defense_elapsed,
         )?;
-        cs_preoutput_diagnostic_mark(29);
-        buflo_preoutput_diagnostic_mark(29, None, None);
         // FRONT's frozen schedule is reconciled before every action batch so
         // RequestChaff-created streams can immediately receive any due credit
         // before a prearmed outgoing target is eligible to flush.
-        cs_preoutput_diagnostic_mark(30);
-        buflo_preoutput_diagnostic_mark(30, None, None);
         controller.reconcile_due_fixed(defense_elapsed);
-        cs_preoutput_diagnostic_mark(31);
-        buflo_preoutput_diagnostic_mark(31, None, None);
-        buflo_preoutput_diagnostic_mark(34, None, None);
+        for (slot, packet, attempted_at, next_wake) in
+            controller.drain_cs_rbing_capacity_retry_observations()
+        {
+            traces.event(now, None, "cs_rbing_same_window_capacity_retry", "uncommitted_allocation_rolled_back",
+                &json!({"slot":slot.0,"packet_timestamp_us":packet.timestamp_us(),"cell_bytes":packet.length(),
+                    "attempted_at_us":attempted_at.as_micros(),"next_wake_us":next_wake.as_micros(),
+                    "original_deadline_us":packet.timestamp_us().saturating_add(5_000),
+                    "scheduled_credit_issued":false,"wire_handoff_claimed":false}))?;
+        }
         let actions: Vec<_> = controller.drain_actions().collect();
-        buflo_preoutput_diagnostic_mark(35, None, None);
         if actions.is_empty() {
             return Ok(());
         }
@@ -22378,54 +21403,6 @@ fn abandon_buflo_terminal_chaff(
 /// handoff. Complete-application cleanup accepts either an exact drained
 /// response or the separately proved untouched initial sixteen-byte window;
 /// its unread QUIC bytes remain buffered. No STOP/RESET/credit/QPACK is queued.
-fn cs_terminal_chaff_readiness(
-    endpoint: &mut Endpoint,
-    controller: &QcsdController,
-    stream: StreamId,
-) -> Result<neqo_http3::QcsdCsTerminalReadiness, Error> {
-    let diagnostics = controller.defense_diagnostics();
-    if !matches!(controller.config().defense, DefenseConfig::CsBuflo(_))
-        || !diagnostics.cs_buflo_application_complete
-        || !diagnostics.cs_buflo_local_termination_latched
-        || !diagnostics.cs_buflo_outgoing_termination_stop_latched
-        || !diagnostics.cs_buflo_incoming_termination_stop_latched
-        || diagnostics.scheduled_incoming_unresolved_bytes != 0
-        || controller.terminal_failure().is_some()
-        || !endpoint.pending_chaff_requests.is_empty()
-    {
-        return Err(Error::SlotInvariant(
-            "CS-BuFLO local abandonment lacks the original drained terminal latch".into(),
-        ));
-    }
-    let record = endpoint.streams.get(&stream).ok_or_else(|| {
-        Error::SlotInvariant("CS-BuFLO local abandonment targeted unknown chaff".into())
-    })?;
-    let QcsdRequestRole::Chaff {
-        resource_id,
-        request_id: Some(request_id),
-    } = record.role
-    else {
-        return Err(Error::SlotInvariant(
-            "CS-BuFLO local abandonment targeted an unqualified non-chaff identity".into(),
-        ));
-    };
-    if record.complete
-        || record.outcome != "in_flight"
-        || endpoint
-            .terminal_local_abandonments
-            .iter()
-            .any(|proof| proof["stream"].as_u64() == Some(stream.as_u64()))
-    {
-        return Err(Error::SlotInvariant(
-            "CS-BuFLO local abandonment targeted a completed or repeated response".into(),
-        ));
-    }
-    let witness = controller.cs_buflo_terminal_parser_allowance(
-        endpoint.id, neqo_csdef::QcsdStreamId(stream.as_u64()),
-    );
-    Ok(endpoint.client.qcsd_cs_terminal_chaff_readiness(stream, record.role, witness.as_ref())?)
-}
-
 fn abandon_cs_buflo_terminal_chaff(
     endpoint: &mut Endpoint,
     controller: &QcsdController,
@@ -22592,7 +21569,7 @@ fn apply_action(
     normalize_rolling_prearm_window(
         &mut action,
         defense_elapsed,
-        controller.config().control_interval(),
+        controller.rolling_outgoing_realization_window(),
     )?;
     let endpoint_id = action_endpoint(&action);
     let action_time_us = traces.elapsed_us(now);
@@ -22707,6 +21684,28 @@ fn apply_action(
         return Ok(());
     };
     let transport_at = endpoint.transport_instant(now);
+    if let QcsdAction::RequestChaff {
+        resource,
+        request_id,
+        ..
+    } = &trace_action
+        && controller.reject_terminal_chaff_replenishment(resource.id, *request_id)
+    {
+        traces.event(
+            now,
+            endpoint_id,
+            "terminal_chaff_replenishment",
+            "request_rejected",
+            &json!({
+                "schema_version": 1,
+                "policy": "r-bing-cs600-first-proven-terminal-chaff-fin-closes-replenishment-v1",
+                "resource_id": resource.id,
+                "request_id": request_id.0,
+                "stream_opened": false,
+            }),
+        )?;
+        return Ok(());
+    }
     if let QcsdAction::CancelPrearmedPacket { packet, slot, .. } = &trace_action {
         let Some(index) = endpoint
             .prearmed_outgoing
@@ -22782,11 +21781,132 @@ fn apply_action(
             )));
         }
         cs_preoutput_diagnostic_receive(11, &trace_action, controller.config().control_interval());
-        buflo_preoutput_diagnostic_receive(11, &trace_action, controller.config().control_interval());
         match endpoint.client.apply_qcsd_receive_action(&trace_action) {
             Ok(Some(QcsdReceiveLimitOutcome::Applied)) => {
-                cs_preoutput_diagnostic_receive(12, &trace_action, controller.config().control_interval());
-                buflo_preoutput_diagnostic_receive(12, &trace_action, controller.config().control_interval());
+                cs_preoutput_diagnostic_receive(
+                    12,
+                    &trace_action,
+                    controller.config().control_interval(),
+                );
+                if let QcsdAction::LeaseParserReceive {
+                    endpoint: lease_endpoint,
+                    stream,
+                    absolute_limit,
+                    increase,
+                    owner: None,
+                } = &trace_action
+                    && let Some(record) = controller.b816_preproof_capacity_witness(
+                        *lease_endpoint,
+                        *stream,
+                        *absolute_limit,
+                        *increase,
+                    )
+                {
+                    traces.event(
+                        now,
+                        endpoint_id,
+                        "b816_preproof_active_chaff_capacity",
+                        "adapter_accepted_pending_wire_advertisement",
+                        &json!({
+                            "schema_version": record.schema_version,
+                            "source": record.source,
+                            "policy": record.policy,
+                            "resource_id": record.resource_id,
+                            "endpoint": record.endpoint,
+                            "stream": record.stream,
+                            "frontier": record.frontier,
+                            "later_slot": record.slot,
+                            "original_target_us": record.target_us,
+                            "lease_start": record.lease_start,
+                            "lease_end": record.lease_end,
+                            "lease_bytes": record.lease_bytes,
+                            "prepared_at_us": record.prepared_at_us,
+                            "materialized_at_us": record.materialized_at_us,
+                            "owner": null,
+                            "scheduled_credit_issued": false,
+                            "wire_handoff_claimed": false,
+                            "request_or_stream_created": false,
+                        }),
+                    )?;
+                }
+                if let QcsdAction::LeaseParserReceive {
+                    endpoint: lease_endpoint,
+                    stream,
+                    absolute_limit,
+                    increase,
+                    owner: Some(owner),
+                } = &trace_action
+                    && let Some(record) = controller.terminal_chaff_preproof_capacity_preparation()
+                    && record.endpoint == lease_endpoint.0
+                    && record.stream == stream.0
+                    && record.slot == owner.slot.0
+                    && *increase == 600
+                    && record.lease_end.checked_add(600) == Some(*absolute_limit)
+                    && record.materialized_at_us.is_some()
+                {
+                    traces.event(
+                        now,
+                        endpoint_id,
+                        "b816_preproof_active_chaff_capacity",
+                        "original_slot_materialized_after_real_capacity",
+                        &json!({
+                            "schema_version": record.schema_version,
+                            "source": record.source,
+                            "policy": record.policy,
+                            "resource_id": record.resource_id,
+                            "endpoint": record.endpoint,
+                            "stream": record.stream,
+                            "frontier": record.frontier,
+                            "later_slot": record.slot,
+                            "original_target_us": record.target_us,
+                            "lease_start": record.lease_start,
+                            "lease_end": record.lease_end,
+                            "lease_bytes": record.lease_bytes,
+                            "prepared_at_us": record.prepared_at_us,
+                            "materialized_at_us": record.materialized_at_us,
+                            "owner_slot": owner.slot.0,
+                            "owned_lease_start": absolute_limit - increase,
+                            "owned_lease_end": absolute_limit,
+                            "owned_lease_bytes": increase,
+                            "preproof_scheduled_credit_issued": false,
+                            "request_or_stream_created": false,
+                        }),
+                    )?;
+                }
+                if let QcsdAction::LeaseParserReceive {
+                    endpoint: lease_endpoint,
+                    stream,
+                    absolute_limit,
+                    increase,
+                    owner: Some(owner),
+                } = &trace_action
+                    && let Some(record) = controller.terminal_chaff_postlease_live_data()
+                    && record.endpoint == lease_endpoint.0
+                    && record.stream == stream.0
+                    && record.slot == owner.slot.0
+                    && *increase == 600
+                    && record.owned_lease_end == *absolute_limit
+                    && record.owned_lease_start.checked_add(*increase) == Some(*absolute_limit)
+                    && record.owned_advertised_at_us.is_none()
+                {
+                    traces.event(
+                        now,
+                        endpoint_id,
+                        "b817_post_lease_live_data_successor",
+                        "owned_receive_action_applied_pending_wire_advertisement",
+                        &json!({
+                            "schema_version": record.schema_version,
+                            "source": record.source,
+                            "policy": record.policy,
+                            "handoff_diagnostics": record,
+                            "owner_slot": owner.slot.0,
+                            "owned_lease_start": record.owned_lease_start,
+                            "owned_lease_end": record.owned_lease_end,
+                            "transport_receive_action_applied": true,
+                            "physical_receive_limit_advertised": false,
+                        }),
+                    )?;
+                }
                 traces.event(now, endpoint_id, "action", "applied", &trace_action)?;
                 return Ok(());
             }
@@ -22964,28 +22084,7 @@ fn apply_action(
                     && diagnostics.cs_buflo_local_termination_latched
             })
         {
-            let readiness = cs_terminal_chaff_readiness(endpoint, controller, stream)?;
-            if readiness != neqo_http3::QcsdCsTerminalReadiness::Ready {
-                if endpoint.pending_cs_terminal_cancellations.iter().any(|item|
-                    matches!(&item.action, QcsdAction::CancelChaff { stream: old, .. }
-                        if old.0 == stream.as_u64()))
-                {
-                    return Err(Error::SlotInvariant("duplicate pending CS terminal cancellation".into()));
-                }
-                let progress = cs_terminal_packet_progress(endpoint);
-                endpoint.pending_cs_terminal_cancellations.push_back(PendingCsTerminalCancellation {
-                    action: trace_action.clone(), deferred_packet_progress: progress,
-                });
-                traces.event(now, endpoint_id, "cs_chaff_local_abandonment", "deferred",
-                    &json!({"stream": stream.as_u64(), "readiness": format!("{readiness:?}"),
-                        "packet_rx": progress.0, "packet_tx": progress.1,
-                        "receipt_applied": false, "receive_credit_increase": 0}))?;
-                return Ok(());
-            }
             let proof = abandon_cs_buflo_terminal_chaff(endpoint, controller, stream)?;
-            controller.acknowledge_cs_terminal_chaff_cancellation(
-                endpoint.id, neqo_csdef::QcsdStreamId(stream.as_u64()), defense_elapsed,
-            )?;
             applied_action_trace_at = self::now();
             traces.event(
                 applied_action_trace_at,
@@ -22997,11 +22096,7 @@ fn apply_action(
             endpoint.terminal_local_abandonments.push(proof);
             Ok(None)
         } else {
-            let event_id = self::scheduled_action(&trace_action).map(|(_, _, slot)| slot.0);
-            buflo_preoutput_diagnostic_mark(40, None, event_id);
-            let result = endpoint.client.apply_qcsd_action(transport_at, action);
-            buflo_preoutput_diagnostic_mark(41, None, event_id);
-            result
+            endpoint.client.apply_qcsd_action(transport_at, action)
         };
     match adapter_result {
         Ok(chaff_stream) => {
@@ -23158,10 +22253,19 @@ fn apply_action(
                 )?;
             }
             if let QcsdAction::LeaseParserReceive {
-                endpoint: lease_endpoint, stream, absolute_limit, increase, owner: None,
+                endpoint: lease_endpoint,
+                stream,
+                absolute_limit,
+                increase,
+                owner: None,
             } = &trace_action
                 && let Some((header_debt, prepared_body_bytes)) = controller
-                    .cs_live_chaff_header_lease_witness(*lease_endpoint, *stream, *absolute_limit, *increase)
+                    .cs_live_chaff_header_lease_witness(
+                        *lease_endpoint,
+                        *stream,
+                        *absolute_limit,
+                        *increase,
+                    )
             {
                 traces.event(
                     applied_action_trace_at,
@@ -23180,10 +22284,19 @@ fn apply_action(
                 )?;
             }
             if let QcsdAction::LeaseParserReceive {
-                endpoint: lease_endpoint, stream, absolute_limit, increase, owner: None,
+                endpoint: lease_endpoint,
+                stream,
+                absolute_limit,
+                increase,
+                owner: None,
             } = &trace_action
                 && let Some((blocked_at, prepared_body_bytes)) = controller
-                    .cs_live_chaff_header_bootstrap_witness(*lease_endpoint, *stream, *absolute_limit, *increase)
+                    .cs_live_chaff_header_bootstrap_witness(
+                        *lease_endpoint,
+                        *stream,
+                        *absolute_limit,
+                        *increase,
+                    )
             {
                 traces.event(
                     applied_action_trace_at,
@@ -23694,7 +22807,11 @@ fn buflo_exact_release_guard_excluding_candidates(
     };
     let realization_window = candidate.deadline.duration_since(candidate.release);
     let admission_lead = realization_window.saturating_mul(2);
-    let active_wait_tail = active_wait_tail.min(realization_window);
+    let active_wait_tail = if matches!(duration_as_u64_nanos(realization_window), 9_999_000 | 10_000_000 | 19_999_000 | 20_000_000) {
+        realization_window
+    } else {
+        active_wait_tail.min(realization_window)
+    };
     let active_wait_at = candidate
         .release
         .checked_sub(active_wait_tail)
@@ -24441,7 +23558,6 @@ async fn dispatch_due_cs_exact_incoming_retry(
 ) -> Result<bool, Error> {
     let current = now();
     cs_preoutput_diagnostic_mark(15);
-    buflo_preoutput_diagnostic_mark(15, None, None);
     let inventory = cs_exact_incoming_retry_inventory(
         defense,
         endpoints,
@@ -24451,10 +23567,8 @@ async fn dispatch_due_cs_exact_incoming_retry(
         attempted,
     )?;
     cs_preoutput_diagnostic_mark(16);
-    buflo_preoutput_diagnostic_mark(16, None, None);
     if inventory.earliest_expired_deadline.is_some() {
         cs_preoutput_diagnostic_mark(17);
-        buflo_preoutput_diagnostic_mark(17, None, None);
         expire_due_cs_exact_incoming_credit(
             endpoints,
             controller,
@@ -24690,14 +23804,14 @@ fn buflo_exact_incoming_identities_with_policy(
                 )));
             }
             if kernel_tai_projected {
-                let control_interval = controller.config().control_interval();
+                let outgoing_window = controller.rolling_outgoing_realization_window();
                 if !buflo_adapter_window_is_normalized(
                     guard.release,
                     guard.deadline,
-                    control_interval,
+                    outgoing_window,
                 ) {
                     return Err(Error::SlotInvariant(format!(
-                        "BuFLO kernel incoming slot {} projected adapter window was neither the control interval nor its one-microsecond normalization",
+                        "BuFLO kernel incoming slot {} projected adapter window did not match the bound outgoing window or its one-microsecond normalization",
                         slot.0
                     )));
                 }
@@ -25148,7 +24262,7 @@ fn buflo_incoming_retry_guard(
     if !buflo_adapter_window_is_normalized(
         outgoing.release,
         outgoing.deadline,
-        controller.config().control_interval(),
+        controller.rolling_outgoing_realization_window(),
     ) {
         return Err(Error::SlotInvariant(
             "BuFLO incoming policy cannot replace a malformed outgoing guard".into(),
@@ -25498,7 +24612,7 @@ fn stage_buflo_kernel_tick_zero(
         || candidate.not_before != defense_start
         || candidate.deadline
             != defense_start
-                .checked_add(BUFLO_KERNEL_TX_SELECTION_CUTOFF)
+                .checked_add(buflo_kernel_physical_window(runtime.cadence))
                 .ok_or_else(|| {
                     Error::DefenseExecution("BuFLO tick-zero deadline overflow".into())
                 })?
@@ -25535,10 +24649,10 @@ fn next_buflo_kernel_guard(
     if !buflo_adapter_window_is_normalized(
         guard.release,
         guard.deadline,
-        BUFLO_KERNEL_TX_SELECTION_CUTOFF,
+        buflo_kernel_physical_window(runtime.cadence),
     ) {
         return Err(Error::DefenseExecution(format!(
-            "BuFLO kernel slot {} adapter window did not retain the five-millisecond normalized width",
+            "BuFLO kernel slot {} adapter window did not retain the bound prospective normalized width",
             guard.slot.0
         )));
     }
@@ -25676,223 +24790,6 @@ impl Drop for BufloPostSelectionDiagnostic {
     }
 }
 
-
-// BEGIN ROOT Native152 failure-only runner-wait observations.
-// Raw samples only: none is a clock/deadline/phase authority or a wait input.
-// Keep two completed calls, without allocation or output on an ordinary wait.
-#[cfg(target_os = "linux")]
-const BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT: usize = 2;
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Serialize)]
-struct BufloRunnerWaitClocks {
-    monotonic_before_ns: Option<u64>,
-    tai_before_ns: Option<u64>,
-    thread_cpu_ns: Option<u64>,
-    tai_after_ns: Option<u64>,
-    monotonic_after_ns: Option<u64>,
-}
-
-#[cfg(target_os = "linux")]
-impl BufloRunnerWaitClocks {
-    fn sample() -> (Instant, Self) {
-        let monotonic_before_ns = timed_egress::clock_monotonic_ns().ok();
-        let instant = now();
-        let tai_before_ns = timed_egress::clock_tai_ns().ok();
-        let thread_cpu_ns = timed_egress::clock_thread_cpu_ns().ok();
-        let tai_after_ns = timed_egress::clock_tai_ns().ok();
-        let monotonic_after_ns = timed_egress::clock_monotonic_ns().ok();
-        (instant, Self {
-            monotonic_before_ns,
-            tai_before_ns,
-            thread_cpu_ns,
-            tai_after_ns,
-            monotonic_after_ns,
-        })
-    }
-}
-
-// Native153: the original timer future is polled exactly once per wrapper
-// poll with the original Context. Clock reads observe userspace only; neither
-// construction nor a poll establishes a kernel arm/wake timestamp.
-#[cfg(target_os = "linux")]
-type BufloRunnerTimerPollClocks = [Option<u64>; 5];
-
-#[cfg(target_os = "linux")]
-fn buflo_runner_timer_poll_clocks() -> BufloRunnerTimerPollClocks {
-    [
-        timed_egress::clock_monotonic_ns().ok(),
-        timed_egress::clock_tai_ns().ok(),
-        timed_egress::clock_thread_cpu_ns().ok(),
-        timed_egress::clock_tai_ns().ok(),
-        timed_egress::clock_monotonic_ns().ok(),
-    ]
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-struct BufloRunnerTimerPollObservation {
-    timer_constructed: Option<BufloRunnerTimerPollClocks>,
-    before_await_expression: Option<BufloRunnerTimerPollClocks>,
-    first_poll_before: Option<BufloRunnerTimerPollClocks>,
-    first_poll_after: Option<BufloRunnerTimerPollClocks>,
-    last_pending_after: Option<BufloRunnerTimerPollClocks>,
-    ready_poll_before: Option<BufloRunnerTimerPollClocks>,
-    ready_poll_after: Option<BufloRunnerTimerPollClocks>,
-    poll_count: u64,
-    pending_poll_count: u64,
-    actual_kernel_arm_observed: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl BufloRunnerTimerPollObservation {
-    fn constructed_with(clocks: BufloRunnerTimerPollClocks) -> Self {
-        Self { timer_constructed: Some(clocks), ..Self::default() }
-    }
-
-    fn before_await_with(&mut self, clocks: BufloRunnerTimerPollClocks) {
-        self.before_await_expression = Some(clocks);
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn observe_exact_runner_timer_with_clock<F: std::future::Future>(
-    future: F,
-    observation: Option<&mut BufloRunnerTimerPollObservation>,
-    mut clocks: impl FnMut() -> BufloRunnerTimerPollClocks,
-) -> F::Output {
-    let Some(observation) = observation else {
-        return future.await;
-    };
-    let mut future = std::pin::pin!(future);
-    std::future::poll_fn(|cx| {
-        let before = clocks();
-        let first = observation.poll_count == 0;
-        observation.poll_count = observation.poll_count.saturating_add(1);
-        if first {
-            observation.first_poll_before = Some(before);
-        }
-        // No new wake, retry, timer, loop or readiness poll. Preserve exactly
-        // one original poll and its unchanged Pending/Ready value.
-        let result = std::future::Future::poll(future.as_mut(), cx);
-        let after = clocks();
-        if first {
-            observation.first_poll_after = Some(after);
-        }
-        match &result {
-            std::task::Poll::Pending => {
-                observation.pending_poll_count = observation.pending_poll_count.saturating_add(1);
-                observation.last_pending_after = Some(after);
-            }
-            std::task::Poll::Ready(_) => {
-                observation.ready_poll_before = Some(before);
-                observation.ready_poll_after = Some(after);
-            }
-        }
-        result
-    })
-    .await
-}
-
-#[cfg(target_os = "linux")]
-async fn observe_exact_runner_timer<F: std::future::Future>(
-    future: F,
-    observation: Option<&mut BufloRunnerTimerPollObservation>,
-) -> F::Output {
-    observe_exact_runner_timer_with_clock(future, observation, buflo_runner_timer_poll_clocks).await
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Serialize)]
-struct BufloRunnerWaitSample {
-    // This Instant is an observation anchor only, never returned to the wait.
-    #[serde(skip)]
-    started: Instant,
-    selected_wakeup_offset_ns: Option<i64>,
-    wait_policy: &'static str,
-    admission_tai_ns: Option<u64>,
-    service_buffered_http: bool,
-    before: BufloRunnerWaitClocks,
-    after: Option<BufloRunnerWaitClocks>,
-    std_instant_elapsed_ns: Option<u64>,
-    returned: &'static str,
-    timer_poll: Option<BufloRunnerTimerPollObservation>,
-}
-
-#[cfg(target_os = "linux")]
-impl BufloRunnerWaitSample {
-    fn begin_with(
-        wakeup: Instant,
-        policy: RunnerWaitPolicy,
-        service_buffered_http: bool,
-        current: Instant,
-        before: BufloRunnerWaitClocks,
-    ) -> Self {
-        // Positive means the selected hint was still in the future at this
-        // observation. A past hint remains negative, not an invented timer arm.
-        let selected_wakeup_offset_ns = if wakeup >= current {
-            i64::try_from(wakeup.duration_since(current).as_nanos()).ok()
-        } else {
-            i64::try_from(current.duration_since(wakeup).as_nanos())
-                .ok()
-                .and_then(i64::checked_neg)
-        };
-        let (wait_policy, admission_tai_ns) = match policy {
-            RunnerWaitPolicy::Ordinary => ("ordinary", None),
-            RunnerWaitPolicy::KernelBufloAdmission { admission_tai_ns } =>
-                ("kernel-buflo-admission", Some(admission_tai_ns)),
-        };
-        Self {
-            started: current,
-            selected_wakeup_offset_ns,
-            wait_policy,
-            admission_tai_ns,
-            service_buffered_http,
-            before,
-            after: None,
-            std_instant_elapsed_ns: None,
-            returned: "not-returned",
-            timer_poll: None,
-        }
-    }
-
-    fn begin_timer_poll_observation(&mut self) -> &mut BufloRunnerTimerPollObservation {
-        self.timer_poll.insert(BufloRunnerTimerPollObservation::constructed_with(
-            buflo_runner_timer_poll_clocks(),
-        ))
-    }
-
-    fn begin(wakeup: Instant, policy: RunnerWaitPolicy, service_buffered_http: bool) -> Self {
-        let (current, before) = BufloRunnerWaitClocks::sample();
-        Self::begin_with(wakeup, policy, service_buffered_http, current, before)
-    }
-
-    fn finish_with(
-        &mut self,
-        current: Instant,
-        after: BufloRunnerWaitClocks,
-        result: &Result<Option<ActivityWake>, Error>,
-    ) {
-        self.after = Some(after);
-        self.std_instant_elapsed_ns = current.checked_duration_since(self.started)
-            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok());
-        self.returned = match result {
-            Ok(Some(ActivityWake::Timer)) => "timer",
-            Ok(Some(ActivityWake::SocketReady)) => "socket-ready",
-            // The original buffered-HTTP and due-admission paths both return
-            // None. Do not infer which branch ran from this observation alone.
-            Ok(None) => "no-wake",
-            Err(_) => "error",
-        };
-    }
-
-    fn finish(&mut self, result: &Result<Option<ActivityWake>, Error>) {
-        let (current, after) = BufloRunnerWaitClocks::sample();
-        self.finish_with(current, after, result);
-    }
-}
-// END ROOT Native152 failure-only runner-wait observations.
-
 // Bounded last-phase context for a failure before protected selection.
 // The original post-confirm twelve-sample diagnostic below remains separate.
 #[cfg(target_os = "linux")]
@@ -25913,9 +24810,6 @@ struct BufloPreSelectionDiagnostic {
     len: usize,
     truncated: bool,
     emitted: bool,
-    runner_waits: [Option<BufloRunnerWaitSample>; BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT],
-    runner_wait_len: usize,
-    runner_wait_truncated: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -25926,9 +24820,6 @@ impl BufloPreSelectionDiagnostic {
             len: 0,
             truncated: false,
             emitted: false,
-            runner_waits: [None; BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT],
-            runner_wait_len: 0,
-            runner_wait_truncated: false,
         }
     }
 
@@ -25966,19 +24857,6 @@ impl BufloPreSelectionDiagnostic {
         );
     }
 
-    fn record_runner_wait(&mut self, sample: BufloRunnerWaitSample) {
-        if self.emitted {
-            return;
-        }
-        if self.runner_wait_len == self.runner_waits.len() {
-            self.runner_waits.rotate_left(1);
-            self.runner_wait_len -= 1;
-            self.runner_wait_truncated = true;
-        }
-        self.runner_waits[self.runner_wait_len] = Some(sample);
-        self.runner_wait_len += 1;
-    }
-
     fn finish_protected_check_with(
         &mut self,
         failed_slot: Option<u64>,
@@ -26007,15 +24885,6 @@ impl BufloPreSelectionDiagnostic {
         let value = json!({
             "schema_version": 1,
             "source": "buflo-pre-selection-failure-boundaries-v1",
-            "runner_wait_observation_schema_version": 2,
-            "runner_wait_clock_order": "CLOCK_MONOTONIC-before,std-Instant,CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after,CLOCK_MONOTONIC-after",
-            "runner_wait_observations": &self.runner_waits[..self.runner_wait_len],
-            "runner_wait_observation_limit": BUFLO_RUNNER_WAIT_DIAGNOSTIC_LIMIT,
-            "runner_wait_observations_truncated": self.runner_wait_truncated,
-            "selected_wakeup_is_actual_timer_arm": false,
-            "runner_wait_poll_clock_order": "CLOCK_MONOTONIC-before,CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after,CLOCK_MONOTONIC-after",
-            "timer_constructor_is_not_first_poll_or_kernel_arm": true,
-            "no_wake_branch_is_not_inferred": true,
             "diagnostic_only": true,
             "slot": slot,
             "sample_order": "CLOCK_TAI-before,CLOCK_THREAD_CPUTIME_ID,CLOCK_TAI-after",
@@ -26081,10 +24950,11 @@ fn validate_buflo_kernel_main_with_policy(
         || satisfied.observed_size != 1_200
         || attribution.observed != 1_200
         || (if preparation_reserve {
-            // Preserve the actual construction lateness. CLOCK_TAI dispatch
-            // confirmation authorizes only the earlier +4ms cutoff; actual
-            // enqueue and TX must still satisfy the independent +5ms guard.
-            attribution.composition.lateness_us >= 5_000
+            // Preserve actual construction lateness and enforce the bound
+            // adapter window independently from the earlier selection cutoff.
+            attribution.composition.lateness_us >= duration_as_trace_micros(
+                guard.deadline.duration_since(guard.release),
+            )
         } else {
             attribution.composition.lateness_us != 0
         })
@@ -26578,8 +25448,6 @@ async fn dispatch_buflo_kernel_release(
     runtime: &mut BufloKernelTxRuntime,
 ) -> Result<(), Error> {
     runtime.confirm_protected_selection(guard.slot.0)?;
-    let mut enqueue_gap = timed_egress::BufloEnqueueGapDiagnostic::runner(guard.slot.0);
-    enqueue_gap.record("runner-confirm-return");
     let mut preparation_diagnostic = BufloPostSelectionDiagnostic::new(guard.slot.0);
     preparation_diagnostic.record("post-confirm");
     let logical_elapsed = guard.packet.timestamp();
@@ -26618,17 +25486,13 @@ async fn dispatch_buflo_kernel_release(
         )));
     }
     let job_id = runtime.begin_job(guard)?;
-    enqueue_gap.bind_job(job_id);
     let captured_incoming_credit =
         buflo_kernel_exact_incoming_identities(guard, endpoints, controller, defense_start, None)?;
     runtime.retain_credit_identities(job_id, &captured_incoming_credit)?;
     preparation_diagnostic.record("post-job-credit-inventory");
     preparation_diagnostic.record("pre-transport-output");
-    let prepared_result = prepare_output_once_with_evidence(
-        &mut endpoints[guard.endpoint_index],
-        now(),
-    )
-    .await;
+    let prepared_result =
+        prepare_output_once_with_evidence(&mut endpoints[guard.endpoint_index], now()).await;
     preparation_diagnostic.record("post-transport-output");
     let prepared = match prepared_result {
         Err(failure) => {
@@ -26694,6 +25558,7 @@ async fn dispatch_buflo_kernel_release(
         validate_buflo_kernel_main(guard, &prepared)
     };
     if let Err(error) = validation {
+        emit_buflo_failed_output_builder_state(&endpoints[guard.endpoint_index], &error, guard.release);
         return Err(retain_buflo_prepared_output_failure(
             runtime,
             job_id,
@@ -26703,19 +25568,15 @@ async fn dispatch_buflo_kernel_release(
         ));
     }
     preparation_diagnostic.complete();
-    enqueue_gap.record("runner-before-exact-main");
-    buflo_preoutput_diagnostic_mark(54, Some(job_id), Some(guard.slot.0));
-    let main_result = if runtime.conservative_kernel_enqueue_witness {
-        runtime.transmit_exact_main_schema15(job_id, guard.endpoint_index, guard.endpoint, guard.slot.0, prepared.batch.clone())
-    } else {
-        runtime.transmit_exact_main(job_id, guard.endpoint_index, guard.endpoint, guard.slot.0, prepared.batch.clone())
-    };
-    buflo_preoutput_diagnostic_mark(55, Some(job_id), Some(guard.slot.0));
-    let (physical_time, main_item_id) = match main_result {
+    let (physical_time, main_item_id) = match runtime.transmit_exact_main(
+        job_id,
+        guard.endpoint_index,
+        guard.endpoint,
+        guard.slot.0,
+        prepared.batch.clone(),
+    ) {
         Ok(result) => result,
         Err(error) => {
-            enqueue_gap.record("runner-main-result-error");
-            enqueue_gap.emit_failure();
             return Err(retain_buflo_prepared_output_failure(
                 runtime,
                 job_id,
@@ -27150,20 +26011,6 @@ async fn wait_for_runner_activity_until(
     service_buffered_http: bool,
     wait_policy: RunnerWaitPolicy,
 ) -> Result<Option<ActivityWake>, Error> {
-    wait_for_runner_activity_until_observed(
-        endpoints, wakeup, service_buffered_http, wait_policy,
-        #[cfg(target_os = "linux")]
-        None,
-    ).await
-}
-
-async fn wait_for_runner_activity_until_observed(
-    endpoints: &[Endpoint],
-    wakeup: Instant,
-    service_buffered_http: bool,
-    wait_policy: RunnerWaitPolicy,
-    #[cfg(target_os = "linux")] observation: Option<&mut BufloRunnerWaitSample>,
-) -> Result<Option<ActivityWake>, Error> {
     if service_buffered_http
         && endpoints.iter().any(|endpoint| {
             endpoint.network_active
@@ -27172,15 +26019,13 @@ async fn wait_for_runner_activity_until_observed(
     {
         return Ok(None);
     }
-    wait_for_activity_until_with_policy_observed(
+    wait_for_activity_until_with_policy(
         endpoints
             .iter()
             .filter(|endpoint| endpoint.network_active)
             .map(|endpoint| &endpoint.socket),
         wakeup,
         wait_policy,
-        #[cfg(target_os = "linux")]
-        observation,
     )
     .await
 }
@@ -27198,19 +26043,6 @@ async fn wait_for_activity_until_with_policy<'a>(
     sockets: impl IntoIterator<Item = &'a Socket>,
     wakeup: Instant,
     wait_policy: RunnerWaitPolicy,
-) -> Result<Option<ActivityWake>, Error> {
-    wait_for_activity_until_with_policy_observed(
-        sockets, wakeup, wait_policy,
-        #[cfg(target_os = "linux")]
-        None,
-    ).await
-}
-
-async fn wait_for_activity_until_with_policy_observed<'a>(
-    sockets: impl IntoIterator<Item = &'a Socket>,
-    wakeup: Instant,
-    wait_policy: RunnerWaitPolicy,
-    #[cfg(target_os = "linux")] mut observation: Option<&mut BufloRunnerWaitSample>,
 ) -> Result<Option<ActivityWake>, Error> {
     #[cfg(not(target_os = "linux"))]
     let _ = wait_policy;
@@ -27235,31 +26067,12 @@ async fn wait_for_activity_until_with_policy_observed<'a>(
         .map(|socket| Box::pin(socket.readable()))
         .collect();
     let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wakeup));
-    #[cfg(target_os = "linux")]
-    let mut timer_poll = observation.as_deref_mut()
-        .map(BufloRunnerWaitSample::begin_timer_poll_observation);
     if readiness.is_empty() {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(observation) = timer_poll.as_deref_mut() {
-                observation.before_await_with(buflo_runner_timer_poll_clocks());
-            }
-            observe_exact_runner_timer(timer, timer_poll).await;
-        }
-        #[cfg(not(target_os = "linux"))]
         timer.await;
         return Ok(Some(ActivityWake::Timer));
     }
     let sockets_ready =
         select_all(readiness).map(|(result, _, _)| result.map(|()| ActivityWake::SocketReady));
-    #[cfg(target_os = "linux")]
-    let timeout_ready = {
-        if let Some(observation) = timer_poll.as_deref_mut() {
-            observation.before_await_with(buflo_runner_timer_poll_clocks());
-        }
-        Box::pin(observe_exact_runner_timer(timer, timer_poll).map(|()| Ok(ActivityWake::Timer)))
-    };
-    #[cfg(not(target_os = "linux"))]
     let timeout_ready = Box::pin(timer.map(|()| Ok(ActivityWake::Timer)));
     select(sockets_ready, timeout_ready)
         .map(|either| either.factor_first().0)
@@ -27485,10 +26298,95 @@ fn cs_exact_incoming_advertisement_handoffs(
     Ok(advertisements)
 }
 
+/// Failure-only snapshot of the same output call that failed main validation.
+/// It reads already retained metadata and cannot change any packet or slot gate.
+fn emit_buflo_failed_output_builder_state(endpoint: &Endpoint, error: &Error, release: Instant) {
+    let snapshot = endpoint.client.qcsd_last_output_target_diagnostic();
+    let diagnostic = json!({
+        "schema_version": 1,
+        "source": "actual-same-call-buflo-transport-builder-failure-v1",
+        "diagnostic_only": true,
+        "endpoint": endpoint.id.0,
+        "terminal_error": error.to_string(),
+        "same_output_call_reached_builder": snapshot.is_some(),
+        "builder_monotonic_ns": snapshot.map(|(at, _)| duration_as_u64_nanos(
+            at.saturating_duration_since(endpoint.receive_loop.origin))),
+        "fields": snapshot.map(|(_, fields)| fields),
+        "front_now_minus_deadline_ns": snapshot.and_then(|(_, fields)| (fields[1] != 0).then(|| i64::from_ne_bytes(fields[20].to_ne_bytes()))),
+        "front_now_minus_not_before_ns": snapshot.and_then(|(_, fields)|
+            (fields[22] != 0).then(|| i64::from_ne_bytes(fields[21].to_ne_bytes()))),
+        "floor_minus_guard_release_ns": if endpoint.transport_instant_floor >= release {
+            i64::try_from(endpoint.transport_instant_floor.duration_since(release).as_nanos()).unwrap_or(i64::MAX)
+        } else {
+            -i64::try_from(release.duration_since(endpoint.transport_instant_floor).as_nanos()).unwrap_or(i64::MAX)
+        },
+        "field_names": [
+            "queued_after_expiry", "front_present_before_expiry", "front_slot",
+            "front_committed", "front_not_before_is_future", "front_deadline_expired",
+            "eligible_present", "eligible_slot", "eligible_desired_udp_bytes",
+            "configured_limit", "send_profile_limit", "ack_only", "paced",
+            "active_present", "active_slot", "cwnd_available", "amplification_limit",
+            "path_plpmtu", "path_primary", "front_send_policy_exact",
+            "now_minus_deadline_ns_as_i64_bits", "now_minus_not_before_ns_as_i64_bits",
+            "front_not_before_present",
+        ],
+        "authorization_or_new_transport_call": false,
+        "packet_bytes_included": false,
+    });
+    if let Ok(encoded) = serde_json::to_string(&diagnostic)
+        && encoded.len() <= 8_192
+    {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "QCSD_BUFLO_MAIN_VALIDATION_BUILDER_STATE_V1 {encoded}"
+        );
+    }
+}
+
 /// Evidence emitted only after the physical attempt (or a no-output return).
 /// It cannot authorize a slot, replace its first physical timestamp, or change
 /// the original timing window. Callbacks/None retain the accepted identities
 /// that still need encoding, rather than guessing a transport failure reason.
+// Failure-only missing cause evidence for strict CS receive-credit expiry.
+// No output, queue, CC, deadline, cell or receipt predicate is changed.
+fn emit_cs_failed_output_builder_state(endpoints: &[Endpoint], error: &Error) {
+    for endpoint in endpoints.iter().take(64) {
+        let snapshot = endpoint.client.qcsd_last_output_target_diagnostic();
+        let diagnostic = json!({
+            "schema_version": 2,
+            "source": "actual-same-call-CS-transport-builder-failure-v2",
+            "diagnostic_only": true,
+            "endpoint": endpoint.id.0,
+            "terminal_error": error.to_string(),
+            "same_output_call_reached_builder": snapshot.is_some(),
+            "builder_monotonic_ns": snapshot.map(|(at, _)| duration_as_u64_nanos(
+                at.saturating_duration_since(endpoint.receive_loop.origin))),
+            "fields": snapshot.map(|(_, fields)| fields),
+            "field_names": [
+                "queued_after_expiry", "front_present_before_expiry", "front_slot",
+                "front_committed", "front_not_before_is_future", "front_deadline_expired",
+                "eligible_present", "eligible_slot", "eligible_desired_udp_bytes",
+                "configured_limit", "send_profile_limit", "ack_only", "paced",
+                "active_present", "active_slot", "cwnd_available", "amplification_limit",
+                "path_plpmtu", "path_primary", "front_send_policy_exact",
+                "now_minus_deadline_ns_as_i64_bits", "now_minus_not_before_ns_as_i64_bits",
+                "front_not_before_present",
+            ],
+            "pending_receive_action_count": endpoint.client.qcsd_pending_receive_action_count(),
+            "authorization_or_new_transport_call": false,
+            "packet_bytes_included": false,
+        });
+        if let Ok(encoded) = serde_json::to_string(&diagnostic)
+            && encoded.len() <= 8_192
+        {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "QCSD_CS_BLOCKED_CREDIT_FAILURE_STATE_V2 {encoded}"
+            );
+        }
+    }
+}
+
 fn record_cs_incoming_output_phase(
     endpoint: &Endpoint,
     traces: &mut TraceFiles,
@@ -29429,7 +28327,6 @@ async fn process_output_once_with_clock_with_admitted_tail(
     };
     let cs_incoming = matches!(controller.config().defense, DefenseConfig::CsBuflo(_));
     cs_preoutput_diagnostic_mark(19);
-    buflo_preoutput_diagnostic_mark(19, None, None);
     let pending_receive_actions = if cs_incoming {
         endpoint.client.qcsd_pending_receive_action_identities()
     } else {
@@ -29441,10 +28338,8 @@ async fn process_output_once_with_clock_with_admitted_tail(
         drive_now
     };
     cs_preoutput_diagnostic_mark(20);
-    buflo_preoutput_diagnostic_mark(20, None, None);
     let prepared_output = prepare_output_once_with_clock(endpoint, drive_now).await;
     cs_preoutput_diagnostic_mark(21);
-    buflo_preoutput_diagnostic_mark(21, None, None);
     let preparation_completed = if cs_incoming {
         monotonic_clock()
     } else {
@@ -29777,8 +28672,19 @@ async fn process_output_once_with_clock_with_admitted_tail(
             last_handoff_guard_entry = monotonic_clock();
             guarded_handoff_attempts = guarded_handoff_attempts.saturating_add(1);
         }
+        // Exploratory WTF-PAD-only grace; original deadlines remain in
+        // the trace and late sends are explicitly recorded below.
+        let relaxed_target_deadlines: Vec<Instant> =
+            if matches!(controller.config().defense, DefenseConfig::WtfPad(_)) {
+                target_deadlines
+                    .iter()
+                    .map(|d| d.checked_add(Duration::from_millis(5)).unwrap_or(*d))
+                    .collect()
+            } else {
+                target_deadlines.clone()
+            };
         let handoff = attempt_socket_handoff_timestamped(
-            &target_deadlines,
+            &relaxed_target_deadlines,
             hard_unshaped_handoff_interrupt(
                 defense_clock.uses_kernel_tai(),
                 unshaped_handoff_interrupt,
@@ -29895,6 +28801,16 @@ async fn process_output_once_with_clock_with_admitted_tail(
         };
         match handoff {
             SocketHandoff::Sent(sent_at) => {
+                if matches!(controller.config().defense, DefenseConfig::WtfPad(_)) {
+                    if let Some(deadline) = target_deadlines.iter().copied().min() {
+                        if sent_at >= deadline {
+                            traces.event(sent_at, Some(endpoint.id), "wtf_pad_relaxed_late_handoff", "sent", &json!({
+                                "grace_us": 5000,
+                                "lateness_ns": duration_as_u64_nanos(sent_at.saturating_duration_since(deadline)),
+                            }))?;
+                        }
+                    }
+                }
                 let (elapsed, crossed) = match defense_start {
                     Some(started) => match handoff_semantic_interrupt {
                         Some(interrupt_elapsed) => {
@@ -30391,13 +29307,9 @@ fn render_run_json(
         "request_policy": spec.request_policy,
         "application_response_policy": spec.application_response_policy.name(),
         "workload_hash_sha256": spec.workload_hash,
-        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _, _, _)| hash),
-        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _, _, _)| *policy).name(),
+        "application_workload_source_hash_sha256": spec.application_workload_source.as_ref().map(|(_, hash, _, _, _, _, _, _, _, _, _)| hash),
+        "primary_document_identity_policy": spec.application_workload_source.as_ref().map_or(PrimaryDocumentIdentityPolicy::default(), |(_, _, _, _, _, policy, _, _, _, _, _)| *policy).name(),
         "chaff_manifest_hash_sha256": spec.chaff_manifest_hash,
-        "supplemental_chaff_policy": spec.supplemental_chaff_source.as_ref().map(BoundSupplementalPoolSource::policy),
-        "supplemental_chaff_pool_source_hash_sha256": spec.supplemental_chaff_source.as_ref().map(BoundSupplementalPoolSource::sha256),
-        "supplemental_chaff_selected_pool_resource_id": spec.chaff_manifest.as_ref().and_then(|m| match m { RuntimeChaffManifest::SupplementalFtV7(v) => Some(v.selected_pool_resource_id), RuntimeChaffManifest::SupplementalCsV8(v) => Some(v.selected_pool_resource_id), _ => None }),
-        "supplemental_chaff_qualification_evidence_sha256": spec.chaff_manifest.as_ref().and_then(|m| match m { RuntimeChaffManifest::SupplementalFtV7(v) => Some(&v.qualification_evidence_sha256), RuntimeChaffManifest::SupplementalCsV8(v) => Some(&v.qualification_evidence_sha256), _ => None }),
         "max_response_bytes": spec.max_response_bytes,
         "time_anchor_unix_ns": started_unix_ns,
         "started_unix_ns": started_unix_ns,
@@ -30420,14 +29332,23 @@ fn render_run_json(
     if let Some(proof) = &completion.buflo_fin_permission {
         run["buflo_retained_parser_fin_permission"] = proof.clone();
     }
+    if spec.config.buflo_direct_fin_credit_reassignment {
+        run["buflo_direct_fin_credit_reassignment_policy"] = json!({
+            "schema_version": 1,
+            "source": "explicit-cli-opt-in-v1",
+            "policy": "buflo-direct-advertised-exact-credit-genuine-fin-reassignment-v1",
+            "resource_scope": "secondary_application_streams_only",
+            "same_endpoint_activated_chaff_required": true,
+            "original_exclusive_deadline_preserved": true,
+            "partial_or_unresolved_cells_credited": false,
+            "scientific_credit": false,
+        });
+    }
     // A successful run's scientific DTO stays unchanged. These optional
     // failure observations do not replace the original error or authorize it.
     if completion_status != "complete" {
         if let Some(window) = cs_preoutput_diagnostic_take_failure() {
             run["cs_preoutput_control_segment_observations"] = window;
-        }
-        if let Some(window) = buflo_preoutput_diagnostic_take_failure() {
-            run["buflo_preoutput_control_segment_observations"] = window;
         }
         if let Some(first_causes) = http3_first_error_snapshot(endpoints) {
             run["http3_first_error_observations"] = first_causes;
@@ -30473,6 +29394,18 @@ fn render_run_json(
         run["terminal_primary_partial_cell_policy"] = policy;
         if let Some(proof) = &completion.terminal_primary_partial_cell {
             run["terminal_primary_partial_cell"] = proof.clone();
+        }
+    }
+    if let Some(policy) = terminal_chaff_partial_cell_policy_receipt(spec) {
+        run["terminal_chaff_partial_cell_policy"] = policy;
+        if let Some(proofs) = &completion.terminal_chaff_partial_cells {
+            run["terminal_chaff_partial_cells"] = proofs.clone();
+        }
+        if let Some(closure) = &completion.terminal_chaff_replenishment_closure {
+            run["terminal_chaff_replenishment_closure"] = closure.clone();
+        }
+        if let Some(receipt) = &completion.terminal_chaff_postlease_live_data {
+            run["terminal_chaff_postlease_live_data"] = receipt.clone();
         }
     }
     serde_json::to_vec_pretty(&run)
@@ -30624,6 +29557,37 @@ fn now() -> Instant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rbing_ten_chaff_scope_is_exact_and_never_accepts_explicit_override() {
+        assert_eq!(
+            super::rbing_ten_chaff_stream_count(true, true, 5, Some(10)).unwrap(),
+            10
+        );
+        assert_eq!(
+            super::rbing_ten_chaff_stream_count(true, true, 5, Some(50)).unwrap(),
+            50
+        );
+        assert_eq!(
+            super::rbing_ten_chaff_stream_count(false, true, 5, Some(50)).unwrap(),
+            5
+        );
+        assert!(super::rbing_ten_chaff_stream_count(true, true, 50, Some(50)).is_err());
+        for (scope, enabled, current, qualified) in [
+            (false, true, 5, Some(10)),
+            (true, false, 5, Some(10)),
+            (true, true, 5, Some(5)),
+            (true, true, 5, None),
+            (true, true, 4, Some(10)),
+        ] {
+            assert_eq!(
+                super::rbing_ten_chaff_stream_count(scope, enabled, current, qualified).unwrap(),
+                current
+            );
+        }
+        assert!(super::rbing_ten_chaff_stream_count(true, true, 10, Some(10)).is_err());
+        assert!(super::rbing_ten_chaff_stream_count(false, true, 10, Some(10)).is_err());
+    }
+
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
         fs, io,
@@ -31064,7 +30028,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.clone(),
@@ -31542,7 +30505,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 9,
             output_dir: output.clone(),
@@ -32321,6 +31283,7 @@ mod tests {
                 super::TamarawCapturePolicy::default(),
                 super::FrontCapturePolicy::default(),
                 super::TerminalPrimaryPartialCellPolicy::default(),
+                super::TerminalChaffPartialCellPolicy::default(),
             )),
             application_response_policy: ApplicationResponsePolicy::default(),
             config: QcsdConfig {
@@ -32330,7 +31293,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: Some(schema_four.into()),
             chaff_manifest_hash: Some("f".repeat(64)),
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: trace_output_dir("schema-four-fallback"),
@@ -32412,6 +31374,7 @@ mod tests {
             super::TamarawCapturePolicy::default(),
             super::FrontCapturePolicy::default(),
             super::TerminalPrimaryPartialCellPolicy::default(),
+            super::TerminalChaffPartialCellPolicy::default(),
         ));
         spec.chaff_manifest = Some(
             response_only_chaff_manifest_v4(
@@ -32435,7 +31398,7 @@ mod tests {
         .expect("legacy metadata does not opt into approved origins");
         assert_eq!(policy, super::QualifiedChaffOriginPolicy::PrimaryOrigin);
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, _, _, _, _, _, _) =
+        let (source, _, expected, _, _, _, _, _, _, _, _) =
             spec.application_workload_source.as_ref().unwrap();
         assert!(
             super::selected_identity_chaff_resource(
@@ -32519,7 +31482,7 @@ mod tests {
             json!(["https://example.com", "https://api.example.com"]);
         let bytes = serde_json::to_vec(&value).expect("serialize opt-in source");
         fs::write(&path, &bytes).expect("write source");
-        let (source, digest, expected, _, policy, _, _, _, _, _) =
+        let (source, digest, expected, _, policy, _, _, _, _, _, _) =
             super::load_application_workload_source(&path).expect("load bound opt-in source");
         assert_eq!(digest, sha256(&bytes).expect("exact raw-source hash"));
         assert_eq!(source.resources.len(), 2);
@@ -32539,7 +31502,7 @@ mod tests {
     #[test]
     fn qualified_chaff_origin_policy_accepts_only_approved_auxiliary_identity_resource() {
         let mut spec = approved_origin_chaff_spec();
-        let (source, _, expected, _, policy, _, _, _, _, _) =
+        let (source, _, expected, _, policy, _, _, _, _, _, _) =
             spec.application_workload_source.as_mut().unwrap();
         let (resource, response) = super::selected_identity_chaff_resource(
             source,
@@ -32764,7 +31727,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: Some(qualified_chaff_manifest(resources).into()),
             chaff_manifest_hash: Some("f".repeat(64)),
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: trace_output_dir("walkie-preflight"),
@@ -32946,6 +31908,9 @@ mod tests {
             buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
+            terminal_chaff_partial_cells: None,
+            terminal_chaff_replenishment_closure: None,
+            terminal_chaff_postlease_live_data: None,
         };
         let authorized = super::receive_loop_completion_authorized(&completion, &[]);
         let receipt = receive_loop.receipt(authorized);
@@ -33112,7 +32077,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.clone(),
@@ -33135,6 +32099,9 @@ mod tests {
                 buflo_fin_permission: None,
                 runner_wakeup_metrics: Some(runner_wakeup_metrics),
                 terminal_primary_partial_cell: None,
+                terminal_chaff_partial_cells: None,
+                terminal_chaff_replenishment_closure: None,
+                terminal_chaff_postlease_live_data: None,
             },
         )
         .expect("write run receipt");
@@ -33465,7 +32432,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0x5eed,
             output_dir: output.clone(),
@@ -35599,7 +34565,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.to_path_buf(),
@@ -36781,7 +35746,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.to_path_buf(),
@@ -39121,7 +38085,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output,
@@ -40972,7 +39935,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.clone(),
@@ -41261,7 +40223,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.clone(),
@@ -41401,7 +40362,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: output.clone(),
@@ -46274,6 +45234,19 @@ mod tests {
     }
 
     #[test]
+    fn prospective_rolling_normalizer_preserves_the_selected_window() {
+        let packet = Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_200).expect("packet");
+        for window_us in [5_000_u64, 10_000, 20_000] {
+            let mut action = QcsdAction::PrearmPacket { endpoint: QcsdEndpointId(1), packet, slot: QcsdSlotId(7), not_before_after_us: 9, deadline_after_us: 19, allow_stream_data: true };
+            normalize_rolling_prearm_window(&mut action, Duration::from_micros(31), Duration::from_micros(window_us)).expect("valid normalization");
+            match action {
+                QcsdAction::PrearmPacket { not_before_after_us, deadline_after_us, .. } => assert_eq!(deadline_after_us - not_before_after_us, window_us),
+                _ => panic!("unexpected action"),
+            }
+        }
+    }
+
+    #[test]
     fn delayed_prearm_dispatch_preserves_the_absolute_defense_window() {
         let packet =
             Packet::new(Duration::from_micros(40), Direction::Outgoing, 1_200).expect("packet");
@@ -47437,7 +46410,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 7,
             output_dir: PathBuf::from("/unused-policy-test-output"),
@@ -47769,6 +46741,9 @@ mod tests {
             buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: Some(json!(proof)),
+            terminal_chaff_partial_cells: None,
+            terminal_chaff_replenishment_closure: None,
+            terminal_chaff_postlease_live_data: None,
         };
         let scheduler = super::process_scheduler_evidence().expect("scheduler");
         let render = |spec: &RunSpec| -> serde_json::Value {
@@ -49349,6 +48324,9 @@ mod tests {
                 buflo_fin_permission: None,
                 runner_wakeup_metrics: None,
                 terminal_primary_partial_cell: None,
+                terminal_chaff_partial_cells: None,
+                terminal_chaff_replenishment_closure: None,
+                terminal_chaff_postlease_live_data: None,
             },
         );
         serde_json::from_slice(&bytes).expect("run receipt")
@@ -49741,6 +48719,9 @@ mod tests {
             buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
+            terminal_chaff_partial_cells: None,
+            terminal_chaff_replenishment_closure: None,
+            terminal_chaff_postlease_live_data: None,
         };
         let before =
             super::render_run_json(&spec, &endpoints, &[], &[], &scheduler, &[], 0, &completion);
@@ -50725,7 +49706,7 @@ mod tests {
         let value = terminal_http_error_source();
         let bytes = serde_json::to_vec(&value).expect("serialize source");
         fs::write(&path, &bytes).expect("write source");
-        let (manifest, digest, expected, policy, _, _, _, _, _, _) =
+        let (manifest, digest, expected, policy, _, _, _, _, _, _, _) =
             super::load_application_workload_source(&path).expect("policy source");
         assert_eq!(
             policy,
@@ -50936,6 +49917,9 @@ mod tests {
                     buflo_fin_permission: None,
                     runner_wakeup_metrics: None,
                     terminal_primary_partial_cell: None,
+                    terminal_chaff_partial_cells: None,
+                    terminal_chaff_replenishment_closure: None,
+                    terminal_chaff_postlease_live_data: None,
                 },
             );
             let receipt: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt");
@@ -58650,7 +57634,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: PathBuf::from("/synthetic-output"),
@@ -58677,6 +57660,9 @@ mod tests {
                 buflo_fin_permission: None,
                 runner_wakeup_metrics: Some(RunnerWakeupMetrics::new()),
                 terminal_primary_partial_cell: None,
+                terminal_chaff_partial_cells: None,
+                terminal_chaff_replenishment_closure: None,
+                terminal_chaff_postlease_live_data: None,
             },
         );
         let receipt: serde_json::Value =
@@ -61135,7 +60121,10 @@ mod tests {
         assert_eq!(entry.confirmation_attempts, 0);
         assert_eq!(entry.wait_duration_ns, 0);
         assert!(entry.dispatch_confirmed_tai_ns.is_none());
-        assert_eq!(entry.failure.as_ref().expect("failure").kind, "selection-expired");
+        assert_eq!(
+            entry.failure.as_ref().expect("failure").kind,
+            "selection-expired"
+        );
         assert!(error.to_string().contains("selection expired"));
         let mut diagnostic = super::BufloPreSelectionDiagnostic::new();
         diagnostic.record_with(
@@ -61151,7 +60140,10 @@ mod tests {
             |raw| emitted.push(raw.to_owned()),
         );
         assert_eq!(emitted.len(), 1);
-        assert_eq!(entry.failure.as_ref().expect("unchanged failure").kind, "selection-expired");
+        assert_eq!(
+            entry.failure.as_ref().expect("unchanged failure").kind,
+            "selection-expired"
+        );
         let super::BufloKernelProtectedSelectionStep::Ready(ready) =
             super::buflo_kernel_protected_selection_wait_with_clock(&identity, || {
                 Ok(RELEASE - 1_000_000)
@@ -61222,7 +60214,9 @@ mod tests {
         assert_eq!(diagnostic.len, super::BUFLO_PRE_SELECTION_MAX_SAMPLES);
         assert!(diagnostic.truncated);
         assert_eq!(
-            diagnostic.samples[0].expect("oldest retained").tai_before_ns,
+            diagnostic.samples[0]
+                .expect("oldest retained")
+                .tai_before_ns,
             Some(5)
         );
         let mut emitted = Vec::new();
@@ -61246,8 +60240,7 @@ mod tests {
         );
         assert_eq!(emitted.len(), 1);
         assert!(emitted[0].len() <= super::BUFLO_POST_SELECTION_MAX_JSON_BYTES);
-        let value: serde_json::Value =
-            serde_json::from_str(&emitted[0]).expect("diagnostic JSON");
+        let value: serde_json::Value = serde_json::from_str(&emitted[0]).expect("diagnostic JSON");
         let samples = value["samples"].as_array().expect("bounded samples");
         assert_eq!(samples.len(), 11);
         assert_eq!(samples[0]["tai_before_ns"], 5);
@@ -61268,13 +60261,18 @@ mod tests {
             || None,
             |raw| emitted.push(raw.to_owned()),
         );
-        let value: serde_json::Value =
-            serde_json::from_str(&emitted[0]).expect("nullable JSON");
-        assert!(value["samples"].as_array().expect("samples").iter().all(|row| {
-            row["tai_before_ns"].is_null()
-                && row["thread_cpu_ns"].is_null()
-                && row["tai_after_ns"].is_null()
-        }));
+        let value: serde_json::Value = serde_json::from_str(&emitted[0]).expect("nullable JSON");
+        assert!(
+            value["samples"]
+                .as_array()
+                .expect("samples")
+                .iter()
+                .all(|row| {
+                    row["tai_before_ns"].is_null()
+                        && row["thread_cpu_ns"].is_null()
+                        && row["tai_after_ns"].is_null()
+                })
+        );
         assert_eq!(value["diagnostic_only"], true);
         assert_eq!(value["phase_or_deadline_authority"], false);
     }
@@ -61320,9 +60318,7 @@ mod tests {
         assert_eq!(diagnostic.len, super::BUFLO_POST_SELECTION_MAX_SAMPLES);
         assert!(diagnostic.truncated);
         assert!(diagnostic.samples.iter().flatten().all(|row| {
-            row.tai_before_ns.is_none()
-                && row.thread_cpu_ns.is_none()
-                && row.tai_after_ns.is_none()
+            row.tai_before_ns.is_none() && row.thread_cpu_ns.is_none() && row.tai_after_ns.is_none()
         }));
     }
 
@@ -61422,7 +60418,10 @@ mod tests {
         let samples = value["samples"].as_array().expect("sample array");
         assert_eq!(samples.len(), super::BUFLO_POST_SELECTION_MAX_SAMPLES);
         assert_eq!(value["truncated"], true);
-        assert_eq!(samples.last().expect("final sample")["phase"], "failure-return");
+        assert_eq!(
+            samples.last().expect("final sample")["phase"],
+            "failure-return"
+        );
         assert_eq!(diagnostic.len, super::BUFLO_POST_SELECTION_MAX_SAMPLES);
 
         // Exercise the actual encoded-byte guard, even for a future accidental
@@ -62369,8 +61368,6 @@ mod tests {
             incoming_credit_release_window: Duration::from_micros(5_000),
             cadence: Duration::from_micros(20_000),
             preparation_reserve: false,
-            conservative_kernel_enqueue_witness: false,
-            enqueue_witnesses: Vec::new(),
         }
     }
 
@@ -62599,6 +61596,23 @@ mod tests {
                 assert!(super::buflo_incoming_retry_guard(&malformed, &controller, start).is_err());
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prospective_buflo_incoming_pair_accepts_20ms_outgoing_and_keeps_32ms_incoming() {
+        let spec = buflo_cadence64_bound_spec();
+        let parameters = spec.defense_parameters.as_ref().expect("parameters").buflo_parameters.as_ref().expect("buflo").clone();
+        let mut controller = QcsdController::with_defense(spec.config.clone(), None, Box::new(neqo_csdef::Buflo::from_parameters(parameters))).expect("controller");
+        controller.enable_buflo_half_period_incoming_window_for_interval(64_000).expect("incoming");
+        controller.enable_buflo_outgoing_20ms_variant().expect("variant");
+        let start=Instant::now();let release=start+Duration::from_millis(64);
+        let outgoing=BufloExactReleaseGuard {endpoint_index:0,endpoint:QcsdEndpointId(0),slot:QcsdSlotId(2),packet:Packet::new(Duration::from_millis(64),Direction::Outgoing,1_200).expect("packet"),phase:BufloExactReleasePhase::Committed,output_admission_at:release-Duration::from_millis(20),guard_at:release-Duration::from_millis(10),active_wait_at:release-Duration::from_millis(10),release,deadline:release+Duration::from_millis(20)};
+        let incoming=super::buflo_incoming_retry_guard(&outgoing,&controller,start).expect("paired window");
+        assert_eq!(incoming.deadline,release+Duration::from_millis(32));
+        assert!(super::buflo_adapter_window_is_normalized(outgoing.release,outgoing.deadline,controller.rolling_outgoing_realization_window()));
+        let malformed=BufloExactReleaseGuard { deadline:release+Duration::from_millis(5), ..outgoing };
+        assert!(super::buflo_incoming_retry_guard(&malformed,&controller,start).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -63211,7 +62225,6 @@ mod tests {
             defense_parameters: None,
             chaff_manifest: None,
             chaff_manifest_hash: None,
-            supplemental_chaff_source: None,
             request_policy: RequestPolicyArg::AsDefined,
             seed: 0,
             output_dir: PathBuf::from("/synthetic-output"),
@@ -63252,6 +62265,9 @@ mod tests {
                 buflo_fin_permission: None,
                 runner_wakeup_metrics: Some(metrics),
                 terminal_primary_partial_cell: None,
+                terminal_chaff_partial_cells: None,
+                terminal_chaff_replenishment_closure: None,
+                terminal_chaff_postlease_live_data: None,
             },
         );
         let receipt: serde_json::Value =
@@ -63690,6 +62706,9 @@ mod tests {
             buflo_fin_permission: None,
             runner_wakeup_metrics: None,
             terminal_primary_partial_cell: None,
+            terminal_chaff_partial_cells: None,
+            terminal_chaff_replenishment_closure: None,
+            terminal_chaff_postlease_live_data: None,
         };
         let before = super::render_run_json(
             &spec,
@@ -64302,8 +63321,6 @@ mod tests {
         drop(server);
         fs::remove_dir_all(output).expect("remove original-refusal fixture");
     }
-    include!("cs_terminal_cleanup_pending_flow_tests.rs");
-
 }
 
 // BEGIN ROOT CS PREOUTPUT OBSERVATIONAL TESTS 001
@@ -64315,8 +63332,13 @@ mod cs_preoutput_control_segment_diagnostic_tests {
     fn cs_preoutput_ring_is_fixed_and_first_terminal_freeze_preserves_order() {
         let mut diagnostic = CsPreoutputDiagnostic::new(Instant::now());
         for sequence in 0..300_u64 {
-            diagnostic.record_sample(6, CsPreoutputIdentity::default(), sequence * 10,
-                Some(sequence * 2), sequence * 10 + 1);
+            diagnostic.record_sample(
+                6,
+                CsPreoutputIdentity::default(),
+                sequence * 10,
+                Some(sequence * 2),
+                sequence * 10 + 1,
+            );
         }
         assert_eq!(diagnostic.len, CS_PREOUTPUT_SAMPLE_LIMIT);
         assert_eq!(diagnostic.dropped, 44);
@@ -64329,8 +63351,12 @@ mod cs_preoutput_control_segment_diagnostic_tests {
         let entries = value["entries"].as_array().unwrap();
         assert!(!entries.is_empty());
         assert_eq!(entries.last().unwrap()["sequence"], 299);
-        assert!(entries.windows(2).all(|pair|
-            pair[0]["sequence"].as_u64().unwrap() + 1 == pair[1]["sequence"].as_u64().unwrap()));
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0]["sequence"].as_u64().unwrap() + 1
+                    == pair[1]["sequence"].as_u64().unwrap())
+        );
         assert!(serde_json::to_vec(&value).unwrap().len() <= CS_PREOUTPUT_JSON_LIMIT);
     }
 
@@ -64346,12 +63372,27 @@ mod cs_preoutput_control_segment_diagnostic_tests {
         diagnostic.control = 3;
         diagnostic.control_at_process_ns = Some(49737412000);
         diagnostic.control_elapsed_defense_ns = Some(49725580000);
-        diagnostic.record_sample(11, CsPreoutputIdentity {
-            endpoint: Some(0), stream: Some(76), slot: Some(13837), limit: Some(7931999),
-            target_defense_ns: Some(49725580000), deadline_defense_ns: Some(49730580000),
-        }, 49737412000, Some(2000000), 49737412040);
-        diagnostic.record_sample(13, CsPreoutputIdentity::default(),
-            49742412000, Some(2010000), 49742412040);
+        diagnostic.record_sample(
+            11,
+            CsPreoutputIdentity {
+                endpoint: Some(0),
+                stream: Some(76),
+                slot: Some(13837),
+                limit: Some(7931999),
+                target_defense_ns: Some(49725580000),
+                deadline_defense_ns: Some(49730580000),
+            },
+            49737412000,
+            Some(2000000),
+            49737412040,
+        );
+        diagnostic.record_sample(
+            13,
+            CsPreoutputIdentity::default(),
+            49742412000,
+            Some(2010000),
+            49742412040,
+        );
         assert_eq!(semantic_clock_samples.get(), 1);
         assert_eq!(decision_before, 49730600000);
         // Deliberately different wall/CPU deltas remain raw observations;
@@ -64384,11 +63425,20 @@ mod cs_preoutput_control_segment_diagnostic_tests {
     fn cs_preoutput_failure_json_is_bounded_and_taken_once() {
         let mut diagnostic = CsPreoutputDiagnostic::new(Instant::now());
         for _ in 0..CS_PREOUTPUT_SAMPLE_LIMIT {
-            diagnostic.record_sample(21, CsPreoutputIdentity {
-                endpoint: Some(u64::MAX), stream: Some(u64::MAX), slot: Some(u64::MAX),
-                limit: Some(u64::MAX), target_defense_ns: Some(u64::MAX),
-                deadline_defense_ns: Some(u64::MAX),
-            }, u64::MAX, Some(u64::MAX), u64::MAX);
+            diagnostic.record_sample(
+                21,
+                CsPreoutputIdentity {
+                    endpoint: Some(u64::MAX),
+                    stream: Some(u64::MAX),
+                    slot: Some(u64::MAX),
+                    limit: Some(u64::MAX),
+                    target_defense_ns: Some(u64::MAX),
+                    deadline_defense_ns: Some(u64::MAX),
+                },
+                u64::MAX,
+                Some(u64::MAX),
+                u64::MAX,
+            );
         }
         diagnostic.freeze("bounded-largest-numeric-fixture");
         CS_PREOUTPUT_DIAGNOSTIC.with(|state| *state.borrow_mut() = Some(diagnostic));
@@ -64399,386 +63449,3 @@ mod cs_preoutput_control_segment_diagnostic_tests {
     }
 }
 // END ROOT CS PREOUTPUT OBSERVATIONAL TESTS 001
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "buflo_runner_wait_failure_diagnostic_tests.rs"]
-mod buflo_runner_wait_failure_diagnostic_tests;
-
-#[cfg(all(test, target_os = "linux"))]
-mod conservative_kernel_enqueue_witness_tests {
-    use super::{timed_egress, BufloKernelConservativeEnqueueWitness, BufloKernelRawItem};
-
-    fn witness(late: bool) -> BufloKernelConservativeEnqueueWitness {
-        let source = "10.0.0.2:40001".parse().expect("fixture source");
-        let destination = "192.0.2.1:443".parse().expect("fixture destination");
-        let socket = timed_egress::KernelEnqueueSocketGuard { schema_version: 1,
-            family: timed_egress::SocketFamily::Ipv4, local_address: source,
-            socket_type: libc::SOCK_DGRAM, protocol: libc::IPPROTO_UDP,
-            timestamping_report_flags: 2192, so_timestamp: 0, so_timestampns: 0,
-            fragment_policy: libc::IP_PMTUDISC_PROBE };
-        let helper = timed_egress::KernelEnqueueGuardReceipt { schema_version: 1,
-            before: socket.clone(), after: socket, datagram_sha256: "a".repeat(64),
-            source, destination, udp_payload_bytes: 1200,
-            requested_txtime_tai_ns: 110_000_000, latest_enqueue_tai_ns: 105_000_000,
-            per_message_timestamp_flags: 258 };
-        BufloKernelConservativeEnqueueWitness { schema_version: 1,
-            basis: if late { "same-datagram-kernel-software-upper" } else { "direct-userspace-upper" },
-            item_id: 0, job_id: 0, event_id: 0, endpoint_index: 0, endpoint: 0,
-            datagram_sha256: helper.datagram_sha256.clone(), source_address: source,
-            destination_address: destination, udp_payload_bytes: 1200,
-            release_tai_ns: 100_000_000, deadline_tai_ns: 105_000_000,
-            observed_enqueue_tai_lower_ns: 99_000_000,
-            observed_enqueue_tai_upper_ns: if late { 112_000_000 } else { 99_500_000 },
-            kernel_timestamp_id: 7, tx_sched_realtime_ns: 101_000_000,
-            tx_software_realtime_ns: 102_000_000,
-            provisional_software_tai_lower_ns: 102_000_000,
-            provisional_software_tai_upper_ns: 102_000_100,
-            enqueue_event_tai_upper_ns: if late { 102_000_100 } else { 99_500_000 },
-            helper_guard: helper }
-    }
-
-    fn raw(w: &BufloKernelConservativeEnqueueWitness) -> BufloKernelRawItem {
-        BufloKernelRawItem { item_id: w.item_id, job_id: w.job_id, order_index: 0,
-            event_id: w.event_id, role: "exact-outgoing", endpoint_index: w.endpoint_index,
-            endpoint: super::QcsdEndpointId(w.endpoint), send_path: "etf",
-            datagram_sha256: w.datagram_sha256.clone(), source_address: w.source_address,
-            destination_address: w.destination_address, udp_payload_bytes: 1200,
-            target_tai_ns: w.release_tai_ns, scm_txtime_tai_ns: Some(110_000_000),
-            enqueue_monotonic_ns: Some(111_999_999),
-            enqueue_tai_lower_ns: Some(w.observed_enqueue_tai_lower_ns),
-            enqueue_tai_upper_ns: Some(w.observed_enqueue_tai_upper_ns),
-            socket_timestamp_id: Some(w.kernel_timestamp_id),
-            tx_sched_realtime_ns: Some(w.tx_sched_realtime_ns),
-            tx_software_realtime_ns: Some(w.tx_software_realtime_ns), post_tx_clock_phase: None,
-            provisional_tx_software_tai_lower_ns: Some(w.provisional_software_tai_lower_ns),
-            provisional_tx_software_tai_upper_ns: Some(w.provisional_software_tai_upper_ns),
-            send_attempt: None, txtime_error: None, terminal_error: None, terminal_error_detail: None,
-            finalization_state: "controller-and-trace-finalized".into(), terminal_outcome: "transmitted".into() }
-    }
-
-    #[test]
-    fn direct_and_kernel_witnesses_keep_the_observed_userspace_interval_literal() {
-        for late in [false, true] {
-            let w = witness(late);
-            let item = raw(&w);
-            assert!(w.valid_fields());
-            assert!(w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
-                Some((102_000_020, 102_000_080))));
-            let encoded = serde_json::to_value(&w).expect("fixture serializes");
-            assert_eq!(encoded["observed_enqueue_tai_upper_ns"],
-                w.observed_enqueue_tai_upper_ns);
-            assert_eq!(item.enqueue_tai_upper_ns, Some(if late { 112_000_000 } else { 99_500_000 }));
-        }
-    }
-
-    #[test]
-    fn sched_fallback_fragmentation_and_deadline_ambiguity_are_not_proofs() {
-        let base = witness(true);
-        let mut changed = base.clone();
-        changed.basis = "same-datagram-kernel-sched-upper";
-        assert!(!changed.valid_fields());
-        changed = base.clone();
-        changed.helper_guard.before.so_timestamp = 1;
-        changed.helper_guard.after.so_timestamp = 1;
-        assert!(!changed.valid_fields());
-        changed = base.clone();
-        changed.helper_guard.before.so_timestampns = 1;
-        changed.helper_guard.after.so_timestampns = 1;
-        assert!(!changed.valid_fields());
-        changed = base.clone();
-        changed.helper_guard.before.fragment_policy = libc::IP_PMTUDISC_WANT;
-        changed.helper_guard.after.fragment_policy = libc::IP_PMTUDISC_WANT;
-        assert!(!changed.valid_fields());
-        changed = base.clone();
-        changed.provisional_software_tai_upper_ns = changed.deadline_tai_ns;
-        assert!(!changed.valid_fields());
-        changed = base.clone();
-        changed.observed_enqueue_tai_lower_ns = changed.deadline_tai_ns;
-        assert!(!changed.valid_fields());
-    }
-
-    #[test]
-    fn final_item_identity_and_clock_refinement_cannot_be_substituted() {
-        let w = witness(true);
-        let mut item = raw(&w);
-        assert!(w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
-            Some((102_000_020, 102_000_080))));
-        item.socket_timestamp_id = Some(8);
-        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
-            Some((102_000_020, 102_000_080))));
-        item = raw(&w);
-        item.datagram_sha256 = "b".repeat(64);
-        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
-            Some((102_000_020, 102_000_080))));
-        item = raw(&w);
-        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item,
-            Some((101_999_999, 102_000_080))));
-        assert!(!w.matches_final_item(0, 0, 100_000_000, 105_000_000, &item, None));
-    }
-}
-
-
-// BEGIN ROOT BF PREOUTPUT OBSERVATIONAL TEST 001
-#[cfg(test)]
-mod buflo_preoutput_diagnostic_tests {
-    use super::*;
-
-    #[test]
-    fn bf_preoutput_subcall_identity_ring_freeze_and_disabled_hook_are_observational() {
-        let bf = DefenseConfig::Buflo(Default::default());
-        let cs = DefenseConfig::CsBuflo(Default::default());
-        let one = Some(std::ffi::OsStr::new("1"));
-        assert!(buflo_preoutput_diagnostic_enabled(&bf, one));
-        assert!(!buflo_preoutput_diagnostic_enabled(&bf, None));
-        assert!(!buflo_preoutput_diagnostic_enabled(&bf, Some(std::ffi::OsStr::new("0"))));
-        assert!(!buflo_preoutput_diagnostic_enabled(&cs, one));
-        assert!(!buflo_preoutput_diagnostic_enabled(&DefenseConfig::None, one));
-        assert_eq!(&BUFLO_PREOUTPUT_STAGES[..34], CS_PREOUTPUT_STAGES.as_slice());
-        assert_eq!(&BUFLO_PREOUTPUT_STAGES[34..], &[
-            "queued_drain_before", "queued_drain_after",
-            "action_register_before", "action_register_after",
-            "receive_preflight_before", "receive_preflight_after",
-            "transport_apply_before", "transport_apply_after",
-            "main_job_lookup_before", "main_job_lookup_after",
-            "main_tuple_before", "main_tuple_after",
-            "main_sha256_before", "main_sha256_after",
-            "main_helper_before", "main_helper_after",
-            "response_channel_before", "response_channel_after",
-            "command_send_before", "command_send_after",
-            "main_call_before", "main_call_after",
-        ]);
-        // A disabled hook neither constructs a ring nor returns an observation.
-        BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| *state.borrow_mut() = None);
-        buflo_preoutput_diagnostic_mark(50, Some(7), None);
-        buflo_preoutput_diagnostic_freeze("disabled");
-        assert!(buflo_preoutput_diagnostic_take_failure().is_none());
-
-        // Install only the test thread's BF ring; no process environment mutation.
-        BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-            *state.borrow_mut() = Some(BufloPreoutputDiagnostic::new(Instant::now()));
-        });
-        for stage in 50..54 {
-            buflo_preoutput_diagnostic_mark(stage, Some(7), None);
-        }
-        buflo_preoutput_diagnostic_mark(54, Some(7), Some(14));
-        assert!(BUFLO_PREOUTPUT_DIAGNOSTIC.with(|state| {
-            state.borrow().as_ref().unwrap().failure_value().is_none()
-        }));
-        buflo_preoutput_diagnostic_freeze("test-terminal");
-        buflo_preoutput_diagnostic_mark(55, Some(7), Some(14));
-        buflo_preoutput_diagnostic_freeze("must-not-replace-first");
-        let value = buflo_preoutput_diagnostic_take_failure().unwrap();
-        assert_eq!(value["freeze_reason"], "test-terminal");
-        let entries = value["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 5);
-        for (index, stage) in (50..54).enumerate() {
-            assert_eq!(entries[index]["stage"], stage);
-            assert_eq!(entries[index]["job_id"], 7);
-            assert!(entries[index]["event_id"].is_null());
-        }
-        assert_eq!(entries[4]["event_id"], 14);
-        assert_eq!(value["scientific_credit_added"], 0);
-        assert_eq!(value["decision_clock_samples_consumed"], false);
-        assert!(buflo_preoutput_diagnostic_take_failure().is_none());
-
-        // Deterministic samples exercise wrap/drop and worst-width JSON trimming.
-        let mut ring = BufloPreoutputDiagnostic::new(Instant::now());
-        ring.control = u64::MAX;
-        ring.control_at_process_ns = Some(u64::MAX);
-        ring.control_elapsed_defense_ns = Some(u64::MAX);
-        ring.defense_start_process_ns = Some(u64::MAX);
-        for sequence in 0..300_u64 {
-            ring.record_sample(55, BufloPreoutputIdentity {
-                endpoint: Some(u64::MAX), stream: Some(u64::MAX), slot: Some(u64::MAX),
-                limit: Some(u64::MAX), target_defense_ns: Some(u64::MAX),
-                deadline_defense_ns: Some(u64::MAX), job_id: Some(7), event_id: Some(14),
-            }, u64::MAX - 1, Some(u64::MAX - sequence), u64::MAX);
-        }
-        assert_eq!(ring.len, BUFLO_PREOUTPUT_SAMPLE_LIMIT);
-        assert_eq!(ring.dropped, 44);
-        assert!(ring.failure_value().is_none());
-        ring.freeze("bounded-test-terminal");
-        ring.record_sample(1, BufloPreoutputIdentity::default(), 1, None, 2);
-        assert_eq!(ring.sequence, 300);
-        let value = ring.failure_value().unwrap();
-        assert_eq!(value["stages"].as_array().unwrap().len(), 56);
-        assert!(value["serialized_dropped"].as_u64().unwrap() > 0);
-        let entries = value["entries"].as_array().unwrap();
-        assert!(!entries.is_empty());
-        assert_eq!(entries.last().unwrap()["sequence"], 299);
-        assert!(entries.windows(2).all(|pair|
-            pair[0]["sequence"].as_u64().unwrap() + 1 == pair[1]["sequence"].as_u64().unwrap()));
-        assert!(serde_json::to_vec(&value).unwrap().len() <= BUFLO_PREOUTPUT_JSON_LIMIT);
-
-        let mut no_cpu = BufloPreoutputDiagnostic::new(Instant::now());
-        no_cpu.record_sample(40, BufloPreoutputIdentity::default(), 1, None, 2);
-        assert_eq!(no_cpu.unavailable_cpu, 1);
-        assert!(no_cpu.samples[0].unwrap().thread_cpu_ns.is_none());
-    }
-}
-// END ROOT BF PREOUTPUT OBSERVATIONAL TEST 001
-
-#[cfg(test)]
-mod cs_supplemental_source_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-    fn directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "neqo-cs8-synthetic-noncredit-bin-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("test clock").as_nanos(),
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir(&path).expect("create-only synthetic fixture");
-        path
-    }
-
-    fn resource(known_valid: bool) -> serde_json::Value {
-        json!({"id": 2_147_483_648_u32, "url": "https://fonts.synthetic.example/padding.woff2",
-            "type": "Other", "content_length": if known_valid { Some(4096) } else { None },
-            "data_length": if known_valid { 4096 } else { 0 }, "known_valid": known_valid,
-            "chaff_priority": false, "depends_on": [], "headers": [
-                ["accept", "*/*"], ["accept-encoding", "identity"],
-                ["accept-language", "en-US,en;q=0.9"]]})
-    }
-
-    fn manifest() -> serde_json::Value {
-        json!({"schema_version": 8,
-            "artifact_type": "qcsd-cs-supplemental-same-host-qualified-chaff-manifest",
-            "policy": CS_SUPPLEMENTAL_POLICY,
-            "qualification_scope": "response-only-separate-same-host-cs-pool-v1",
-            "application_manifest_sha256": "a".repeat(64),
-            "application_workload_sha256": "b".repeat(64),
-            "chaff_pool_source_sha256": "c".repeat(64),
-            "candidate_manifest_sha256": "d".repeat(64),
-            "discovery_provenance_sha256": "e".repeat(64),
-            "qualification_evidence_sha256": "f".repeat(64),
-            "application_resource_id": 0, "selected_pool_resource_id": 2_147_483_648_u32,
-            "qualified_parallel_chaff_streams": 5, "resources": [{"resource": resource(true),
-                "chaff_qualification": {"schema_version": 8,
-                    "qualification_scope": "response-only-separate-same-host-cs-pool-v1",
-                    "method": "GET", "request_stream_bytes": 150,
-                    "qualified_parallel_chaff_streams": 5, "qualification_runs": 3,
-                    "qualified_completion_count": 15,
-                    "expected_response": {"status": 200, "content_encoding": "identity",
-                        "body_bytes": 4096, "body_sha256": "1".repeat(64)},
-                    "response_qualification_sha256": "2".repeat(64)}}]})
-    }
-
-    #[test]
-    fn cs8_runtime_dispatch_preserves_exact_five_stream_cap_and_mode_scope() {
-        let runtime = RuntimeChaffManifest::from_json(&manifest().to_string())
-            .expect("strict new CS8 runtime metadata");
-        assert!(matches!(runtime, RuntimeChaffManifest::SupplementalCsV8(_)));
-        assert_eq!(runtime.selected_chaff_resource_id(), 2_147_483_648);
-        assert_eq!(runtime.qualified_parallel_chaff_streams(), 5);
-        assert_eq!(runtime.qualification(2_147_483_648).unwrap().request_stream_bytes(), 150);
-        let cs = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig {
-            parameters: "synthetic-noncredit-cs-parameters.json".into(),
-        });
-        validate_chaff_manifest_defense(&cs, &runtime).expect("CS8 only for CS");
-        let mut config = QcsdConfig { defense: cs, max_chaff_streams: 5,
-                                     ..QcsdConfig::default() };
-        bind_qualified_chaff_stream_limits(&mut config, &runtime).expect("five qualified streams");
-        config.max_chaff_streams = 6;
-        assert!(bind_qualified_chaff_stream_limits(&mut config, &runtime).is_err());
-        for other in [DefenseConfig::None,
-            DefenseConfig::Front(neqo_csdef::FrontConfig::default()),
-            DefenseConfig::Tamaraw(neqo_csdef::TamarawConfig::default()),
-            DefenseConfig::Buflo(neqo_csdef::BufloConfig { parameters: "unused.json".into() })] {
-            assert!(validate_chaff_manifest_defense(&other, &runtime).is_err());
-        }
-    }
-
-    #[test]
-    fn ft7_and_cs8_are_distinct_runtime_authorities() {
-        let mut ft = manifest();
-        ft["schema_version"] = json!(7);
-        ft["artifact_type"] = json!("qcsd-ft-supplemental-same-host-qualified-chaff-manifest");
-        ft["policy"] = json!(FT_SUPPLEMENTAL_POLICY);
-        ft["qualification_scope"] = json!("response-only-separate-same-host-pool-v1");
-        ft["resources"][0]["chaff_qualification"]["schema_version"] = json!(7);
-        ft["resources"][0]["chaff_qualification"]["qualification_scope"] =
-            json!("response-only-separate-same-host-pool-v1");
-        let runtime = RuntimeChaffManifest::from_json(&ft.to_string()).expect("retained FT7");
-        assert!(matches!(runtime, RuntimeChaffManifest::SupplementalFtV7(_)));
-        let cs = DefenseConfig::CsBuflo(neqo_csdef::CsBufloConfig { parameters: "unused.json".into() });
-        assert!(validate_chaff_manifest_defense(&cs, &runtime).is_err());
-        let mut relabelled = ft;
-        relabelled["schema_version"] = json!(8);
-        assert!(RuntimeChaffManifest::from_json(&relabelled.to_string()).is_err());
-    }
-
-    #[test]
-    fn original_unshaped_candidate_probe_preserves_high_id_and_unknown_body() {
-        let root = directory();
-        let workload = root.join("candidate.json");
-        fs::write(&workload, json!({"resources": [resource(false)]}).to_string())
-            .expect("synthetic declared candidate bytes");
-        let (loaded, workload_hash) = load_manifest(&workload).expect("original complete workload parser");
-        assert_eq!(loaded.resources[0].id, 2_147_483_648);
-        assert!(!loaded.resources[0].known_valid);
-        assert_eq!(loaded.resources[0].content_length, None);
-        assert_eq!(loaded.resources[0].data_length, 0);
-        let output = root.join("must-not-create");
-        let parsed = Args::try_parse_from([
-            "neqo-qcsd-client", "run", "--workload", workload.to_str().unwrap(),
-            "--profile", "research-1200", "--defense", "none", "--request-policy", "as-defined",
-            "--application-response-policy", "http-2xx-only-v1", "--seed", "0",
-            "--output-dir", output.to_str().unwrap(), "--max-response-bytes", "16777216",
-            "--timeout-seconds", "120",
-        ]).expect("actual high-ID undefended probe CLI");
-        parsed.validate_ft_supplemental_arguments().expect("no shaped pool authority on ordinary probe");
-        let mut spec = RunSpec {
-            method: "GET", workload: loaded, workload_hash,
-            application_workload_source: None,
-            application_response_policy: ApplicationResponsePolicy::Http2xxOnly,
-            config: QcsdConfig { defense: DefenseConfig::None, ..QcsdConfig::default() },
-            defense_parameters: None, chaff_manifest: None, chaff_manifest_hash: None,
-            supplemental_chaff_source: None, request_policy: RequestPolicyArg::AsDefined,
-            seed: 0, output_dir: output.clone(), max_response_bytes: 16_777_216,
-            timeout_seconds: 120,
-        };
-        // These are the same pure guards called by execute_run before output
-        // creation. Do not enter execute_run, NSS, scheduler setup or network.
-        spec.workload.validate().expect("high-ID unshaped workload survives RunSpec");
-        spec.application_response_policy.validate_workload(&spec.workload)
-            .expect("ordinary strict working-GET response contract");
-        validate_buflo_incoming_credit_release_policy(&spec).expect("no BuFLO authority");
-        validate_tamaraw_capture_policy(&spec).expect("no Tamaraw authority");
-        validate_front_capture_policy(&spec).expect("no FRONT authority");
-        validate_terminal_primary_partial_cell_policy(&spec).expect("no terminal partial-cell authority");
-        validate_workload_urls(&spec.workload).expect("same-host absolute HTTPS candidate");
-        validate_qualified_chaff_binding(&spec).expect("ordinary candidate does not require shaped pool");
-        validate_walkie_talkie_chaff_precondition(&spec).expect("no Walkie-Talkie authority");
-        assert_eq!(spec.workload.resources[0].id, 2_147_483_648);
-        assert!(!spec.workload.resources[0].known_valid);
-        assert!(!shapes_stream_sends(&spec.config.defense));
-        // Adding a shaped CS claim cannot turn this unknown-body probe into
-        // a qualified session without its distinct full application/source.
-        spec.chaff_manifest = Some(RuntimeChaffManifest::from_json(&manifest().to_string())
-            .expect("synthetic typed CS manifest"));
-        assert!(validate_qualified_chaff_binding(&spec).is_err());
-        assert!(!output.exists());
-        fs::remove_dir_all(root).expect("remove only owned synthetic fixture");
-    }
-
-    #[test]
-    fn supplemental_qualifier_rejects_wrong_parallelism_before_reading_sources_or_NSS() {
-        for parallel in ["4", "6", "20"] {
-            let parsed = Args::try_parse_from([
-                "neqo-qcsd-client", "qualify-chaff-response", "--workload", "/must-not-read/prepared.json",
-                "--application-manifest", "/must-not-read/formal.json",
-                "--supplemental-chaff-source", "/must-not-read/pool.json",
-                "--application-resource-id", "0", "--selected-chaff-resource-id", "2147483648",
-                "--parallel-requests", parallel, "--packet-size", "1200",
-                "--max-response-bytes", "16777216", "--output-dir", "/must-not-create/native159",
-            ]).expect("valid CLI syntax for semantic refusal");
-            let refusal = parsed.validate_ft_supplemental_arguments().expect_err("exactly five required");
-            assert!(refusal.to_string().contains("5 simultaneous"));
-        }
-    }
-}

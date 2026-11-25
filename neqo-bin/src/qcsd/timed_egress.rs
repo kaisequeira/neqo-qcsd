@@ -18,8 +18,7 @@
 
 use std::{
     collections::VecDeque,
-    fs,
-    io::{self, Write as _},
+    fs, io,
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
@@ -35,113 +34,6 @@ use std::{
 use neqo_common::datagram;
 use serde::Serialize;
 use thiserror::Error;
-
-// Native153 userspace-only main-enqueue gap observations. Each record is
-// fixed-size, emitted only for an actual failed main operation, and has no
-// authority over a clock, packet, deadline, phase, receipt or return value.
-const BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT: usize = 4;
-const BUFLO_ENQUEUE_GAP_JSON_LIMIT: usize = 4 * 1024;
-
-pub(super) type BufloEnqueueGapClocks = [Option<u64>; 5];
-
-pub(super) fn buflo_enqueue_gap_clocks() -> BufloEnqueueGapClocks {
-    [clock_monotonic_ns().ok(), clock_tai_ns().ok(), clock_thread_cpu_ns().ok(),
-     clock_tai_ns().ok(), clock_monotonic_ns().ok()]
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-struct BufloEnqueueGapSample {
-    phase: &'static str,
-    clocks: BufloEnqueueGapClocks,
-}
-
-pub(super) struct BufloEnqueueGapDiagnostic {
-    side: &'static str,
-    slot: Option<u64>,
-    job_id: Option<u64>,
-    socket_index: Option<usize>,
-    txtime_tai_ns: Option<u64>,
-    latest_enqueue_tai_ns: Option<u64>,
-    runner_submit_clocks: Option<BufloEnqueueGapClocks>,
-    samples: [Option<BufloEnqueueGapSample>; BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT],
-    len: usize,
-    truncated: bool,
-    emitted: bool,
-}
-
-impl BufloEnqueueGapDiagnostic {
-    pub(super) const fn runner(slot: u64) -> Self {
-        Self { side: "runner", slot: Some(slot), job_id: None, socket_index: None,
-            txtime_tai_ns: None, latest_enqueue_tai_ns: None, runner_submit_clocks: None,
-            samples: [None; BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT], len: 0,
-            truncated: false, emitted: false }
-    }
-
-    pub(super) const fn helper(job_id: u64, socket_index: usize, txtime_tai_ns: u64,
-        latest_enqueue_tai_ns: u64, runner_submit_clocks: BufloEnqueueGapClocks) -> Self {
-        Self { side: "helper", slot: None, job_id: Some(job_id),
-            socket_index: Some(socket_index), txtime_tai_ns: Some(txtime_tai_ns),
-            latest_enqueue_tai_ns: Some(latest_enqueue_tai_ns),
-            runner_submit_clocks: Some(runner_submit_clocks),
-            samples: [None; BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT], len: 0,
-            truncated: false, emitted: false }
-    }
-
-    pub(super) fn bind_job(&mut self, job_id: u64) {
-        self.job_id = Some(job_id);
-    }
-
-    pub(super) fn record_with(&mut self, phase: &'static str, clocks: BufloEnqueueGapClocks) {
-        if self.emitted { return; }
-        if self.len == self.samples.len() {
-            self.truncated = true;
-            return;
-        }
-        self.samples[self.len] = Some(BufloEnqueueGapSample { phase, clocks });
-        self.len += 1;
-    }
-
-    pub(super) fn record(&mut self, phase: &'static str) {
-        self.record_with(phase, buflo_enqueue_gap_clocks());
-    }
-
-    pub(super) fn emit_failure_with(&mut self, failed: bool, emit: impl FnOnce(&str)) {
-        if !failed || self.emitted { return; }
-        self.emitted = true;
-        let value = serde_json::json!({
-            "schema_version": 1,
-            "source": "buflo-two-thread-main-enqueue-gap-v1",
-            "diagnostic_only": true,
-            "side": self.side,
-            "slot": self.slot,
-            "job_id": self.job_id,
-            "socket_index": self.socket_index,
-            "txtime_tai_ns": self.txtime_tai_ns,
-            "latest_enqueue_tai_ns": self.latest_enqueue_tai_ns,
-            "clock_order": "MONOTONIC-before,TAI-before,THREAD_CPU,TAI-after,MONOTONIC-after",
-            "runner_submit_clocks": self.runner_submit_clocks,
-            "runner_submit_CPU_belongs_to_runner": true,
-            "sample_CPU_belongs_to_record_side": true,
-            "cross_thread_CPU_values_are_not_subtractable": true,
-            "samples": &self.samples[..self.len],
-            "sample_limit": BUFLO_ENQUEUE_GAP_SAMPLE_LIMIT,
-            "truncated": self.truncated,
-            "operation_failed": true,
-            "actual_kernel_enqueue_or_wake_observed": false,
-            "phase_or_deadline_authority": false,
-        });
-        if let Ok(encoded) = serde_json::to_string(&value)
-            && encoded.len() <= BUFLO_ENQUEUE_GAP_JSON_LIMIT {
-            emit(&encoded);
-        }
-    }
-
-    pub(super) fn emit_failure(&mut self) {
-        self.emit_failure_with(true, |encoded| {
-            let _ = writeln!(io::stderr().lock(), "QCSD_BUFLO_ENQUEUE_GAP_V1 {encoded}");
-        });
-    }
-}
 
 const SCM_PRIORITY: libc::c_int = libc::SO_PRIORITY;
 const SO_EE_ORIGIN_TXTIME: u8 = 6;
@@ -488,7 +380,6 @@ impl PreparedTimedEgressSocket {
             pending: None,
             timestamp_feedback: TimestampFeedback::default(),
             layered_timestamp_feedback: false,
-            conservative_kernel_enqueue_witness: false,
             poison: None,
         })
     }
@@ -779,60 +670,6 @@ pub fn drop_process_privileges_permanently(
     Ok(receipt)
 }
 
-/// Prospective schema15 eligibility for a software-TX causal bound. The
-/// observed socket options are receipts, not an option-changing policy.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct KernelEnqueueSocketGuard {
-    pub schema_version: u32,
-    pub family: SocketFamily,
-    pub local_address: SocketAddr,
-    pub socket_type: libc::c_int,
-    pub protocol: libc::c_int,
-    pub timestamping_report_flags: libc::c_int,
-    pub so_timestamp: libc::c_int,
-    pub so_timestampns: libc::c_int,
-    pub fragment_policy: libc::c_int,
-}
-
-impl KernelEnqueueSocketGuard {
-    pub fn valid(&self) -> bool {
-        self.schema_version == 1 && self.socket_type == libc::SOCK_DGRAM
-            && self.protocol == libc::IPPROTO_UDP
-            && self.timestamping_report_flags == REPORT_FLAGS
-            && self.so_timestamp == 0 && self.so_timestampns == 0
-            && match self.family {
-                SocketFamily::Ipv4 => self.local_address.is_ipv4()
-                    && matches!(self.fragment_policy, libc::IP_PMTUDISC_DO | libc::IP_PMTUDISC_PROBE),
-                SocketFamily::Ipv6 => self.local_address.is_ipv6() && self.fragment_policy == 1,
-            }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct KernelEnqueueGuardReceipt {
-    pub schema_version: u32,
-    pub before: KernelEnqueueSocketGuard,
-    pub after: KernelEnqueueSocketGuard,
-    pub datagram_sha256: String,
-    pub source: SocketAddr,
-    pub destination: SocketAddr,
-    pub udp_payload_bytes: usize,
-    pub requested_txtime_tai_ns: u64,
-    pub latest_enqueue_tai_ns: u64,
-    pub per_message_timestamp_flags: libc::c_int,
-}
-
-impl KernelEnqueueGuardReceipt {
-    pub fn valid(&self) -> bool {
-        self.schema_version == 1 && self.before == self.after && self.before.valid()
-            && self.before.local_address == self.source && self.udp_payload_bytes == 1_200
-            && self.per_message_timestamp_flags == REQUEST_FLAGS
-            && self.datagram_sha256.len() == 64
-            && self.datagram_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            && self.latest_enqueue_tai_ns < self.requested_txtime_tai_ns
-    }
-}
-
 /// Successful timed-send enqueue evidence.
 ///
 /// The helper samples these fields in strict operation order:
@@ -853,8 +690,6 @@ pub struct TimedEnqueueReceipt {
     pub source: SocketAddr,
     pub destination: SocketAddr,
     pub tos: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kernel_enqueue_guard: Option<KernelEnqueueGuardReceipt>,
     pub per_message_priority: Option<libc::c_int>,
     pub effective_socket_priority: libc::c_int,
     pub priority_method: TimedPriorityMethod,
@@ -1195,7 +1030,6 @@ pub struct ActiveTimedEgressSocket {
     pending: Option<PendingTransmission>,
     timestamp_feedback: TimestampFeedback,
     layered_timestamp_feedback: bool,
-    conservative_kernel_enqueue_witness: bool,
     poison: Option<String>,
 }
 
@@ -1210,71 +1044,6 @@ impl ActiveTimedEgressSocket {
         }
         self.layered_timestamp_feedback = true;
         Ok(())
-    }
-
-    /// Read-only eligibility; never enable a receive timestamp fallback or
-    /// change a packet/fragmentation/socket option for this witness.
-    fn kernel_enqueue_socket_guard(&self) -> Result<KernelEnqueueSocketGuard, TimedEgressError> {
-        let fd = self.fd.as_raw_fd();
-        let socket_type: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE,
-            "getsockopt(schema15 SO_TYPE)")?;
-        let protocol: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL,
-            "getsockopt(schema15 SO_PROTOCOL)")?;
-        let reports: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPING,
-            "getsockopt(schema15 SO_TIMESTAMPING)")?;
-        let timestamp: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMP,
-            "getsockopt(schema15 SO_TIMESTAMP)")?;
-        let timestampns: libc::c_int = getsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS,
-            "getsockopt(schema15 SO_TIMESTAMPNS)")?;
-        let fragment_policy: libc::c_int = match self.family {
-            SocketFamily::Ipv4 => getsockopt(fd, libc::SOL_IP, libc::IP_MTU_DISCOVER,
-                "getsockopt(schema15 IP_MTU_DISCOVER)")?,
-            SocketFamily::Ipv6 => getsockopt(fd, libc::SOL_IPV6, libc::IPV6_DONTFRAG,
-                "getsockopt(schema15 IPV6_DONTFRAG)")?,
-        };
-        let (family, local_address) = socket_identity(fd)?;
-        let guard = KernelEnqueueSocketGuard { schema_version: 1, family, local_address,
-            socket_type, protocol, timestamping_report_flags: reports,
-            so_timestamp: timestamp, so_timestampns: timestampns, fragment_policy };
-        if !guard.valid() || family != self.family || local_address != self.local_address {
-            return Err(TimedEgressError::CapabilityMismatch(
-                "schema15 requires exact unfragmented UDP socket with receive timestamp fallbacks disabled".into()));
-        }
-        Ok(guard)
-    }
-
-    pub fn enable_conservative_kernel_enqueue_witness(&mut self) -> Result<(), TimedEgressError> {
-        self.ensure_usable()?;
-        if self.pending.is_some() || !self.timestamp_feedback.events.is_empty()
-            || !self.layered_timestamp_feedback {
-            return self.fail(TimedEgressError::Protocol(
-                "schema15 must be selected after layered feedback and before any send".into()));
-        }
-        self.kernel_enqueue_socket_guard()?;
-        self.conservative_kernel_enqueue_witness = true;
-        Ok(())
-    }
-
-    fn enqueue_exact_schema15(&mut self, batch: &datagram::Batch,
-        txtime_tai_ns: u64, latest_enqueue_tai_ns: u64)
-        -> Result<TimedEnqueueReceipt, TimedEgressError> {
-        let before = self.kernel_enqueue_socket_guard()?;
-        validate_exact_batch(batch, self.family, self.local_address)?;
-        let digest = super::sha256(batch.data()).map_err(|error|
-            TimedEgressError::Protocol(format!("schema15 helper hash failed: {error}")))?;
-        let mut result = self.enqueue_exact(batch, txtime_tai_ns, latest_enqueue_tai_ns)?;
-        let after = self.kernel_enqueue_socket_guard()?;
-        if before != after {
-            return self.fail(TimedEgressError::CapabilityMismatch(
-                "schema15 socket witness capability changed across exact send".into()));
-        }
-        result.kernel_enqueue_guard = Some(KernelEnqueueGuardReceipt {
-            schema_version: 1, before, after, datagram_sha256: digest,
-            source: batch.source(), destination: batch.destination(),
-            udp_payload_bytes: batch.data().len(), requested_txtime_tai_ns: txtime_tai_ns,
-            latest_enqueue_tai_ns, per_message_timestamp_flags: REQUEST_FLAGS,
-        });
-        Ok(result)
     }
 
     pub const fn setup_receipt(&self) -> &TimedEgressSetupReceipt {
@@ -1491,7 +1260,6 @@ impl ActiveTimedEgressSocket {
             source: batch.source(),
             destination: batch.destination(),
             tos: u8::from(batch.tos()),
-            kernel_enqueue_guard: None,
             per_message_priority: matches!(
                 self.setup_receipt.priority_method,
                 TimedPriorityMethod::PerDatagramScmPriority
@@ -2209,7 +1977,6 @@ enum HelperCommand {
         latest_enqueue_tai_ns: u64,
         report_timeout: Duration,
         response: SyncSender<Result<TimedEgressJobResult, TimedEgressError>>,
-        runner_submit_clocks: BufloEnqueueGapClocks,
     },
     TransmitImmediate {
         job_id: u64,
@@ -2300,13 +2067,7 @@ impl TimedEgressHelper {
                             latest_enqueue_tai_ns,
                             report_timeout,
                             response,
-                            runner_submit_clocks,
                         } => {
-                            let mut enqueue_gap = BufloEnqueueGapDiagnostic::helper(
-                                job_id, socket_index, txtime_tai_ns, latest_enqueue_tai_ns,
-                                runner_submit_clocks,
-                            );
-                            enqueue_gap.record("helper-command-received");
                             let result = global_poison.as_ref().map_or_else(
                                 || {
                                     if let Some(active) = active_job_id {
@@ -2320,7 +2081,6 @@ impl TimedEgressHelper {
                                             last_main_job_id.unwrap_or_default()
                                         )))
                                     } else {
-                                        enqueue_gap.record("helper-before-compound-job");
                                         execute_compound_job(
                                             &mut sockets,
                                             socket_index,
@@ -2335,8 +2095,6 @@ impl TimedEgressHelper {
                                 },
                                 |reason| Err(TimedEgressError::Poisoned(reason.clone())),
                             );
-                            enqueue_gap.record("helper-compound-result");
-                            let main_failed = result.is_err();
                             match &result {
                                 Ok(_) => {
                                     active_job_id = Some(job_id);
@@ -2367,11 +2125,8 @@ impl TimedEgressHelper {
                                     &mut global_poison,
                                     "main response channel disconnected".into(),
                                 );
-                                if main_failed { enqueue_gap.emit_failure(); }
                                 break;
                             }
-                            // Do not delay the original response with failure serialization.
-                            if main_failed { enqueue_gap.emit_failure(); }
                         }
                         HelperCommand::TransmitImmediate {
                             job_id,
@@ -2600,10 +2355,7 @@ impl TimedEgressHelper {
         latest_enqueue_tai_ns: u64,
         report_timeout: Duration,
     ) -> Result<TimedEgressJobResult, TimedEgressError> {
-        super::buflo_preoutput_diagnostic_mark(50, Some(job_id), None);
         let (response, result) = mpsc::sync_channel(1);
-        super::buflo_preoutput_diagnostic_mark(51, Some(job_id), None);
-        super::buflo_preoutput_diagnostic_mark(52, Some(job_id), None);
         self.sender
             .send(HelperCommand::TransmitMain {
                 job_id,
@@ -2613,10 +2365,8 @@ impl TimedEgressHelper {
                 latest_enqueue_tai_ns,
                 report_timeout,
                 response,
-                runner_submit_clocks: buflo_enqueue_gap_clocks(),
             })
             .map_err(|source| TimedEgressError::Channel(source.to_string()))?;
-        super::buflo_preoutput_diagnostic_mark(53, Some(job_id), None);
         result
             .recv()
             .map_err(|source| TimedEgressError::Channel(source.to_string()))?
@@ -2969,11 +2719,7 @@ fn execute_compound_job(
 
     let deadline_monotonic_ns = monotonic_deadline(report_timeout)?;
     let main_socket = &mut sockets[main_socket_index];
-    let enqueue = if main_socket.conservative_kernel_enqueue_witness {
-        main_socket.enqueue_exact_schema15(main_batch, txtime_tai_ns, latest_enqueue_tai_ns)?
-    } else {
-        main_socket.enqueue_exact(main_batch, txtime_tai_ns, latest_enqueue_tai_ns)?
-    };
+    let enqueue = main_socket.enqueue_exact(main_batch, txtime_tai_ns, latest_enqueue_tai_ns)?;
     let outcome_timeout = match remaining_until(deadline_monotonic_ns) {
         Ok(timeout) => timeout,
         Err(source) => {
@@ -4526,7 +4272,10 @@ pub fn clock_tai_ns() -> Result<u64, TimedEgressError> {
 }
 
 pub fn clock_thread_cpu_ns() -> Result<u64, TimedEgressError> {
-    clock_ns(libc::CLOCK_THREAD_CPUTIME_ID, "clock_gettime(CLOCK_THREAD_CPUTIME_ID)")
+    clock_ns(
+        libc::CLOCK_THREAD_CPUTIME_ID,
+        "clock_gettime(CLOCK_THREAD_CPUTIME_ID)",
+    )
 }
 
 pub fn clock_monotonic_ns() -> Result<u64, TimedEgressError> {
@@ -4787,7 +4536,6 @@ mod tests {
             }),
             timestamp_feedback: TimestampFeedback::default(),
             layered_timestamp_feedback: true,
-            conservative_kernel_enqueue_witness: false,
             poison: None,
         }
     }
@@ -6779,7 +6527,6 @@ mod tests {
             source: SocketAddr::from((Ipv4Addr::LOCALHOST, 12000)),
             destination: SocketAddr::from((Ipv4Addr::LOCALHOST, 12001)),
             tos: 0,
-            kernel_enqueue_guard: None,
             per_message_priority: None,
             effective_socket_priority: 6,
             priority_method: TimedPriorityMethod::SerializedSocketSoPriority,

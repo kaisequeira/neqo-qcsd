@@ -203,6 +203,7 @@ impl QcsdProfile {
             keep_alive_lead_time_us: controller.keep_alive_lead_time_us,
             tail_wait_us: controller.tail_wait_us,
             buflo_retained_parser_fin_permission: false,
+            buflo_direct_fin_credit_reassignment: false,
             cs_live_chaff_header_progress: self == Self::Research1200
                 && matches!(&defense, DefenseConfig::CsBuflo(_)),
             defense,
@@ -227,20 +228,20 @@ mod tests {
             .resolve(defense)
             .expect("research-1200 profile");
         let mut expected = json!({
-                "schema_version": 2,
-                "control_interval_us": 5_000,
-                "initial_max_stream_data": 16,
-                "automatic_receive_window": 1_048_576,
-                "max_chaff_streams": 5,
-                "low_watermark": 1_000_000,
-                "use_empty_resources": false,
-                "max_stream_data_excess": 1_000,
-                "max_udp_payload_size": 1_200,
-                "drop_unsatisfied_events": false,
-                "keep_alive_lead_time_us": 100_000,
-                "tail_wait_us": 0,
-                "defense": expected_defense,
-            });
+            "schema_version": 2,
+            "control_interval_us": 5_000,
+            "initial_max_stream_data": 16,
+            "automatic_receive_window": 1_048_576,
+            "max_chaff_streams": 5,
+            "low_watermark": 1_000_000,
+            "use_empty_resources": false,
+            "max_stream_data_excess": 1_000,
+            "max_udp_payload_size": 1_200,
+            "drop_unsatisfied_events": false,
+            "keep_alive_lead_time_us": 100_000,
+            "tail_wait_us": 0,
+            "defense": expected_defense,
+        });
         if expected_defense.get("kind").and_then(Value::as_str) == Some("cs_buflo") {
             expected["cs_live_chaff_header_progress"] = json!(true);
         }
@@ -590,7 +591,9 @@ mod tests {
                 parameters: "cs-buflo-cpsp-live.json".into(),
             })
             .expect("ordinary public research CS profile");
-        resolved.validate().expect("unchanged strict CS configuration");
+        resolved
+            .validate()
+            .expect("unchanged strict CS configuration");
         assert!(resolved.cs_live_chaff_header_progress);
         assert!(!resolved.buflo_retained_parser_fin_permission);
         assert_eq!(
@@ -646,11 +649,17 @@ mod tests {
                 parameters: "cs-buflo-cpsp-live.json".into(),
             },
         ];
-        for profile in [QcsdProfile::Published, QcsdProfile::Live, QcsdProfile::Research1200] {
+        for profile in [
+            QcsdProfile::Published,
+            QcsdProfile::Live,
+            QcsdProfile::Research1200,
+        ] {
             for kind in &kinds {
                 let selected = profile == QcsdProfile::Research1200
                     && matches!(kind, DefenseKind::CsBuflo { .. });
-                let resolved = profile.resolve(kind.clone()).expect("actual profile resolution");
+                let resolved = profile
+                    .resolve(kind.clone())
+                    .expect("actual profile resolution");
                 assert_eq!(resolved.cs_live_chaff_header_progress, selected);
                 assert!(!resolved.buflo_retained_parser_fin_permission);
                 let serialized = serde_json::to_value(&resolved).expect("serialize actual profile");
@@ -675,9 +684,11 @@ mod tests {
             |config| config.max_chaff_streams = 6,
             |config| config.use_empty_resources = true,
             |config| config.drop_unsatisfied_events = true,
-            |config| config.defense = DefenseConfig::CsBuflo(CsBufloConfig {
-                parameters: String::new(),
-            }),
+            |config| {
+                config.defense = DefenseConfig::CsBuflo(CsBufloConfig {
+                    parameters: String::new(),
+                })
+            },
         ];
         for mutate in mutations {
             let mut invalid = selected.clone();

@@ -211,6 +211,11 @@ impl ChaffManager {
         }
     }
 
+    /// Forget one planned request that was never opened.
+    pub(crate) fn cancel_pending(&mut self, request_id: QcsdChaffRequestId) -> bool {
+        self.pending.remove(&request_id).is_some()
+    }
+
     pub fn request_failed(&mut self, resource_id: u32, request_id: Option<QcsdChaffRequestId>) {
         if let Some(request_id) = request_id {
             self.pending.remove(&request_id);

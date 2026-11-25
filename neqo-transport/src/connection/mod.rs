@@ -394,6 +394,9 @@ pub struct Connection {
     /// Target selected for the datagram currently being assembled.
     #[cfg(feature = "qcsd")]
     qcsd_active_target: Option<QcsdPacketTarget>,
+    /// Same-output-call fixed-size metadata; never authorizes output.
+    #[cfg(feature = "qcsd")]
+    qcsd_last_output_target_diagnostic: Option<(Instant, [u64; 23])>,
     /// Endpoint used to attribute transport outcomes to the controller.
     #[cfg(feature = "qcsd")]
     qcsd_endpoint: Option<QcsdEndpointId>,
@@ -513,7 +516,10 @@ impl Connection {
                 Ok(())
             }
         }
-        let mut text = Text { value: String::new(), truncated: false };
+        let mut text = Text {
+            value: String::new(),
+            truncated: false,
+        };
         let _format_result = fmt::write(&mut text, value);
         (text.value, text.truncated)
     }
@@ -532,7 +538,9 @@ impl Connection {
         if self.qcsd_error_diagnostics.first_http3_error.is_some() {
             return;
         }
-        let processing_monotonic_ns = self.qcsd_observation_clock.as_ref()
+        let processing_monotonic_ns = self
+            .qcsd_observation_clock
+            .as_ref()
             .map(|clock| clock.elapsed_ns_at(now));
         let (phase, phase_truncated) = Self::qcsd_bounded_error_text(format_args!("{phase}"));
         let (error_debug, debug_truncated) = Self::qcsd_bounded_error_text(error_debug);
@@ -542,9 +550,17 @@ impl Connection {
         let connection_sequence = self.qcsd_error_diagnostics.next_sequence;
         self.qcsd_error_diagnostics.next_sequence = connection_sequence.saturating_add(1);
         self.qcsd_error_diagnostics.first_http3_error = Some(QcsdFirstHttp3Error {
-            processing_monotonic_ns, connection_sequence, phase, error_debug, error_display,
-            close_code, transport_state_debug,
-            text_truncated: phase_truncated || debug_truncated || display_truncated || state_truncated,
+            processing_monotonic_ns,
+            connection_sequence,
+            phase,
+            error_debug,
+            error_display,
+            close_code,
+            transport_state_debug,
+            text_truncated: phase_truncated
+                || debug_truncated
+                || display_truncated
+                || state_truncated,
         });
     }
 
@@ -559,16 +575,22 @@ impl Connection {
         if self.qcsd_error_diagnostics.first_peer_close.is_some() {
             return;
         }
-        let processing_monotonic_ns = self.qcsd_observation_clock.as_ref()
+        let processing_monotonic_ns = self
+            .qcsd_observation_clock
+            .as_ref()
             .map(|clock| clock.elapsed_ns_at(now));
         let (reason_phrase, reason_truncated) =
             Self::qcsd_bounded_error_text(format_args!("{reason_phrase}"));
         let connection_sequence = self.qcsd_error_diagnostics.next_sequence;
         self.qcsd_error_diagnostics.next_sequence = connection_sequence.saturating_add(1);
         self.qcsd_error_diagnostics.first_peer_close = Some(QcsdFirstPeerClose {
-            processing_monotonic_ns, connection_sequence,
+            processing_monotonic_ns,
+            connection_sequence,
             application: matches!(error_code, CloseError::Application(_)),
-            error_code: error_code.code(), triggering_frame_type, reason_phrase, reason_truncated,
+            error_code: error_code.code(),
+            triggering_frame_type,
+            reason_phrase,
+            reason_truncated,
         });
     }
 
@@ -706,6 +728,8 @@ impl Connection {
             qcsd_packet_targets: VecDeque::new(),
             #[cfg(feature = "qcsd")]
             qcsd_active_target: None,
+            #[cfg(feature = "qcsd")]
+            qcsd_last_output_target_diagnostic: None,
             #[cfg(feature = "qcsd")]
             qcsd_endpoint: None,
             #[cfg(feature = "qcsd")]
@@ -1510,6 +1534,11 @@ impl Connection {
         max_datagrams: NonZeroUsize,
     ) -> OutputBatch {
         qtrace!("[{self}] process_output {:?} {now:?}", self.state);
+        #[cfg(feature = "qcsd")]
+        {
+            // Never relabel a previous call's profile as the current callback.
+            self.qcsd_last_output_target_diagnostic = None;
+        }
 
         match (&self.state, self.role) {
             (State::Init, Role::Client) => {
@@ -3399,7 +3428,11 @@ impl Connection {
 
         #[cfg(feature = "qcsd")]
         {
+            let diagnostic_front_before_expiry = self.qcsd_packet_targets.front().copied();
             self.qcsd_expire_packet_targets(now, Some(configured_limit), profile.paced());
+            // Observe the decision inputs before suppression can pop a target.
+            let diagnostic_queue_after_expiry = self.qcsd_packet_targets.len();
+            let diagnostic_eligible_before_selection = self.qcsd_eligible_packet_target(now);
             self.qcsd_active_target = None;
             if let Some(mut target) = self.qcsd_eligible_packet_target(now) {
                 target.lateness_us = target.not_before.map_or(0, |release| {
@@ -3438,6 +3471,28 @@ impl Connection {
                     0
                 }
             });
+            // Copy the decision actually used above, with its existing clock.
+            // No allocation, second send-profile call, new clock or retry.
+            self.qcsd_last_output_target_diagnostic = Some((
+                now,
+                qcsd::output_target_diagnostic(
+                    diagnostic_front_before_expiry,
+                    diagnostic_eligible_before_selection,
+                    self.qcsd_active_target,
+                    now,
+                    [
+                        u64::try_from(diagnostic_queue_after_expiry).unwrap_or(u64::MAX),
+                        u64::try_from(configured_limit).unwrap_or(u64::MAX),
+                        u64::try_from(profile.limit()).unwrap_or(u64::MAX),
+                        u64::from(profile.ack_only()),
+                        u64::from(profile.paced()),
+                        u64::try_from(path.borrow().sender().cwnd_avail()).unwrap_or(u64::MAX),
+                        u64::try_from(path.borrow().amplification_limit()).unwrap_or(u64::MAX),
+                        u64::try_from(path.borrow().plpmtu()).unwrap_or(u64::MAX),
+                        u64::from(path.borrow().is_primary()),
+                    ],
+                ),
+            ));
         }
 
         // Frames for different epochs must go in different packets, but then these
@@ -5235,6 +5290,13 @@ impl Connection {
             }
         }
         Ok(outcome)
+    }
+
+    /// Count accepted-but-unencoded actions without allocating an identity Vec.
+    #[cfg(feature = "qcsd")]
+    #[must_use]
+    pub fn qcsd_pending_receive_action_count(&self) -> usize {
+        self.qcsd_pending_receive_actions.len()
     }
 
     /// Exact receive actions accepted by transport but not yet encoded.

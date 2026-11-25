@@ -326,15 +326,6 @@ where
     /// earlier update can recover.  Flow-control limits are monotonic, so the
     /// duplicate update is safe.
     pub const fn peer_blocked(&mut self, blocked_at: u64) {
-        // Duplicate only the unchanged, already encoded manual ceiling.
-        // A stale report creates no permission or automatic window growth.
-        #[cfg(feature = "qcsd")]
-        if let Some(manual_limit) = self.manual_limit {
-            if manual_limit == self.max_allowed && blocked_at < self.max_allowed {
-                self.frame_pending = true;
-                return;
-            }
-        }
         if self.auto_updates_enabled()
             && (blocked_at < self.max_allowed || self.retired + self.max_active > self.max_allowed)
         {
@@ -2080,11 +2071,4 @@ mod test {
 
         Ok(())
     }
-}
-
-
-#[cfg(all(test, feature = "qcsd"))]
-mod manual_stale_blocked_recovery_tests {
-    const EXPECT_RECOVERY: bool = true;
-    include!("manual_stale_blocked_recovery_tests.rs");
 }

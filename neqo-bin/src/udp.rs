@@ -255,7 +255,9 @@ mod qcsd_receive_tests {
         );
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
         let payload = [7_u8; 37];
-        sender.send_to(&payload, address).expect("queued UDP packet");
+        sender
+            .send_to(&payload, address)
+            .expect("queued UDP packet");
 
         // No await between send and receive: the Tokio reactor has not had a
         // turn to refresh readiness. Its generic API still reports None.
@@ -286,10 +288,11 @@ mod qcsd_receive_tests {
         let address = socket.local_addr().expect("bound address");
         let mut buffer = RecvBuf::default();
         let samples = Cell::new(0);
-        let (received, empty_receive_entry) = socket.recv_qcsd_timestamped(address, &mut buffer, || {
-            samples.set(samples.get() + 1);
-            receive_test_now()
-        });
+        let (received, empty_receive_entry) =
+            socket.recv_qcsd_timestamped(address, &mut buffer, || {
+                samples.set(samples.get() + 1);
+                receive_test_now()
+            });
         assert!(received.expect("actual empty receive").is_none());
         let after_empty_receive = receive_test_now();
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");

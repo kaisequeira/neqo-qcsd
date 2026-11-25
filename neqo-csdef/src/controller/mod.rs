@@ -4,6 +4,7 @@
 // option.
 
 mod control_loop;
+mod same_window_retry;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -22,6 +23,8 @@ use crate::{
     chaff_manager::ChaffManager, stream::StreamRegistry,
 };
 
+const RBING_CS600_B816_POLICY: &str = "r-bing-cs600-b816-due-only-preproof-active-r4-parser-capacity-then-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1";
+const RBING_CS600_B817_POLICY: &str = "r-bing-cs600-b817-post-lease-live-data-frame-same-stream-600-successor-then-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1";
 /// Independently sampled process-clock evidence for one owned incoming terminal.
 /// Construction is private to the actual controller terminal transition.
 #[derive(Clone, Copy, Debug)]
@@ -187,6 +190,10 @@ fn duration_as_ceil_micros(duration: Duration) -> u64 {
 
 fn duration_as_floor_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn duration_as_floor_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl QueuedDefenseObservation {
@@ -407,6 +414,9 @@ pub struct BufloFinPermissionRelease {
     pub start: u64,
     /// Historical encoded range end.
     pub end: u64,
+    /// Provenance category for this reclaimed receive permission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_source: Option<&'static str>,
     /// Genuine final offset, equal to all received and read raw bytes.
     pub final_size: u64,
     /// Actual controller FIN reduction, never backdated.
@@ -572,6 +582,173 @@ pub struct TerminalPrimaryPartialCellDiagnostics {
     pub body_bytes: u64,
 }
 
+/// Actual FIN ledger for one activated r.bing chaff request whose final
+/// physically advertised CS/600 owned cell was only partly consumed.
+///
+/// A request ID is globally issued by `ChaffManager`; records are therefore
+/// unique per activated request, rather than incorrectly capped by concurrent
+/// chaff-stream capacity. Retired offsets remain retired and are never
+/// reassigned or promoted to a fully realized cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct TerminalChaffPartialCellDiagnostics {
+    pub schema_version: u32,
+    pub source: &'static str,
+    pub policy: &'static str,
+    pub resource_id: u32,
+    pub request_id: u64,
+    pub endpoint: u64,
+    pub stream: u64,
+    pub slot: u64,
+    pub target_us: u64,
+    pub cell_bytes: u64,
+    pub requested_bytes: u64,
+    pub advertised_bytes: u64,
+    pub consumed_bytes: u64,
+    pub retired_bytes: u64,
+    pub fin_at_us: u64,
+    pub status: u16,
+    pub body_bytes: u64,
+}
+
+/// The B814 controller closure triggered by its first fully proved terminal
+/// r.bing chaff FIN. Existing streams remain live; only unactivated and
+/// future replenishment requests for this qualified resource are rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct TerminalChaffReplenishmentClosureDiagnostics {
+    pub schema_version: u32,
+    pub source: &'static str,
+    pub policy: &'static str,
+    pub resource_id: u32,
+    pub request_id: u64,
+    pub endpoint: u64,
+    pub stream: u64,
+    pub slot: u64,
+    pub proof_count: u64,
+    pub future_replenishment: &'static str,
+    pub active_streams: &'static str,
+}
+///
+/// B816's one bounded pre-materialization parser-capacity preparation.
+/// This is not a scheduled-credit receipt: it records only the actual
+/// ACKed r4 chaff parser frontier that existed before the original due
+/// incoming cell was materialized. The original slot retains its timestamp,
+/// half-open deadline, and normal owned-credit lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct TerminalChaffPreproofCapacityPreparationDiagnostics {
+    pub schema_version: u32,
+    pub source: &'static str,
+    pub policy: &'static str,
+    pub resource_id: u32,
+    pub endpoint: u64,
+    pub stream: u64,
+    pub frontier: u64,
+    pub slot: u64,
+    pub target_us: u64,
+    pub lease_start: u64,
+    pub lease_end: u64,
+    pub lease_bytes: u64,
+    pub prepared_at_us: u64,
+    pub materialized_at_us: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct B816PreMaterialization {
+    slot: QcsdSlotId,
+    packet: crate::Packet,
+    endpoint: QcsdEndpointId,
+    stream: QcsdStreamId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct B816MaterializedAdmission {
+    slot: QcsdSlotId,
+    endpoint: QcsdEndpointId,
+    stream: QcsdStreamId,
+}
+
+/// One B817 receipt ties the original held scheduled cell to the exact
+/// physical post-lease data evidence that authorized its successor. The
+/// production fields are populated only by the timestamped runner path; unit
+/// reducers deliberately leave them absent rather than inventing wire order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct TerminalChaffPostLeaseLiveDataDiagnostics {
+    pub schema_version: u32,
+    pub source: &'static str,
+    pub policy: &'static str,
+    pub resource_id: u32,
+    pub request_id: u64,
+    pub endpoint: u64,
+    pub stream: u64,
+    pub slot: u64,
+    pub target_us: u64,
+    pub original_deadline_us: u64,
+    pub original_deadline_ns: u64,
+    pub lease_start: u64,
+    pub lease_end: u64,
+    pub lease_advertised_at_us: u64,
+    pub lease_advertised_production_sequence: Option<u64>,
+    pub lease_advertised_production_monotonic_ns: Option<u64>,
+    pub blocked_at_us: u64,
+    pub blocked_production_sequence: Option<u64>,
+    pub blocked_production_monotonic_ns: Option<u64>,
+    pub frame_at_us: u64,
+    pub frame_production_sequence: Option<u64>,
+    pub frame_production_monotonic_ns: Option<u64>,
+    pub frame_header_start: u64,
+    pub frame_payload_start: u64,
+    pub frame_payload_end: u64,
+    pub lease_consumed_at_us: u64,
+    pub lease_consumed_production_sequence: Option<u64>,
+    pub lease_consumed_production_monotonic_ns: Option<u64>,
+    pub lease_consumption_end: u64,
+    pub owned_lease_start: u64,
+    pub owned_lease_end: u64,
+    pub handoff_at_us: u64,
+    pub owned_advertised_at_us: Option<u64>,
+    pub owned_advertised_predeadline_verified: bool,
+    pub owned_advertised_at_ns: Option<u64>,
+    pub owned_advertised_production_sequence: Option<u64>,
+    pub owned_advertised_production_monotonic_ns: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct B817ProductionObservation {
+    sequence: u64,
+    monotonic_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct B817ObservationPoint {
+    at: Duration,
+    order: u64,
+    production: Option<B817ProductionObservation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct B817DataFrameWitness {
+    point: B817ObservationPoint,
+    header_start: u64,
+    payload_start: u64,
+    payload_end: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct B817PostLeaseLiveDataWitness {
+    slot: QcsdSlotId,
+    packet: crate::Packet,
+    endpoint: QcsdEndpointId,
+    stream: QcsdStreamId,
+    request_id: crate::QcsdChaffRequestId,
+    lease_start: u64,
+    lease_end: u64,
+    lease_advertised: Option<B817ObservationPoint>,
+    blocked: Option<B817ObservationPoint>,
+    frame: Option<B817DataFrameWitness>,
+    lease_consumed: Option<B817ObservationPoint>,
+    lease_consumption_cursor: u64,
+    invalid: bool,
+}
+
 /// Orchestrates one defense across one or more client connections.
 ///
 /// This is the single-owner modern equivalent of the published `FlowShaper`.
@@ -587,11 +764,29 @@ pub struct QcsdController {
     scheduler: RoundRobinScheduler,
     endpoint_origins: HashMap<QcsdEndpointId, String>,
     buflo_chaff_ack_observed_at: HashMap<(QcsdEndpointId, QcsdStreamId), Duration>,
+    /// B816 only: a due incoming cell may prepare one actual r4 parser
+    /// frontier after application completion and before its own ledger exists.
+    terminal_chaff_preproof_capacity_preparation: bool,
+    /// B817 alone may turn one fully witnessed B816 lease into the original
+    /// held 600-byte owner without reconstructing a fresh parser boundary.
+    terminal_chaff_postlease_live_data_successor: bool,
+    terminal_chaff_preproof_capacity_preparation_record:
+        Option<TerminalChaffPreproofCapacityPreparationDiagnostics>,
+    terminal_chaff_postlease_live_data_record: Option<TerminalChaffPostLeaseLiveDataDiagnostics>,
+    b816_pre_materialization: Option<B816PreMaterialization>,
+    b817_postlease_live_data_witness: Option<B817PostLeaseLiveDataWitness>,
+    b817_observation_order: u64,
+    b817_current_production_observation: Option<B817ProductionObservation>,
+    /// One held slot may enter the unchanged owned-DATA allocator after the
+    /// actual frontier has become physically usable. It is consumed on that
+    /// first materialization attempt and never changes retry timing.
+    b816_pre_materialized_admission: Option<B816MaterializedAdmission>,
     buflo_aggregate_selected: Option<(u32, u64)>,
     buflo_startup_requested_chaff: HashMap<(QcsdEndpointId, u64), u32>,
     /// Only an independently validated prepared BuFLO policy may widen the
     /// incoming advertisement window; outgoing deadlines stay unchanged.
     buflo_incoming_half_period_window: Option<Duration>,
+    buflo_outgoing_20ms_variant: bool,
     /// Last committed ordinary receive allocation within each endpoint and
     /// role class. Only the authenticated 64 ms BuFLO path advances these
     /// cursors; registry eligibility and application priority stay unchanged.
@@ -605,10 +800,22 @@ pub struct QcsdController {
     /// Incoming releases can still complete across real transport callbacks;
     /// slotless parser bootstrap never becomes scheduled ownership afterward.
     tamaraw_rapid_capture_policy: bool,
+    // Prospective source-bound r.bing only. Default false; no Ang activation.
+    cs_rbing_capacity_retry: bool,
+    cs_rbing_current_data: bool,
+    cs_rbing_owned_data_continuation: bool,
+    cs_rbing_capacity_retry_at: HashMap<QcsdSlotId, Duration>,
+    cs_rbing_capacity_retry_trace: VecDeque<(QcsdSlotId, crate::Packet, Duration, Duration)>,
     front_padding_outgoing_window: bool,
     terminal_primary_partial_cell_policy: bool,
     terminal_primary_stream: Option<(QcsdEndpointId, QcsdStreamId)>,
     terminal_primary_partial_cell: Option<TerminalPrimaryPartialCellDiagnostics>,
+    terminal_chaff_partial_cell_policy: bool,
+    terminal_chaff_partial_resource_id: Option<u32>,
+    terminal_chaff_partial_cells: Vec<TerminalChaffPartialCellDiagnostics>,
+    terminal_chaff_replenishment_closure: bool,
+    terminal_chaff_replenishment_b815_incoming_stop: bool,
+    terminal_chaff_replenishment_closed: Option<TerminalChaffReplenishmentClosureDiagnostics>,
     streams: StreamRegistry,
     chaff: Option<ChaffManager>,
     control: ControlLoop,
@@ -626,6 +833,8 @@ pub struct QcsdController {
     parser_lease_ranges: HashMap<(QcsdEndpointId, QcsdStreamId), Vec<ParserLeaseRange>>,
     // New opt-in only. The old Source061/Native110 contract remains default.
     buflo_retained_parser_policy: bool,
+    /// Separately versioned direct exact-credit FIN reassignment opt-in.
+    buflo_direct_fin_credit_reassignment: bool,
     buflo_retained_parser_demands:
         HashMap<(QcsdEndpointId, QcsdStreamId), BufloRetainedParserDemand>,
     // Known-length chaff uses original exact credit, separately from no-CL FIN release.
@@ -639,8 +848,10 @@ pub struct QcsdController {
     buflo_fin_permission_releases: Vec<BufloFinPermissionRelease>,
     buflo_gross_advertised: u64,
     /// Exact CS terminal parser suffixes survive controller stream retirement.
-    cs_live_chaff_header_lease_witnesses: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
-    cs_live_chaff_header_bootstrap_witnesses: HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
+    cs_live_chaff_header_lease_witnesses:
+        HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
+    cs_live_chaff_header_bootstrap_witnesses:
+        HashMap<(QcsdEndpointId, QcsdStreamId), (u64, u64, u64, u64)>,
     cs_buflo_terminal_parser_allowances:
         HashMap<(QcsdEndpointId, QcsdStreamId), CsBufloTerminalParserAllowance>,
     incoming_credit_ledger: HashMap<QcsdSlotId, IncomingCreditLedger>,
@@ -719,8 +930,6 @@ pub struct QcsdController {
     buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: u64,
     cs_buflo_local_et_pending_request_cancellations: u64,
     cs_buflo_local_et_stream_cancellations: u64,
-    // Complete-application CS cleanup is counted only after the real adapter acknowledgement.
-    cs_terminal_cancellations_pending: HashSet<(QcsdEndpointId, QcsdStreamId)>,
     cs_buflo_application_passthrough: bool,
     cs_buflo_local_et_before_application_complete: bool,
     cs_buflo_local_et_application_receive_streams_handed_off: u64,
@@ -869,14 +1078,35 @@ impl QcsdController {
             buflo_aggregate_selected: None,
             buflo_startup_requested_chaff: HashMap::new(),
             buflo_incoming_half_period_window: None,
+            buflo_outgoing_20ms_variant: false,
             buflo_incoming_stream_cursor: HashMap::new(),
             buflo_chaff_service_turn: 0,
             buflo_chaff_last_read_at: HashMap::new(),
             tamaraw_rapid_capture_policy: false,
+            cs_rbing_capacity_retry: false,
+            cs_rbing_current_data: false,
+            cs_rbing_owned_data_continuation: false,
+            cs_rbing_capacity_retry_at: HashMap::new(),
+            cs_rbing_capacity_retry_trace: VecDeque::new(),
             front_padding_outgoing_window: false,
             terminal_primary_partial_cell_policy: false,
             terminal_primary_stream: None,
             terminal_primary_partial_cell: None,
+            terminal_chaff_partial_cell_policy: false,
+            terminal_chaff_partial_resource_id: None,
+            terminal_chaff_partial_cells: Vec::new(),
+            terminal_chaff_replenishment_closure: false,
+            terminal_chaff_replenishment_b815_incoming_stop: false,
+            terminal_chaff_replenishment_closed: None,
+            terminal_chaff_preproof_capacity_preparation: false,
+            terminal_chaff_postlease_live_data_successor: false,
+            terminal_chaff_preproof_capacity_preparation_record: None,
+            terminal_chaff_postlease_live_data_record: None,
+            b816_pre_materialization: None,
+            b817_postlease_live_data_witness: None,
+            b817_observation_order: 0,
+            b817_current_production_observation: None,
+            b816_pre_materialized_admission: None,
             streams: StreamRegistry::default(),
             chaff,
             control,
@@ -887,6 +1117,7 @@ impl QcsdController {
             advertised_incoming_credit: HashMap::new(),
             parser_lease_ranges: HashMap::new(),
             buflo_retained_parser_policy: false,
+            buflo_direct_fin_credit_reassignment: false,
             buflo_retained_parser_demands: HashMap::new(),
             buflo_known_chaff_demands: HashMap::new(),
             buflo_known_chaff_service_ranges: HashMap::new(),
@@ -929,7 +1160,6 @@ impl QcsdController {
             buflo_terminal_subcell_pending_application_parser_boundaries_at_latch: 0,
             cs_buflo_local_et_pending_request_cancellations: 0,
             cs_buflo_local_et_stream_cancellations: 0,
-            cs_terminal_cancellations_pending: HashSet::new(),
             cs_buflo_application_passthrough: false,
             cs_buflo_local_et_before_application_complete: false,
             cs_buflo_local_et_application_receive_streams_handed_off: 0,
@@ -944,6 +1174,1188 @@ impl QcsdController {
             rolling_outgoing_prearm: None,
             rolling_reconcile_due: None,
         })
+    }
+
+    /// Opt into the prospective unallocated-cell retry for the exact r.bing
+    /// workload only. This grants no credit and changes no physical deadline.
+    /// The runner also authenticates the frozen workload and parameter hashes.
+    ///
+    /// # Errors
+    /// Rejects every other host/configuration and any already-started owner.
+    pub fn enable_cs_rbing_same_window_capacity_retry(&mut self, hostname: &str) -> Result<()> {
+        let diagnostics = self.defense.diagnostics();
+        if hostname != "r.bing.com"
+            || self.cs_rbing_capacity_retry
+            || !diagnostics.cs_buflo_client_only
+            || !diagnostics.cs_buflo_payload_padding
+            || diagnostics.cs_buflo_runtime_udp_packet_size_bytes != 600
+            || diagnostics.cs_buflo_incoming_interval_us != 8_192
+            || diagnostics.cs_buflo_outgoing_interval_us != 8_192
+            || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || !self.defense.incoming_slot_must_resolve_in_window()
+            || self.defense.mode() != DefenseMode::ChaffAndShape
+            || self.config.control_interval_us != 5_000
+            || self.exact_incoming_release_window() != same_window_retry::window()
+            || self.config.initial_max_stream_data != 16
+            || self.config.max_stream_data_excess != 1_000
+            || self.config.max_udp_payload_size != 1_200
+            || !matches!(self.config.max_chaff_streams, 5 | 10 | 50)
+            || self.config.use_empty_resources
+            || self.config.drop_unsatisfied_events
+            || self.control.next_slot_id != 0
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.control.incoming.is_empty()
+            || !self.control.outgoing.is_empty()
+            || !self.control.credit.is_empty()
+            || !self.control.claims.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+            || self.application_complete
+            || self.defense.terminal_failure().is_some()
+            || self.defense.is_complete()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "same-window capacity retry requires unstarted exact r.bing CS/600/5000us/16+1000/five-stream/1200 configuration".into(),
+            ));
+        }
+        self.cs_rbing_capacity_retry = true;
+        Ok(())
+    }
+
+    // Separate default-off capability, enabled only before work by the
+    // exact frozen r.bing runner gate after the original retry/header gates.
+    pub fn enable_cs_rbing_current_data(&mut self, hostname: &str) -> Result<()> {
+        if hostname != "r.bing.com"
+            || !self.cs_rbing_capacity_retry
+            || self.cs_rbing_current_data
+            || !self.streams.cs_live_chaff_headers_enabled()
+            || self.control.next_slot_id != 0
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+            || self.application_complete
+            || self.defense.terminal_failure().is_some()
+            || self.defense.is_complete()
+            || !self.streams.enable_cs_rbing_current_data()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "current DATA requires unstarted exact r.bing retry/header scope".into(),
+            ));
+        }
+        self.cs_rbing_current_data = true;
+        Ok(())
+    }
+
+    /// Inert new Native capability. Exact same-window/header/current-DATA gates
+    /// must already be enabled before any stream or scheduled work exists.
+    pub fn enable_cs_rbing_owned_data_continuation(&mut self, hostname: &str) -> Result<()> {
+        if hostname != "r.bing.com"
+            || !self.cs_rbing_capacity_retry
+            || !self.cs_rbing_current_data
+            || self.cs_rbing_owned_data_continuation
+            || self.control.next_slot_id != 0
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.control.incoming.is_empty()
+            || !self.control.outgoing.is_empty()
+            || !self.control.credit.is_empty()
+            || !self.control.claims.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+            || self.application_complete
+            || self.defense.terminal_failure().is_some()
+            || self.defense.is_complete()
+            || !self.streams.enable_cs_rbing_owned_data_continuation()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "owned DATA requires unstarted exact r.bing CS600 current-DATA scope".into(),
+            ));
+        }
+        self.cs_rbing_owned_data_continuation = true;
+        Ok(())
+    }
+
+    /// Enable the B813 terminal chaff FIN reducer only for the already-bound
+    /// unstarted r.bing CS/600 current-DATA continuation path.
+    ///
+    /// This is deliberately separate from the ordinary continuation gate: it
+    /// is the only authority that lifts B812's known-subcell-tail veto, and it
+    /// does not create credit, extend deadlines, or alter normal acceptance.
+    pub fn enable_cs_rbing_terminal_chaff_partial(
+        &mut self,
+        hostname: &str,
+        resource_id: u32,
+    ) -> Result<()> {
+        self.enable_cs_rbing_terminal_chaff_partial_policy(
+            hostname,
+            resource_id,
+            false,
+            false,
+            false,
+        )
+    }
+
+    /// Enable B814's terminal-FIN proof reducer and close future qualified
+    /// chaff replenishment after its first fully proved partial cell.
+    ///
+    /// Already-open chaff streams are deliberately not canceled: their
+    /// existing ordinary lifecycle and exact receipt checks remain intact.
+    pub fn enable_cs_rbing_terminal_chaff_partial_replenishment_closure(
+        &mut self,
+        hostname: &str,
+        resource_id: u32,
+    ) -> Result<()> {
+        self.enable_cs_rbing_terminal_chaff_partial_policy(
+            hostname,
+            resource_id,
+            true,
+            false,
+            false,
+        )
+    }
+
+    /// Enable B815’s strict successor closure: no fresh incoming cell may
+    /// be emitted after its first proven terminal-chaff FIN.
+    pub fn enable_cs_rbing_terminal_chaff_partial_replenishment_b815(
+        &mut self,
+        hostname: &str,
+        resource_id: u32,
+    ) -> Result<()> {
+        self.enable_cs_rbing_terminal_chaff_partial_policy(hostname, resource_id, true, true, false)
+    }
+
+    /// Enable B816's due-only pre-proof parser-capacity successor. It retains
+    /// B815's first-proven-FIN closure and creates neither a request nor a
+    /// scheduled owner; the later original exact cell remains authoritative.
+    pub fn enable_cs_rbing_terminal_chaff_partial_replenishment_b816(
+        &mut self,
+        hostname: &str,
+        resource_id: u32,
+    ) -> Result<()> {
+        if resource_id != 4 {
+            return Err(crate::Error::InvalidConfig(
+                "B816 pre-proof capacity preparation requires r4".into(),
+            ));
+        }
+        self.enable_cs_rbing_terminal_chaff_partial_policy(hostname, resource_id, true, true, true)
+    }
+
+    /// Enable B817's post-lease current-DATA successor. It inherits B816's
+    /// one held r4 identity but will not use B816's fresh-boundary allocator;
+    /// a separate physical witness is required before the original owner can
+    /// be handed to the transport.
+    pub fn enable_cs_rbing_terminal_chaff_partial_replenishment_b817(
+        &mut self,
+        hostname: &str,
+        resource_id: u32,
+    ) -> Result<()> {
+        self.enable_cs_rbing_terminal_chaff_partial_replenishment_b816(hostname, resource_id)?;
+        self.terminal_chaff_postlease_live_data_successor = true;
+        Ok(())
+    }
+
+    fn enable_cs_rbing_terminal_chaff_partial_policy(
+        &mut self,
+        hostname: &str,
+        resource_id: u32,
+        replenish_closure: bool,
+        successor_incoming_stop: bool,
+        preproof_capacity_preparation: bool,
+    ) -> Result<()> {
+        if hostname != "r.bing.com"
+            || (successor_incoming_stop && !replenish_closure)
+            || !self.cs_rbing_capacity_retry
+            || (preproof_capacity_preparation && (!replenish_closure || !successor_incoming_stop))
+            || !self.cs_rbing_current_data
+            || !self.cs_rbing_owned_data_continuation
+            || self.terminal_chaff_partial_cell_policy
+            || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || self.config.max_chaff_streams != 5
+            || self.control.next_slot_id != 0
+            || !self.scheduler.endpoints().is_empty()
+            || !self.pending_slots.is_empty()
+            || !self.control.incoming.is_empty()
+            || !self.control.outgoing.is_empty()
+            || !self.control.credit.is_empty()
+            || !self.control.claims.is_empty()
+            || !self.actions.is_empty()
+            || !self.observations.is_empty()
+            || self.application_complete
+            || self.defense.terminal_failure().is_some()
+            || self.defense.is_complete()
+            || !self
+                .streams
+                .enable_cs_rbing_terminal_chaff_partial(resource_id)
+        {
+            return Err(crate::Error::InvalidConfig(
+                "terminal chaff partial requires unstarted exact r.bing CS600 owned-DATA scope"
+                    .into(),
+            ));
+        }
+        self.terminal_chaff_partial_cell_policy = true;
+        self.terminal_chaff_partial_resource_id = Some(resource_id);
+        self.terminal_chaff_replenishment_closure = replenish_closure;
+        self.terminal_chaff_replenishment_b815_incoming_stop = successor_incoming_stop;
+        self.terminal_chaff_preproof_capacity_preparation = preproof_capacity_preparation;
+        Ok(())
+    }
+
+    fn cs_rbing_owned_chaff_boundary(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+    ) -> bool {
+        self.cs_rbing_owned_chaff_boundary_for_retry(endpoint, stream, false)
+    }
+
+    // `retry_after_complete_rollback` may only be the current untouched
+    // slot's same-window rollback marker. Application completion closes new
+    // request dispatch, but it must not invalidate that already-due retry.
+    fn cs_rbing_owned_chaff_boundary_for_retry(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        retry_after_complete_rollback: bool,
+    ) -> bool {
+        // The live server can be at any remaining prefix within a sixteen-byte
+        // unowned header lease. Keep that range unowned while a disjoint whole
+        // scheduled cell is advertised after it.
+        // It never becomes scheduled capacity or resolves the new owner.
+        let old_unowned_prefix = self
+            .parser_lease_ranges
+            .get(&(endpoint, stream))
+            .is_none_or(|ranges| {
+                ranges.is_empty()
+                    || (ranges.len() == 1
+                        && ranges[0].owner.is_none()
+                        && ranges[0].unowned
+                        && ranges[0].advertised
+                        && !ranges[0].reservation_debited
+                        && (1..=16).contains(&ranges[0].bytes())
+                        && self.streams.consumed(endpoint, stream) == Some(ranges[0].start)
+                        && self.streams.receive_limits(endpoint, stream)
+                            == Some((ranges[0].end, ranges[0].end)))
+            });
+        // An advertised prior whole cell can also leave a short unread suffix
+        // at the parser boundary. Keep that byte with its original owner;
+        // the later cell owns only a new, disjoint 600-byte interval.
+        let old_owned_prefix = self
+            .parser_lease_ranges
+            .get(&(endpoint, stream))
+            .is_some_and(|ranges| {
+                let [range] = ranges.as_slice() else {
+                    return false;
+                };
+                let Some(owner) = range.owner else {
+                    return false;
+                };
+                let Some(ledger) = self.incoming_credit_ledger.get(&owner.slot) else {
+                    return false;
+                };
+                range.advertised
+                    && !range.unowned
+                    && !range.reservation_debited
+                    && (range.bytes() == 1
+                        || (matches!(self.config.max_chaff_streams, 5 | 10 | 50)
+                            && (2..=3).contains(&range.bytes())))
+                    && self.streams.consumed(endpoint, stream) == Some(range.start)
+                    && self.streams.receive_limits(endpoint, stream) == Some((range.end, range.end))
+                    && owner.packet.direction() == Direction::Incoming
+                    && owner.packet.length() == 600
+                    && self.pending_slots.get(&owner.slot) == Some(&owner.packet)
+                    && ledger.packet == owner.packet
+                    && ledger.action_endpoint() == Some(endpoint)
+                    && ledger.local_realization_emitted
+                    && ledger.advertised == 600
+                    && ledger.consumed.checked_add(range.bytes()) == Some(600)
+                    && ledger.retired == 0
+                    && ledger.unresolved() == range.bytes()
+            });
+        // Diagnostic-only chained frontier: prior due-cell owners may remain
+        // outstanding up to the bounded 512 KiB live receive budget. Keep
+        // each existing range intact and contiguous; validate every old owner
+        // against its original advertised cell ledger before appending a new
+        // disjoint cell at the current receive limit.
+        let diagnostic_body_room =
+            if std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some() {
+                let outstanding =
+                    self.parser_lease_ranges
+                        .get(&(endpoint, stream))
+                        .map_or(0, |ranges| {
+                            ranges
+                                .iter()
+                                .filter(|range| range.owner.is_some())
+                                .map(|range| range.bytes())
+                                .sum::<u64>()
+                        });
+                self.streams
+                    .cs_rbing_owned_body_bytes_remaining(endpoint, stream)
+                    .is_some_and(|remaining| outstanding.saturating_add(600) <= remaining)
+            } else {
+                true
+            };
+        let diagnostic_chained_frontier = std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K")
+            .is_some()
+            && self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|ranges| {
+                    let Some((advertised, requested)) =
+                        self.streams.receive_limits(endpoint, stream)
+                    else {
+                        return false;
+                    };
+                    let Some(mut cursor) = self.streams.consumed(endpoint, stream) else {
+                        return false;
+                    };
+                    if advertised != requested || ranges.is_empty() {
+                        return false;
+                    }
+                    let mut parser_bytes = 0_u64;
+                    let mut owner_count = 0_u16;
+                    let mut owner_bytes = 0_u64;
+                    for range in ranges {
+                        if range.start != cursor
+                            || range.end <= range.start
+                            || !range.advertised
+                            || range.reservation_debited
+                        {
+                            return false;
+                        }
+                        let bytes = range.bytes();
+                        if range.unowned {
+                            if range.owner.is_some() {
+                                return false;
+                            }
+                            parser_bytes = parser_bytes.saturating_add(bytes);
+                            if parser_bytes > 32 {
+                                return false;
+                            }
+                        } else {
+                            owner_count = owner_count.saturating_add(1);
+                            owner_bytes = owner_bytes.saturating_add(bytes);
+                            if owner_count > 875 || owner_bytes.saturating_add(600) > 524_288 {
+                                return false;
+                            }
+                            let Some(owner) = range.owner else {
+                                return false;
+                            };
+                            let Some(ledger) = self.incoming_credit_ledger.get(&owner.slot) else {
+                                return false;
+                            };
+                            if owner.packet.direction() != Direction::Incoming
+                                || owner.packet.length() != 600
+                                || ledger.packet != owner.packet
+                                || ledger.action_endpoint() != Some(endpoint)
+                                || !ledger.local_realization_emitted
+                                || ledger.advertised != 600
+                                || ledger.retired != 0
+                                || ledger.consumed.checked_add(bytes) != Some(600)
+                                || ledger.unresolved() != bytes
+                            {
+                                return false;
+                            }
+                        }
+                        cursor = range.end;
+                    }
+                    cursor == advertised && owner_count <= 875
+                });
+        self.cs_rbing_owned_data_continuation
+            && self.cs_rbing_current_data
+            && self.cs_rbing_capacity_retry
+            && diagnostic_body_room
+            && matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            && (!self.application_complete || retry_after_complete_rollback)
+            && !self.defense.is_complete()
+            && self.defense.terminal_failure().is_none()
+            && self.scheduler.endpoints().contains(&endpoint)
+            && !self
+                .control
+                .credit
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            && !self
+                .control
+                .claims
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            && (old_unowned_prefix || old_owned_prefix || diagnostic_chained_frontier)
+            && self
+                .streams
+                .cs_rbing_owned_data_opportunities(endpoint)
+                .iter()
+                .any(|o| o.stream == stream)
+    }
+
+    fn try_cs_rbing_current_data_prefix(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        min_remaining: u64,
+    ) {
+        if !self.cs_rbing_current_data
+            || !self.cs_rbing_capacity_retry
+            || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            || self.application_complete
+            || self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || !self.scheduler.endpoints().contains(&endpoint)
+            || self
+                .control
+                .credit
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|r| !r.is_empty())
+        {
+            return;
+        }
+        let Some(lease) =
+            self.streams
+                .cs_rbing_current_data_prefix_lease(endpoint, stream, min_remaining)
+        else {
+            return;
+        };
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                reservation_debited: false,
+                start: lease.absolute_limit - lease.increase,
+                end: lease.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: false,
+            });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: None,
+        });
+    }
+
+    /// Consume exactly one due B816 incoming identity into a bounded,
+    /// slotless parser permission before the identity gains a ledger. This is
+    /// deliberately called only by `collect_due_events` after the defense has
+    /// returned the original due packet and before controller materialization.
+    fn try_b816_pre_materialize_incoming(
+        &mut self,
+        slot: QcsdSlotId,
+        packet: crate::Packet,
+        elapsed: Duration,
+    ) -> bool {
+        if !self.terminal_chaff_preproof_capacity_preparation
+            || !self.application_complete
+            || self.terminal_chaff_replenishment_closed()
+            || !self.terminal_chaff_partial_cells.is_empty()
+            || self.terminal_chaff_partial_resource_id != Some(4)
+            || self.b816_pre_materialization.is_some()
+            || self.b816_pre_materialized_admission.is_some()
+            || self
+                .terminal_chaff_preproof_capacity_preparation_record
+                .is_some()
+            || packet.direction() != Direction::Incoming
+            || packet.length() != 600
+            || packet.timestamp() > elapsed
+            || !self.defense.incoming_slot_must_resolve_in_window()
+            || self.exact_incoming_release_window() != same_window_retry::window()
+            || self.defense.is_complete()
+            || self.defense.terminal_failure().is_some()
+            || self.pending_slots.contains_key(&slot)
+        {
+            return false;
+        }
+
+        let candidates = self.streams.cs_rbing_b816_preproof_prefix_candidates(4);
+        let [(endpoint, stream, frontier)] = candidates.as_slice() else {
+            return false;
+        };
+        let (endpoint, stream, frontier) = (*endpoint, *stream, *frontier);
+        let b817_request_id = self
+            .terminal_chaff_postlease_live_data_successor
+            .then(|| self.streams.activated_chaff_identity(endpoint, stream, 4))
+            .flatten();
+        if self.terminal_chaff_postlease_live_data_successor && b817_request_id.is_none() {
+            return false;
+        }
+        if !self.scheduler.endpoints().contains(&endpoint)
+            || self
+                .control
+                .receiver_continuation_reserves
+                .contains(&(endpoint, stream))
+            || self
+                .control
+                .credit
+                .iter()
+                .any(|credit| credit.endpoint == endpoint && credit.stream == stream)
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|claim| claim.endpoint == endpoint && claim.stream == stream)
+            || self
+                .advertised_incoming_credit
+                .get(&(endpoint, stream))
+                .is_some_and(|ranges| !ranges.is_empty())
+            || self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|ranges| !ranges.is_empty())
+            || self.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    QcsdAction::IncreaseReceiveLimit {
+                        endpoint: candidate_endpoint,
+                        stream: candidate_stream,
+                        ..
+                    }
+                        | QcsdAction::LeaseParserReceive {
+                            endpoint: candidate_endpoint,
+                            stream: candidate_stream,
+                            ..
+                        } if *candidate_endpoint == endpoint && *candidate_stream == stream
+                )
+            })
+        {
+            return false;
+        }
+
+        let Some(lease) = self
+            .streams
+            .cs_rbing_current_data_prefix_lease(endpoint, stream, 1)
+        else {
+            return false;
+        };
+        // The registry candidate applies the same immutable receive-state
+        // predicate first. Keep the implementation fail-closed if a future
+        // state transition weakens that exact sixteen-byte bound.
+        if lease.increase != 16 {
+            return false;
+        }
+        let lease_start = lease.absolute_limit - lease.increase;
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                reservation_debited: false,
+                start: lease_start,
+                end: lease.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: false,
+            });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: None,
+        });
+        self.b816_pre_materialization = Some(B816PreMaterialization {
+            slot,
+            packet,
+            endpoint,
+            stream,
+        });
+        if let Some(request_id) = b817_request_id {
+            self.b817_postlease_live_data_witness = Some(B817PostLeaseLiveDataWitness {
+                slot,
+                packet,
+                endpoint,
+                stream,
+                request_id,
+                lease_start,
+                lease_end: lease.absolute_limit,
+                lease_advertised: None,
+                blocked: None,
+                frame: None,
+                lease_consumed: None,
+                lease_consumption_cursor: lease_start,
+                invalid: false,
+            });
+        }
+        self.terminal_chaff_preproof_capacity_preparation_record =
+            Some(TerminalChaffPreproofCapacityPreparationDiagnostics {
+                schema_version: 1,
+                source: "native-b816-due-only-preproof-parser-capacity-v1",
+                policy: if self.terminal_chaff_postlease_live_data_successor {
+                    RBING_CS600_B817_POLICY
+                } else {
+                    RBING_CS600_B816_POLICY
+                },
+                resource_id: 4,
+                endpoint: endpoint.0,
+                stream: stream.0,
+                frontier,
+                slot: slot.0,
+                target_us: duration_as_floor_micros(packet.timestamp()),
+                lease_start,
+                lease_end: lease.absolute_limit,
+                lease_bytes: lease.increase,
+                prepared_at_us: duration_as_floor_micros(elapsed),
+                materialized_at_us: None,
+            });
+        true
+    }
+
+    /// Materialize B816's one held original identity only after its actual
+    /// same-stream parser prefix has exposed the existing owned-DATA600
+    /// continuation. At the original exclusive deadline, materialize solely
+    /// so the unchanged ordinary expiry reducer records `DeadlineExpired`.
+    fn materialize_b816_pre_materialization_if_ready(&mut self, elapsed: Duration) {
+        let Some(held) = self.b816_pre_materialization else {
+            return;
+        };
+        let deadline = held
+            .packet
+            .timestamp()
+            .saturating_add(self.exact_incoming_release_window());
+        if self.terminal_chaff_postlease_live_data_successor {
+            if elapsed < deadline {
+                return;
+            }
+            self.b816_pre_materialization = None;
+            self.b817_postlease_live_data_witness = None;
+            self.pending_slots.insert(held.slot, held.packet);
+            self.materialize_incoming_with_disposition(held.slot, held.packet, elapsed, None);
+            return;
+        }
+        let capacity_ready = elapsed < deadline
+            && self.cs_rbing_owned_chaff_boundary_for_retry(held.endpoint, held.stream, true);
+        if !capacity_ready && elapsed < deadline {
+            return;
+        }
+
+        self.b816_pre_materialization = None;
+        self.pending_slots.insert(held.slot, held.packet);
+        self.materialize_incoming_with_disposition(held.slot, held.packet, elapsed, None);
+        if capacity_ready {
+            self.b816_pre_materialized_admission = Some(B816MaterializedAdmission {
+                slot: held.slot,
+                endpoint: held.endpoint,
+                stream: held.stream,
+            });
+            if let Some(record) = self
+                .terminal_chaff_preproof_capacity_preparation_record
+                .as_mut()
+            {
+                record.materialized_at_us = Some(duration_as_floor_micros(elapsed));
+            }
+        }
+    }
+
+    fn b817_observation_point(&self, at: Duration) -> B817ObservationPoint {
+        B817ObservationPoint {
+            at,
+            order: self.b817_observation_order,
+            production: self.b817_current_production_observation,
+        }
+    }
+
+    fn b817_point_follows(previous: B817ObservationPoint, current: B817ObservationPoint) -> bool {
+        current.order > previous.order
+            && match (previous.production, current.production) {
+                (Some(previous), Some(current)) => current.sequence > previous.sequence,
+                // B817 receipts are production evidence, not test-time
+                // controller ordering. A non-timestamped reducer cannot
+                // complete this successor.
+                _ => false,
+            }
+    }
+
+    fn b817_binding_is_current(&self, witness: B817PostLeaseLiveDataWitness) -> bool {
+        self.terminal_chaff_postlease_live_data_successor
+            && self.application_complete
+            && !self.terminal_chaff_replenishment_closed()
+            && self.terminal_chaff_partial_cells.is_empty()
+            && self.terminal_chaff_partial_resource_id == Some(4)
+            && self.b816_pre_materialization.is_some_and(|held| {
+                held.slot == witness.slot
+                    && held.packet == witness.packet
+                    && held.endpoint == witness.endpoint
+                    && held.stream == witness.stream
+            })
+            && self
+                .streams
+                .activated_chaff_identity(witness.endpoint, witness.stream, 4)
+                == Some(witness.request_id)
+    }
+
+    fn b817_invalidate_if_bound_stream(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
+        if let Some(witness) = self.b817_postlease_live_data_witness.as_mut()
+            && (witness.endpoint, witness.stream) == (endpoint, stream)
+        {
+            witness.invalid = true;
+        }
+    }
+
+    fn record_b817_lease_advertised(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        slot: Option<QcsdSlotId>,
+        at: Duration,
+    ) {
+        let Some(witness) = self.b817_postlease_live_data_witness else {
+            return;
+        };
+        if (witness.endpoint, witness.stream) != (endpoint, stream) {
+            return;
+        }
+        let physical_lease = self
+            .parser_lease_ranges
+            .get(&(endpoint, stream))
+            .is_some_and(|ranges| {
+                ranges.iter().any(|range| {
+                    range.start == witness.lease_start
+                        && range.end == witness.lease_end
+                        && range.owner.is_none()
+                        && range.unowned
+                        && !range.reservation_debited
+                        && range.advertised
+                })
+            });
+        if slot.is_none()
+            && absolute_limit == witness.lease_end
+            && physical_lease
+            && self.b817_binding_is_current(witness)
+        {
+            let point = self.b817_observation_point(at);
+            if let Some(witness) = self.b817_postlease_live_data_witness.as_mut() {
+                witness.lease_advertised = Some(point);
+            }
+        } else {
+            self.b817_invalidate_if_bound_stream(endpoint, stream);
+        }
+    }
+
+    fn record_b817_owned_lease_advertised(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        slot: Option<QcsdSlotId>,
+        at: Duration,
+    ) {
+        let point = self.b817_observation_point(at);
+        // Parser-lease receive actions are deliberately slotless at the
+        // transport callback boundary. The original scheduled slot is instead
+        // carried by the still-live controller range and ledger; accepting a
+        // synthetic slot here would either fabricate an adapter identity or
+        // let a post-expiry tombstone complete the receipt.
+        let Some(production) = point.production else {
+            return;
+        };
+        let Some((
+            record_endpoint,
+            record_stream,
+            record_slot,
+            record_target_us,
+            record_deadline_ns,
+            lease_start,
+            lease_end,
+            owned_lease_start,
+            owned_lease_end,
+            already_advertised,
+        )) = self
+            .terminal_chaff_postlease_live_data_record
+            .as_ref()
+            .map(|record| {
+                (
+                    record.endpoint,
+                    record.stream,
+                    QcsdSlotId(record.slot),
+                    record.target_us,
+                    record.original_deadline_ns,
+                    record.lease_start,
+                    record.lease_end,
+                    record.owned_lease_start,
+                    record.owned_lease_end,
+                    record.owned_advertised_at_us.is_some(),
+                )
+            })
+        else {
+            return;
+        };
+        let live_owner_range = self
+            .parser_lease_ranges
+            .get(&(endpoint, stream))
+            .is_some_and(|ranges| {
+                ranges.iter().any(|range| {
+                    range.start == owned_lease_start
+                        && range.end == owned_lease_end
+                        && range.owner.is_some_and(|owner| owner.slot == record_slot)
+                        && !range.unowned
+                        && range.advertised
+                })
+            });
+        let exact_window = self.exact_incoming_release_window();
+        let Some((deadline, ledger_target_matches, ledger_deadline_matches, live_realized_ledger)) =
+            self.incoming_credit_ledger.get(&record_slot).map(|ledger| {
+                let packet_timestamp = ledger.packet.timestamp();
+                let deadline = packet_timestamp.saturating_add(exact_window);
+                (
+                    deadline,
+                    duration_as_floor_micros(packet_timestamp) == record_target_us,
+                    duration_as_floor_nanos(deadline) == record_deadline_ns,
+                    ledger.endpoint == Some(endpoint)
+                        && !ledger.multiple_endpoints
+                        && ledger.local_realization_emitted
+                        && ledger.requested() == 600
+                        && ledger.advertised == ledger.requested(),
+                )
+            })
+        else {
+            return;
+        };
+        if slot.is_some()
+            || point.at >= deadline
+            || !ledger_target_matches
+            || !ledger_deadline_matches
+            || record_endpoint != endpoint.0
+            || record_stream != stream.0
+            || owned_lease_end != absolute_limit
+            || owned_lease_end.saturating_sub(owned_lease_start) != 600
+            || lease_end.saturating_sub(lease_start) != 16
+            || already_advertised
+            || !live_owner_range
+            || !live_realized_ledger
+        {
+            return;
+        }
+        if let Some(record) = self.terminal_chaff_postlease_live_data_record.as_mut() {
+            record.owned_advertised_at_us = Some(duration_as_floor_micros(point.at));
+            record.owned_advertised_predeadline_verified = true;
+            record.owned_advertised_at_ns = Some(duration_as_floor_nanos(point.at));
+            record.owned_advertised_production_sequence = Some(production.sequence);
+            record.owned_advertised_production_monotonic_ns = Some(production.monotonic_ns);
+        }
+    }
+
+    fn record_b817_blocked(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        blocked_at: u64,
+        accepted_by_receive_state: bool,
+        at: Duration,
+    ) {
+        let Some(witness) = self.b817_postlease_live_data_witness else {
+            return;
+        };
+        if (witness.endpoint, witness.stream) != (endpoint, stream) {
+            return;
+        }
+        let point = self.b817_observation_point(at);
+        let accepted = !witness.invalid
+            && accepted_by_receive_state
+            && blocked_at == witness.lease_end
+            && self.b817_binding_is_current(witness)
+            && witness
+                .lease_advertised
+                .is_some_and(|advertised| Self::b817_point_follows(advertised, point));
+        if accepted {
+            if let Some(witness) = self.b817_postlease_live_data_witness.as_mut() {
+                witness.blocked = Some(point);
+            }
+        } else if witness.lease_advertised.is_some() {
+            self.b817_invalidate_if_bound_stream(endpoint, stream);
+        }
+    }
+
+    fn record_b817_data_frame(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        frame_header_bytes: u64,
+        data_bytes: u64,
+        consumed_before: u64,
+        at: Duration,
+    ) {
+        let Some(witness) = self.b817_postlease_live_data_witness else {
+            return;
+        };
+        if (witness.endpoint, witness.stream) != (endpoint, stream) {
+            return;
+        }
+        let point = self.b817_observation_point(at);
+        let header_start = consumed_before.checked_sub(frame_header_bytes);
+        let payload_end = consumed_before.checked_add(data_bytes);
+        let accepted = !witness.invalid
+            && frame_header_bytes == 5
+            && data_bytes > 0
+            && self.b817_binding_is_current(witness)
+            && witness
+                .blocked
+                .is_some_and(|blocked| Self::b817_point_follows(blocked, point))
+            && header_start
+                .is_some_and(|start| start >= witness.lease_start && start < witness.lease_end)
+            && payload_end.is_some_and(|end| end >= witness.lease_end.saturating_add(600));
+        if accepted {
+            if let (Some(header_start), Some(payload_end), Some(witness)) = (
+                header_start,
+                payload_end,
+                self.b817_postlease_live_data_witness.as_mut(),
+            ) {
+                witness.frame = Some(B817DataFrameWitness {
+                    point,
+                    header_start,
+                    payload_start: consumed_before,
+                    payload_end,
+                });
+            }
+        } else if witness.blocked.is_some() {
+            self.b817_invalidate_if_bound_stream(endpoint, stream);
+        }
+    }
+    fn record_b817_lease_consumption(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        consumed_start: u64,
+        consumed_end: u64,
+        at: Duration,
+    ) {
+        let Some(witness) = self.b817_postlease_live_data_witness else {
+            return;
+        };
+        if (witness.endpoint, witness.stream) != (endpoint, stream)
+            || consumed_end <= consumed_start
+            || consumed_start >= witness.lease_end
+        {
+            return;
+        }
+        let point = self.b817_observation_point(at);
+        let can_consume = !witness.invalid
+            && self.b817_binding_is_current(witness)
+            && witness
+                .blocked
+                .is_some_and(|blocked| Self::b817_point_follows(blocked, point));
+        let contiguous = consumed_start == witness.lease_consumption_cursor;
+        if !can_consume || !contiguous {
+            self.b817_invalidate_if_bound_stream(endpoint, stream);
+            return;
+        }
+        let next = consumed_end.min(witness.lease_end);
+        if let Some(witness) = self.b817_postlease_live_data_witness.as_mut() {
+            witness.lease_consumption_cursor = next;
+            if next == witness.lease_end {
+                witness.lease_consumed = Some(point);
+            }
+        }
+    }
+
+    /// Immediately hand off exactly the one B817-held original cell after
+    /// the BytesRead reducer has consumed the final lease byte. This bypasses
+    /// neither the original deadline nor physical receive action; it only
+    /// avoids a later ordinary poll after the event-local witness is complete.
+    fn try_b817_postlease_live_data_handoff(&mut self, at: Duration) {
+        let Some(witness) = self.b817_postlease_live_data_witness else {
+            return;
+        };
+        let (Some(advertised), Some(blocked), Some(frame), Some(consumed)) = (
+            witness.lease_advertised,
+            witness.blocked,
+            witness.frame,
+            witness.lease_consumed,
+        ) else {
+            return;
+        };
+        if witness.invalid
+            || witness.lease_consumption_cursor != witness.lease_end
+            || !Self::b817_point_follows(advertised, blocked)
+            || !Self::b817_point_follows(blocked, frame.point)
+            || !Self::b817_point_follows(blocked, consumed)
+            || !Self::b817_point_follows(frame.point, consumed)
+        {
+            return;
+        }
+        let deadline = witness
+            .packet
+            .timestamp()
+            .saturating_add(self.exact_incoming_release_window());
+        if at >= deadline {
+            self.materialize_b816_pre_materialization_if_ready(at);
+            self.expire_unadvertised_exact_incoming(at);
+            return;
+        }
+        if !self.b817_binding_is_current(witness)
+            || self
+                .parser_lease_ranges
+                .get(&(witness.endpoint, witness.stream))
+                .is_some_and(|ranges| !ranges.is_empty())
+        {
+            self.b817_invalidate_if_bound_stream(witness.endpoint, witness.stream);
+            return;
+        }
+        let Some(lease) = self.streams.b817_post_lease_live_data_successor(
+            witness.endpoint,
+            witness.stream,
+            4,
+            witness.request_id,
+            witness.lease_end,
+            frame.payload_end,
+        ) else {
+            self.b817_invalidate_if_bound_stream(witness.endpoint, witness.stream);
+            return;
+        };
+        if !lease.scheduled
+            || lease.increase != 600
+            || lease.absolute_limit != witness.lease_end.saturating_add(600)
+        {
+            self.b817_invalidate_if_bound_stream(witness.endpoint, witness.stream);
+            return;
+        }
+
+        self.b816_pre_materialization = None;
+        self.b817_postlease_live_data_witness = None;
+        self.pending_slots.insert(witness.slot, witness.packet);
+        self.materialize_incoming_with_disposition(witness.slot, witness.packet, at, None);
+        let before = self.control.incoming.len();
+        self.control
+            .incoming
+            .retain(|incoming| incoming.slot != witness.slot);
+        assert_eq!(
+            before,
+            self.control.incoming.len().saturating_add(1),
+            "B817 must remove only its directly handed-off original slot"
+        );
+        self.incoming_credit_ledger
+            .get_mut(&witness.slot)
+            .expect("B817 materialized original slot must have one ledger")
+            .assign_endpoint(witness.endpoint);
+        let owner = QcsdParserLeaseOwner {
+            slot: witness.slot,
+            packet: witness.packet,
+        };
+        self.parser_lease_ranges
+            .entry((witness.endpoint, witness.stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                reservation_debited: false,
+                start: lease.absolute_limit - lease.increase,
+                end: lease.absolute_limit,
+                owner: Some(owner),
+                unowned: false,
+                advertised: false,
+            });
+        self.actions.push_back(QcsdAction::LeaseParserReceive {
+            endpoint: witness.endpoint,
+            stream: witness.stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: Some(owner),
+        });
+        if let Some(record) = self
+            .terminal_chaff_preproof_capacity_preparation_record
+            .as_mut()
+        {
+            record.materialized_at_us = Some(duration_as_floor_micros(at));
+        }
+        self.terminal_chaff_postlease_live_data_record =
+            Some(TerminalChaffPostLeaseLiveDataDiagnostics {
+                schema_version: 1,
+                source: "native-b817-post-lease-live-data-successor-v1",
+                policy: RBING_CS600_B817_POLICY,
+                resource_id: 4,
+                request_id: witness.request_id.0,
+                endpoint: witness.endpoint.0,
+                stream: witness.stream.0,
+                slot: witness.slot.0,
+                target_us: duration_as_floor_micros(witness.packet.timestamp()),
+                original_deadline_us: duration_as_floor_micros(
+                    witness
+                        .packet
+                        .timestamp()
+                        .saturating_add(self.exact_incoming_release_window()),
+                ),
+                original_deadline_ns: duration_as_floor_nanos(
+                    witness
+                        .packet
+                        .timestamp()
+                        .saturating_add(self.exact_incoming_release_window()),
+                ),
+                lease_start: witness.lease_start,
+                lease_end: witness.lease_end,
+                lease_advertised_at_us: duration_as_floor_micros(advertised.at),
+                lease_advertised_production_sequence: advertised.production.map(|p| p.sequence),
+                lease_advertised_production_monotonic_ns: advertised
+                    .production
+                    .map(|p| p.monotonic_ns),
+                blocked_at_us: duration_as_floor_micros(blocked.at),
+                blocked_production_sequence: blocked.production.map(|p| p.sequence),
+                blocked_production_monotonic_ns: blocked.production.map(|p| p.monotonic_ns),
+                frame_at_us: duration_as_floor_micros(frame.point.at),
+                frame_production_sequence: frame.point.production.map(|p| p.sequence),
+                frame_production_monotonic_ns: frame.point.production.map(|p| p.monotonic_ns),
+                frame_header_start: frame.header_start,
+                frame_payload_start: frame.payload_start,
+                frame_payload_end: frame.payload_end,
+                lease_consumed_at_us: duration_as_floor_micros(consumed.at),
+                lease_consumed_production_sequence: consumed.production.map(|p| p.sequence),
+                lease_consumed_production_monotonic_ns: consumed.production.map(|p| p.monotonic_ns),
+                lease_consumption_end: witness.lease_end,
+                owned_lease_start: lease.absolute_limit - lease.increase,
+                owned_lease_end: lease.absolute_limit,
+                handoff_at_us: duration_as_floor_micros(at),
+                owned_advertised_at_us: None,
+                owned_advertised_predeadline_verified: false,
+                owned_advertised_at_ns: None,
+                owned_advertised_production_sequence: None,
+                owned_advertised_production_monotonic_ns: None,
+            });
+    }
+
+    fn cs_rbing_retry_slot_is_pristine(&self, incoming: &PendingIncoming) -> bool {
+        self.cs_rbing_capacity_retry
+            && matches!(self.config.defense, DefenseConfig::CsBuflo(_))
+            && !self.config.drop_unsatisfied_events
+            && self.defense.incoming_slot_must_resolve_in_window()
+            && self.exact_incoming_release_window() == same_window_retry::window()
+            && self.defense.mode() == DefenseMode::ChaffAndShape
+            && u64::from(incoming.packet.length()) == same_window_retry::CELL_BYTES
+            && incoming.packet.direction() == Direction::Incoming
+            && self.incoming_slot_is_untouched(incoming)
+            && self.pending_slots.get(&incoming.slot) == Some(&incoming.packet)
+            && self.incoming_credit_ledger.get(&incoming.slot)
+                == Some(&IncomingCreditLedger::new(incoming.packet))
+            && !self
+                .actions
+                .iter()
+                .filter_map(QcsdAction::receive_identity)
+                .any(|action| action.slot() == Some(incoming.slot))
+            && !self
+                .parser_lease_ranges
+                .values()
+                .flatten()
+                .any(|range| range.owner.is_some_and(|owner| owner.slot == incoming.slot))
+            && !self
+                .control
+                .receiver_continuations
+                .contains_key(&incoming.slot)
+            && self.defense.pending_receiver_continuation().is_none()
+            && !self
+                .terminal_slot_resolution_at
+                .contains_key(&incoming.slot)
+    }
+
+    /// Observed deferrals only, never wire handoff or satisfaction evidence.
+    pub fn drain_cs_rbing_capacity_retry_observations(
+        &mut self,
+    ) -> impl Iterator<Item = (QcsdSlotId, crate::Packet, Duration, Duration)> + '_ {
+        self.cs_rbing_capacity_retry_trace.drain(..)
     }
 
     /// Enable the prospective live-CS chaff HEADERS capability before any
@@ -968,7 +2380,7 @@ impl QcsdController {
             || self.config.initial_max_stream_data != 16
             || self.config.max_stream_data_excess != 1_000
             || self.config.max_udp_payload_size != 1_200
-            || self.config.max_chaff_streams != 5
+            || !matches!(self.config.max_chaff_streams, 5 | 10 | 50)
             || self.config.use_empty_resources
             || self.config.drop_unsatisfied_events
             || self.control.next_slot_id != 0
@@ -1017,8 +2429,9 @@ impl QcsdController {
         if !self.streams.cs_live_chaff_headers_enabled() {
             return None;
         }
-        let &(limit, amount, debt, prepared) =
-            self.cs_live_chaff_header_lease_witnesses.get(&(endpoint, stream))?;
+        let &(limit, amount, debt, prepared) = self
+            .cs_live_chaff_header_lease_witnesses
+            .get(&(endpoint, stream))?;
         (limit == absolute_limit && amount == increase && amount == debt)
             .then_some((debt, prepared))
     }
@@ -1036,10 +2449,14 @@ impl QcsdController {
         if !self.streams.cs_live_chaff_headers_enabled() {
             return None;
         }
-        let &(limit, amount, blocked_at, prepared) =
-            self.cs_live_chaff_header_bootstrap_witnesses.get(&(endpoint, stream))?;
-        (limit == absolute_limit && amount == increase && blocked_at == 16
-            && limit == 1_000 && amount == limit - blocked_at)
+        let &(limit, amount, blocked_at, prepared) = self
+            .cs_live_chaff_header_bootstrap_witnesses
+            .get(&(endpoint, stream))?;
+        (limit == absolute_limit
+            && amount == increase
+            && blocked_at == 16
+            && limit == 1_000
+            && amount == limit - blocked_at)
             .then_some((blocked_at, prepared))
     }
 
@@ -1166,11 +2583,21 @@ impl QcsdController {
     }
 
     fn outgoing_realization_window(&self) -> Duration {
-        if self.tamaraw_rapid_capture_policy || self.front_padding_outgoing_window {
+        if self.buflo_outgoing_20ms_variant {
+            Duration::from_micros(20_000)
+        } else if self.tamaraw_rapid_capture_policy || self.front_padding_outgoing_window {
             Duration::from_micros(10_000)
         } else {
             self.config.control_interval()
         }
+    }
+
+    /// Bound adapter window for rolling outgoing prearms; unchanged unless
+    /// the explicitly authenticated prospective BuFLO variant is enabled.
+    #[must_use]
+    pub fn rolling_outgoing_realization_window(&self) -> Duration {
+        if self.buflo_outgoing_20ms_variant { Duration::from_micros(20_000) }
+        else { self.config.control_interval() }
     }
 
     fn fixed_outgoing_realization_window(&self) -> Duration {
@@ -1225,6 +2652,30 @@ impl QcsdController {
             ));
         }
         self.buflo_retained_parser_policy = true;
+        Ok(())
+    }
+
+    /// Enable the separate prospective policy for exact direct receive credit
+    /// made impossible by a genuine application-stream FIN.
+    ///
+    /// # Errors
+    /// Requires the existing unstarted fixed64ms retained-FIN BuFLO policy.
+    pub fn enable_buflo_direct_fin_credit_reassignment(&mut self) -> Result<()> {
+        if !self.buflo_retained_parser_policy
+            || !matches!(self.config.defense, DefenseConfig::Buflo(_))
+            || self.buflo_incoming_half_period_window != Some(Duration::from_micros(32_000))
+            || !self.terminal_primary_partial_cell_policy
+            || !self.buflo_startup_present()
+            || self.buflo_direct_fin_credit_reassignment
+            || self.control.next_slot_id != 0
+            || !self.pending_slots.is_empty()
+        {
+            return Err(crate::Error::InvalidConfig(
+                "direct FIN credit reassignment requires unstarted fixed64ms retained-FIN BuFLO"
+                    .into(),
+            ));
+        }
+        self.buflo_direct_fin_credit_reassignment = true;
         Ok(())
     }
 
@@ -1290,8 +2741,16 @@ impl QcsdController {
     pub fn buflo_permission_accounting(&self) -> Option<BufloPermissionAccounting> {
         self.buflo_retained_parser_policy
             .then(|| BufloPermissionAccounting {
-                schema_version: 1,
-                policy: "buflo-retained-owned-parser-demand-genuine-fin-permission-release-v1",
+                schema_version: if self.buflo_direct_fin_credit_reassignment {
+                    2
+                } else {
+                    1
+                },
+                policy: if self.buflo_direct_fin_credit_reassignment {
+                    "buflo-retained-direct-and-parser-genuine-fin-permission-release-v2"
+                } else {
+                    "buflo-retained-owned-parser-demand-genuine-fin-permission-release-v1"
+                },
                 requested: self.scheduled_incoming_requested_bytes,
                 gross_advertised: self.buflo_gross_advertised,
                 fin_released: self
@@ -1335,6 +2794,88 @@ impl QcsdController {
         &self,
     ) -> Option<&TerminalPrimaryPartialCellDiagnostics> {
         self.terminal_primary_partial_cell.as_ref()
+    }
+
+    /// Every separately proved activated-chaff terminal partial for the
+    /// prospective B813/B814 r.bing policies. B813 permits ordinary bounded
+    /// replenishment; B814 closes it after its first fully proved partial.
+    #[must_use]
+    pub fn terminal_chaff_partial_cells(&self) -> &[TerminalChaffPartialCellDiagnostics] {
+        &self.terminal_chaff_partial_cells
+    }
+
+    /// B814's one-way closure evidence, if a first terminal partial was
+    /// fully proved. This is not set by a merely attempted or invalid FIN.
+    #[must_use]
+    pub const fn terminal_chaff_replenishment_closure(
+        &self,
+    ) -> Option<&TerminalChaffReplenishmentClosureDiagnostics> {
+        self.terminal_chaff_replenishment_closed.as_ref()
+    }
+
+    /// B816's actual due-only parser-capacity preparation, if the exact
+    /// frontier was admitted. This is absent unless the slotless 16-byte
+    /// lease was emitted for an already-ACKed r4 response stream.
+    #[must_use]
+    pub const fn terminal_chaff_preproof_capacity_preparation(
+        &self,
+    ) -> Option<&TerminalChaffPreproofCapacityPreparationDiagnostics> {
+        self.terminal_chaff_preproof_capacity_preparation_record
+            .as_ref()
+    }
+
+    /// B817's complete post-lease live-DATA receipt, present only after its
+    /// one original held slot has become an owned physical 600-byte action.
+    #[must_use]
+    pub const fn terminal_chaff_postlease_live_data(
+        &self,
+    ) -> Option<&TerminalChaffPostLeaseLiveDataDiagnostics> {
+        self.terminal_chaff_postlease_live_data_record.as_ref()
+    }
+
+    /// Return B816 trace evidence only for the exact slotless parser lease
+    /// whose frontier/stream/later slot were recorded together.
+    #[must_use]
+    pub fn b816_preproof_capacity_witness(
+        &self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        absolute_limit: u64,
+        increase: u64,
+    ) -> Option<&TerminalChaffPreproofCapacityPreparationDiagnostics> {
+        self.terminal_chaff_preproof_capacity_preparation_record
+            .as_ref()
+            .filter(|record| {
+                record.endpoint == endpoint.0
+                    && record.stream == stream.0
+                    && record.lease_end == absolute_limit
+                    && record.lease_bytes == increase
+            })
+    }
+
+    /// Whether B814 has closed its qualified chaff replenisher.
+    #[must_use]
+    pub const fn terminal_chaff_replenishment_closed(&self) -> bool {
+        self.terminal_chaff_replenishment_closed.is_some()
+    }
+
+    /// Reject a B814 request that was planned before the first proven FIN but
+    /// has not opened a stream yet. The ordinary B813 path always returns
+    /// false and keeps its existing replenishment behavior.
+    pub fn reject_terminal_chaff_replenishment(
+        &mut self,
+        resource_id: u32,
+        request_id: crate::QcsdChaffRequestId,
+    ) -> bool {
+        if !self.terminal_chaff_replenishment_closed()
+            || self.terminal_chaff_partial_resource_id != Some(resource_id)
+        {
+            return false;
+        }
+        if let Some(chaff) = &mut self.chaff {
+            chaff.cancel_pending(request_id);
+        }
+        true
     }
 
     /// Enable only the explicit prepared-policy fixed `BuFLO` startup.
@@ -1546,7 +3087,31 @@ impl QcsdController {
         Ok(())
     }
 
+    /// Enable the isolated 64ms BuFLO experiment with a 20ms half-open outgoing window.
+    /// The caller must bind and disclose the prospective native binary variant.
+    ///
+    /// # Errors
+    /// Requires the already-bound 64ms BuFLO incoming policy and an unstarted controller.
+    pub fn enable_buflo_outgoing_20ms_variant(&mut self) -> Result<()> {
+        if !matches!(self.config.defense, DefenseConfig::Buflo(_))
+            || self.buflo_incoming_half_period_window != Some(Duration::from_micros(32_000))
+            || self.config.control_interval_us != 5_000
+            || self.config.max_udp_payload_size != 1_200
+            || self.config.drop_unsatisfied_events
+            || self.buflo_outgoing_20ms_variant
+            || self.control.next_slot_id != 0
+            || !self.pending_slots.is_empty()
+        {
+            return Err(crate::Error::InvalidConfig("20ms BuFLO outgoing variant requires an unstarted 64ms fixed-cell controller".into()));
+        }
+        self.buflo_outgoing_20ms_variant = true;
+        Ok(())
+    }
+
     fn exact_incoming_release_window(&self) -> Duration {
+        if std::env::var_os("QCSD_RBING_INCOMING_WINDOW_1S").is_some() {
+            return same_window_retry::window();
+        }
         self.buflo_incoming_half_period_window
             .unwrap_or_else(|| self.config.control_interval())
     }
@@ -2127,6 +3692,47 @@ impl QcsdController {
         self.incoming_terminal_process_witnesses.get(&slot).copied()
     }
 
+    /// Explicit experimental WTF-PAD-only disposal of a tiny final receive-credit tail.
+    pub fn experimental_retire_wtf_pad_tiny_tail(&mut self, at: Duration) -> Option<(u64, u64)> {
+        if !matches!(self.config.defense, crate::DefenseConfig::WtfPad(_))
+            || !self.observations.is_empty()
+            || !self.actions.is_empty()
+            || !self.control.outgoing.is_empty()
+            || !self.control.incoming.is_empty()
+        {
+            return None;
+        }
+        let quiet = at.checked_sub(self.last_delivered_observation_at?)?;
+        if quiet < Duration::from_secs(2) {
+            return None;
+        }
+        let tail = self.defense.experimental_tiny_incoming_tail()?;
+        if self.incoming_credit_ledger.len() != 1
+            || self.pending_slots.len() != self.incoming_credit_ledger.len()
+            || self
+                .incoming_credit_ledger
+                .values()
+                .any(|ledger| !ledger.local_realization_emitted)
+            || self
+                .incoming_credit_ledger
+                .values()
+                .map(|ledger| ledger.unresolved())
+                .sum::<u64>()
+                != tail
+            || self
+                .pending_slots
+                .keys()
+                .any(|slot| !self.incoming_credit_ledger.contains_key(slot))
+        {
+            return None;
+        }
+        let slots: HashSet<_> = self.incoming_credit_ledger.keys().copied().collect();
+        self.defense.authorize_experimental_tiny_tail();
+        self.fail_incoming_slots(&slots, MissedSlotReason::DeadlineExpired, at, true);
+        self.drain_observations();
+        Some((tail, u64::try_from(quiet.as_micros()).unwrap_or(u64::MAX)))
+    }
+
     /// Terminalize every outstanding scheduled slot after a run aborts.
     ///
     /// Incoming slots retire every unresolved scheduled offset before their
@@ -2283,11 +3889,30 @@ impl QcsdController {
         Ok(ranges)
     }
 
+    /// Reduce a production-timestamped observation while retaining B817's
+    /// real adapter sequence and monotonic time in its narrowly scoped
+    /// witness. Other controller behavior is identical to [`Self::observe`].
+    pub fn observe_with_production_metadata(
+        &mut self,
+        observation: QcsdObservation,
+        at: Duration,
+        sequence: u64,
+        monotonic_ns: u64,
+    ) {
+        self.b817_current_production_observation = Some(B817ProductionObservation {
+            sequence,
+            monotonic_ns,
+        });
+        self.observe(observation, at);
+        self.b817_current_production_observation = None;
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the exhaustive observation reducer makes every state transition auditable"
     )]
     pub fn observe(&mut self, observation: QcsdObservation, at: Duration) {
+        self.b817_observation_order = self.b817_observation_order.saturating_add(1);
         self.terminal_state_observation_at = self.terminal_state_observation_at.max(at);
         match observation {
             QcsdObservation::EndpointReady {
@@ -2409,6 +4034,9 @@ impl QcsdController {
                     min_remaining,
                     awaiting_data_frame,
                 );
+                if awaiting_data_frame {
+                    self.try_cs_rbing_current_data_prefix(endpoint, stream, min_remaining);
+                }
                 self.try_parser_lease(endpoint, stream, awaiting_data_frame);
             }
             QcsdObservation::ResponseHeaders {
@@ -2420,7 +4048,10 @@ impl QcsdController {
                 ..
             } => {
                 self.streams.clear_pre_header_blocked(endpoint, stream);
-                if let Some(demand) = self.buflo_retained_parser_demands.get_mut(&(endpoint, stream)) {
+                if let Some(demand) = self
+                    .buflo_retained_parser_demands
+                    .get_mut(&(endpoint, stream))
+                {
                     demand.pre_header_frontier = None;
                 }
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
@@ -2435,6 +4066,25 @@ impl QcsdController {
                 data_bytes,
                 ..
             } => {
+                let consumed_before = self
+                    .streams
+                    .get_mut(endpoint, stream)
+                    .map(|state| state.receive.consumed())
+                    .unwrap_or_default();
+                self.record_b817_data_frame(
+                    endpoint,
+                    stream,
+                    frame_header_bytes,
+                    data_bytes,
+                    consumed_before,
+                    at,
+                );
+                self.streams.record_cs_rbing_current_data_frame(
+                    endpoint,
+                    stream,
+                    frame_header_bytes,
+                    data_bytes,
+                );
                 self.streams.clear_pre_header_blocked(endpoint, stream);
                 if let Some(state) = self.streams.get_mut(endpoint, stream) {
                     state.receive.data_frame(frame_header_bytes, data_bytes);
@@ -2524,6 +4174,14 @@ impl QcsdController {
                         at,
                     );
                     self.consume_buflo_known_chaff_service(endpoint, stream, consumed_end);
+                    self.record_b817_lease_consumption(
+                        endpoint,
+                        stream,
+                        consumed_start,
+                        consumed_end,
+                        at,
+                    );
+                    self.try_b817_postlease_live_data_handoff(at);
                 }
             }
             QcsdObservation::StreamDataBlocked {
@@ -2534,17 +4192,19 @@ impl QcsdController {
                 // Retain the actual peer-blocked receive frontier for the
                 // exact-window parser continuation guard. This observation
                 // does not itself allocate or realize scheduled credit.
-                self.streams
+                let blocked_accepted = self
+                    .streams
                     .record_parser_blocked(endpoint, stream, blocked_at);
+                self.record_b817_blocked(endpoint, stream, blocked_at, blocked_accepted, at);
                 // Retain actual peer demand before HTTP/3 parses its first
                 // byte, including when BLOCKED arrives before the request ACK.
                 // All service still requires the real complete request ACK.
                 // Intent establishes no frame extent, permission, or old owner.
                 if self.buflo_acknowledged_application_bootstrap_enabled()
                     && self.buflo_secondary_fresh_parser_bridge_enabled(endpoint, stream)
-                    && self.streams.accepts_buflo_initial_headers_blocked(
-                        endpoint, stream, blocked_at,
-                    )
+                    && self
+                        .streams
+                        .accepts_buflo_initial_headers_blocked(endpoint, stream, blocked_at)
                 {
                     self.buflo_retained_parser_demands.insert(
                         (endpoint, stream),
@@ -2571,7 +4231,11 @@ impl QcsdController {
                 stream,
                 absolute_limit,
                 slot,
-            } => self.credit_advertised(endpoint, stream, absolute_limit, slot, at),
+            } => {
+                self.credit_advertised(endpoint, stream, absolute_limit, slot, at);
+                self.record_b817_lease_advertised(endpoint, stream, absolute_limit, slot, at);
+                self.record_b817_owned_lease_advertised(endpoint, stream, absolute_limit, slot, at);
+            }
             QcsdObservation::PeerFinRead {
                 endpoint,
                 stream,
@@ -2635,6 +4299,19 @@ impl QcsdController {
             QcsdObservation::ApplicationComplete => {
                 if !self.application_complete {
                     self.application_complete = true;
+                    if self.terminal_chaff_replenishment_b815_incoming_stop
+                        && self.terminal_chaff_replenishment_closed.is_some()
+                        && !self
+                            .defense
+                            .diagnostics()
+                            .cs_buflo_terminal_chaff_replenishment_incoming_stop
+                    {
+                        assert!(
+                            self.defense
+                                .stop_fresh_incoming_after_terminal_chaff_replenishment(at),
+                            "deferred terminal-chaff stop must latch after application completion"
+                        );
+                    }
                     self.push_signal(at, SignalKind::ApplicationComplete);
                 }
             }
@@ -2760,6 +4437,15 @@ impl QcsdController {
                     self.buflo_chaff_ack_observed_at
                         .entry((endpoint, stream))
                         .or_insert(at);
+                    // Arm the ordinary single-stream startup at the ACK
+                    // observation while this exact request stream is still
+                    // live. A response FIN can be reduced before the next
+                    // poll; waiting for poll would then lose its allocation
+                    // opportunity even though the request ACK was genuine.
+                    // Aggregate startup retains its separate batch policy.
+                    if self.buflo_aggregate_selected.is_none() {
+                        self.arm_buflo_incoming_if_ready(at);
+                    }
                     if self.buflo_aggregate_selected.is_some() {
                         for (candidate, id, debt, pristine) in
                             self.streams.aggregate_framing_debts()
@@ -2883,6 +4569,7 @@ impl QcsdController {
     }
 
     fn resolve_slot(&mut self, at: Duration, slot: QcsdSlotId, outcome: EventOutcome) {
+        self.cs_rbing_capacity_retry_at.remove(&slot);
         let Some(packet) = self.pending_slots.remove(&slot) else {
             return;
         };
@@ -2900,6 +4587,23 @@ impl QcsdController {
             self.push_signal(
                 at,
                 SignalKind::TerminalPrimaryPartial {
+                    slot,
+                    packet,
+                    consumed: partial.consumed_bytes,
+                    retired: partial.retired_bytes,
+                },
+            );
+            return;
+        }
+        if let Some(partial) = self
+            .terminal_chaff_partial_cells
+            .iter()
+            .find(|partial| partial.slot == slot.0)
+            && outcome == EventOutcome::Missed(MissedSlotReason::ReceiveCreditRetired)
+        {
+            self.push_signal(
+                at,
+                SignalKind::TerminalChaffPartial {
                     slot,
                     packet,
                     consumed: partial.consumed_bytes,
@@ -2990,6 +4694,7 @@ impl QcsdController {
                 .remove(&(endpoint, request_id.0));
         }
         self.retain_terminal_primary_partial_fin(endpoint, stream, finish, at);
+        self.retain_terminal_chaff_partial_fin(endpoint, stream, finish, at);
         self.release_buflo_final_permission(endpoint, stream, finish, at);
         self.buflo_peer_fin_reads.remove(&(endpoint, stream));
         self.buflo_known_chaff_demands.remove(&(endpoint, stream));
@@ -3109,6 +4814,192 @@ impl QcsdController {
         });
     }
 
+    fn retain_terminal_chaff_partial_fin(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        finish: crate::QcsdStreamFinish,
+        at: Duration,
+    ) {
+        if !self.terminal_chaff_partial_cell_policy
+            || finish != crate::QcsdStreamFinish::Fin
+            || self.terminal_chaff_partial_resource_id.is_none()
+            || !self
+                .streams
+                .cs_rbing_terminal_chaff_partial_eligible(endpoint, stream)
+        {
+            return;
+        }
+        let Some(state) = self.streams.get_mut(endpoint, stream) else {
+            return;
+        };
+        let (resource_id, request_id, status, body_bytes) =
+            match (&state.receive, state.role, state.status) {
+                (
+                    crate::stream::ReceiveState::ReceivingData { data_length, .. },
+                    QcsdRequestRole::Chaff {
+                        resource_id,
+                        request_id: Some(request_id),
+                    },
+                    Some(status),
+                ) if (200..300).contains(&status) && *data_length > 0 => {
+                    (resource_id, request_id, status, *data_length)
+                }
+                _ => return,
+            };
+        if self.terminal_chaff_partial_resource_id != Some(resource_id) {
+            return;
+        }
+        // ChaffManager request IDs are monotonically issued; a second FIN for
+        // an identity is never a new qualified terminal lifecycle.
+        if self
+            .terminal_chaff_partial_cells
+            .iter()
+            .any(|partial| partial.request_id == request_id.0)
+        {
+            return;
+        }
+        let Some(ranges) = self.parser_lease_ranges.get(&(endpoint, stream)) else {
+            return;
+        };
+        let owned: Vec<_> = ranges
+            .iter()
+            .filter(|range| range.owner.is_some() && range.bytes() > 0)
+            .collect();
+        let [range] = owned.as_slice() else {
+            return;
+        };
+        let owner = range.owner.expect("filtered owned range");
+        if !range.advertised || range.unowned || range.reservation_debited {
+            return;
+        }
+        let Some(ledger) = self.incoming_credit_ledger.get(&owner.slot) else {
+            return;
+        };
+        if self
+            .terminal_chaff_partial_cells
+            .iter()
+            .any(|partial| partial.slot == owner.slot.0)
+        {
+            return;
+        }
+        let requested = ledger.requested();
+        let remaining = range.bytes();
+        if owner.packet.direction() != Direction::Incoming
+            || owner.packet.length() != 600
+            || self.pending_slots.get(&owner.slot) != Some(&owner.packet)
+            || ledger.packet != owner.packet
+            || ledger.action_endpoint() != Some(endpoint)
+            || !ledger.local_realization_emitted
+            || requested != 600
+            || ledger.advertised != requested
+            || ledger.consumed == 0
+            || remaining == 0
+            || ledger.retired != 0
+            || ledger.consumed.checked_add(remaining) != Some(requested)
+            || at < ledger.packet.timestamp()
+        {
+            return;
+        }
+        let closes_replenishment = self.terminal_chaff_replenishment_closure
+            && self.terminal_chaff_replenishment_closed.is_none()
+            && self.terminal_chaff_partial_cells.is_empty();
+        let policy = if self.terminal_chaff_postlease_live_data_successor {
+            RBING_CS600_B817_POLICY
+        } else if self.terminal_chaff_preproof_capacity_preparation {
+            RBING_CS600_B816_POLICY
+        } else if self.terminal_chaff_replenishment_b815_incoming_stop {
+            "r-bing-cs600-b815-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1"
+        } else if self.terminal_chaff_replenishment_closure {
+            "r-bing-cs600-first-proven-terminal-chaff-fin-closes-replenishment-v1"
+        } else {
+            "r-bing-cs600-one-owned-terminal-chaff-partial-incoming-cell-v1"
+        };
+        let proof = TerminalChaffPartialCellDiagnostics {
+            schema_version: 1,
+            source: "native-owned-terminal-chaff-fin-v1",
+            policy,
+            resource_id,
+            request_id: request_id.0,
+            endpoint: endpoint.0,
+            stream: stream.0,
+            slot: owner.slot.0,
+            target_us: duration_as_floor_micros(ledger.packet.timestamp()),
+            cell_bytes: requested,
+            requested_bytes: requested,
+            advertised_bytes: ledger.advertised,
+            consumed_bytes: ledger.consumed,
+            retired_bytes: remaining,
+            fin_at_us: duration_as_floor_micros(at),
+            status,
+            body_bytes,
+        };
+        self.terminal_chaff_partial_cells.push(proof);
+        if closes_replenishment {
+            self.close_terminal_chaff_replenishment(proof, at);
+        }
+    }
+
+    fn close_terminal_chaff_replenishment(
+        &mut self,
+        proof: TerminalChaffPartialCellDiagnostics,
+        at: Duration,
+    ) {
+        debug_assert!(self.terminal_chaff_replenishment_closure);
+        debug_assert!(self.terminal_chaff_replenishment_closed.is_none());
+        self.terminal_chaff_replenishment_closed = Some(
+            TerminalChaffReplenishmentClosureDiagnostics {
+                schema_version: 1,
+                source: "native-owned-terminal-chaff-fin-v1",
+                policy: if self.terminal_chaff_postlease_live_data_successor {
+                    RBING_CS600_B817_POLICY
+                } else if self.terminal_chaff_preproof_capacity_preparation {
+                    RBING_CS600_B816_POLICY
+                } else if self.terminal_chaff_replenishment_b815_incoming_stop {
+                    "r-bing-cs600-b815-first-proven-terminal-chaff-fin-closes-replenishment-and-stops-fresh-incoming-v1"
+                } else {
+                    "r-bing-cs600-first-proven-terminal-chaff-fin-closes-replenishment-v1"
+                },
+                resource_id: proof.resource_id,
+                request_id: proof.request_id,
+                endpoint: proof.endpoint,
+                stream: proof.stream,
+                slot: proof.slot,
+                proof_count: 1,
+                future_replenishment: "rejected",
+                active_streams: "preserved",
+            },
+        );
+        if self.terminal_chaff_replenishment_b815_incoming_stop && self.application_complete {
+            assert!(
+                self.defense
+                    .stop_fresh_incoming_after_terminal_chaff_replenishment(at),
+                "terminal-chaff closure must latch only after application completion",
+            );
+        }
+        let mut retained = VecDeque::with_capacity(self.actions.len());
+        let mut canceled = Vec::new();
+        while let Some(action) = self.actions.pop_front() {
+            if let QcsdAction::RequestChaff {
+                resource,
+                request_id,
+                ..
+            } = &action
+                && resource.id == proof.resource_id
+            {
+                canceled.push(*request_id);
+            } else {
+                retained.push_back(action);
+            }
+        }
+        self.actions = retained;
+        if let Some(chaff) = &mut self.chaff {
+            for request_id in canceled {
+                chaff.cancel_pending(request_id);
+            }
+        }
+    }
+
     fn credit_advertised(
         &mut self,
         endpoint: QcsdEndpointId,
@@ -3121,6 +5012,7 @@ impl QcsdController {
         // exclusive deadline is physical late evidence, never a successful
         // scheduling transition. Expire all older accepted releases first so
         // this observation cannot remove their live deadline ownership.
+        self.materialize_b816_pre_materialization_if_ready(at);
         self.expire_unadvertised_exact_incoming(at);
         if let Some(state) = self.streams.get_mut(endpoint, stream) {
             state.receive.advertised(absolute_limit);
@@ -3232,6 +5124,9 @@ impl QcsdController {
         // now that requested and advertised limits can agree.
         self.try_pre_header_bootstrap(endpoint, stream);
         self.try_parser_lease(endpoint, stream, true);
+        // Only the completed observation reducer may make B816's held
+        // identity eligible; expiry already ran before this advertisement.
+        self.materialize_b816_pre_materialization_if_ready(at);
     }
 
     /// Attribute physically advertised receive capacity to one scheduled
@@ -3320,41 +5215,76 @@ impl QcsdController {
         if !self.streams.cs_live_chaff_headers_enabled()
             || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
             || !self.incoming_requires_explicit_physical_ownership()
-            || self.defense.is_incoming_complete()
+            || self.application_complete
             || self.defense.is_complete()
             || self.defense.terminal_failure().is_some()
             || !self.scheduler.endpoints().contains(&endpoint)
-            || self.control.credit.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
-            || self.control.claims.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
-            || self.parser_lease_ranges.get(&(endpoint, stream)).is_some_and(|r| !r.is_empty())
+            || self
+                .control
+                .credit
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|r| !r.is_empty())
         {
             return;
         }
-        let Some(state) = self.streams.get_mut(endpoint, stream) else { return; };
-        let QcsdRequestRole::Chaff { resource_id, request_id: Some(_) } = state.role else {
+        let Some(state) = self.streams.get_mut(endpoint, stream) else {
             return;
         };
-        let Some(manager) = self.chaff.as_ref() else { return; };
+        let QcsdRequestRole::Chaff {
+            resource_id,
+            request_id: Some(_),
+        } = state.role
+        else {
+            return;
+        };
+        let Some(manager) = self.chaff.as_ref() else {
+            return;
+        };
         let expected = manager.estimate(resource_id);
         if expected == 0 {
             return;
         }
-        let Some(lease) = self.streams.cs_live_chaff_header_lease(endpoint, stream, min_remaining, expected) else {
+        let Some(lease) =
+            self.streams
+                .cs_live_chaff_header_lease(endpoint, stream, min_remaining, expected)
+        else {
             return;
         };
         self.cs_live_chaff_header_lease_witnesses.insert(
-            (endpoint, stream), (lease.absolute_limit, lease.increase, min_remaining, expected),
+            (endpoint, stream),
+            (
+                lease.absolute_limit,
+                lease.increase,
+                min_remaining,
+                expected,
+            ),
         );
-        self.parser_lease_ranges.entry((endpoint, stream)).or_default().push(ParserLeaseRange {
-            reservation_debited: false,
-            start: lease.absolute_limit - lease.increase,
-            end: lease.absolute_limit,
-            owner: None,
-            unowned: true,
-            advertised: false,
-        });
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                reservation_debited: false,
+                start: lease.absolute_limit - lease.increase,
+                end: lease.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: false,
+            });
         self.actions.push_back(QcsdAction::LeaseParserReceive {
-            endpoint, stream, absolute_limit: lease.absolute_limit, increase: lease.increase, owner: None,
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: None,
         });
     }
 
@@ -3368,37 +5298,71 @@ impl QcsdController {
         if !self.streams.cs_live_chaff_headers_enabled()
             || !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
             || !self.incoming_requires_explicit_physical_ownership()
-            || self.defense.is_incoming_complete() || self.defense.is_complete()
+            || self.application_complete
+            || self.defense.is_complete()
             || self.defense.terminal_failure().is_some()
             || !self.scheduler.endpoints().contains(&endpoint)
-            || self.control.credit.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
-            || self.control.claims.iter().any(|c| c.endpoint == endpoint && c.stream == stream)
-            || self.parser_lease_ranges.get(&(endpoint, stream)).is_some_and(|r| !r.is_empty())
+            || self
+                .control
+                .credit
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|c| c.endpoint == endpoint && c.stream == stream)
+            || self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|r| !r.is_empty())
         {
             return;
         }
-        let Some(state) = self.streams.get_mut(endpoint, stream) else { return; };
-        let QcsdRequestRole::Chaff { resource_id, request_id: Some(_) } = state.role else {
+        let Some(state) = self.streams.get_mut(endpoint, stream) else {
             return;
         };
-        let Some(manager) = self.chaff.as_ref() else { return; };
+        let QcsdRequestRole::Chaff {
+            resource_id,
+            request_id: Some(_),
+        } = state.role
+        else {
+            return;
+        };
+        let Some(manager) = self.chaff.as_ref() else {
+            return;
+        };
         let expected = manager.estimate(resource_id);
-        if expected == 0 { return; }
-        let Some(lease) = self.streams.cs_live_chaff_header_bootstrap_lease(endpoint, stream, expected) else {
+        if expected == 0 {
+            return;
+        }
+        let Some(lease) = self
+            .streams
+            .cs_live_chaff_header_bootstrap_lease(endpoint, stream, expected)
+        else {
             return;
         };
         self.cs_live_chaff_header_bootstrap_witnesses.insert(
-            (endpoint, stream), (lease.absolute_limit, lease.increase, 16, expected),
+            (endpoint, stream),
+            (lease.absolute_limit, lease.increase, 16, expected),
         );
-        self.parser_lease_ranges.entry((endpoint, stream)).or_default().push(ParserLeaseRange {
-            reservation_debited: false,
-            start: lease.absolute_limit - lease.increase,
-            end: lease.absolute_limit,
-            owner: None, unowned: true, advertised: false,
-        });
+        self.parser_lease_ranges
+            .entry((endpoint, stream))
+            .or_default()
+            .push(ParserLeaseRange {
+                reservation_debited: false,
+                start: lease.absolute_limit - lease.increase,
+                end: lease.absolute_limit,
+                owner: None,
+                unowned: true,
+                advertised: false,
+            });
         self.actions.push_back(QcsdAction::LeaseParserReceive {
-            endpoint, stream, absolute_limit: lease.absolute_limit,
-            increase: lease.increase, owner: None,
+            endpoint,
+            stream,
+            absolute_limit: lease.absolute_limit,
+            increase: lease.increase,
+            owner: None,
         });
     }
 
@@ -3511,9 +5475,21 @@ impl QcsdController {
 
     fn try_pre_header_bootstrap(&mut self, endpoint: QcsdEndpointId, stream: QcsdStreamId) {
         let live_scheduled_prefix = self.live_advertised_scheduled_prefix(endpoint, stream);
-        let mut lease =
+        // Scoped experimental framing policy for the two frozen Bing small
+        // application bodies; use only the original bounded parser allowance.
+        let mut lease = if self.cs_rbing_owned_data_continuation
+            && self.config.max_chaff_streams == 5
+        {
             self.streams
-                .pre_header_bootstrap_lease(endpoint, stream, live_scheduled_prefix);
+                .rbing_small_header_bootstrap_lease(endpoint, stream, live_scheduled_prefix)
+        } else {
+            None
+        };
+        if lease.is_none() {
+            lease =
+                self.streams
+                    .pre_header_bootstrap_lease(endpoint, stream, live_scheduled_prefix);
+        }
         if lease.is_none() && self.buflo_acknowledged_application_bootstrap_enabled() {
             lease = self
                 .streams
@@ -3633,13 +5609,12 @@ impl QcsdController {
             return;
         };
         let tail = requested.saturating_sub(boundary);
-        // A pristine known-body DATA end can leave exactly three old unread
-        // bytes, as well as the earlier one/two-byte tails. Retain a bounded
-        // fair-service intent for those real owned suffixes. This is not a
-        // minimum server-write claim or new parser/FIN permission: each later
-        // due cell must still advertise1200 NEW known-body offsets atomically.
-        const MAX_PRISTINE_TINY_KNOWN_DATA_TAIL: u64 = 3;
-        if !(1..=MAX_PRISTINE_TINY_KNOWN_DATA_TAIL).contains(&tail)
+        // HTTP/3's smallest nonempty DATA frame is two varints (type and
+        // length) plus one body byte: three bytes. A positive tail below
+        // that floor cannot carry the next frame even for a one-byte writer.
+        // This narrow known-capacity repair makes no larger-write guarantee.
+        const MIN_NONEMPTY_H3_DATA_FRAME: u64 = 3;
+        if !(1..MIN_NONEMPTY_H3_DATA_FRAME).contains(&tail)
             || self
                 .control
                 .credit
@@ -3798,6 +5773,7 @@ impl QcsdController {
         finish: crate::QcsdStreamFinish,
         at: Duration,
     ) {
+        self.release_buflo_direct_final_permission(endpoint, stream, finish, at);
         if !self.buflo_retained_parser_policy
             || finish != crate::QcsdStreamFinish::Fin
             || !self
@@ -3920,6 +5896,7 @@ impl QcsdController {
             self.return_advertised_credit(owner.slot, bytes);
             self.streams.restore_claim(endpoint, stream, bytes);
             self.return_claim(&PendingClaim {
+                mixed_rbing: false,
                 reservation_debited: true,
                 slot: owner.slot,
                 packet: owner.packet,
@@ -3939,6 +5916,7 @@ impl QcsdController {
                     stream,
                     start: range.start,
                     end: range.end,
+                    permission_source: Some("owned_parser_lease_suffix"),
                     final_size: proof.final_size,
                     fin_at_us: duration_as_floor_micros(at),
                     target_us: owner.packet.timestamp_us(),
@@ -3956,15 +5934,178 @@ impl QcsdController {
         }
     }
 
+    /// Reassign only exact residual ranges already recorded in the direct
+    /// advertised-credit ledger. The suffix must be contiguous through the
+    /// peer-proved encoded limit; raw MAX values alone never establish owner.
+    fn release_buflo_direct_final_permission(
+        &mut self,
+        endpoint: QcsdEndpointId,
+        stream: QcsdStreamId,
+        finish: crate::QcsdStreamFinish,
+        at: Duration,
+    ) {
+        if !self.buflo_direct_fin_credit_reassignment
+            || finish != crate::QcsdStreamFinish::Fin
+            || !self.buflo_retained_parser_policy
+            || !self
+                .streams
+                .buflo_direct_fin_response_eligible(endpoint, stream)
+            || !self.buflo_secondary_fresh_parser_bridge_enabled(endpoint, stream)
+            || self.defense.terminal_failure().is_some()
+        {
+            return;
+        }
+        let Some(proof) = self.buflo_peer_fin_reads.get(&(endpoint, stream)).copied() else {
+            return;
+        };
+        if proof.at > at
+            || self.streams.consumed(endpoint, stream) != Some(proof.final_size)
+            || self.streams.receive_limits(endpoint, stream)
+                != Some((proof.encoded_limit, proof.encoded_limit))
+        {
+            return;
+        }
+        let Some(state) = self.streams.get_mut(endpoint, stream) else {
+            return;
+        };
+        if state.role != QcsdRequestRole::Application
+            || !state
+                .status
+                .is_some_and(|status| (200..300).contains(&status) && !matches!(status, 204 | 205))
+            || !matches!(state.receive, crate::stream::ReceiveState::ReceivingData { data_length, .. } if data_length > 0)
+        {
+            return;
+        }
+        let mut ranges = self
+            .advertised_incoming_credit
+            .get(&(endpoint, stream))
+            .cloned()
+            .unwrap_or_default();
+        ranges.sort_unstable_by_key(|range| (range.start, range.end, range.slot));
+        if ranges.is_empty()
+            || self
+                .parser_lease_ranges
+                .get(&(endpoint, stream))
+                .is_some_and(|parser_ranges| !parser_ranges.is_empty())
+            || self
+                .control
+                .claims
+                .iter()
+                .any(|claim| claim.endpoint == endpoint && claim.stream == stream)
+        {
+            return;
+        }
+        let mut cursor = proof.final_size;
+        for range in &ranges {
+            if range.start != cursor || range.end <= range.start || range.end > proof.encoded_limit
+            {
+                return;
+            }
+            let Some(ledger) = self.incoming_credit_ledger.get(&range.slot) else {
+                return;
+            };
+            let deadline = ledger
+                .packet
+                .timestamp()
+                .saturating_add(self.exact_incoming_release_window());
+            let amount = range.bytes();
+            if ledger.packet.direction() != Direction::Incoming
+                || ledger.packet.length() != 1_200
+                || self.pending_slots.get(&range.slot) != Some(&ledger.packet)
+                || ledger.action_endpoint() != Some(endpoint)
+                || !ledger.local_realization_emitted
+                || ledger.advertised != ledger.requested()
+                || ledger.retired != 0
+                || ledger.consumed >= ledger.requested()
+                || amount == 0
+                || amount > ledger.unresolved()
+                || self
+                    .control
+                    .credit
+                    .iter()
+                    .any(|credit| credit.slot == range.slot)
+                || self
+                    .control
+                    .claims
+                    .iter()
+                    .any(|claim| claim.slot == range.slot)
+                || self
+                    .control
+                    .incoming
+                    .iter()
+                    .any(|pending| pending.slot == range.slot && pending.remaining > 0)
+                || self.buflo_fin_replacement_pending.contains_key(&range.slot)
+                || at < ledger.packet.timestamp()
+                || at >= deadline
+            {
+                return;
+            }
+            cursor = range.end;
+        }
+        if cursor != proof.encoded_limit {
+            return;
+        }
+
+        // Validation is complete. Remove each exact range before stream-close
+        // retirement and requeue only its same-slot bytes. The QUIC MAX on the
+        // closed application stream remains historical and is never rewound.
+        self.advertised_incoming_credit.remove(&(endpoint, stream));
+        for range in ranges {
+            let Some(ledger) = self.incoming_credit_ledger.get(&range.slot).copied() else {
+                unreachable!("direct FIN previews validated every slot")
+            };
+            let bytes = range.bytes();
+            self.return_advertised_credit(range.slot, bytes);
+            if let Some(pending) = self
+                .control
+                .incoming
+                .iter_mut()
+                .find(|pending| pending.slot == range.slot)
+            {
+                assert_eq!(pending.packet, ledger.packet);
+                pending.remaining = pending.remaining.saturating_add(bytes);
+                pending.endpoint = None;
+            } else {
+                self.control.incoming.push(PendingIncoming {
+                    slot: range.slot,
+                    packet: ledger.packet,
+                    endpoint: None,
+                    remaining: bytes,
+                });
+            }
+            self.buflo_fin_replacement_pending
+                .insert(range.slot, endpoint);
+            let release_index = u64::try_from(self.buflo_fin_permission_releases.len())
+                .expect("release index fits u64");
+            self.buflo_fin_permission_releases
+                .push(BufloFinPermissionRelease {
+                    release_index,
+                    slot: range.slot,
+                    endpoint,
+                    stream,
+                    start: range.start,
+                    end: range.end,
+                    permission_source: Some("direct_advertised_exact_credit_suffix"),
+                    final_size: proof.final_size,
+                    fin_at_us: duration_as_floor_micros(at),
+                    target_us: ledger.packet.timestamp_us(),
+                    deadline_us: duration_as_floor_micros(
+                        ledger
+                            .packet
+                            .timestamp()
+                            .saturating_add(self.exact_incoming_release_window()),
+                    ),
+                    replacements: Vec::new(),
+                });
+        }
+    }
+
     fn try_parser_lease(
         &mut self,
         endpoint: QcsdEndpointId,
         stream: QcsdStreamId,
         pristine_data_boundary: bool,
     ) {
-        if self.cs_terminal_cancellations_pending.contains(&(endpoint, stream)) {
-            return;
-        }
         let retained_boundary = (self.buflo_retained_parser_policy
             && self.buflo_secondary_fresh_parser_bridge_enabled(endpoint, stream)
             && self.defense.terminal_failure().is_none())
@@ -3983,10 +6124,31 @@ impl QcsdController {
                 .and_then(|d| d.pre_header_frontier)
         })
         .flatten();
+        let diagnostic_owned_data_claim = std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K")
+            .is_some()
+            && self.control.claims.iter().any(|claim| {
+                claim.endpoint == endpoint
+                    && claim.stream == stream
+                    && claim.packet.direction() == Direction::Incoming
+                    && claim.packet.length() == 600
+                    && !claim.reservation_debited
+                    && if claim.mixed_rbing {
+                        self.streams
+                            .rbing_mixed_data_capacity(endpoint, stream, claim.remaining)
+                            == claim.remaining
+                    } else {
+                        self.streams.owned_data_continuation_capacity(
+                            endpoint,
+                            stream,
+                            claim.remaining,
+                        ) == claim.remaining
+                    }
+            });
         if !pristine_data_boundary
             || (!self.streams.has_pending_parser_boundary(endpoint, stream)
                 && retained_boundary.is_none()
-                && pre_header_frontier.is_none())
+                && pre_header_frontier.is_none()
+                && !diagnostic_owned_data_claim)
         {
             return;
         }
@@ -4022,19 +6184,19 @@ impl QcsdController {
         let lease = if let Some(frontier) = pre_header_frontier
             && claim.is_some_and(|claim| claim.reservation_debited)
         {
-            self.streams.lease_buflo_initial_headers(endpoint, stream, frontier, backing)
+            self.streams
+                .lease_buflo_initial_headers(endpoint, stream, frontier, backing)
         } else if let Some(boundary) = retained_boundary
             && claim.is_some_and(|claim| claim.reservation_debited)
         {
             self.streams
                 .lease_buflo_retained_parser(endpoint, stream, boundary, backing)
+        } else if claim.is_some_and(|claim| claim.mixed_rbing && !claim.reservation_debited) {
+            self.streams
+                .rbing_mixed_data_continuation(endpoint, stream, backing)
         } else if claim.is_some_and(|claim| !claim.reservation_debited) {
-            let cs_chaff = claim.filter(|claim| {
-                claim.packet.direction() == Direction::Incoming && claim.packet.length() == 600
-            }).and_then(|_| {
-                self.streams.cs_live_chaff_owned_data_continuation(endpoint, stream, backing)
-            });
-            cs_chaff.or_else(|| self.streams.owned_data_continuation(endpoint, stream, backing))
+            self.streams
+                .owned_data_continuation(endpoint, stream, backing)
         } else if self.incoming_requires_explicit_physical_ownership() {
             let fresh = if self.buflo_secondary_fresh_parser_bridge_enabled(endpoint, stream) {
                 let owned_suffix = self.buflo_fresh_owned_parser_suffix(endpoint, stream);
@@ -4424,6 +6586,12 @@ impl QcsdController {
             *total = total.saturating_add(range.bytes());
         }
         for (slot, bytes) in retired_by_slot {
+            if std::env::var_os("QCSD_RBING_RETIRED_TRACE").is_some() {
+                eprintln!(
+                    "QCSD_RBING_RETIRED_CREDIT endpoint={} stream={} slot={} bytes={}",
+                    endpoint.0, stream.0, slot.0, bytes
+                );
+            }
             self.record_retired_credit(slot, bytes, at);
         }
     }
@@ -4492,6 +6660,17 @@ impl QcsdController {
             .incoming_consumed_ranges
             .remove(&slot)
             .unwrap_or_default();
+        if ledger.retired > 0 && std::env::var_os("QCSD_RBING_RETIRED_TRACE").is_some() {
+            eprintln!(
+                "QCSD_RBING_RETIRED_RESOLVED slot={} requested={} advertised={} consumed={} retired={} ranges={:?}",
+                slot.0,
+                ledger.requested(),
+                ledger.advertised,
+                ledger.consumed,
+                ledger.retired,
+                ranges
+            );
+        }
         if ranges.iter().any(|range| range.reclassified_parser)
             || (self.buflo_retained_parser_policy
                 && self
@@ -4538,12 +6717,7 @@ impl QcsdController {
             });
             EventOutcome::Missed(reason)
         };
-        if ledger.retired == 0
-            && matches!(
-                &self.config.defense,
-                DefenseConfig::Buflo(_) | DefenseConfig::CsBuflo(_)
-            )
-        {
+        if ledger.retired == 0 && matches!(&self.config.defense, DefenseConfig::CsBuflo(_)) {
             // Independent process-clock sample at the actual owned-credit
             // terminal transition. The complete original ledger remains the
             // owner; no controller `Duration at` is projected onto this clock.
@@ -4632,6 +6806,7 @@ impl QcsdController {
         let mut canceled_slots: Vec<_> = ranges.iter().filter_map(|range| range.slot()).collect();
         for credit in returned_credit {
             self.return_claim(&PendingClaim {
+                mixed_rbing: false,
                 reservation_debited: true,
                 slot: credit.slot,
                 packet: credit.packet,
@@ -4645,6 +6820,7 @@ impl QcsdController {
                 self.streams.restore_claim(endpoint, stream, bytes);
             }
             self.return_claim(&PendingClaim {
+                mixed_rbing: false,
                 reservation_debited,
                 slot: owner.slot,
                 packet: owner.packet,
@@ -4743,6 +6919,7 @@ impl QcsdController {
                     self.streams.restore_claim(endpoint, stream, range.bytes());
                 }
                 self.return_claim(&PendingClaim {
+                    mixed_rbing: false,
                     reservation_debited: range.reservation_debited,
                     slot: owner.slot,
                     packet: owner.packet,
@@ -4776,6 +6953,7 @@ impl QcsdController {
                 self.streams.restore_claim(endpoint, stream, remaining);
             }
             self.return_claim(&PendingClaim {
+                mixed_rbing: false,
                 reservation_debited: range.reservation_debited,
                 slot: owner.slot,
                 packet: owner.packet,
@@ -5123,6 +7301,7 @@ impl QcsdController {
             }
             if !affected.contains(&owner.slot) {
                 self.return_claim(&PendingClaim {
+                    mixed_rbing: false,
                     reservation_debited,
                     slot: owner.slot,
                     packet: owner.packet,
@@ -5223,12 +7402,27 @@ impl QcsdController {
         let mut slots: Vec<_> = affected.iter().copied().collect();
         slots.sort_unstable();
         for slot in slots {
-            self.incoming_consumed_ranges.remove(&slot);
+            let consumed_ranges = self
+                .incoming_consumed_ranges
+                .remove(&slot)
+                .unwrap_or_default();
             self.buflo_fin_replacement_pending.remove(&slot);
             let Some(mut ledger) = self.incoming_credit_ledger.remove(&slot) else {
                 continue;
             };
             let retired = ledger.unresolved();
+            if retired > 0 && std::env::var_os("QCSD_RBING_RETIRED_TRACE").is_some() {
+                eprintln!(
+                    "QCSD_RBING_RETIRED_FAILURE_CLOSURE slot={} requested={} advertised={} consumed={} retiring={} reason={:?} ranges={:?}",
+                    slot.0,
+                    ledger.requested(),
+                    ledger.advertised,
+                    ledger.consumed,
+                    retired,
+                    reason,
+                    consumed_ranges
+                );
+            }
             ledger.retired = ledger.retired.saturating_add(retired);
             self.scheduled_incoming_retired_bytes = self
                 .scheduled_incoming_retired_bytes
@@ -5276,6 +7470,78 @@ impl QcsdController {
                     .then_some(*slot)
             })
             .collect();
+        // No-credit diagnostic: observe the exact expiry boundary before
+        // terminalization. No scheduling or credit decision is changed.
+        if !roots.is_empty()
+            && self.cs_rbing_capacity_retry
+            && std::env::var_os("QCSD_RBING_EXPIRY_BOUNDARY_V2").is_some()
+        {
+            static EXPIRY_SAMPLES: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let sample = EXPIRY_SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if sample < 4 {
+                let mut expired: Vec<_> = roots.iter().copied().collect();
+                expired.sort_unstable();
+                let capacity = self.streams.aggregate_capacity();
+                let mut chaff = self.streams.open_chaff_streams();
+                chaff.sort_unstable();
+                eprintln!(
+                    "QCSD_RBING_EXPIRY_BOUNDARY_V2 sample={sample} at_us={} roots={} app_capacity={} chaff_capacity={} open_chaff={}",
+                    at.as_micros(),
+                    expired.len(),
+                    capacity.application_incoming,
+                    capacity.chaff_incoming,
+                    chaff.len()
+                );
+                for slot in expired.into_iter().take(4) {
+                    if let Some(ledger) = self.incoming_credit_ledger.get(&slot) {
+                        let pending = self.control.incoming.iter().any(|item| item.slot == slot);
+                        eprintln!(
+                            "QCSD_RBING_EXPIRY_BOUNDARY_V2 sample={sample} slot={} target_us={} endpoint={:?} advertised={} consumed={} retired={} locally_realized={} pending={} retry_pending={}",
+                            slot.0,
+                            ledger.packet.timestamp_us(),
+                            ledger.endpoint,
+                            ledger.advertised,
+                            ledger.consumed,
+                            ledger.retired,
+                            ledger.local_realization_emitted,
+                            pending,
+                            self.cs_rbing_capacity_retry_at.contains_key(&slot)
+                        );
+                    }
+                }
+                for key in chaff.into_iter().take(4) {
+                    let state = self
+                        .streams
+                        .get_mut(key.0, key.1)
+                        .map(|stream| (stream.role.clone(), stream.receive.clone()));
+                    let claims = self
+                        .control
+                        .claims
+                        .iter()
+                        .filter(|claim| (claim.endpoint, claim.stream) == key)
+                        .count();
+                    let ranges = self.parser_lease_ranges.get(&key).map_or(0, Vec::len);
+                    let advertised = self
+                        .advertised_incoming_credit
+                        .get(&key)
+                        .map_or(0, Vec::len);
+                    eprintln!(
+                        "QCSD_RBING_EXPIRY_BOUNDARY_V2 sample={sample} key={key:?} state={state:?} claims={claims} parser_ranges={ranges} advertised_ranges={advertised}"
+                    );
+                    if let Some(items) = self.parser_lease_ranges.get(&key) {
+                        for range in items.iter().take(2) {
+                            let ledger = range
+                                .owner
+                                .and_then(|owner| self.incoming_credit_ledger.get(&owner.slot));
+                            eprintln!(
+                                "QCSD_RBING_EXPIRY_BOUNDARY_V2 sample={sample} key={key:?} range={range:?} ledger={ledger:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if !roots.is_empty() {
             let (_, accepted_but_unencoded) =
                 self.fail_incoming_slots(&roots, MissedSlotReason::DeadlineExpired, at, true);
@@ -5315,9 +7581,11 @@ impl QcsdController {
             self.update_completion(elapsed);
             return;
         }
+        self.materialize_b816_pre_materialization_if_ready(elapsed);
 
         self.expire_unadvertised_exact_incoming(elapsed);
         self.drain_observations();
+        self.materialize_b816_pre_materialization_if_ready(elapsed);
         self.arm_buflo_incoming_if_ready(elapsed);
         let candidate_terminal_drain = self.defense.requires_terminal_chaff_drain();
         if !candidate_terminal_drain {
@@ -5349,8 +7617,9 @@ impl QcsdController {
             // controller's legacy control interval (CS-BuFLO deliberately
             // jitters them).  Handle each due event at the current instant;
             // rounding it to the next interval can move the first allocation
-            // attempt beyond its exclusive deadline.  Exact-window failures
-            // are terminal, so this cannot create a retry or catch-up loop.
+            // attempt beyond its exclusive deadline. The separate r.bing-only
+            // opt-in defers only rolled-back, unallocated cells to a strictly
+            // future wake; every original physical deadline stays exclusive.
             self.process_incoming(elapsed_us, elapsed);
         } else {
             let boundary_us = ControlLoop::boundary_us(elapsed_us, self.config.control_interval_us);
@@ -5519,7 +7788,7 @@ impl QcsdController {
         if let Some(packet) = abandoned_due {
             let deadline = packet
                 .timestamp()
-                .saturating_add(self.config.control_interval());
+                .saturating_add(self.rolling_outgoing_realization_window());
             if (elapsed > packet.timestamp()
                 || duration_as_floor_micros(deadline.saturating_sub(elapsed)) == 0)
                 && !self.defense.is_outgoing_complete()
@@ -5540,7 +7809,7 @@ impl QcsdController {
         {
             let deadline = packet
                 .timestamp()
-                .saturating_add(self.config.control_interval());
+                .saturating_add(self.rolling_outgoing_realization_window());
             if duration_as_floor_micros(deadline.saturating_sub(elapsed)) == 0
                 && !self.defense.is_outgoing_complete()
                 && self.defense.terminal_failure().is_none()
@@ -5625,7 +7894,7 @@ impl QcsdController {
         }
         let deadline = packet
             .timestamp()
-            .saturating_add(self.config.control_interval());
+            .saturating_add(self.rolling_outgoing_realization_window());
         let not_before_after_us =
             duration_as_ceil_micros(packet.timestamp().saturating_sub(elapsed));
         let deadline_after_us = duration_as_floor_micros(deadline.saturating_sub(elapsed));
@@ -5756,7 +8025,7 @@ impl QcsdController {
         let deadline = abandoned
             .packet
             .timestamp()
-            .saturating_add(self.config.control_interval());
+            .saturating_add(self.rolling_outgoing_realization_window());
         let deadline_after_us = duration_as_floor_micros(deadline.saturating_sub(elapsed));
         if deadline_after_us > 0
             && self.defense.terminal_failure().is_none()
@@ -5842,7 +8111,7 @@ impl QcsdController {
         let slot = replacement.map_or_else(|| self.next_dynamic_slot(packet), |prearm| prearm.slot);
         let deadline = packet
             .timestamp()
-            .saturating_add(self.config.control_interval());
+            .saturating_add(self.rolling_outgoing_realization_window());
         let reason = if elapsed >= deadline {
             MissedSlotReason::DeadlineExpired
         } else {
@@ -5887,9 +8156,11 @@ impl QcsdController {
         if self.fixed_schedule.is_none() {
             return;
         }
+        self.materialize_b816_pre_materialization_if_ready(elapsed);
 
         self.expire_unadvertised_exact_incoming(elapsed);
         self.drain_observations();
+        self.materialize_b816_pre_materialization_if_ready(elapsed);
         self.request_chaff_if_needed(true);
         self.refresh_receiver_continuation_reserves();
         self.emit_capacity_signal(elapsed);
@@ -6032,6 +8303,41 @@ impl QcsdController {
     }
 
     fn retry_pending_parser_leases(&mut self) {
+        // Diagnostic Bing continuation: a cell can own a live DATA suffix
+        // after the bounded parser lease cleared its pending-boundary marker.
+        // Retry only that exact, unissued 600-byte owner through the normal
+        // materializer and its authenticated stream/receive checks.
+        if std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some() {
+            let mut owned_claims: Vec<_> = self
+                .control
+                .claims
+                .iter()
+                .filter_map(|claim| {
+                    (claim.packet.direction() == Direction::Incoming
+                        && claim.packet.length() == 600
+                        && !claim.reservation_debited
+                        && if claim.mixed_rbing {
+                            self.streams.rbing_mixed_data_capacity(
+                                claim.endpoint,
+                                claim.stream,
+                                claim.remaining,
+                            ) == claim.remaining
+                        } else {
+                            self.streams.owned_data_continuation_capacity(
+                                claim.endpoint,
+                                claim.stream,
+                                claim.remaining,
+                            ) == claim.remaining
+                        })
+                    .then_some((claim.endpoint, claim.stream))
+                })
+                .collect();
+            owned_claims.sort_unstable();
+            owned_claims.dedup();
+            for (endpoint, stream) in owned_claims {
+                self.try_parser_lease(endpoint, stream, true);
+            }
+        }
         if self.buflo_aggregate_selected.is_some() {
             for (endpoint, stream, debt, pristine) in self.streams.aggregate_framing_debts() {
                 self.try_buflo_aggregate_prebody_framing_lease(endpoint, stream, debt, pristine);
@@ -6051,14 +8357,17 @@ impl QcsdController {
         let mut pending = self.streams.pending_parser_boundaries();
         pending.extend(self.buflo_retained_parser_demands.iter().filter_map(
             |(&(endpoint, stream), demand)| {
-                demand.boundary
+                demand
+                    .boundary
                     .filter(|boundary| {
                         self.streams.receive_actions_available(endpoint, stream)
                             && self.streams.consumed(endpoint, stream) == Some(*boundary)
                     })
-                    .or_else(|| demand.pre_header_frontier.filter(|_| {
-                        self.streams.receive_actions_available(endpoint, stream)
-                    }))
+                    .or_else(|| {
+                        demand
+                            .pre_header_frontier
+                            .filter(|_| self.streams.receive_actions_available(endpoint, stream))
+                    })
                     .map(|_| (endpoint, stream))
             },
         ));
@@ -6120,6 +8429,12 @@ impl QcsdController {
                 .filter(|prearm| prearm.packet == packet);
             let slot =
                 prearmed.map_or_else(|| self.next_dynamic_slot(packet), |prearm| prearm.slot);
+            if packet.direction() == Direction::Incoming
+                && receiver_continuation.is_none()
+                && self.try_b816_pre_materialize_incoming(slot, packet, elapsed)
+            {
+                continue;
+            }
             self.pending_slots.insert(slot, packet);
             match packet.direction() {
                 Direction::Outgoing => {
@@ -6282,6 +8597,71 @@ impl QcsdController {
                         .timestamp()
                         .saturating_add(self.exact_incoming_release_window())
             {
+                // Opt-in diagnostic only: expiry has already occurred; no credit
+                // or scheduling decision may be inferred from this snapshot.
+                if self.cs_rbing_capacity_retry
+                    && std::env::var_os("QCSD_RBING_EXPIRY_DIAG_V1").is_some()
+                {
+                    static SAMPLES: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let sample = SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if sample < 4 {
+                        let capacity = self.streams.aggregate_capacity();
+                        let keys = self.streams.open_chaff_streams();
+                        eprintln!(
+                            "QCSD_RBING_EXPIRY_DIAG_V1 sample={sample} slot={} target_us={} observed_us={} app_capacity={} chaff_capacity={} retry_pending={} open_chaff_count={} displayed_chaff={} trace_count={}",
+                            incoming.slot.0,
+                            incoming.packet.timestamp_us(),
+                            elapsed.as_micros(),
+                            capacity.application_incoming,
+                            capacity.chaff_incoming,
+                            self.cs_rbing_capacity_retry_at.contains_key(&incoming.slot),
+                            keys.len(),
+                            keys.len().min(4),
+                            self.cs_rbing_capacity_retry_trace.len()
+                        );
+                        for key in keys.into_iter().take(4) {
+                            let claims: Vec<_> = self
+                                .control
+                                .claims
+                                .iter()
+                                .filter(|claim| (claim.endpoint, claim.stream) == key)
+                                .take(4)
+                                .copied()
+                                .collect();
+                            let claim_count = self
+                                .control
+                                .claims
+                                .iter()
+                                .filter(|claim| (claim.endpoint, claim.stream) == key)
+                                .count();
+                            let ranges = self.parser_lease_ranges.get(&key);
+                            let range_count = ranges.map_or(0, Vec::len);
+                            let range_sample: Vec<_> =
+                                ranges.into_iter().flatten().take(4).copied().collect();
+                            let advertised = self.advertised_incoming_credit.get(&key);
+                            let advertised_count = advertised.map_or(0, Vec::len);
+                            let advertised_sample: Vec<_> = advertised
+                                .into_iter()
+                                .flatten()
+                                .take(4)
+                                .map(|range| {
+                                    (
+                                        *range,
+                                        self.incoming_credit_ledger.get(&range.slot).copied(),
+                                    )
+                                })
+                                .collect();
+                            let state = self
+                                .streams
+                                .get_mut(key.0, key.1)
+                                .map(|stream| (stream.role.clone(), stream.receive.clone()));
+                            eprintln!(
+                                "QCSD_RBING_EXPIRY_DIAG_V1 sample={sample} key={key:?} state={state:?} claim_count={claim_count} claims={claims:?} range_count={range_count} ranges={range_sample:?} advertised_count={advertised_count} advertised={advertised_sample:?}"
+                            );
+                        }
+                    }
+                }
                 self.fail_incoming_slot(
                     incoming.slot,
                     MissedSlotReason::DeadlineExpired,
@@ -6290,6 +8670,46 @@ impl QcsdController {
                 );
                 continue;
             }
+            // A retained unallocated cell cannot spin on repeated callbacks.
+            // Expiration above (and the original ledger reducer) runs first.
+            if self
+                .cs_rbing_capacity_retry_at
+                .get(&incoming.slot)
+                .is_some_and(|next| elapsed < *next)
+            {
+                self.control.incoming.push(incoming);
+                continue;
+            }
+            let retry_after_complete_rollback = self
+                .cs_rbing_capacity_retry_at
+                .remove(&incoming.slot)
+                .is_some();
+            // B816's held identity is not a retry and does not alter the
+            // same-window retry clock. It receives this one existing
+            // post-app-complete owned-DATA admission only after its actual
+            // parser prefix was physically advanced before materialization.
+            let b816_pre_materialized = self
+                .b816_pre_materialized_admission
+                .filter(|admission| admission.slot == incoming.slot);
+            if b816_pre_materialized.is_some() {
+                self.b816_pre_materialized_admission = None;
+            }
+            let retry_after_complete_permitted =
+                retry_after_complete_rollback || b816_pre_materialized.is_some();
+            // B816 adds exactly one initial post-complete admission and only
+            // for the same ACKed r4 stream whose concrete parser lease was
+            // observed before this slot existed. A normal later rollback keeps
+            // its pre-existing B815 retry scope.
+            let retry_after_complete_target_permitted =
+                |endpoint: QcsdEndpointId, stream: QcsdStreamId| {
+                    b816_pre_materialized.is_none()
+                        || retry_after_complete_rollback
+                        || b816_pre_materialized.is_some_and(|admission| {
+                            (admission.endpoint, admission.stream) == (endpoint, stream)
+                        })
+                };
+            let retry_pristine = self.cs_rbing_retry_slot_is_pristine(&incoming);
+            let retry_scheduler = retry_pristine.then(|| self.scheduler.clone());
             let endpoint_order = self.scheduler.next_incoming_order();
             let miss_reason = if endpoint_order.is_empty() {
                 MissedSlotReason::NoEndpoint
@@ -6535,26 +8955,24 @@ impl QcsdController {
                 && incoming.remaining == 1_200
                 && incoming.remaining == u64::from(incoming.packet.length());
             let mut staged_credit = Vec::new();
+            let mut staged_application_exact = 0_u64;
             let mut staged_claims: Vec<PendingClaim> = Vec::new();
             let mut staged_stream_turns = HashMap::new();
             let mut staged_demands = Vec::new();
             let mut opportunities = Vec::new();
             for endpoint in endpoint_order {
-                let mut endpoint_opportunities = self.streams.allocation_opportunities_excluding(
-                    endpoint,
-                    self.defense.mode(),
-                    &self.control.receiver_continuation_reserves,
-                    self.defense.base_chaff_requires_peer_acknowledgment(),
-                );
-                if incoming.packet.length() == 600
-                    && self.streams.cs_live_chaff_headers_enabled()
-                    && self.defense.terminal_failure().is_none()
-                {
-                    endpoint_opportunities.extend(
-                        self.streams.cs_live_chaff_owned_data_opportunities(endpoint),
-                    );
-                }
-                if self.terminal_primary_partial_cell_policy
+                let mut endpoint_opportunities = if b816_pre_materialized.is_some() {
+                    Vec::new()
+                } else {
+                    self.streams.allocation_opportunities_excluding(
+                        endpoint,
+                        self.defense.mode(),
+                        &self.control.receiver_continuation_reserves,
+                        self.defense.base_chaff_requires_peer_acknowledgment(),
+                    )
+                };
+                if b816_pre_materialized.is_none()
+                    && self.terminal_primary_partial_cell_policy
                     && self.incoming_requires_explicit_physical_ownership()
                     && incoming.remaining == u64::from(incoming.packet.length())
                     && let Some((bound_endpoint, bound_stream)) = self.terminal_primary_stream
@@ -6574,7 +8992,30 @@ impl QcsdController {
                 {
                     endpoint_opportunities.push(opportunity);
                 }
-                if self.buflo_retained_parser_policy {
+                // No decoded body forecast is added. These zero-capacity
+                // opportunities may reserve ONLY an untouched full due600 cell.
+                // Original application/exact priority and atomic rollback remain.
+                if retry_pristine && self.cs_rbing_owned_data_continuation {
+                    for opportunity in self.streams.cs_rbing_owned_data_opportunities(endpoint) {
+                        if retry_after_complete_target_permitted(endpoint, opportunity.stream)
+                            && self.cs_rbing_owned_chaff_boundary_for_retry(
+                                endpoint,
+                                opportunity.stream,
+                                retry_after_complete_permitted,
+                            )
+                            && !self
+                                .control
+                                .receiver_continuation_reserves
+                                .contains(&(endpoint, opportunity.stream))
+                            && !endpoint_opportunities
+                                .iter()
+                                .any(|o| o.stream == opportunity.stream)
+                        {
+                            endpoint_opportunities.push(opportunity);
+                        }
+                    }
+                }
+                if b816_pre_materialized.is_none() && self.buflo_retained_parser_policy {
                     for (&(candidate, stream), demand) in &self.buflo_retained_parser_demands {
                         if candidate != endpoint
                             || endpoint_opportunities.iter().any(|o| o.stream == stream)
@@ -6582,10 +9023,13 @@ impl QcsdController {
                             continue;
                         }
                         if let Some(frontier) = demand.pre_header_frontier
-                            && let Some(opportunity) = self.streams.buflo_initial_headers_opportunity(
-                                endpoint, stream, frontier,
-                                self.buflo_retained_parser_room(endpoint, stream),
-                            )
+                            && let Some(opportunity) =
+                                self.streams.buflo_initial_headers_opportunity(
+                                    endpoint,
+                                    stream,
+                                    frontier,
+                                    self.buflo_retained_parser_room(endpoint, stream),
+                                )
                         {
                             endpoint_opportunities.push(opportunity);
                         } else if let Some(boundary) = demand.boundary
@@ -6600,6 +9044,25 @@ impl QcsdController {
                             endpoint_opportunities.push(opportunity);
                         }
                     }
+                }
+                // Frozen Bing ten-stream experiment: distribute only already
+                // eligible chaff by observed consumed offset. Stable sorting
+                // preserves original application order and never creates credit.
+                if self.cs_rbing_owned_data_continuation
+                    && matches!(self.config.max_chaff_streams, 10 | 50)
+                {
+                    endpoint_opportunities.sort_by_key(|opportunity| {
+                        if matches!(opportunity.role, QcsdRequestRole::Chaff { .. }) {
+                            (
+                                1,
+                                self.streams
+                                    .consumed(endpoint, opportunity.stream)
+                                    .unwrap_or(u64::MAX),
+                            )
+                        } else {
+                            (0, 0)
+                        }
+                    });
                 }
                 if fair_stream_turns {
                     endpoint_opportunities.sort_by_key(|opportunity| {
@@ -6878,51 +9341,64 @@ impl QcsdController {
             })
             .map(|opportunity| (opportunity.endpoint, opportunity.stream));
 
-            // Ordinary pristine cells share the existing cyclic application
-            // order with an eligible retained secondary parser boundary. A
-            // known application extent must not indefinitely preempt that turn.
-            // This changes priority only: the original allocator still requires
-            // new owned offsets, the shared parser cap and a complete1200 cell.
-            let fair_retained_application_turns = self.buflo_retained_parser_policy
-                && fair_stream_turns
-                && !terminal_chaff_incoming
-                && tagged_disposition.is_none()
-                && reserve_disposition.is_none()
-                && incoming.packet.length() == 1_200
-                && incoming.remaining == 1_200
-                && self.incoming_slot_is_untouched(&incoming)
-                && known_chaff_service.is_none()
-                && fair_owned_primary_turn.is_none()
-                && !self.buflo_fin_replacement_pending.contains_key(&incoming.slot)
-                && opportunities.iter().any(|opportunity| {
-                    opportunity.role == QcsdRequestRole::Application
-                        && opportunity.exact == 0
-                        && self.buflo_secondary_fresh_parser_bridge_enabled(
-                            opportunity.endpoint,
-                            opportunity.stream,
-                        )
-                        && self.buflo_retained_parser_demands
-                            .get(&(opportunity.endpoint, opportunity.stream))
-                            .and_then(|demand| demand.boundary)
-                            .is_some_and(|boundary| {
-                                self.streams.buflo_retained_parser_capacity(
-                                    opportunity.endpoint,
-                                    opportunity.stream,
-                                    boundary,
-                                    self.buflo_retained_parser_room(
-                                        opportunity.endpoint,
-                                        opportunity.stream,
-                                    ),
-                                ) > 0
+            // This diagnostic cell has one sub-600 application extent and
+            // a verified chaff DATA suffix that can own exactly the remainder.
+            // Stage the application's exact bytes first, then permit the chaff
+            // split on the same cell; application parser claims stay disabled
+            // for this cell so they cannot consume its chaff remainder.
+            let diagnostic_application_first =
+                if std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                    && self.config.max_chaff_streams == 5
+                    && incoming.packet.direction() == Direction::Incoming
+                    && incoming.packet.length() == 600
+                    && incoming.remaining == 600
+                {
+                    let mut app_exact = opportunities
+                        .iter()
+                        .filter(|o| o.role == QcsdRequestRole::Application && o.exact > 0);
+                    let candidate = app_exact
+                        .next()
+                        .copied()
+                        .filter(|o| (1..600).contains(&o.exact) && app_exact.next().is_none());
+                    candidate
+                        .filter(|app| {
+                            opportunities.iter().any(|chaff| {
+                                chaff.endpoint == app.endpoint
+                                    && matches!(chaff.role, QcsdRequestRole::Chaff { .. })
+                                    && self
+                                        .cs_rbing_owned_chaff_boundary(chaff.endpoint, chaff.stream)
+                                    && self.streams.rbing_mixed_data_capacity(
+                                        chaff.endpoint,
+                                        chaff.stream,
+                                        600 - app.exact,
+                                    ) == 600 - app.exact
                             })
-                });
-            // Every special/partial/primary/known-chaff/replacement turn keeps
-            // the original exact-first pass. Eligible ordinary application
-            // turns use the same existing cyclic opportunity order for both.
+                        })
+                        .map(|app| (app.endpoint, app.stream))
+                } else {
+                    None
+                };
             let mut allocation_passes = Vec::new();
-            if self.buflo_retained_parser_policy
+            if let Some(app_key) = diagnostic_application_first {
+                if let Some(mut app) = opportunities
+                    .iter()
+                    .copied()
+                    .find(|o| (o.endpoint, o.stream) == app_key && o.exact > 0)
+                {
+                    app.claimable = 0;
+                    allocation_passes.push((app, false));
+                }
+                for mut opportunity in opportunities {
+                    if opportunity.role == QcsdRequestRole::Application {
+                        opportunity.exact = 0;
+                        opportunity.claimable = 0;
+                        allocation_passes.push((opportunity, false));
+                    } else {
+                        allocation_passes.push((opportunity, true));
+                    }
+                }
+            } else if self.buflo_retained_parser_policy
                 && fair_stream_turns
-                && !fair_retained_application_turns
                 && opportunities
                     .first()
                     .is_some_and(|opportunity| opportunity.role == QcsdRequestRole::Application)
@@ -6953,6 +9429,73 @@ impl QcsdController {
                 let primary_turn = allocation_passes.remove(index);
                 allocation_passes.insert(0, primary_turn);
             }
+            // Keep the original exact-first attempt. Only a later retry of
+            // this same wholly rolled-back, untouched cell may put one proven
+            // full600 chaff permission ahead of sub-cell exact fragments.
+            // No previous release, parser byte, deadline or owner is retagged.
+            if retry_pristine && retry_after_complete_permitted {
+                let preferred: Vec<_> = allocation_passes
+                    .iter()
+                    .filter(|(o, allow)| {
+                        *allow
+                            && retry_after_complete_target_permitted(o.endpoint, o.stream)
+                            && self.cs_rbing_owned_chaff_boundary_for_retry(
+                                o.endpoint,
+                                o.stream,
+                                retry_after_complete_permitted,
+                            )
+                            && self
+                                .streams
+                                .owned_data_continuation_capacity(o.endpoint, o.stream, 600)
+                                == 600
+                    })
+                    .map(|(o, _)| *o)
+                    .collect();
+                for mut opportunity in preferred.into_iter().rev() {
+                    opportunity.exact = 0;
+                    opportunity.claimable = 0;
+                    allocation_passes.insert(0, (opportunity, true));
+                }
+            }
+            // Snapshot only this opt-in cell's candidate receive states.
+            // Every allocator mutation below is a ReceiveState release/claim;
+            // compare the COMPLETE state after the original LIFO rollback.
+            let mut retry_receive_states = HashMap::new();
+            if retry_pristine {
+                for (opportunity, _) in &allocation_passes {
+                    let key = (opportunity.endpoint, opportunity.stream);
+                    if let Some(state) = self.streams.get_mut(key.0, key.1) {
+                        retry_receive_states
+                            .entry(key)
+                            .or_insert_with(|| state.receive.clone());
+                    }
+                }
+            }
+            if std::env::var_os("QCSD_RBING_CAPACITY_TRACE").is_some()
+                && incoming.packet.direction() == Direction::Incoming
+                && incoming.packet.length() == 600
+                && (8_500_000..40_000_000).contains(&incoming.packet.timestamp_us())
+            {
+                let candidates: Vec<_> = allocation_passes
+                    .iter()
+                    .map(|(o, allow)| {
+                        (
+                            o.stream.0,
+                            format!("{:?}", o.role),
+                            o.exact,
+                            o.claimable,
+                            *allow,
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "QCSD_RBING_ALLOCATOR_TRACE slot={} timestamp_us={} remaining={} candidates={:?}",
+                    incoming.slot.0,
+                    incoming.packet.timestamp_us(),
+                    incoming.remaining,
+                    candidates
+                );
+            }
             for (opportunity, allow_parser) in allocation_passes {
                 if incoming.remaining == 0 {
                     break;
@@ -6968,6 +9511,9 @@ impl QcsdController {
                         )
                         .expect("snapshotted exact stream capacity remains available");
                     incoming.remaining = incoming.remaining.saturating_sub(release.increase);
+                    if opportunity.role == QcsdRequestRole::Application {
+                        staged_application_exact += release.increase;
+                    }
                     staged_credit.push(PendingCredit {
                         slot: incoming.slot,
                         packet: incoming.packet,
@@ -6993,7 +9539,105 @@ impl QcsdController {
                 let bound_owned_primary = self.terminal_primary_partial_cell_policy
                     && self.terminal_primary_stream
                         == Some((opportunity.endpoint, opportunity.stream));
-                let primary_owned_data_quantum = if bound_owned_primary
+                let diagnostic_mixed_owned =
+                    std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                        && self.config.max_chaff_streams == 5
+                        && staged_application_exact > 0;
+                let mixed_data_capacity = self.streams.rbing_mixed_data_capacity(
+                    opportunity.endpoint,
+                    opportunity.stream,
+                    incoming.remaining,
+                );
+                let mixed_owned = (retry_pristine && self.config.max_chaff_streams == 50
+                    || diagnostic_mixed_owned)
+                    && incoming.packet.length() == 600
+                    && (3..600).contains(&incoming.remaining)
+                    && staged_credit.len() == 1
+                    && staged_claims.is_empty()
+                    && staged_application_exact == 600 - incoming.remaining
+                    && staged_credit[0].endpoint == opportunity.endpoint
+                    && self.cs_rbing_owned_chaff_boundary(opportunity.endpoint, opportunity.stream)
+                    && mixed_data_capacity == incoming.remaining;
+                if std::env::var_os("QCSD_RBING_CAPACITY_TRACE").is_some()
+                    && incoming.packet.direction() == Direction::Incoming
+                    && incoming.packet.length() == 600
+                    && (8_500_000..40_000_000).contains(&incoming.packet.timestamp_us())
+                    && matches!(opportunity.role, QcsdRequestRole::Chaff { .. })
+                {
+                    let capacity = self.streams.owned_data_continuation_capacity(
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        incoming.remaining,
+                    );
+                    let boundary = self.cs_rbing_owned_chaff_boundary_for_retry(
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        retry_after_complete_permitted,
+                    );
+                    let eligible = self
+                        .streams
+                        .cs_rbing_owned_data_opportunities(opportunity.endpoint)
+                        .iter()
+                        .any(|o| o.stream == opportunity.stream);
+                    let has_claim =
+                        self.control
+                            .claims
+                            .iter()
+                            .chain(staged_claims.iter())
+                            .any(|c| {
+                                c.endpoint == opportunity.endpoint
+                                    && c.stream == opportunity.stream
+                                    && !c.reservation_debited
+                            });
+                    eprintln!(
+                        "QCSD_RBING_CAPACITY_TRACE slot={} stream={} exact={} claimable={} cap={} mixed_cap={} mixed={} app_exact={} staged_credit={} boundary={} eligible={} has_claim={} app_complete={} pristine={} retry_permitted={} remaining={} limits={:?} consumed={:?} ranges={:?}",
+                        incoming.slot.0,
+                        opportunity.stream.0,
+                        opportunity.exact,
+                        opportunity.claimable,
+                        capacity,
+                        mixed_data_capacity,
+                        mixed_owned,
+                        staged_application_exact,
+                        staged_credit.len(),
+                        boundary,
+                        eligible,
+                        has_claim,
+                        self.application_complete,
+                        self.cs_rbing_retry_slot_is_pristine(&incoming),
+                        retry_after_complete_permitted,
+                        incoming.remaining,
+                        self.streams
+                            .receive_limits(opportunity.endpoint, opportunity.stream),
+                        self.streams
+                            .consumed(opportunity.endpoint, opportunity.stream),
+                        self.parser_lease_ranges
+                            .get(&(opportunity.endpoint, opportunity.stream))
+                    );
+                }
+                let diagnostic_initial_owned_chaff =
+                    std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                        && self.incoming_slot_is_untouched(&incoming)
+                        && incoming.packet.length() == 600
+                        && matches!(opportunity.role, QcsdRequestRole::Chaff { .. })
+                        && self.cs_rbing_owned_chaff_boundary(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                        );
+                let owned_data_quantum = if mixed_owned {
+                    incoming.remaining
+                } else if (diagnostic_initial_owned_chaff
+                    || bound_owned_primary
+                    || (self.cs_rbing_retry_slot_is_pristine(&incoming)
+                        && retry_after_complete_target_permitted(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                        )
+                        && self.cs_rbing_owned_chaff_boundary_for_retry(
+                            opportunity.endpoint,
+                            opportunity.stream,
+                            retry_after_complete_permitted,
+                        )))
                     && self.incoming_requires_explicit_physical_ownership()
                     && incoming.remaining == u64::from(incoming.packet.length())
                     && !self
@@ -7005,25 +9649,9 @@ impl QcsdController {
                             claim.endpoint == opportunity.endpoint
                                 && claim.stream == opportunity.stream
                                 && !claim.reservation_debited
-                        }) {
-                    self.streams.owned_data_continuation_capacity(
-                        opportunity.endpoint,
-                        opportunity.stream,
-                        incoming.remaining,
-                    )
-                } else {
-                    0
-                };
-                let owned_data_quantum = if primary_owned_data_quantum > 0 {
-                    primary_owned_data_quantum
-                } else if incoming.packet.length() == 600
-                    && !self.control.claims.iter().chain(staged_claims.iter()).any(|claim| {
-                        claim.endpoint == opportunity.endpoint
-                            && claim.stream == opportunity.stream
-                            && !claim.reservation_debited
-                    })
+                        })
                 {
-                    self.streams.cs_live_chaff_owned_data_capacity(
+                    self.streams.owned_data_continuation_capacity(
                         opportunity.endpoint,
                         opportunity.stream,
                         incoming.remaining,
@@ -7067,12 +9695,16 @@ impl QcsdController {
                         retained_room,
                     )
                 });
-                let pre_header_frontier = self.buflo_retained_parser_demands
+                let pre_header_frontier = self
+                    .buflo_retained_parser_demands
                     .get(&(opportunity.endpoint, opportunity.stream))
                     .and_then(|d| d.pre_header_frontier);
                 let pre_header_capacity = pre_header_frontier.map_or(0, |frontier| {
                     self.streams.buflo_initial_headers_capacity(
-                        opportunity.endpoint, opportunity.stream, frontier, retained_room,
+                        opportunity.endpoint,
+                        opportunity.stream,
+                        frontier,
+                        retained_room,
                     )
                 });
                 let fresh_owned_suffix =
@@ -7188,6 +9820,7 @@ impl QcsdController {
                             }
                         }
                         staged_claims.push(PendingClaim {
+                            mixed_rbing: mixed_owned,
                             reservation_debited: owned_data_quantum == 0,
                             slot: incoming.slot,
                             packet: incoming.packet,
@@ -7206,7 +9839,8 @@ impl QcsdController {
                             .entry((opportunity.endpoint, false))
                             .or_insert(opportunity.stream);
                     } else {
-                        staged_stream_turns.insert((opportunity.endpoint, false), opportunity.stream);
+                        staged_stream_turns
+                            .insert((opportunity.endpoint, false), opportunity.stream);
                     }
                 }
             }
@@ -7246,6 +9880,18 @@ impl QcsdController {
                         ledger.assign_endpoint(claim.endpoint);
                     }
                     self.control.claims.push(claim);
+                    // The exact cell has a 5 ms deadline. Materialize its
+                    // authenticated live-DATA continuation in this same
+                    // allocation pass so the transport can advertise it
+                    // before that deadline; deferred parser retries can be
+                    // tens of milliseconds later under the live event load.
+                    if std::env::var_os("QCSD_RBING_PARSER_LEASE_CAPACITY_512K").is_some()
+                        && !claim.reservation_debited
+                        && claim.packet.direction() == Direction::Incoming
+                        && claim.packet.length() == 600
+                    {
+                        self.try_parser_lease(claim.endpoint, claim.stream, true);
+                    }
                 }
                 for (key, boundary) in staged_demands {
                     self.buflo_retained_parser_demands.insert(
@@ -7264,6 +9910,25 @@ impl QcsdController {
                     self.buflo_chaff_service_turn = (self.buflo_chaff_service_turn + 1) % 6;
                 }
             } else {
+                let rollback_complete = retry_pristine
+                    && miss_reason == MissedSlotReason::InsufficientIncomingCapacity
+                    && staged_credit.iter().all(|credit| {
+                        credit.slot == incoming.slot && credit.packet == incoming.packet
+                    })
+                    && staged_claims.iter().all(|claim| {
+                        claim.slot == incoming.slot
+                            && claim.packet == incoming.packet
+                            && claim.reservation_debited
+                    })
+                    && same_window_retry::complete_rollback(
+                        incoming.remaining,
+                        staged_credit
+                            .iter()
+                            .try_fold(0_u64, |sum, credit| sum.checked_add(credit.increase)),
+                        staged_claims
+                            .iter()
+                            .try_fold(0_u64, |sum, claim| sum.checked_add(claim.remaining)),
+                    );
                 for credit in staged_credit.into_iter().rev() {
                     assert!(self.streams.cancel_release(
                         credit.endpoint,
@@ -7276,6 +9941,41 @@ impl QcsdController {
                     if claim.reservation_debited {
                         self.streams
                             .restore_claim(claim.endpoint, claim.stream, claim.remaining);
+                    }
+                }
+                let receive_states_restored = rollback_complete
+                    && retry_receive_states
+                        .iter()
+                        .all(|(&(endpoint, stream), before)| {
+                            self.streams
+                                .get_mut(endpoint, stream)
+                                .is_some_and(|state| &state.receive == before)
+                        });
+                if receive_states_restored {
+                    // No staged action/claim escaped. Reset the ENTIRE same
+                    // packet only after byte-exact receive-state rollback.
+                    incoming.remaining = same_window_retry::CELL_BYTES;
+                    if self.cs_rbing_retry_slot_is_pristine(&incoming)
+                        && let Some(next) =
+                            same_window_retry::next_wake(incoming.packet.timestamp(), elapsed)
+                    {
+                        if let Some(scheduler) = retry_scheduler {
+                            self.scheduler = scheduler;
+                        }
+                        self.cs_rbing_capacity_retry_at.insert(incoming.slot, next);
+                        // At most twenty wakes for the fixed 5ms window. Keep
+                        // diagnostic storage bounded even if not drained.
+                        if self.cs_rbing_capacity_retry_trace.len() == 32 {
+                            self.cs_rbing_capacity_retry_trace.pop_front();
+                        }
+                        self.cs_rbing_capacity_retry_trace.push_back((
+                            incoming.slot,
+                            incoming.packet,
+                            elapsed,
+                            next,
+                        ));
+                        self.control.incoming.push(incoming);
+                        continue;
                     }
                 }
             }
@@ -7635,8 +10335,7 @@ impl QcsdController {
                             || self.streams.aggregate_capacity().chaff_incoming >= required
                     },
                 );
-        !self.cs_terminal_cancellations_pending.is_empty()
-            || self.rolling_reconcile_due.is_some()
+        self.rolling_reconcile_due.is_some()
             || !self.pending_slots.is_empty()
             || !self.control.incoming.is_empty()
             || !self.control.outgoing.is_empty()
@@ -7905,43 +10604,6 @@ impl QcsdController {
         );
     }
 
-    /// Acknowledge only an actually applied, complete-application CS cleanup.
-    /// Queuing or deferring CancelChaff never closes a stream or increments its
-    /// applied diagnostic. Duplicate or foreign acknowledgements fail closed.
-    ///
-    /// # Errors
-    /// Returns a controller invariant error for an unissued/terminal identity
-    /// or a different defense/application phase.
-    pub fn acknowledge_cs_terminal_chaff_cancellation(
-        &mut self,
-        endpoint: QcsdEndpointId,
-        stream: QcsdStreamId,
-        at: Duration,
-    ) -> Result<()> {
-        if !matches!(self.config.defense, DefenseConfig::CsBuflo(_))
-            || !self.application_complete_delivered_to_defense
-            || self.defense.terminal_chaff_cancellation_reason()
-                != Some(QcsdChaffCancellationReason::CsBufloLocalEarlyTermination)
-            || !self.defense.is_complete()
-            || self.defense.terminal_failure().is_some()
-            || !self.cs_terminal_cancellations_pending.contains(&(endpoint, stream))
-            || !self.streams.get_mut(endpoint, stream).is_some_and(|state|
-                matches!(state.role, QcsdRequestRole::Chaff { request_id: Some(_), .. })
-                    && state.chaff_request_activated())
-        {
-            return Err(crate::Error::ControllerInvariant(
-                "CS terminal cancellation acknowledgement lacks its exact live pending identity".into(),
-            ));
-        }
-        self.close_stream(endpoint, stream, crate::QcsdStreamFinish::LocalError, at);
-        self.cs_terminal_cancellations_pending.remove(&(endpoint, stream));
-        self.cs_buflo_local_et_stream_cancellations =
-            self.cs_buflo_local_et_stream_cancellations.saturating_add(1);
-        self.terminal_chaff_cancellation_empty_snapshot_required = true;
-        self.terminal_chaff_cancellation_empty_snapshot_observed = false;
-        Ok(())
-    }
-
     fn terminalize_local_chaff(&mut self, at: Duration) {
         if !self.defense.is_complete() || self.defense.terminal_failure().is_some() {
             return;
@@ -8016,12 +10678,6 @@ impl QcsdController {
                     .is_some_and(|state| state.chaff_request_activated())
             });
         }
-        let acknowledged_cs_cleanup = reason == QcsdChaffCancellationReason::CsBufloLocalEarlyTermination
-            && matches!(self.config.defense, DefenseConfig::CsBuflo(_))
-            && self.application_complete_delivered_to_defense;
-        if acknowledged_cs_cleanup {
-            open_chaff_streams.retain(|key| !self.cs_terminal_cancellations_pending.contains(key));
-        }
         if !open_chaff_streams.is_empty() {
             // The aggregate false that authorized terminal cancellation
             // predates the RESET/STOP work queued below and is no longer valid
@@ -8039,10 +10695,6 @@ impl QcsdController {
                 stream,
                 reason,
             });
-            if acknowledged_cs_cleanup {
-                self.cs_terminal_cancellations_pending.insert((endpoint, stream));
-                continue;
-            }
             self.close_stream(endpoint, stream, crate::QcsdStreamFinish::LocalError, at);
             match reason {
                 QcsdChaffCancellationReason::BufloTerminalSubcellTail => {
@@ -8191,8 +10843,7 @@ impl QcsdController {
         self.terminalize_local_chaff(elapsed);
         self.handoff_cs_buflo_application_after_local_et();
         self.release_cs_buflo_application_send_cleanup_if_needed();
-        let has_backlog = !self.cs_terminal_cancellations_pending.is_empty()
-            || self.control.incoming_backlog() > 0
+        let has_backlog = self.control.incoming_backlog() > 0
             || self.control.claim_backlog() > 0
             || !self.control.receiver_continuations.is_empty()
             || !self.control.outgoing.is_empty()
@@ -8200,6 +10851,7 @@ impl QcsdController {
             || !self.incoming_credit_ledger.is_empty()
             || !self.advertised_incoming_credit.is_empty()
             || !self.pending_slots.is_empty()
+            || self.b816_pre_materialization.is_some()
             || !self.observations.is_empty()
             || self.terminal_chaff_cancellation_empty_snapshot_required
             || (self.defense.terminal_chaff_cancellation_reason()
@@ -8430,26 +11082,40 @@ impl QcsdController {
         if !self.control.outgoing.is_empty() {
             candidates.push(Duration::ZERO);
         }
+        if let Some(held) = self.b816_pre_materialization {
+            candidates.push(
+                held.packet
+                    .timestamp()
+                    .saturating_add(self.exact_incoming_release_window()),
+            );
+        }
         if !self.control.incoming.is_empty() {
             let earliest = self
                 .control
                 .incoming
                 .iter()
+                .filter(|pending| !self.cs_rbing_capacity_retry_at.contains_key(&pending.slot))
                 .map(|pending| pending.packet.timestamp_us())
-                .min()
-                .unwrap_or(0);
-            let interval = self.config.control_interval_us;
-            let next = if earliest == 0 {
-                0
-            } else {
-                earliest.div_ceil(interval).saturating_mul(interval)
-            };
-            let next_unprocessed = self
-                .control
-                .last_incoming_boundary_us
-                .filter(|last| next <= *last)
-                .map_or(next, |last| last.saturating_add(interval));
-            candidates.push(Duration::from_micros(next_unprocessed));
+                .min();
+            for pending in &self.control.incoming {
+                if let Some(next) = self.cs_rbing_capacity_retry_at.get(&pending.slot) {
+                    candidates.push(*next);
+                }
+            }
+            if let Some(earliest) = earliest {
+                let interval = self.config.control_interval_us;
+                let next = if earliest == 0 {
+                    0
+                } else {
+                    earliest.div_ceil(interval).saturating_mul(interval)
+                };
+                let next_unprocessed = self
+                    .control
+                    .last_incoming_boundary_us
+                    .filter(|last| next <= *last)
+                    .map_or(next, |last| last.saturating_add(interval));
+                candidates.push(Duration::from_micros(next_unprocessed));
+            }
         }
         if self.defense.incoming_slot_must_resolve_in_window()
             && let Some(deadline) = self
@@ -8508,6 +11174,9 @@ impl QcsdController {
         // a newly opened chaff request.  Enqueuing one here could place
         // RequestChaff immediately before DefenseComplete and leave a gated
         // request stream permanently open.
+        if self.terminal_chaff_replenishment_closed() {
+            return;
+        }
         if !self.defense.accepts_new_chaff_requests()
             || self.defense.requires_terminal_chaff_drain() && self.defense.is_complete()
         {
@@ -12720,6 +15389,7 @@ mod tests {
             controller.pending_slots.insert(slot, packet);
             controller.scheduled_incoming_requested_bytes = 16;
             controller.control.claims.push(PendingClaim {
+                mixed_rbing: false,
                 reservation_debited: true,
                 slot,
                 packet,
@@ -14634,6 +17304,7 @@ mod tests {
         controller.scheduled_incoming_advertised_bytes = 31;
         controller.scheduled_incoming_consumed_bytes = 31;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -14730,6 +17401,7 @@ mod tests {
             .insert(slot, IncomingCreditLedger::new(packet));
         controller.scheduled_incoming_requested_bytes = 100;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -17078,6 +19750,7 @@ mod tests {
             .insert(slot, IncomingCreditLedger::new(packet));
         controller.scheduled_incoming_requested_bytes = 4;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -17242,6 +19915,7 @@ mod tests {
             .insert(slot, IncomingCreditLedger::new(packet));
         controller.scheduled_incoming_requested_bytes = 4;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -18189,6 +20863,7 @@ mod tests {
             .insert(slot, IncomingCreditLedger::new(packet));
         controller.scheduled_incoming_requested_bytes = 4;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -19399,6 +22074,7 @@ mod tests {
             4
         );
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot: failed_slot,
             packet: failed_packet,
@@ -19498,6 +22174,7 @@ mod tests {
             4
         );
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot: next_slot,
             packet: next_packet,
@@ -19734,6 +22411,7 @@ mod tests {
         controller.scheduled_incoming_requested_bytes = 8;
         // Reverse insertion proves allocation is by slot identity, not Vec order.
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot: late,
             packet,
@@ -19742,6 +22420,7 @@ mod tests {
             remaining: 4,
         });
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot: early,
             packet,
@@ -22120,6 +24799,18 @@ mod tests {
             },
             Duration::from_micros(8_165),
         );
+        let armed_at_ack = controller
+            .defense_diagnostics()
+            .buflo_incoming_startup
+            .expect("receipt");
+        assert!(armed_at_ack.armed);
+        assert_eq!(armed_at_ack.ack_observed_at_us, Some(8_165));
+        assert_eq!(armed_at_ack.ready_at_us, Some(8_165));
+        assert_eq!(armed_at_ack.armed_at_us, Some(20_000));
+        assert!(!controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit { .. }
+        )));
         // Duplicate ACK after terminal coverage must not replace its time.
         controller.observe(
             QcsdObservation::StreamDataAcknowledged {
@@ -22138,7 +24829,7 @@ mod tests {
             .buflo_incoming_startup
             .expect("receipt");
         assert_eq!(startup.ack_observed_at_us, Some(8_165));
-        assert_eq!(startup.ready_at_us, Some(8_280));
+        assert_eq!(startup.ready_at_us, Some(8_165));
         assert_eq!(startup.armed_at_us, Some(20_000));
         assert_eq!(startup.startup_suppressed_opportunities, 1);
         assert_eq!(
@@ -22147,6 +24838,11 @@ mod tests {
         );
         assert_eq!(startup.request_stream_final_size, Some(185));
         assert_eq!(startup.eligible_exact_capacity_bytes, Some(24_048));
+        controller.poll(Duration::from_micros(19_999));
+        assert!(!controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit { .. }
+        )));
         controller.poll(Duration::from_micros(20_000));
         let incoming = controller
             .drain_actions()
@@ -22195,14 +24891,224 @@ mod tests {
     }
 
     #[test]
+    fn buflo_ack_start_survives_same_batch_response_fin_without_crediting_closed_chaff() {
+        let mut controller = startup_controller(true);
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let (resource_id, request_id) = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::RequestChaff { resource, request_id, .. } => {
+                    Some((resource.id, *request_id))
+                }
+                _ => None,
+            })
+            .expect("actual qualified request");
+        let (endpoint, slot, size) = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::SendPacket { endpoint, packet, slot, .. } => {
+                    Some((*endpoint, *slot, packet.length()))
+                }
+                _ => None,
+            })
+            .expect("outgoing request packet");
+        let stream = QcsdStreamId(4);
+        let role = QcsdRequestRole::Chaff {
+            resource_id,
+            request_id: Some(request_id),
+        };
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role,
+                expected_response_length: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamDataTransmitted {
+                endpoint,
+                stream,
+                role,
+                offset: 0,
+                bytes: 185,
+                fin: true,
+                slot: Some(slot),
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::SlotSatisfied {
+                endpoint,
+                slot,
+                observed_size: size,
+            },
+            Duration::ZERO,
+        );
+        // These adjacent observations model a poll batch: ACK arms while the
+        // request stream is live, then the response FIN closes it.
+        controller.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint,
+                stream,
+                role,
+                offset: 0,
+                bytes: 185,
+                fin: true,
+            },
+            Duration::from_micros(8_165),
+        );
+        controller.observe(
+            QcsdObservation::StreamFinished {
+                endpoint,
+                stream,
+                finish: QcsdStreamFinish::Fin,
+            },
+            Duration::from_micros(8_166),
+        );
+        let startup = controller
+            .defense_diagnostics()
+            .buflo_incoming_startup
+            .expect("receipt");
+        assert!(startup.armed);
+        assert_eq!(startup.ack_observed_at_us, Some(8_165));
+        assert_eq!(startup.ready_stream, Some(stream.0));
+        assert_eq!(startup.armed_at_us, Some(20_000));
+        controller.poll(Duration::from_micros(20_000));
+        assert!(!controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit { stream: candidate, .. }
+                if candidate == stream
+        )));
+    }
+
+    #[test]
+    fn buflo_ack_start_rejects_other_request_and_partial_ack() {
+        let mut controller = startup_controller(true);
+        controller.poll(Duration::ZERO);
+        let actions: Vec<_> = controller.drain_actions().collect();
+        let (resource_id, request_id) = actions
+            .iter()
+            .find_map(|action| match action {
+                QcsdAction::RequestChaff { resource, request_id, .. } => {
+                    Some((resource.id, *request_id))
+                }
+                _ => None,
+            })
+            .expect("actual qualified request");
+        let endpoint = QcsdEndpointId(1);
+        let wrong_stream = QcsdStreamId(5);
+        let wrong_role = QcsdRequestRole::Chaff {
+            resource_id: resource_id.saturating_add(1),
+            request_id: Some(request_id),
+        };
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: wrong_stream,
+                role: wrong_role,
+                expected_response_length: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamDataTransmitted {
+                endpoint,
+                stream: wrong_stream,
+                role: wrong_role,
+                offset: 0,
+                bytes: 185,
+                fin: true,
+                slot: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint,
+                stream: wrong_stream,
+                role: wrong_role,
+                offset: 0,
+                bytes: 185,
+                fin: true,
+            },
+            Duration::from_micros(8_000),
+        );
+        assert!(!controller
+            .defense_diagnostics()
+            .buflo_incoming_startup
+            .expect("receipt")
+            .armed);
+
+        // FIN without the complete contiguous request prefix is insufficient.
+        let partial_stream = QcsdStreamId(6);
+        let selected_role = QcsdRequestRole::Chaff {
+            resource_id,
+            request_id: Some(request_id),
+        };
+        controller.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream: partial_stream,
+                role: selected_role,
+                expected_response_length: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamDataTransmitted {
+                endpoint,
+                stream: partial_stream,
+                role: selected_role,
+                offset: 0,
+                bytes: 185,
+                fin: true,
+                slot: None,
+            },
+            Duration::ZERO,
+        );
+        controller.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint,
+                stream: partial_stream,
+                role: selected_role,
+                offset: 185,
+                bytes: 0,
+                fin: true,
+            },
+            Duration::from_micros(8_100),
+        );
+        controller.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint,
+                stream: partial_stream,
+                role: selected_role,
+                offset: 0,
+                bytes: 100,
+                fin: false,
+            },
+            Duration::from_micros(8_200),
+        );
+        assert!(!controller
+            .defense_diagnostics()
+            .buflo_incoming_startup
+            .expect("receipt")
+            .armed);
+        assert!(!controller.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::IncreaseReceiveLimit { .. }
+        )));
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "boundary ACK and multiple suppressed cadences exercise the complete live allocation order"
     )]
     fn buflo_ack_start_reserves_only_suppressed_incoming_identity_holes() {
-        for (ack_us, ready_us, first_incoming_us) in
-            [(19_999, 20_000, 40_000), (48_165, 48_280, 60_000)]
-        {
+        for (ack_us, first_incoming_us) in [(19_999, 20_000), (48_165, 60_000)] {
             let mut controller = startup_controller(true);
             controller.poll(Duration::ZERO);
             let initial: Vec<_> = controller.drain_actions().collect();
@@ -22250,14 +25156,14 @@ mod tests {
             );
             controller.drain_actions().for_each(drop);
 
-            let mut next_tick_us = 20_000;
-            while next_tick_us < ready_us {
-                controller.poll(Duration::from_micros(next_tick_us));
+            let mut tick_us = 20_000;
+            while tick_us < first_incoming_us {
+                controller.poll(Duration::from_micros(tick_us));
                 let actions: Vec<_> = controller.drain_actions().collect();
                 assert!(actions.iter().any(|action| matches!(action,
                     QcsdAction::CommitPrearmedPacket { packet, slot, .. }
-                        if packet.timestamp_us() == next_tick_us
-                        && slot.0 == 2 * (next_tick_us / 20_000))));
+                        if packet.timestamp_us() == tick_us
+                        && slot.0 == 2 * (tick_us / 20_000))));
                 assert!(!actions.iter().any(|action| matches!(
                     action,
                     QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::SlotMissed { .. }
@@ -22265,12 +25171,12 @@ mod tests {
                 controller.observe(
                     QcsdObservation::SlotSatisfied {
                         endpoint,
-                        slot: QcsdSlotId(2 * (next_tick_us / 20_000)),
+                        slot: QcsdSlotId(2 * (tick_us / 20_000)),
                         observed_size: 1_200,
                     },
-                    Duration::from_micros(next_tick_us),
+                    Duration::from_micros(tick_us),
                 );
-                next_tick_us += 20_000;
+                tick_us += 20_000;
             }
             controller.observe(
                 QcsdObservation::StreamDataAcknowledged {
@@ -22283,37 +25189,24 @@ mod tests {
                 },
                 Duration::from_micros(ack_us),
             );
-            controller.poll(Duration::from_micros(ready_us));
             let startup = controller
                 .defense_diagnostics()
                 .buflo_incoming_startup
                 .expect("armed receipt");
             assert!(startup.armed);
+            assert_eq!(startup.ack_observed_at_us, Some(ack_us));
+            assert_eq!(startup.ready_at_us, Some(ack_us));
             assert_eq!(startup.armed_at_us, Some(first_incoming_us));
             assert_eq!(
                 startup.startup_suppressed_opportunities,
                 first_incoming_us / 20_000
             );
-            if next_tick_us == ready_us {
-                controller.observe(
-                    QcsdObservation::SlotSatisfied {
-                        endpoint,
-                        slot: QcsdSlotId(2 * (next_tick_us / 20_000)),
-                        observed_size: 1_200,
-                    },
-                    Duration::from_micros(next_tick_us),
-                );
-                next_tick_us += 20_000;
-            }
-            controller.drain_actions().for_each(drop);
-            assert_eq!(
-                controller
-                    .defense_diagnostics()
-                    .buflo_scheduled_incoming_cells,
-                0
-            );
-            controller.poll(Duration::from_micros(next_tick_us));
-            assert_eq!(next_tick_us, first_incoming_us);
+            controller.poll(Duration::from_micros(first_incoming_us - 1));
+            assert!(!controller.drain_actions().any(|action| matches!(
+                action,
+                QcsdAction::IncreaseReceiveLimit { .. }
+            )));
+            controller.poll(Duration::from_micros(first_incoming_us));
             let actions: Vec<_> = controller.drain_actions().collect();
             assert!(actions.iter().any(|action| matches!(action,
                 QcsdAction::CommitPrearmedPacket { packet, slot, .. }
@@ -22323,6 +25216,14 @@ mod tests {
                 QcsdAction::IncreaseReceiveLimit { packet, slot, .. }
                     if packet.timestamp_us() == first_incoming_us && packet.length() == 1_200
                     && slot.0 == 2 * (first_incoming_us / 20_000) + 1)));
+            controller.observe(
+                QcsdObservation::SlotSatisfied {
+                    endpoint,
+                    slot: QcsdSlotId(2 * (first_incoming_us / 20_000)),
+                    observed_size: 1_200,
+                },
+                Duration::from_micros(first_incoming_us),
+            );
             for suppressed_tick in 0..(first_incoming_us / 20_000) {
                 let absent = QcsdSlotId(2 * suppressed_tick + 1);
                 assert!(!controller.pending_slots.contains_key(&absent));
@@ -23033,6 +25934,21 @@ mod tests {
         assert_eq!(diagnostics.scheduled_incoming_requested_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_retired_bytes, 0);
         assert_eq!(diagnostics.scheduled_incoming_unresolved_bytes, 0);
+    }
+
+    #[test]
+    fn prospective_buflo_rolling_prearm_uses_bound_outgoing_window() {
+        for (variant, expected_us) in [(false, 10), (true, 20_000)] {
+            let mut controller = buflo_terminal_capacity_controller(1_216);
+            controller.buflo_outgoing_20ms_variant = variant;
+            controller.observe(QcsdObservation::EgressBacklog { pending: false }, Duration::from_micros(31));
+            controller.poll(Duration::from_micros(31));
+            let (not_before, deadline) = controller.drain_actions().find_map(|action| match action {
+                QcsdAction::PrearmPacket { not_before_after_us, deadline_after_us, .. } => Some((not_before_after_us, deadline_after_us)),
+                _ => None,
+            }).expect("rolling outgoing prearm");
+            assert_eq!(deadline - not_before, expected_us);
+        }
     }
 
     #[test]
@@ -24721,6 +27637,288 @@ mod tests {
         controller.poll(Duration::from_micros(1));
         assert_eq!(outcomes.borrow().len(), 1);
     }
+
+    fn prospective_rbing_config() -> QcsdConfig {
+        QcsdConfig {
+            defense: DefenseConfig::CsBuflo(crate::CsBufloConfig {
+                parameters: "test-only-frozen-parameters.json".into(),
+            }),
+            control_interval_us: 5_000,
+            initial_max_stream_data: 16,
+            max_stream_data_excess: 1_000,
+            max_chaff_streams: 5,
+            max_udp_payload_size: 1_200,
+            use_empty_resources: false,
+            drop_unsatisfied_events: false,
+            ..QcsdConfig::default()
+        }
+    }
+
+    // The test defense emits one exact cell, isolating the REAL controller
+    // allocator/rollback/reducer from CS's adaptive opportunity generator.
+    // This private fixture does not stand in for the public enable gate.
+    fn prospective_rbing_one_shot() -> (QcsdController, Rc<RefCell<Vec<EventOutcome>>>) {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 600).expect("600-byte cell");
+        let (defense, outcomes) = ExactIncomingOneShot::new(packet);
+        let mut controller =
+            QcsdController::with_defense(prospective_rbing_config(), None, Box::new(defense))
+                .expect("controller");
+        controller.cs_rbing_capacity_retry = true;
+        ready(&mut controller, 1, "https://r.bing.com");
+        controller.drain_actions().for_each(drop);
+        (controller, outcomes)
+    }
+
+    #[test]
+    fn prospective_rbing_no_capacity_waits_without_duplicate_or_zero_deadline() {
+        let (mut c, outcomes) = prospective_rbing_one_shot();
+        c.poll(Duration::ZERO);
+        c.drain_observations();
+        assert!(outcomes.borrow().is_empty());
+        assert_eq!(c.control.incoming.len(), 1);
+        let original_slot = c.control.incoming[0].slot;
+        let original_packet = c.control.incoming[0].packet;
+        assert_eq!(c.control.incoming[0].remaining, 600);
+        assert_eq!(c.next_deadline(), Some(Duration::from_micros(250)));
+        assert!(!c.drain_actions().any(|a| matches!(
+            a,
+            QcsdAction::IncreaseReceiveLimit { .. }
+                | QcsdAction::SlotMissed { .. }
+                | QcsdAction::SlotSatisfied { .. }
+        )));
+        for now in 1..250 {
+            c.poll(Duration::from_micros(now));
+            c.drain_observations();
+            assert_eq!(c.next_deadline(), Some(Duration::from_micros(250)));
+            assert_eq!(c.control.incoming[0].slot, original_slot);
+            assert_eq!(c.control.incoming[0].packet, original_packet);
+        }
+        assert_eq!(c.control.next_slot_id, 1);
+        assert_eq!(c.cs_rbing_capacity_retry_trace.len(), 1);
+    }
+
+    #[test]
+    fn prospective_rbing_expiry_is_original_five_ms_and_exactly_once() {
+        let (mut c, outcomes) = prospective_rbing_one_shot();
+        for now in (0..5_000).step_by(250) {
+            c.poll(Duration::from_micros(now));
+            c.drain_observations();
+            assert!(outcomes.borrow().is_empty());
+            assert_eq!(c.control.incoming.len(), 1);
+            assert_eq!(c.control.incoming[0].remaining, 600);
+            assert!(c.next_deadline().is_some_and(
+                |at| at > Duration::from_micros(now) && at <= Duration::from_micros(5_000)
+            ));
+        }
+        c.poll(Duration::from_micros(5_000));
+        c.drain_observations();
+        assert_eq!(
+            &*outcomes.borrow(),
+            &[EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+        assert!(c.control.incoming.is_empty() && c.cs_rbing_capacity_retry_at.is_empty());
+        c.poll(Duration::from_micros(10_000));
+        c.drain_observations();
+        assert_eq!(outcomes.borrow().len(), 1);
+        assert!(c.control.credit.is_empty() && c.control.claims.is_empty());
+    }
+
+    #[test]
+    fn prospective_rbing_partial_staging_is_wholly_rolled_back() {
+        let (mut c, outcomes) = prospective_rbing_one_shot();
+        let endpoint = QcsdEndpointId(1);
+        let stream = QcsdStreamId(0);
+        c.observe(
+            QcsdObservation::StreamOpened {
+                endpoint,
+                stream,
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(50),
+            },
+            Duration::ZERO,
+        );
+        c.drain_observations();
+        let before = c
+            .streams
+            .get_mut(endpoint, stream)
+            .expect("stream")
+            .receive
+            .clone();
+        c.drain_actions().for_each(drop);
+        c.poll(Duration::ZERO);
+        c.drain_observations();
+        assert!(outcomes.borrow().is_empty());
+        assert_eq!(
+            c.streams.get_mut(endpoint, stream).expect("stream").receive,
+            before
+        );
+        assert_eq!(c.control.incoming.len(), 1);
+        assert_eq!(c.control.incoming[0].remaining, 600);
+        assert!(c.control.credit.is_empty() && c.control.claims.is_empty());
+        assert!(!c.drain_actions().any(|a| matches!(
+            a,
+            QcsdAction::IncreaseReceiveLimit { .. } | QcsdAction::SlotMissed { .. }
+        )));
+    }
+
+    #[test]
+    fn prospective_rbing_new_capacity_commits_same_cell_once_without_satisfaction() {
+        let (mut c, outcomes) = prospective_rbing_one_shot();
+        c.poll(Duration::ZERO);
+        c.drain_observations();
+        let slot = c.control.incoming[0].slot;
+        c.observe(
+            QcsdObservation::StreamOpened {
+                endpoint: QcsdEndpointId(1),
+                stream: QcsdStreamId(0),
+                role: QcsdRequestRole::Application,
+                expected_response_length: Some(10_000),
+            },
+            Duration::from_micros(100),
+        );
+        c.poll(Duration::from_micros(100));
+        assert_eq!(c.control.incoming.len(), 1); // Future retry cannot spin early.
+        c.drain_actions().for_each(drop);
+        c.poll(Duration::from_micros(250));
+        assert!(c.control.incoming.is_empty() && c.cs_rbing_capacity_retry_at.is_empty());
+        assert_eq!(c.control.next_slot_id, 1);
+        let credit: u64 = c
+            .control
+            .credit
+            .iter()
+            .filter(|credit| credit.slot == slot)
+            .map(|credit| credit.increase)
+            .sum();
+        let claims: u64 = c
+            .control
+            .claims
+            .iter()
+            .filter(|claim| claim.slot == slot)
+            .map(|claim| claim.remaining)
+            .sum();
+        assert_eq!(credit + claims, 600);
+        assert!(outcomes.borrow().is_empty()); // Allocation is NOT physical proof.
+        assert!(
+            !c.drain_actions()
+                .any(|a| matches!(a, QcsdAction::SlotSatisfied { .. }))
+        );
+        c.poll(Duration::from_micros(5_000));
+        c.drain_observations();
+        assert_eq!(
+            &*outcomes.borrow(),
+            &[EventOutcome::Missed(MissedSlotReason::DeadlineExpired)]
+        );
+    }
+
+    #[test]
+    fn prospective_rbing_dirty_or_published_identity_cannot_be_retried() {
+        let (mut c, _) = prospective_rbing_one_shot();
+        c.poll(Duration::ZERO);
+        c.drain_observations();
+        let incoming = c.control.incoming[0];
+        assert!(c.cs_rbing_retry_slot_is_pristine(&incoming));
+        c.incoming_credit_ledger
+            .get_mut(&incoming.slot)
+            .expect("ledger")
+            .advertised = 1;
+        assert!(!c.cs_rbing_retry_slot_is_pristine(&incoming));
+        c.incoming_credit_ledger
+            .get_mut(&incoming.slot)
+            .expect("ledger")
+            .advertised = 0;
+        c.actions.push_back(QcsdAction::IncreaseReceiveLimit {
+            endpoint: QcsdEndpointId(1),
+            stream: QcsdStreamId(0),
+            absolute_limit: 17,
+            packet: incoming.packet,
+            slot: incoming.slot,
+        });
+        assert!(!c.cs_rbing_retry_slot_is_pristine(&incoming));
+        c.actions.clear();
+        c.terminal_slot_resolution_at
+            .insert(incoming.slot, Duration::ZERO);
+        assert!(!c.cs_rbing_retry_slot_is_pristine(&incoming));
+    }
+
+    fn prospective_rbing_actual_cs() -> QcsdController {
+        let defense = CsBuflo::from_parameters(
+            CsBufloParameters {
+                schema_version: 1,
+                packet_size: 600,
+                initial_interval_us: 8_192,
+                minimum_interval_us: 4_096,
+                maximum_interval_us: 32_768,
+                initial_adaptation_boundary_bytes: 16_384,
+                quiet_time_us: 2_000_000,
+                outgoing_padding_mode: CsBufloPaddingMode::Payload,
+                incoming_padding_mode: CsBufloPaddingMode::Payload,
+                timing_sample_limit: 1_000,
+                jitter_denominator: 100,
+                jitter_max_numerator: 200,
+                early_termination: CsBufloEarlyTermination::Local,
+                max_events: 1_000_000,
+                implementation_scope: QcsdImplementationScope::ClientOnlyQuic,
+                paper_equivalent: false,
+            },
+            42,
+        );
+        QcsdController::with_defense(prospective_rbing_config(), None, Box::new(defense))
+            .expect("actual CS controller")
+    }
+
+    #[test]
+    fn prospective_rbing_public_enable_gate_rejects_ang_started_and_wrong_policy() {
+        let mut c = prospective_rbing_actual_cs();
+        assert!(!c.cs_rbing_capacity_retry);
+        assert!(
+            c.enable_cs_rbing_same_window_capacity_retry("www.angkanet.com")
+                .is_err()
+        );
+        assert!(!c.cs_rbing_capacity_retry);
+        c.enable_cs_rbing_same_window_capacity_retry("r.bing.com")
+            .expect("exact unstarted config");
+        assert!(
+            c.enable_cs_rbing_same_window_capacity_retry("r.bing.com")
+                .is_err()
+        );
+        let mut c = prospective_rbing_actual_cs();
+        ready(&mut c, 1, "https://r.bing.com");
+        assert!(
+            c.enable_cs_rbing_same_window_capacity_retry("r.bing.com")
+                .is_err()
+        );
+        for mutation in 0..5 {
+            let mut c = prospective_rbing_actual_cs();
+            match mutation {
+                0 => c.config.control_interval_us = 5_001,
+                1 => c.config.initial_max_stream_data = 8_192,
+                2 => c.config.drop_unsatisfied_events = true,
+                3 => c.config.max_stream_data_excess = 1_001,
+                _ => c.config.max_chaff_streams = 6,
+            }
+            assert!(
+                c.enable_cs_rbing_same_window_capacity_retry("r.bing.com")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prospective_rbing_default_still_terminalizes_early_capacity_failure() {
+        let (mut c, outcomes) = prospective_rbing_one_shot();
+        c.cs_rbing_capacity_retry = false;
+        c.poll(Duration::ZERO);
+        c.drain_observations();
+        assert_eq!(
+            &*outcomes.borrow(),
+            &[EventOutcome::Missed(
+                MissedSlotReason::InsufficientIncomingCapacity
+            )]
+        );
+        assert!(c.control.incoming.is_empty() && c.cs_rbing_capacity_retry_at.is_empty());
+    }
+
+    include!("rbing_owned_data_controller_tests.rs");
 
     fn exact_parser_controller() -> (QcsdController, QcsdEndpointId, QcsdStreamId, QcsdStreamId) {
         let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1).expect("policy packet");
@@ -26860,6 +30058,26 @@ mod tests {
     }
 
     #[test]
+    fn prospective_buflo_20ms_changes_only_bound_outgoing_window() {
+        let packet = Packet::new(Duration::ZERO, Direction::Incoming, 1_200).expect("incoming cell");
+        let (defense, _) = ExactIncomingOneShot::new(packet);
+        let mut controller = QcsdController::with_defense(
+            QcsdConfig {
+                defense: DefenseConfig::Buflo(crate::BufloConfig { parameters: "bound-fixed-buflo.json".into() }),
+                max_udp_payload_size: 1_200,
+                control_interval_us: 5_000,
+                ..QcsdConfig::default()
+            }, None, Box::new(defense),
+        ).expect("controller");
+        assert_eq!(controller.outgoing_realization_window(), Duration::from_millis(5));
+        controller.enable_buflo_half_period_incoming_window_for_interval(64_000).expect("64ms incoming policy");
+        controller.enable_buflo_outgoing_20ms_variant().expect("prospective outgoing variant");
+        assert_eq!(controller.outgoing_realization_window(), Duration::from_millis(20));
+        assert_eq!(controller.exact_incoming_release_window(), Duration::from_millis(32));
+        assert!(controller.enable_buflo_outgoing_20ms_variant().is_err());
+    }
+
+    #[test]
     fn buflo_half_period_incoming_window_preserves_physical_half_open_boundaries() {
         for opted_in in [false, true] {
             for advertised_at_us in [4_999_u64, 5_000, 6_090, 9_999, 10_000] {
@@ -27273,6 +30491,7 @@ mod tests {
             .insert(slot, IncomingCreditLedger::new(packet));
         controller.scheduled_incoming_requested_bytes = 10;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -28384,6 +31603,7 @@ mod tests {
                 .incoming_credit_ledger
                 .insert(slot, IncomingCreditLedger::new(packet));
             controller.control.claims.push(PendingClaim {
+                mixed_rbing: false,
                 reservation_debited: true,
                 slot,
                 packet,
@@ -28534,6 +31754,7 @@ mod tests {
             .insert(slot, IncomingCreditLedger::new(packet));
         controller.scheduled_incoming_requested_bytes = 5;
         controller.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot,
             packet,
@@ -31282,8 +34503,8 @@ mod tests {
         // Synthetic already-live1200 owner: the other bytes are declared
         // consumed/advertised elsewhere. Only its remaining2 or8 bytes enter
         // the unchanged actual allocator. This is not an actual cell receipt.
-        let packet = crate::Packet::new(target, Direction::Incoming, 1_200).unwrap();
-        let mut ledger = super::IncomingCreditLedger::new(packet);
+        let packet = Packet::new(target, Direction::Incoming, 1_200).unwrap();
+        let mut ledger = IncomingCreditLedger::new(packet);
         ledger.assign_endpoint(endpoint);
         ledger.advertised = 1_200 - remainder;
         ledger.consumed = 1_200 - remainder;
@@ -31595,7 +34816,7 @@ mod tests {
                 }],
             );
             // Native112 already tracked stream80 before its later three-byte
-            // tail. Native160 also retains that real DATA-end service intent.
+            // tail. No new three-byte tiny-tail intent is fabricated here.
             c.buflo_known_chaff_service_ranges
                 .insert((ep, stream), vec![(raw, max)]);
             let slot = QcsdSlotId(owner);
@@ -31657,10 +34878,10 @@ mod tests {
         }
         c.drain_actions().for_each(drop);
         assert!(
-            c.buflo_known_chaff_demands
+            !c.buflo_known_chaff_demands
                 .contains_key(&(ep, QcsdStreamId(80)))
         );
-        assert_eq!(c.buflo_known_chaff_demands.len(), 5);
+        assert_eq!(c.buflo_known_chaff_demands.len(), 4);
         assert_eq!(c.buflo_known_chaff_service_ranges.len(), 5);
         c
     }
@@ -31710,9 +34931,9 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            // Stream80 is now the oldest genuine1..3-tail DATA-end candidate.
-            // Its OLD [6489,6492) stays slot579; NEW [6492,7692) is slot589.
-            assert_eq!(exact, vec![(QcsdStreamId(80), 7_692)]);
+            // Stream92 is the oldest genuine 1..2-tail DATA-end candidate.
+            // Its OLD [1224,1225) remains slot583; NEW [1225,2425) is slot589.
+            assert_eq!(exact, vec![(QcsdStreamId(92), 2_425)]);
             assert_eq!(c.advertised_incoming_credit, old_ranges);
             for (slot, ledger) in old_ledgers {
                 assert_eq!(c.incoming_credit_ledger[&slot], ledger);
@@ -31738,8 +34959,8 @@ mod tests {
             c.observe(
                 QcsdObservation::ReceiveLimitAdvertised {
                     endpoint: ep,
-                    stream: QcsdStreamId(80),
-                    absolute_limit: 7_692,
+                    stream: QcsdStreamId(92),
+                    absolute_limit: 2_425,
                     slot: Some(QcsdSlotId(589)),
                 },
                 Duration::from_micros(18_817_000),
@@ -31749,19 +34970,19 @@ mod tests {
             c.observe(
                 QcsdObservation::BytesRead {
                     endpoint: ep,
-                    stream: QcsdStreamId(80),
+                    stream: QcsdStreamId(92),
                     bytes: 3,
                 },
                 read_at,
             );
-            assert_eq!(c.incoming_credit_ledger[&QcsdSlotId(589)].consumed, 0);
+            assert_eq!(c.incoming_credit_ledger[&QcsdSlotId(589)].consumed, 2);
             assert_eq!(native113_tracked_bytes(&c), 1_205);
             c.observe(
                 QcsdObservation::DataFrame {
                     endpoint: ep,
-                    stream: QcsdStreamId(80),
+                    stream: QcsdStreamId(92),
                     frame_header_bytes: 3,
-                    data_bytes: 1_200,
+                    data_bytes: 1_198,
                 },
                 read_at,
             );
@@ -31773,8 +34994,8 @@ mod tests {
             c.observe(
                 QcsdObservation::BytesRead {
                     endpoint: ep,
-                    stream: QcsdStreamId(80),
-                    bytes: 1_199,
+                    stream: QcsdStreamId(92),
+                    bytes: 1_197,
                 },
                 read_at,
             );
@@ -31785,7 +35006,7 @@ mod tests {
             c.observe(
                 QcsdObservation::BytesRead {
                     endpoint: ep,
-                    stream: QcsdStreamId(80),
+                    stream: QcsdStreamId(92),
                     bytes: 1,
                 },
                 read_at,
@@ -31793,7 +35014,7 @@ mod tests {
             assert!(c.drain_actions().any(
                 |a| matches!(a, QcsdAction::SlotSatisfied { slot, .. } if slot == QcsdSlotId(589))
             ));
-            assert_eq!(native113_tracked_bytes(&c), 5);
+            assert_eq!(native113_tracked_bytes(&c), 7);
             assert_eq!(c.scheduled_incoming_retired_bytes, 0);
             assert!(c.buflo_fin_permission_releases.is_empty());
         }
@@ -31953,6 +35174,7 @@ mod tests {
         }
         assert_eq!(c.buflo_retained_parser_room(ep, s), 600);
         c.control.claims.push(PendingClaim {
+            mixed_rbing: false,
             reservation_debited: true,
             slot: QcsdSlotId(70_002),
             packet,
@@ -32075,6 +35297,168 @@ mod tests {
         );
         c.drain_actions().for_each(drop);
         (c, ep, app, cover)
+    }
+
+    // Synthetic controller/ledger state for direct advertised-credit FIN
+    // tests. It represents 1049 consumed bytes and an exact 151-byte direct
+    // suffix from one already-realized 1200-byte incoming cell; it is not
+    // transport or capture evidence.
+    fn direct_fin_reassignment_snapshot() -> (
+        QcsdController,
+        QcsdEndpointId,
+        QcsdStreamId,
+        QcsdSlotId,
+        Duration,
+    ) {
+        let (mut c, ep, app) = seed016_controller_snapshot_with_response(true, 200, Some(659));
+        c.enable_buflo_direct_fin_credit_reassignment()
+            .expect("unstarted fixed64ms direct-FIN opt-in");
+        // The direct policy must not appropriate or clear a parser lease.
+        // Remove only the synthetic unowned fixture range.
+        c.parser_lease_ranges.remove(&(ep, app));
+        let target = Duration::from_micros(64_000);
+        let final_size = 1_049;
+        if let crate::stream::ReceiveState::ReceivingData {
+            advertised_limit,
+            requested_limit,
+            known_limit,
+            consumed,
+            data_length,
+            ..
+        } = &mut c.streams.get_mut(ep, app).unwrap().receive
+        {
+            *advertised_limit = 1_200;
+            *requested_limit = 1_200;
+            *known_limit = final_size;
+            *consumed = final_size;
+            *data_length = 659;
+        } else {
+            unreachable!("fixture application must have a data response");
+        }
+        let slot = QcsdSlotId(70_119);
+        let packet = Packet::new(target, Direction::Incoming, 1_200).unwrap();
+        let mut ledger = IncomingCreditLedger::new(packet);
+        ledger.assign_endpoint(ep);
+        ledger.advertised = 1_200;
+        ledger.local_realization_emitted = true;
+        ledger.consumed = final_size;
+        c.pending_slots.insert(slot, packet);
+        c.incoming_credit_ledger.insert(slot, ledger);
+        c.advertised_incoming_credit.insert(
+            (ep, app),
+            vec![AdvertisedIncomingCredit {
+                slot,
+                start: final_size,
+                end: 1_200,
+            }],
+        );
+        c.scheduled_incoming_requested_bytes = 1_200;
+        c.scheduled_incoming_advertised_bytes = 1_200;
+        c.scheduled_incoming_consumed_bytes = final_size;
+        c.buflo_gross_advertised = 1_200;
+        (c, ep, app, slot, target)
+    }
+
+    fn observe_direct_fin(
+        c: &mut QcsdController,
+        ep: QcsdEndpointId,
+        app: QcsdStreamId,
+        target: Duration,
+        finish: QcsdStreamFinish,
+        finish_at: Duration,
+    ) {
+        c.observe(
+            QcsdObservation::PeerFinRead {
+                endpoint: ep,
+                stream: app,
+                final_size: 1_049,
+                encoded_receive_limit: 1_200,
+                manual_receive_limit: 1_200,
+                bytes_received: 1_049,
+                bytes_read: 1_049,
+                buffered_bytes: 0,
+            },
+            target + Duration::from_micros(1),
+        );
+        c.observe(
+            QcsdObservation::StreamFinished {
+                endpoint: ep,
+                stream: app,
+                finish,
+            },
+            finish_at,
+        );
+    }
+
+    #[test]
+    fn buflo_direct_fin_reassigns_only_exact_suffix_without_crediting_it() {
+        let (mut c, ep, app, slot, target) = direct_fin_reassignment_snapshot();
+        observe_direct_fin(
+            &mut c,
+            ep,
+            app,
+            target,
+            QcsdStreamFinish::Fin,
+            target + Duration::from_micros(2),
+        );
+
+        assert_eq!(c.buflo_fin_permission_releases.len(), 1);
+        let release = &c.buflo_fin_permission_releases[0];
+        assert_eq!(release.slot, slot);
+        assert_eq!(
+            release.permission_source,
+            Some("direct_advertised_exact_credit_suffix")
+        );
+        assert_eq!((release.start, release.end), (1_049, 1_200));
+        assert_eq!((release.final_size, release.fin_at_us), (1_049, 64_002));
+        assert_eq!(release.target_us, 64_000);
+        assert_eq!(release.deadline_us, 96_000);
+        assert_eq!(c.scheduled_incoming_advertised_bytes, 1_049);
+        assert_eq!(c.scheduled_incoming_retired_bytes, 0);
+        assert_eq!(c.scheduled_incoming_consumed_bytes, 1_049);
+        assert_eq!(
+            c.pending_slots.get(&slot),
+            Some(&c.incoming_credit_ledger[&slot].packet)
+        );
+        assert_eq!(c.control.incoming.len(), 1);
+        assert_eq!(c.control.incoming[0].slot, slot);
+        assert_eq!(c.control.incoming[0].remaining, 151);
+        assert_eq!(c.control.incoming[0].endpoint, None);
+        assert!(release.replacements.is_empty());
+        assert!(!c.drain_actions().any(|action| matches!(
+            action,
+            QcsdAction::SlotSatisfied { slot: resolved, .. } if resolved == slot
+        )));
+    }
+
+    #[test]
+    fn buflo_direct_fin_reassignment_rejects_reset_and_exclusive_deadline() {
+        for (finish, finish_at) in [
+            (QcsdStreamFinish::Reset, Duration::from_micros(64_002)),
+            (QcsdStreamFinish::Fin, Duration::from_micros(96_000)),
+        ] {
+            let (mut c, ep, app, _slot, target) = direct_fin_reassignment_snapshot();
+            observe_direct_fin(&mut c, ep, app, target, finish, finish_at);
+            assert!(c.buflo_fin_permission_releases.is_empty());
+            assert_eq!(c.scheduled_incoming_retired_bytes, 151);
+        }
+    }
+
+    #[test]
+    fn buflo_direct_fin_reassignment_rejects_a_noncontiguous_direct_range() {
+        let (mut c, ep, app, _slot, target) = direct_fin_reassignment_snapshot();
+        c.advertised_incoming_credit.get_mut(&(ep, app)).unwrap()[0].start = 1_050;
+        observe_direct_fin(
+            &mut c,
+            ep,
+            app,
+            target,
+            QcsdStreamFinish::Fin,
+            target + Duration::from_micros(2),
+        );
+
+        assert!(c.buflo_fin_permission_releases.is_empty());
+        assert_eq!(c.scheduled_incoming_retired_bytes, 150);
     }
 
     #[test]
@@ -32305,7 +35689,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(grants, vec![(QcsdStreamId(80), 7_692)]);
+        assert_eq!(grants, vec![(QcsdStreamId(92), 2_425)]);
         assert!(service.control.claims.is_empty());
     }
 
@@ -32631,8 +36015,13 @@ mod tests {
     // The two pristine states and ACK/BLOCKED ordering are reduced from the
     // closed Native141 stream36/40 stall. Later response frames below are
     // explicit controller fixtures, not claims about those unseen responses.
-    fn native142_initial_headers_snapshot()
-    -> (QcsdController, QcsdEndpointId, QcsdStreamId, QcsdStreamId, QcsdStreamId) {
+    fn native142_initial_headers_snapshot() -> (
+        QcsdController,
+        QcsdEndpointId,
+        QcsdStreamId,
+        QcsdStreamId,
+        QcsdStreamId,
+    ) {
         let (mut c, ep, old, cover) = native118_parser_with_known_cover();
         c.observe(
             QcsdObservation::StreamFinished {
@@ -32702,11 +36091,18 @@ mod tests {
         let before = c.streams.get_mut(ep, first).unwrap().receive.clone();
         for stream in [first, second] {
             c.observe(
-                QcsdObservation::StreamDataBlocked { endpoint: ep, stream, blocked_at: 1_000 },
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: ep,
+                    stream,
+                    blocked_at: 1_000,
+                },
                 Duration::from_micros(123_000),
             );
         }
-        assert!(c.drain_actions().next().is_none(), "BLOCKED grants no immediate permission");
+        assert!(
+            c.drain_actions().next().is_none(),
+            "BLOCKED grants no immediate permission"
+        );
         assert!(c.buflo_retained_parser_demands.contains_key(&(ep, first)));
         assert!(c.buflo_retained_parser_demands.contains_key(&(ep, second)));
         assert!(c.incoming_credit_ledger.is_empty());
@@ -32720,35 +36116,69 @@ mod tests {
             QcsdAction::LeaseParserReceive { stream, absolute_limit: 2_000,
                 increase: 1_000, owner: Some(owner), .. }
                 if *stream == first && owner.slot == slot)));
-        assert!(!actions.iter().any(|a| matches!(a,
+        assert!(
+            !actions.iter().any(|a| matches!(a,
             QcsdAction::LeaseParserReceive { stream, owner: Some(_), .. } if *stream == second)),
-            "remaining200 cannot strand the other stream's complete reservation");
+            "remaining200 cannot strand the other stream's complete reservation"
+        );
         assert!(actions.iter().any(|a| matches!(a,
             QcsdAction::IncreaseReceiveLimit { stream, absolute_limit: 1_200, slot: owner, .. }
                 if *stream == cover && *owner == slot)));
-        assert!(matches!(c.streams.get_mut(ep, first).unwrap().receive,
+        assert!(matches!(
+            c.streams.get_mut(ep, first).unwrap().receive,
             crate::stream::ReceiveState::ReceivingHeaders {
-                known_limit: 16, consumed: 0, reservation_available: 0,
-                parser_lease_used: 984, parser_lease_capacity: 1_000,
-                pending_parser_boundary: None, ..
-            }));
-        assert_eq!(c.parser_lease_ranges[&(ep, first)].iter()
-            .filter(|r| r.unowned && r.owner.is_none()).map(|r| r.bytes()).sum::<u64>(), 984);
-        assert_eq!(c.parser_lease_ranges[&(ep, first)].iter()
-            .filter(|r| r.owner.is_some()).map(|r| r.bytes()).sum::<u64>(), 1_000);
+                known_limit: 16,
+                consumed: 0,
+                reservation_available: 0,
+                parser_lease_used: 984,
+                parser_lease_capacity: 1_000,
+                pending_parser_boundary: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            c.parser_lease_ranges[&(ep, first)]
+                .iter()
+                .filter(|r| r.unowned && r.owner.is_none())
+                .map(|r| r.bytes())
+                .sum::<u64>(),
+            984
+        );
+        assert_eq!(
+            c.parser_lease_ranges[&(ep, first)]
+                .iter()
+                .filter(|r| r.owner.is_some())
+                .map(|r| r.bytes())
+                .sum::<u64>(),
+            1_000
+        );
 
         let advertise = |c: &mut QcsdController, actions: &[QcsdAction], at: Duration| {
             for action in actions {
                 let (stream, absolute_limit, slot) = match *action {
-                    QcsdAction::LeaseParserReceive { stream, absolute_limit, owner: Some(_), .. } =>
-                        (stream, absolute_limit, None),
-                    QcsdAction::IncreaseReceiveLimit { stream, absolute_limit, slot, .. } =>
-                        (stream, absolute_limit, Some(slot)),
+                    QcsdAction::LeaseParserReceive {
+                        stream,
+                        absolute_limit,
+                        owner: Some(_),
+                        ..
+                    } => (stream, absolute_limit, None),
+                    QcsdAction::IncreaseReceiveLimit {
+                        stream,
+                        absolute_limit,
+                        slot,
+                        ..
+                    } => (stream, absolute_limit, Some(slot)),
                     _ => continue,
                 };
-                c.observe(QcsdObservation::ReceiveLimitAdvertised {
-                    endpoint: ep, stream, absolute_limit, slot,
-                }, at);
+                c.observe(
+                    QcsdObservation::ReceiveLimitAdvertised {
+                        endpoint: ep,
+                        stream,
+                        absolute_limit,
+                        slot,
+                    },
+                    at,
+                );
             }
         };
         advertise(&mut c, &actions, target + Duration::from_micros(1));
@@ -32761,38 +36191,70 @@ mod tests {
         // length was observed in the failed live case. Only actual raw reads
         // consume the new [1000,2000) owner, never the old slotless984 prefix.
         for observation in [
-            QcsdObservation::BytesRead { endpoint: ep, stream: first, bytes: 900 },
+            QcsdObservation::BytesRead {
+                endpoint: ep,
+                stream: first,
+                bytes: 900,
+            },
             QcsdObservation::ResponseHeaders {
-                endpoint: ep, stream: first, frame_bytes: 900,
-                status: Some(200), content_length: None,
+                endpoint: ep,
+                stream: first,
+                frame_bytes: 900,
+                status: Some(200),
+                content_length: None,
             },
             QcsdObservation::DataFrame {
-                endpoint: ep, stream: first, frame_header_bytes: 3, data_bytes: 597,
+                endpoint: ep,
+                stream: first,
+                frame_header_bytes: 3,
+                data_bytes: 597,
             },
-            QcsdObservation::BytesRead { endpoint: ep, stream: first, bytes: 600 },
+            QcsdObservation::BytesRead {
+                endpoint: ep,
+                stream: first,
+                bytes: 600,
+            },
             QcsdObservation::PeerFinRead {
-                endpoint: ep, stream: first, final_size: 1_500,
-                encoded_receive_limit: 2_000, manual_receive_limit: 2_000,
-                bytes_received: 1_500, bytes_read: 1_500, buffered_bytes: 0,
+                endpoint: ep,
+                stream: first,
+                final_size: 1_500,
+                encoded_receive_limit: 2_000,
+                manual_receive_limit: 2_000,
+                bytes_received: 1_500,
+                bytes_read: 1_500,
+                buffered_bytes: 0,
             },
             QcsdObservation::StreamFinished {
-                endpoint: ep, stream: first, finish: QcsdStreamFinish::Fin,
+                endpoint: ep,
+                stream: first,
+                finish: QcsdStreamFinish::Fin,
             },
         ] {
             c.observe(observation, target + Duration::from_micros(4));
         }
         assert_eq!(c.buflo_fin_permission_releases.len(), 1);
         assert_eq!(c.buflo_fin_permission_releases[0].slot, slot);
-        assert_eq!((c.buflo_fin_permission_releases[0].start,
-                    c.buflo_fin_permission_releases[0].end), (1_500, 2_000));
+        assert_eq!(
+            (
+                c.buflo_fin_permission_releases[0].start,
+                c.buflo_fin_permission_releases[0].end
+            ),
+            (1_500, 2_000)
+        );
         c.process_incoming(128_005, target + Duration::from_micros(5));
         let replacement: Vec<_> = c.drain_actions().collect();
         assert!(replacement.iter().any(|a| matches!(a,
             QcsdAction::IncreaseReceiveLimit { stream, absolute_limit: 1_700, slot: owner, .. }
                 if *stream == cover && *owner == slot)));
         advertise(&mut c, &replacement, target + Duration::from_micros(6));
-        c.observe(QcsdObservation::BytesRead { endpoint: ep, stream: cover, bytes: 700 },
-            target + Duration::from_micros(7));
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint: ep,
+                stream: cover,
+                bytes: 700,
+            },
+            target + Duration::from_micros(7),
+        );
         assert!(c.drain_actions().any(|a| matches!(a,
             QcsdAction::SlotSatisfied { slot: owner, .. } if owner == slot)));
         assert_eq!(c.scheduled_incoming_consumed_bytes, 1_200);
@@ -32825,45 +36287,78 @@ mod tests {
                 1 => blocked = 999,
                 2 => blocked = 1_001,
                 3 => {
-                    c.observe(QcsdObservation::BytesRead { endpoint: ep, stream, bytes: 1 },
-                        Duration::from_micros(122_000));
+                    c.observe(
+                        QcsdObservation::BytesRead {
+                            endpoint: ep,
+                            stream,
+                            bytes: 1,
+                        },
+                        Duration::from_micros(122_000),
+                    );
                 }
                 4 => {
-                    c.observe(QcsdObservation::ResponseHeaders {
-                        endpoint: ep, stream, frame_bytes: 900,
-                        status: Some(200), content_length: None,
-                    }, Duration::from_micros(122_000));
+                    c.observe(
+                        QcsdObservation::ResponseHeaders {
+                            endpoint: ep,
+                            stream,
+                            frame_bytes: 900,
+                            status: Some(200),
+                            content_length: None,
+                        },
+                        Duration::from_micros(122_000),
+                    );
                 }
                 5 => {
                     c.streams.get_mut(ep, stream).unwrap().role = QcsdRequestRole::Chaff {
-                        resource_id: 14, request_id: None,
+                        resource_id: 14,
+                        request_id: None,
                     };
                 }
                 6 => {
                     if let crate::stream::ReceiveState::ReceivingHeaders {
-                        reservation_available, ..
-                    } = &mut c.streams.get_mut(ep, stream).unwrap().receive {
+                        reservation_available,
+                        ..
+                    } = &mut c.streams.get_mut(ep, stream).unwrap().receive
+                    {
                         *reservation_available = 999;
                     }
                 }
                 _ => {
                     let copy = c.streams.get_mut(ep, stream).unwrap().receive.clone();
                     stream = QcsdStreamId(44);
-                    c.observe(QcsdObservation::StreamOpened {
-                        endpoint: ep, stream, role: QcsdRequestRole::Application,
-                        expected_response_length: Some(1),
-                    }, Duration::from_micros(122_000));
+                    c.observe(
+                        QcsdObservation::StreamOpened {
+                            endpoint: ep,
+                            stream,
+                            role: QcsdRequestRole::Application,
+                            expected_response_length: Some(1),
+                        },
+                        Duration::from_micros(122_000),
+                    );
                     c.streams.get_mut(ep, stream).unwrap().receive = copy;
                     // Same receive snapshot without the real request ACK.
                 }
             }
             c.drain_actions().for_each(drop);
             let before = c.streams.get_mut(ep, stream).unwrap().receive.clone();
-            c.observe(QcsdObservation::StreamDataBlocked { endpoint: ep, stream, blocked_at: blocked },
-                Duration::from_micros(123_000));
-            assert_eq!(c.buflo_retained_parser_demands.contains_key(&(ep, stream)), case == 7,
-                "case{case}: missing ACK may retain demand, never permission");
-            assert_eq!(c.streams.get_mut(ep, stream).unwrap().receive, before, "case{case}");
+            c.observe(
+                QcsdObservation::StreamDataBlocked {
+                    endpoint: ep,
+                    stream,
+                    blocked_at: blocked,
+                },
+                Duration::from_micros(123_000),
+            );
+            assert_eq!(
+                c.buflo_retained_parser_demands.contains_key(&(ep, stream)),
+                case == 7,
+                "case{case}: missing ACK may retain demand, never permission"
+            );
+            assert_eq!(
+                c.streams.get_mut(ep, stream).unwrap().receive,
+                before,
+                "case{case}"
+            );
             assert!(c.control.claims.is_empty() && c.incoming_credit_ledger.is_empty());
             assert_eq!(c.scheduled_incoming_requested_bytes, 0);
             assert_eq!(c.scheduled_incoming_retired_bytes, 0);
@@ -32877,26 +36372,48 @@ mod tests {
         let stream = QcsdStreamId(44);
         for observation in [
             QcsdObservation::StreamOpened {
-                endpoint: ep, stream, role: QcsdRequestRole::Application,
+                endpoint: ep,
+                stream,
+                role: QcsdRequestRole::Application,
                 expected_response_length: Some(1),
             },
             QcsdObservation::StreamDataTransmitted {
-                endpoint: ep, stream, role: QcsdRequestRole::Application,
-                offset: 0, bytes: 63, fin: true, slot: None,
+                endpoint: ep,
+                stream,
+                role: QcsdRequestRole::Application,
+                offset: 0,
+                bytes: 63,
+                fin: true,
+                slot: None,
             },
-            QcsdObservation::StreamDataBlocked { endpoint: ep, stream, blocked_at: 16 },
+            QcsdObservation::StreamDataBlocked {
+                endpoint: ep,
+                stream,
+                blocked_at: 16,
+            },
         ] {
             c.observe(observation, Duration::from_micros(118_000));
         }
         assert!(c.drain_actions().any(|a| matches!(a,
             QcsdAction::LeaseParserReceive { stream: observed, absolute_limit: 1_000,
                 increase: 984, owner: None, .. } if observed == stream)));
-        c.observe(QcsdObservation::ReceiveLimitAdvertised {
-            endpoint: ep, stream, absolute_limit: 1_000, slot: None,
-        }, Duration::from_micros(120_000));
-        c.observe(QcsdObservation::StreamDataBlocked {
-            endpoint: ep, stream, blocked_at: 1_000,
-        }, Duration::from_micros(121_000));
+        c.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: ep,
+                stream,
+                absolute_limit: 1_000,
+                slot: None,
+            },
+            Duration::from_micros(120_000),
+        );
+        c.observe(
+            QcsdObservation::StreamDataBlocked {
+                endpoint: ep,
+                stream,
+                blocked_at: 1_000,
+            },
+            Duration::from_micros(121_000),
+        );
         assert!(c.buflo_retained_parser_demands.contains_key(&(ep, stream)));
         assert!(c.drain_actions().next().is_none());
 
@@ -32904,25 +36421,50 @@ mod tests {
         let target = Duration::from_micros(128_000);
         seed016_stage_due_remainder(&mut c, ep, early, target, 1_200);
         let actions: Vec<_> = c.drain_actions().collect();
-        assert!(!actions.iter().any(|a| matches!(a,
+        assert!(
+            !actions.iter().any(|a| matches!(a,
             QcsdAction::LeaseParserReceive { stream: observed, owner: Some(_), .. }
-                if *observed == stream)), "unacknowledged demand cannot spend a due cell");
+                if *observed == stream)),
+            "unacknowledged demand cannot spend a due cell"
+        );
         assert!(actions.iter().any(|a| matches!(a,
             QcsdAction::IncreaseReceiveLimit { stream: observed, absolute_limit: 2_200,
                 slot, .. } if *observed == cover && *slot == early)));
-        c.observe(QcsdObservation::ReceiveLimitAdvertised {
-            endpoint: ep, stream: cover, absolute_limit: 2_200, slot: Some(early),
-        }, target + Duration::from_micros(1));
-        c.observe(QcsdObservation::BytesRead { endpoint: ep, stream: cover, bytes: 1_200 },
-            target + Duration::from_micros(2));
+        c.observe(
+            QcsdObservation::ReceiveLimitAdvertised {
+                endpoint: ep,
+                stream: cover,
+                absolute_limit: 2_200,
+                slot: Some(early),
+            },
+            target + Duration::from_micros(1),
+        );
+        c.observe(
+            QcsdObservation::BytesRead {
+                endpoint: ep,
+                stream: cover,
+                bytes: 1_200,
+            },
+            target + Duration::from_micros(2),
+        );
         assert!(c.drain_actions().any(|a| matches!(a,
             QcsdAction::SlotSatisfied { slot, .. } if slot == early)));
 
-        c.observe(QcsdObservation::StreamDataAcknowledged {
-            endpoint: ep, stream, role: QcsdRequestRole::Application,
-            offset: 0, bytes: 63, fin: true,
-        }, Duration::from_micros(130_000));
-        assert!(c.drain_actions().next().is_none(), "ACK enables service but grants no MAX");
+        c.observe(
+            QcsdObservation::StreamDataAcknowledged {
+                endpoint: ep,
+                stream,
+                role: QcsdRequestRole::Application,
+                offset: 0,
+                bytes: 63,
+                fin: true,
+            },
+            Duration::from_micros(130_000),
+        );
+        assert!(
+            c.drain_actions().next().is_none(),
+            "ACK enables service but grants no MAX"
+        );
         assert_eq!(c.streams.receive_limits(ep, stream), Some((1_000, 1_000)));
         let later = Duration::from_micros(192_000);
         let next = QcsdSlotId(142_011);
@@ -33665,6 +37207,7 @@ mod tests {
                         Packet::new(Duration::from_micros(6_000), Direction::Incoming, 1_200)
                             .unwrap();
                     c.control.claims.push(PendingClaim {
+                        mixed_rbing: false,
                         reservation_debited: false,
                         slot: QcsdSlotId(9_000),
                         packet,
@@ -33733,7 +37276,7 @@ mod tests {
         }
 
         // Keep the existing explicit known-chaff service turn ahead of an
-        // otherwise eligible primary. Reuse its earliest qualified80 service oracle.
+        // otherwise eligible primary. Reuse its established qualified92 oracle.
         let mut c = native113_five_known_snapshot(false);
         let ep = QcsdEndpointId(1);
         let primary = QcsdStreamId(0);
@@ -33781,7 +37324,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(grants, vec![(QcsdStreamId(80), 7_692)]);
+        assert_eq!(grants, vec![(QcsdStreamId(92), 2_425)]);
         assert!(
             !actions
                 .iter()
@@ -33789,247 +37332,6 @@ mod tests {
         );
         assert!(c.control.claims.is_empty());
     }
-
-    // Explicit synthetic controller fixtures using Zero's saved raw9163/MAX9166
-    // DATA-end geometry. The existing Native113 fixture supplies unrelated
-    // competing owners. These are not network, FIN, qualification or Raw proofs.
-    fn native160_zero_three_tail_snapshot() -> QcsdController {
-        let mut c = native113_five_known_snapshot(false);
-        let ep = QcsdEndpointId(1);
-        let old = (ep, QcsdStreamId(80));
-        let cover = QcsdStreamId(120);
-        let key = (ep, cover);
-        let _ = c.streams.close(old.0, old.1);
-        c.advertised_incoming_credit.remove(&old);
-        c.buflo_known_chaff_demands.remove(&old);
-        c.buflo_known_chaff_service_ranges.remove(&old);
-        c.buflo_chaff_ack_observed_at.remove(&old);
-        c.buflo_chaff_last_read_at.remove(&old);
-        c.chaff = Some(super::ChaffManager::new(
-            ResourceManifest {
-                resources: vec![Resource {
-                    id: 4,
-                    url: "https://fixture.invalid/known-font".into(),
-                    kind: "Font".into(),
-                    content_length: Some(39_620),
-                    data_length: 39_620,
-                    chaff_priority: true,
-                    known_valid: true,
-                    depends_on: Vec::new(),
-                    headers: Vec::new(),
-                }],
-            },
-            false,
-        ));
-        let role = QcsdRequestRole::Chaff {
-            resource_id: 4,
-            request_id: Some(crate::QcsdChaffRequestId(10)),
-        };
-        for observation in [
-            QcsdObservation::StreamOpened {
-                endpoint: ep, stream: cover, role,
-                expected_response_length: Some(39_620),
-            },
-            QcsdObservation::StreamDataTransmitted {
-                endpoint: ep, stream: cover, role, offset: 0,
-                bytes: 99, fin: true, slot: None,
-            },
-            QcsdObservation::StreamDataAcknowledged {
-                endpoint: ep, stream: cover, role, offset: 0,
-                bytes: 99, fin: true,
-            },
-            QcsdObservation::ResponseHeaders {
-                endpoint: ep, stream: cover, frame_bytes: 924,
-                status: Some(200), content_length: Some(39_620),
-            },
-        ] {
-            c.observe(observation, Duration::from_micros(125_000_000));
-        }
-        c.streams.get_mut(ep, cover).unwrap().receive =
-            crate::stream::ReceiveState::ReceivingData {
-                advertised_limit: 9_166,
-                requested_limit: 9_166,
-                known_limit: 40_570,
-                reservation_capacity: 1_000,
-                reservation_available: 1_000,
-                consumed: 9_163,
-                payload_floor: 39_620,
-                framing_bytes: 950,
-                parser_lease_capacity: 1_000,
-                parser_lease_used: 0,
-                parser_lease_exhausted: false,
-                last_parser_lease_boundary: None,
-                pending_parser_boundary: None,
-                data_length: 8_213,
-            };
-        c.advertised_incoming_credit.insert(key, vec![AdvertisedIncomingCredit {
-            slot: QcsdSlotId(579), start: 9_163, end: 9_166,
-        }]);
-        c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().consumed = 1_197;
-        c.buflo_chaff_ack_observed_at.insert(key, Duration::from_micros(125_000_000));
-        c.buflo_chaff_last_read_at.insert(key, Duration::from_micros(140_343_869));
-        c.drain_actions().for_each(drop);
-        c
-    }
-
-    fn native160_observe_pristine_zero_tail(c: &mut QcsdController) {
-        c.observe(QcsdObservation::HeaderProgress {
-            endpoint: QcsdEndpointId(1), stream: QcsdStreamId(120),
-            min_remaining: 1, awaiting_data_frame: true,
-        }, Duration::from_micros(140_343_870));
-    }
-
-    #[test]
-    fn buflo_native160_first_untracked_three_tail_gets_fresh1200_fair_service() {
-        let mut c = native160_zero_three_tail_snapshot();
-        let ep = QcsdEndpointId(1);
-        let cover = QcsdStreamId(120);
-        let key = (ep, cover);
-        let old_ranges = c.advertised_incoming_credit.clone();
-        let old_ledgers = c.incoming_credit_ledger.clone();
-        let old_requested = c.scheduled_incoming_requested_bytes;
-        assert!(!c.buflo_known_chaff_service_ranges.contains_key(&key));
-        native160_observe_pristine_zero_tail(&mut c);
-        assert_eq!(c.buflo_known_chaff_demands.get(&key), Some(&9_163));
-        assert!(c.drain_actions().next().is_none(), "intent is neither MAX nor data");
-        assert_eq!(c.advertised_incoming_credit, old_ranges);
-        let actions = native113_due(&mut c, 140_352_000, 140_352_000);
-        let grants: Vec<_> = actions.iter().filter_map(|action| match action {
-            QcsdAction::IncreaseReceiveLimit {
-                endpoint, stream, absolute_limit, packet, slot,
-            } => Some((*endpoint, *stream, *absolute_limit, packet.length(), *slot)),
-            _ => None,
-        }).collect();
-        assert_eq!(grants, vec![(ep, cover, 10_366, 1_200, QcsdSlotId(589))]);
-        assert_eq!(c.advertised_incoming_credit, old_ranges,
-            "the old unread3 remain owned; the new cell adds1200 new offsets");
-        for (slot, ledger) in old_ledgers {
-            assert_eq!(c.incoming_credit_ledger[&slot], ledger);
-        }
-        assert_eq!(c.scheduled_incoming_requested_bytes, old_requested + 1_200);
-        assert!(c.control.claims.is_empty());
-        assert!(!actions.iter().any(|a| matches!(a,
-            QcsdAction::LeaseParserReceive { .. } | QcsdAction::SlotMissed { .. })));
-        assert!(c.buflo_fin_permission_releases.is_empty());
-    }
-
-    #[test]
-    fn buflo_native160_new_three_tail_keeps_pristine_qualified_and_owner_fences() {
-        let ep = QcsdEndpointId(1);
-        let cover = QcsdStreamId(120);
-        let key = (ep, cover);
-        for case in 0..9 {
-            let mut c = native160_zero_three_tail_snapshot();
-            let mut minimum = 1;
-            let mut awaiting = true;
-            match case {
-                0 => minimum = 2,
-                1 => awaiting = false,
-                2 => { c.buflo_chaff_ack_observed_at.remove(&key); }
-                3 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().retired = 1; }
-                4 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().local_realization_emitted = false; }
-                5 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().advertised = 1_199; }
-                6 => { c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().consumed = 0; }
-                7 => { c.advertised_incoming_credit.get_mut(&key).unwrap()[0].start = 9_164; }
-                8 => { c.chaff = None; }
-                _ => unreachable!(),
-            }
-            let before = c.streams.receive_limits(ep, cover);
-            c.observe(QcsdObservation::HeaderProgress {
-                endpoint: ep, stream: cover, min_remaining: minimum,
-                awaiting_data_frame: awaiting,
-            }, Duration::from_micros(140_343_870));
-            assert!(!c.buflo_known_chaff_demands.contains_key(&key), "case{case}");
-            assert!(!c.buflo_known_chaff_service_ranges.contains_key(&key), "case{case}");
-            assert_eq!(c.streams.receive_limits(ep, cover), before, "case{case}");
-            assert!(c.drain_actions().next().is_none(), "case{case} cannot mint MAX");
-        }
-    }
-
-    #[test]
-    fn buflo_native160_four_byte_tail_is_outside_narrow_new_admission() {
-        let mut c = native160_zero_three_tail_snapshot();
-        let ep = QcsdEndpointId(1);
-        let cover = QcsdStreamId(120);
-        if let crate::stream::ReceiveState::ReceivingData {
-            advertised_limit, requested_limit, ..
-        } = &mut c.streams.get_mut(ep, cover).unwrap().receive {
-            *advertised_limit = 9_167;
-            *requested_limit = 9_167;
-        } else { unreachable!(); }
-        c.advertised_incoming_credit.get_mut(&(ep, cover)).unwrap()[0].end = 9_167;
-        c.incoming_credit_ledger.get_mut(&QcsdSlotId(579)).unwrap().consumed = 1_196;
-        c.scheduled_incoming_consumed_bytes -= 1;
-        native160_observe_pristine_zero_tail(&mut c);
-        assert!(!c.buflo_known_chaff_demands.contains_key(&(ep, cover)));
-        assert!(!c.buflo_known_chaff_service_ranges.contains_key(&(ep, cover)));
-        assert!(c.drain_actions().next().is_none());
-    }
-
-    #[test]
-    fn buflo_native160_saved64_reads_keep_old3_and_remote_reset_retires_new3() {
-        let mut c = native160_zero_three_tail_snapshot();
-        let ep = QcsdEndpointId(1);
-        let cover = QcsdStreamId(120);
-        let slot = QcsdSlotId(6_211);
-        let target = Duration::from_micros(198_720_000);
-        let packet = Packet::new(target, Direction::Incoming, 1_200).unwrap();
-        if let crate::stream::ReceiveState::ReceivingData {
-            advertised_limit, requested_limit, ..
-        } = &mut c.streams.get_mut(ep, cover).unwrap().receive {
-            *advertised_limit = 9_230;
-            *requested_limit = 9_230;
-        } else { unreachable!(); }
-        c.advertised_incoming_credit.get_mut(&(ep, cover)).unwrap()
-            .push(AdvertisedIncomingCredit { slot, start: 9_166, end: 9_230 });
-        c.pending_slots.insert(slot, packet);
-        c.incoming_credit_ledger.insert(slot, IncomingCreditLedger {
-            packet, endpoint: Some(ep), multiple_endpoints: false,
-            advertised: 1_200, local_realization_emitted: true,
-            consumed: 1_136, retired: 0,
-        });
-        // Synthetic saved post-release state, not a genuine transport FIN proof.
-        // It enables the original terminal-witness branch solely for this test.
-        c.buflo_fin_permission_releases.push(super::BufloFinPermissionRelease {
-            release_index: 6, slot, endpoint: ep, stream: QcsdStreamId(12),
-            start: 78_904, end: 78_968, final_size: 78_904,
-            fin_at_us: 198_747_548, target_us: 198_720_000,
-            deadline_us: 198_752_000,
-            replacements: vec![(ep, cover, 9_166, 9_230, 198_747_678)],
-        });
-        c.scheduled_incoming_requested_bytes += 1_200;
-        c.scheduled_incoming_advertised_bytes += 1_200;
-        c.scheduled_incoming_consumed_bytes += 1_136;
-        c.buflo_gross_advertised += 1_264;
-        let before_consumed = c.scheduled_incoming_consumed_bytes;
-        c.observe(QcsdObservation::BytesRead { endpoint: ep, stream: cover, bytes: 64 },
-            Duration::from_micros(198_873_549));
-        assert_eq!(c.streams.consumed(ep, cover), Some(9_227));
-        assert_eq!(c.scheduled_incoming_consumed_bytes, before_consumed + 64);
-        assert_eq!(c.incoming_credit_ledger[&slot].consumed, 1_197,
-            "old3 plus new61 cannot be called64 new owned bytes");
-        assert_eq!(c.incoming_credit_ledger[&slot].retired, 0);
-        assert!(!c.drain_actions().any(|a| matches!(a,
-            QcsdAction::SlotSatisfied { slot: observed, .. } if observed == slot)));
-        let releases = c.buflo_fin_permission_releases.len();
-        c.observe(QcsdObservation::StreamFinished {
-            endpoint: ep, stream: cover, finish: QcsdStreamFinish::Reset,
-        }, Duration::from_micros(268_099_716));
-        let witness = c.incoming_credit_realization_witness(slot).unwrap();
-        assert_eq!((witness.requested, witness.advertised, witness.consumed, witness.retired),
-            (1_200, 1_200, 1_197, 3));
-        assert_eq!(c.buflo_fin_permission_releases.len(), releases,
-            "a remote reset cannot authorize FIN permission replacement");
-        assert!(c.incoming_terminal_process_witness(slot).is_none());
-        let terminal: Vec<_> = c.drain_actions().collect();
-        assert!(terminal.iter().any(|a| matches!(a,
-            QcsdAction::SlotMissed { slot: observed, reason: MissedSlotReason::ReceiveCreditRetired, .. }
-                if *observed == slot)));
-        assert!(!terminal.iter().any(|a| matches!(a,
-            QcsdAction::SlotSatisfied { slot: observed, .. } if *observed == slot)));
-    }
-
-    include!("mixed_known_unknown_parser_tests.rs");
 }
 
 #[cfg(test)]
@@ -34146,7 +37448,3 @@ mod incoming_terminal_process_clock_tests {
 #[cfg(test)]
 #[path = "cs_live_chaff_headers_tests.rs"]
 mod cs_live_chaff_headers_tests;
-
-#[cfg(test)]
-#[path = "cs_live_chaff_owned_data_tests.rs"]
-mod cs_live_chaff_owned_data_tests;

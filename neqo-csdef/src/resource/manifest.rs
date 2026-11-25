@@ -851,9 +851,19 @@ impl ResponseOnlyChaffManifest {
                     .into(),
             ));
         }
-        if self.application_resource_id != 0 || self.qualified_parallel_chaff_streams != 5 {
+        let rbing_ten = matches!(self.qualified_parallel_chaff_streams, 10 | 50)
+            && self.application_workload_sha256
+                == "a9b2aabf1b60d69b75f0cfde88b8aa75967dbfbc35084f2d52b1304e56ebbcaa"
+            && self.selected_chaff_resource_id == 4
+            && self.resources.first().is_some_and(|resource| {
+                resource.id == 4
+                    && resource.url == "https://r.bing.com/rp/5RUBu5dEYIDzWQtuZRVAHjBjuyc.br.js"
+            });
+        if self.application_resource_id != 0
+            || (self.qualified_parallel_chaff_streams != 5 && !rbing_ten)
+        {
             return Err(Error::InvalidConfig(
-                "response-only chaff manifest requires application resource zero and exactly five response-qualified parallel streams"
+                "response-only chaff manifest requires five qualified streams or exact r.bing ten-stream scope"
                     .into(),
             ));
         }
@@ -1884,6 +1894,39 @@ mod tests {
                 "missing schema-three resource field {required} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn rbing_ten_response_manifest_is_narrowly_scoped() {
+        let mut manifest = response_only_manifest();
+        manifest.application_workload_sha256 =
+            "a9b2aabf1b60d69b75f0cfde88b8aa75967dbfbc35084f2d52b1304e56ebbcaa".into();
+        manifest.selected_chaff_resource_id = 4;
+        manifest.qualified_parallel_chaff_streams = 10;
+        manifest.resources[0].id = 4;
+        manifest.resources[0].url =
+            "https://r.bing.com/rp/5RUBu5dEYIDzWQtuZRVAHjBjuyc.br.js".into();
+        manifest.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 10;
+        assert!(manifest.validate().is_ok());
+        let mut fifty = manifest.clone();
+        fifty.qualified_parallel_chaff_streams = 50;
+        fifty.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 50;
+        assert!(fifty.validate().is_ok());
+        let mut wrong = manifest.clone();
+        wrong.application_workload_sha256 = "a".repeat(64);
+        assert!(wrong.validate().is_err());
+        let mut wrong = manifest.clone();
+        wrong.resources[0].url = "https://example.com/other".into();
+        assert!(wrong.validate().is_err());
+        let mut wrong = manifest;
+        wrong.resources[0]
+            .chaff_qualification
+            .qualified_parallel_chaff_streams = 5;
+        assert!(wrong.validate().is_err());
     }
 
     #[test]

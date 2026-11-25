@@ -6,7 +6,9 @@ fn selected() -> QcsdConfig {
     QcsdConfig {
         max_udp_payload_size: 1_200,
         cs_live_chaff_header_progress: true,
-        defense: DefenseConfig::CsBuflo(CsBufloConfig { parameters: "method-fixture-only.json".into() }),
+        defense: DefenseConfig::CsBuflo(CsBufloConfig {
+            parameters: "method-fixture-only.json".into(),
+        }),
         ..QcsdConfig::default()
     }
 }
@@ -54,13 +56,20 @@ fn ali_cs_activation_exact_common_receive_and_timing_settings_are_required() {
             5 => config.use_empty_resources = true,
             _ => config.drop_unsatisfied_events = true,
         }
-        assert!(config.validate().is_err(), "case{case} changes new explicit policy");
+        assert!(
+            config.validate().is_err(),
+            "case{case} changes new explicit policy"
+        );
     }
 }
 
 #[test]
 fn ali_cs_activation_non_boolean_and_unknown_policy_fields_refuse() {
-    for wrong in [serde_json::json!(1), serde_json::json!("true"), serde_json::Value::Null] {
+    for wrong in [
+        serde_json::json!(1),
+        serde_json::json!("true"),
+        serde_json::Value::Null,
+    ] {
         let mut encoded = serde_json::to_value(selected()).unwrap();
         encoded["cs_live_chaff_header_progress"] = wrong;
         assert!(serde_json::from_value::<QcsdConfig>(encoded).is_err());
